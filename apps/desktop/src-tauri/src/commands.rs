@@ -51,6 +51,17 @@ pub fn list_memory_records(state: State<'_, AppState>) -> Result<Vec<MemoryRecor
 }
 
 #[tauri::command]
+pub fn search_memory_records(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<MemoryRecord>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .search_memory_records(&query)
+        .map_err(event_store_error)
+}
+
+#[tauri::command]
 pub fn list_permission_audit_entries(
     state: State<'_, AppState>,
 ) -> Result<Vec<PermissionAuditEntry>, String> {

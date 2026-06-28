@@ -63,6 +63,8 @@ type TranslationSet = {
     autoCapture: string;
     noMemories: string;
     loadFailed: string;
+    search: string;
+    searchPlaceholder: string;
   };
   audit: {
     title: string;
@@ -182,6 +184,8 @@ export const translations: Record<Language, TranslationSet> = {
       autoCapture: "由任务记录自动沉淀",
       noMemories: "暂无自动记忆",
       loadFailed: "记忆加载失败。",
+      search: "搜索",
+      searchPlaceholder: "搜索记忆",
     },
     audit: {
       title: "权限预检",
@@ -299,6 +303,8 @@ export const translations: Record<Language, TranslationSet> = {
       autoCapture: "Captured from task records",
       noMemories: "No auto memories yet",
       loadFailed: "Memories failed to load.",
+      search: "Search",
+      searchPlaceholder: "Search memories",
     },
     audit: {
       title: "Permission Check",

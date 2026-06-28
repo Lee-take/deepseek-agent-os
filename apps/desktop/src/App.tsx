@@ -11,6 +11,7 @@ import {
   MonitorCog,
   PackageOpen,
   Plus,
+  Search,
   ShieldCheck,
 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -79,6 +80,7 @@ export function App() {
   const [taskRecords, setTaskRecords] = useState<TaskRecord[]>([]);
   const [memoryRecords, setMemoryRecords] = useState<MemoryRecord[]>([]);
   const [permissionAudits, setPermissionAudits] = useState<PermissionAuditEntry[]>([]);
+  const [memoryQuery, setMemoryQuery] = useState("");
   const [taskTitle, setTaskTitle] = useState("");
   const [taskSummary, setTaskSummary] = useState("");
   const [exportedPackageJson, setExportedPackageJson] = useState("");
@@ -88,6 +90,7 @@ export function App() {
   const [memoryError, setMemoryError] = useState("");
   const [auditError, setAuditError] = useState("");
   const [packagePending, setPackagePending] = useState(false);
+  const [memoryPending, setMemoryPending] = useState(false);
   const [auditPending, setAuditPending] = useState<CapabilityKind | null>(null);
   const copy = translations[language];
 
@@ -154,6 +157,32 @@ export function App() {
     setLanguage(nextLanguage);
   };
 
+  const loadMemoryRecords = async (query: string) => {
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) {
+      return invoke<MemoryRecord[]>("list_memory_records");
+    }
+
+    return invoke<MemoryRecord[]>("search_memory_records", {
+      query: trimmedQuery,
+    });
+  };
+
+  const searchMemoryRecords = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setMemoryPending(true);
+    setMemoryError("");
+
+    try {
+      const memories = await loadMemoryRecords(memoryQuery);
+      setMemoryRecords(memories);
+    } catch {
+      setMemoryError(copy.memory.loadFailed);
+    } finally {
+      setMemoryPending(false);
+    }
+  };
+
   const recordPermissionAudit = async (capability: CapabilityKind) => {
     setAuditPending(capability);
     setAuditError("");
@@ -191,7 +220,7 @@ export function App() {
         title: taskTitle,
         summary: taskSummary,
       });
-      const memories = await invoke<MemoryRecord[]>("list_memory_records");
+      const memories = await loadMemoryRecords(memoryQuery);
       setTaskRecords((currentRecords) => [record, ...currentRecords]);
       setMemoryRecords(memories);
       setTaskTitle("");
@@ -252,7 +281,7 @@ export function App() {
       });
       const [records, memories] = await Promise.all([
         invoke<TaskRecord[]>("list_task_records"),
-        invoke<MemoryRecord[]>("list_memory_records"),
+        loadMemoryRecords(memoryQuery),
       ]);
       setTaskRecords(records);
       setMemoryRecords(memories);
@@ -372,6 +401,18 @@ export function App() {
                   <Database size={18} aria-hidden="true" />
                   <strong id="memory-panel-title">{copy.memory.title}</strong>
                 </div>
+                <form className="memory-search" onSubmit={searchMemoryRecords}>
+                  <input
+                    value={memoryQuery}
+                    aria-label={copy.memory.searchPlaceholder}
+                    placeholder={copy.memory.searchPlaceholder}
+                    onChange={(event) => setMemoryQuery(event.target.value)}
+                  />
+                  <button type="submit" disabled={memoryPending}>
+                    <Search size={15} aria-hidden="true" />
+                    {copy.memory.search}
+                  </button>
+                </form>
                 {memoryError ? <p className="package-error">{memoryError}</p> : null}
                 {memoryRecords.length === 0 ? (
                   <p className="empty-state">{copy.memory.noMemories}</p>

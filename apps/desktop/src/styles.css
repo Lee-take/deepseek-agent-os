@@ -482,6 +482,22 @@ dd {
   gap: 10px;
 }
 
+.memory-search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.memory-search button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 36px;
+  padding: 0 11px;
+  white-space: nowrap;
+}
+
 .memory-row {
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -608,7 +624,8 @@ dd {
   }
 
   .task-form,
-  .import-row {
+  .import-row,
+  .memory-search {
     grid-template-columns: minmax(0, 1fr);
   }
 

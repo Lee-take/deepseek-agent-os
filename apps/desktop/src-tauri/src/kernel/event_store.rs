@@ -190,6 +190,22 @@ impl EventStore {
             .collect()
     }
 
+    pub fn search_memory_records(&self, query: &str) -> EventStoreResult<Vec<MemoryRecord>> {
+        let query = query.trim().to_lowercase();
+        let memories = self.list_memory_records()?;
+        if query.is_empty() {
+            return Ok(memories);
+        }
+
+        Ok(memories
+            .into_iter()
+            .filter(|memory| {
+                memory.title.to_lowercase().contains(&query)
+                    || memory.body.to_lowercase().contains(&query)
+            })
+            .collect())
+    }
+
     pub fn append_permission_audit_entry(
         &self,
         entry: &PermissionAuditEntry,
@@ -372,6 +388,39 @@ mod tests {
         assert!(memories
             .iter()
             .any(|memory| memory.source_id == Some(incoming.id)));
+    }
+
+    #[test]
+    fn searches_memory_records_by_title_and_body_case_insensitively() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let briefing = TaskRecord::new(
+            "Prepare executive briefing".to_string(),
+            "Include approval history and drive links.".to_string(),
+        )
+        .expect("record is valid");
+        let browser = TaskRecord::new(
+            "Review browser research".to_string(),
+            "Capture competitor pricing notes.".to_string(),
+        )
+        .expect("record is valid");
+        store
+            .append_memory_record(&MemoryRecord::from_task_record(&briefing))
+            .expect("briefing memory appends");
+        store
+            .append_memory_record(&MemoryRecord::from_task_record(&browser))
+            .expect("browser memory appends");
+
+        let title_matches = store
+            .search_memory_records("BRIEF")
+            .expect("title search works");
+        let body_matches = store
+            .search_memory_records("pricing")
+            .expect("body search works");
+
+        assert_eq!(title_matches.len(), 1);
+        assert_eq!(title_matches[0].source_id, Some(briefing.id));
+        assert_eq!(body_matches.len(), 1);
+        assert_eq!(body_matches[0].source_id, Some(browser.id));
     }
 
     #[test]
