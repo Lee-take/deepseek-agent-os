@@ -5,7 +5,10 @@ import {
   Clipboard,
   Database,
   FolderOpen,
+  Globe2,
   Languages,
+  Mail,
+  MonitorCog,
   PackageOpen,
   Plus,
   ShieldCheck,
@@ -15,10 +18,12 @@ import type { ChangeEvent, FormEvent } from "react";
 import { translations } from "./i18n";
 import type {
   AccessMode,
+  CapabilityKind,
   FoundationState,
   Language,
   MemoryRecord,
   ModelRoute,
+  PermissionAuditEntry,
   TaskRecord,
   ThemeStyle,
   ThinkingLevel,
@@ -73,6 +78,7 @@ export function App() {
   const [themeStyle, setThemeStyle] = useState<ThemeStyle>(readInitialThemeStyle);
   const [taskRecords, setTaskRecords] = useState<TaskRecord[]>([]);
   const [memoryRecords, setMemoryRecords] = useState<MemoryRecord[]>([]);
+  const [permissionAudits, setPermissionAudits] = useState<PermissionAuditEntry[]>([]);
   const [taskTitle, setTaskTitle] = useState("");
   const [taskSummary, setTaskSummary] = useState("");
   const [exportedPackageJson, setExportedPackageJson] = useState("");
@@ -80,7 +86,9 @@ export function App() {
   const [packageNotice, setPackageNotice] = useState("");
   const [packageError, setPackageError] = useState("");
   const [memoryError, setMemoryError] = useState("");
+  const [auditError, setAuditError] = useState("");
   const [packagePending, setPackagePending] = useState(false);
+  const [auditPending, setAuditPending] = useState<CapabilityKind | null>(null);
   const copy = translations[language];
 
   useEffect(() => {
@@ -93,16 +101,19 @@ export function App() {
     void Promise.all([
       invoke<TaskRecord[]>("list_task_records"),
       invoke<MemoryRecord[]>("list_memory_records"),
+      invoke<PermissionAuditEntry[]>("list_permission_audit_entries"),
     ])
-      .then(([records, memories]) => {
+      .then(([records, memories, audits]) => {
         setTaskRecords(records);
         setMemoryRecords(memories);
+        setPermissionAudits(audits);
       })
       .catch(() => {
         setPackageError(copy.package.loadFailed);
         setMemoryError(copy.memory.loadFailed);
+        setAuditError(copy.audit.loadFailed);
       });
-  }, [copy.memory.loadFailed, copy.package.loadFailed]);
+  }, [copy.audit.loadFailed, copy.memory.loadFailed, copy.package.loadFailed]);
 
   useEffect(() => {
     document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
@@ -141,6 +152,23 @@ export function App() {
 
   const switchLanguage = (nextLanguage: Language) => {
     setLanguage(nextLanguage);
+  };
+
+  const recordPermissionAudit = async (capability: CapabilityKind) => {
+    setAuditPending(capability);
+    setAuditError("");
+
+    try {
+      const entry = await invoke<PermissionAuditEntry>("record_permission_audit", {
+        accessMode: state.access_mode,
+        capability,
+      });
+      setPermissionAudits((currentAudits) => [entry, ...currentAudits].slice(0, 100));
+    } catch (error) {
+      setAuditError(String(error) || copy.audit.loadFailed);
+    } finally {
+      setAuditPending(null);
+    }
   };
 
   const clearPackageStatus = () => {
@@ -220,7 +248,7 @@ export function App() {
     setPackagePending(true);
     try {
       const summary = await invoke<WorkPackageImportSummary>("import_work_package", {
-        package_json: importPackageJson,
+        packageJson: importPackageJson,
       });
       const records = await invoke<TaskRecord[]>("list_task_records");
       setTaskRecords(records);
@@ -417,6 +445,55 @@ export function App() {
               <Brain size={18} />
               <strong>{copy.inspector.title}</strong>
             </div>
+            <section className="audit-panel" aria-labelledby="audit-panel-title">
+              <div className="inspector-header compact">
+                <ShieldCheck size={18} aria-hidden="true" />
+                <strong id="audit-panel-title">{copy.audit.title}</strong>
+              </div>
+              <div className="audit-actions">
+                <button
+                  type="button"
+                  onClick={() => void recordPermissionAudit("browser_browse")}
+                  disabled={auditPending !== null}
+                >
+                  <Globe2 size={15} aria-hidden="true" />
+                  {auditPending === "browser_browse" ? copy.audit.pending : copy.audit.browser}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void recordPermissionAudit("email_send")}
+                  disabled={auditPending !== null}
+                >
+                  <Mail size={15} aria-hidden="true" />
+                  {auditPending === "email_send" ? copy.audit.pending : copy.audit.emailSend}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void recordPermissionAudit("computer_control")}
+                  disabled={auditPending !== null}
+                >
+                  <MonitorCog size={15} aria-hidden="true" />
+                  {auditPending === "computer_control" ? copy.audit.pending : copy.audit.computerControl}
+                </button>
+              </div>
+              {auditError ? <p className="package-error">{auditError}</p> : null}
+              {permissionAudits.length === 0 ? (
+                <p className="empty-state">{copy.audit.empty}</p>
+              ) : (
+                <div className="audit-list">
+                  {permissionAudits.slice(0, 4).map((entry) => (
+                    <article className="audit-row" key={entry.id}>
+                      <strong>{copy.capabilityOptions[entry.capability]}</strong>
+                      <span className={`decision ${entry.decision}`}>{copy.decisionOptions[entry.decision]}</span>
+                      <p>
+                        {copy.riskOptions[entry.risk_level]} · {copy.accessOptions[entry.access_mode]} ·{" "}
+                        {formatTaskDate(entry.created_at, language)}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
             <dl>
               <div>
                 <dt>{copy.inspector.model}</dt>

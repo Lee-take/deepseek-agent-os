@@ -1,7 +1,10 @@
 import type {
   AccessMode,
+  CapabilityKind,
   Language,
   ModelRoute,
+  PolicyDecision,
+  RiskLevel,
   ThemeStyle,
   ThinkingLevel,
   WorkspaceScope,
@@ -27,6 +30,9 @@ type TranslationSet = {
   thinkingOptions: Record<ThinkingLevel, string>;
   scopeOptions: Record<WorkspaceScope, string>;
   themeOptions: Record<ThemeStyle, string>;
+  capabilityOptions: Record<CapabilityKind, string>;
+  riskOptions: Record<RiskLevel, string>;
+  decisionOptions: Record<PolicyDecision, string>;
   workbench: {
     stage: string;
     title: string;
@@ -57,6 +63,15 @@ type TranslationSet = {
     autoCapture: string;
     noMemories: string;
     loadFailed: string;
+  };
+  audit: {
+    title: string;
+    browser: string;
+    emailSend: string;
+    computerControl: string;
+    empty: string;
+    loadFailed: string;
+    pending: string;
   };
   inspector: {
     title: string;
@@ -109,6 +124,33 @@ export const translations: Record<Language, TranslationSet> = {
       ink: "水墨山水",
       porcelain: "青花瓷",
     },
+    capabilityOptions: {
+      file_read: "读取文件",
+      file_write: "写入文件",
+      network_search: "联网搜索",
+      browser_browse: "浏览网页",
+      browser_submit: "提交网页",
+      email_read: "读取邮件",
+      email_draft: "起草邮件",
+      email_send: "发送邮件",
+      drive_read: "读取网盘",
+      drive_write: "写入网盘",
+      terminal_read: "读取终端",
+      terminal_write: "写入终端",
+      computer_screenshot: "屏幕截图",
+      computer_control: "控制电脑",
+    },
+    riskOptions: {
+      low: "低风险",
+      medium: "中风险",
+      high: "高风险",
+      critical: "关键风险",
+    },
+    decisionOptions: {
+      allow: "允许",
+      ask: "询问",
+      deny: "拒绝",
+    },
     workbench: {
       stage: "基础 MVP",
       title: "运营简报工作台",
@@ -140,6 +182,15 @@ export const translations: Record<Language, TranslationSet> = {
       autoCapture: "由任务记录自动沉淀",
       noMemories: "暂无自动记忆",
       loadFailed: "记忆加载失败。",
+    },
+    audit: {
+      title: "权限预检",
+      browser: "浏览器",
+      emailSend: "发邮件",
+      computerControl: "控电脑",
+      empty: "暂无权限审计",
+      loadFailed: "权限审计加载失败。",
+      pending: "检查中",
     },
     inspector: {
       title: "运行控制",
@@ -190,6 +241,33 @@ export const translations: Record<Language, TranslationSet> = {
       ink: "Ink landscape",
       porcelain: "Blue porcelain",
     },
+    capabilityOptions: {
+      file_read: "Read files",
+      file_write: "Write files",
+      network_search: "Network search",
+      browser_browse: "Browse web",
+      browser_submit: "Submit web",
+      email_read: "Read email",
+      email_draft: "Draft email",
+      email_send: "Send email",
+      drive_read: "Read drive",
+      drive_write: "Write drive",
+      terminal_read: "Read terminal",
+      terminal_write: "Write terminal",
+      computer_screenshot: "Screenshot",
+      computer_control: "Control computer",
+    },
+    riskOptions: {
+      low: "Low risk",
+      medium: "Medium risk",
+      high: "High risk",
+      critical: "Critical risk",
+    },
+    decisionOptions: {
+      allow: "Allow",
+      ask: "Ask",
+      deny: "Deny",
+    },
     workbench: {
       stage: "Foundation MVP",
       title: "Operations Briefing Workbench",
@@ -221,6 +299,15 @@ export const translations: Record<Language, TranslationSet> = {
       autoCapture: "Captured from task records",
       noMemories: "No auto memories yet",
       loadFailed: "Memories failed to load.",
+    },
+    audit: {
+      title: "Permission Check",
+      browser: "Browser",
+      emailSend: "Email",
+      computerControl: "Computer",
+      empty: "No permission audits yet",
+      loadFailed: "Permission audits failed to load.",
+      pending: "Checking",
     },
     inspector: {
       title: "Runtime Controls",

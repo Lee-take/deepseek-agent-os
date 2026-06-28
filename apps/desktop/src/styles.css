@@ -511,7 +511,86 @@ dd {
   font-size: 11px;
 }
 
-@media (max-width: 920px) {
+.audit-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+
+.audit-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.audit-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 8px;
+  white-space: nowrap;
+}
+
+.audit-list {
+  display: grid;
+  gap: 8px;
+}
+
+.audit-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--surface-control) 74%, transparent);
+  padding: 9px;
+}
+
+.audit-row strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.audit-row p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.decision {
+  align-self: start;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.decision.allow {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--accent);
+}
+
+.decision.ask {
+  border-color: color-mix(in srgb, #f1c477 55%, var(--border));
+  color: #f1c477;
+}
+
+.decision.deny {
+  border-color: color-mix(in srgb, #f08f8f 55%, var(--border));
+  color: #f08f8f;
+}
+
+@media (max-width: 1120px) {
   body {
     min-width: 0;
   }
@@ -530,6 +609,10 @@ dd {
 
   .task-form,
   .import-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .audit-actions {
     grid-template-columns: minmax(0, 1fr);
   }
 

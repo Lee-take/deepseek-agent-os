@@ -3,7 +3,8 @@ mod kernel;
 
 use commands::{
     create_task_record, export_work_package, get_foundation_state, import_work_package,
-    list_memory_records, list_task_records, AppState,
+    list_memory_records, list_permission_audit_entries, list_task_records, record_permission_audit,
+    AppState,
 };
 use kernel::event_store::EventStore;
 use tauri::Manager;
@@ -21,6 +22,8 @@ fn main() {
             get_foundation_state,
             list_task_records,
             list_memory_records,
+            list_permission_audit_entries,
+            record_permission_audit,
             create_task_record,
             export_work_package,
             import_work_package

@@ -8,9 +8,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::kernel::models::{KernelEvent, MemoryRecord, TaskRecord};
+use crate::kernel::policy::PermissionAuditEntry;
 use crate::kernel::work_package::WorkPackageImportSummary;
 
 pub const MEMORY_RECORD_CREATED_EVENT: &str = "memory_record.created";
+pub const PERMISSION_AUDIT_RECORDED_EVENT: &str = "permission_audit.recorded";
 pub const TASK_RECORD_CREATED_EVENT: &str = "task_record.created";
 
 #[derive(Debug, Error)]
@@ -186,6 +188,25 @@ impl EventStore {
             .collect()
     }
 
+    pub fn append_permission_audit_entry(
+        &self,
+        entry: &PermissionAuditEntry,
+    ) -> EventStoreResult<()> {
+        let event = KernelEvent::new(PERMISSION_AUDIT_RECORDED_EVENT, entry)?;
+        self.append(&event)
+    }
+
+    pub fn list_permission_audit_entries(&self) -> EventStoreResult<Vec<PermissionAuditEntry>> {
+        let events = self.list_by_type(PERMISSION_AUDIT_RECORDED_EVENT, 100)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<PermissionAuditEntry>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
     fn list_by_type(&self, event_type: &str, limit: usize) -> EventStoreResult<Vec<KernelEvent>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self.conn.prepare(
@@ -225,7 +246,9 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::EventStore;
+    use crate::kernel::models::AccessMode;
     use crate::kernel::models::{KernelEvent, MemoryRecord, TaskRecord};
+    use crate::kernel::policy::{CapabilityKind, PermissionAuditEntry};
 
     #[test]
     fn appends_and_lists_recent_kernel_event() {
@@ -308,5 +331,21 @@ mod tests {
 
         assert!(!duplicate);
         assert_eq!(memories, vec![memory]);
+    }
+
+    #[test]
+    fn appends_and_lists_permission_audit_entries() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let entry =
+            PermissionAuditEntry::evaluate(AccessMode::AskOnRisk, CapabilityKind::BrowserBrowse);
+
+        store
+            .append_permission_audit_entry(&entry)
+            .expect("permission audit appends");
+        let entries = store
+            .list_permission_audit_entries()
+            .expect("permission audits load");
+
+        assert_eq!(entries, vec![entry]);
     }
 }

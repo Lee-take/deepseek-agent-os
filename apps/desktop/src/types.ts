@@ -14,6 +14,26 @@ export type TaskRecordStatus = "active" | "done" | "blocked";
 
 export type MemoryRecordSource = "task_record";
 
+export type CapabilityKind =
+  | "file_read"
+  | "file_write"
+  | "network_search"
+  | "browser_browse"
+  | "browser_submit"
+  | "email_read"
+  | "email_draft"
+  | "email_send"
+  | "drive_read"
+  | "drive_write"
+  | "terminal_read"
+  | "terminal_write"
+  | "computer_screenshot"
+  | "computer_control";
+
+export type RiskLevel = "low" | "medium" | "high" | "critical";
+
+export type PolicyDecision = "allow" | "ask" | "deny";
+
 export type FoundationState = {
   app_name: string;
   model_route: ModelRoute;
@@ -40,6 +60,16 @@ export type MemoryRecord = {
   pinned: boolean;
   created_at: string;
   updated_at: string;
+};
+
+export type PermissionAuditEntry = {
+  id: string;
+  access_mode: AccessMode;
+  capability: CapabilityKind;
+  risk_level: RiskLevel;
+  decision: PolicyDecision;
+  reason: string;
+  created_at: string;
 };
 
 export type WorkPackage = {
