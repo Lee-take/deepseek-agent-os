@@ -14,11 +14,11 @@ Read first:
 Foundation MVP desktop commands:
 
 ```powershell
-pnpm install
+npx pnpm@9.15.9 install
 npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop build
 $env:CARGO_TARGET_DIR = Join-Path $env:TEMP 'deepseek_ui_cargo_target'
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
-pnpm dev
+npx pnpm@9.15.9 dev
 ```
 
 On Windows, `CARGO_TARGET_DIR` keeps Rust build output out of the repo path with a space, which avoids the local MinGW `dlltool` issue.

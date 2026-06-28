@@ -56,11 +56,11 @@ Indexed projects:
 ## Foundation MVP Commands
 
 ```powershell
-pnpm install
+npx pnpm@9.15.9 install
 npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop build
 $env:CARGO_TARGET_DIR = Join-Path $env:TEMP 'deepseek_ui_cargo_target'
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
-pnpm dev
+npx pnpm@9.15.9 dev
 ```
 
 Set `CARGO_TARGET_DIR` before Rust verification on Windows to avoid the local MinGW `dlltool` path-with-space issue under `D:\deepseek UI`.
