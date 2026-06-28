@@ -32,6 +32,26 @@ type TranslationSet = {
     title: string;
     summary: string;
   };
+  package: {
+    title: string;
+    taskTitle: string;
+    taskSummary: string;
+    addRecord: string;
+    exportPackage: string;
+    copyPackage: string;
+    importPackage: string;
+    packageJson: string;
+    importJson: string;
+    emptyTitle: string;
+    emptyImport: string;
+    created: string;
+    exported: string;
+    copied: string;
+    imported: (imported: number, skipped: number) => string;
+    noRecords: string;
+    copyFailed: string;
+    loadFailed: string;
+  };
   inspector: {
     title: string;
     model: string;
@@ -89,6 +109,26 @@ export const translations: Record<Language, TranslationSet> = {
       summary:
         "第一版已打通桌面工作台、权限控制、DeepSeek 路由默认值与本地内核边界。",
     },
+    package: {
+      title: "任务记录与工作包",
+      taskTitle: "任务标题",
+      taskSummary: "任务摘要",
+      addRecord: "记录任务",
+      exportPackage: "导出工作包",
+      copyPackage: "复制",
+      importPackage: "导入",
+      packageJson: "工作包 JSON",
+      importJson: "导入 JSON",
+      emptyTitle: "请先填写任务标题。",
+      emptyImport: "请先粘贴工作包 JSON。",
+      created: "任务记录已写入本地事件库。",
+      exported: "工作包已生成。",
+      copied: "工作包 JSON 已复制。",
+      imported: (imported, skipped) => `导入完成：新增 ${imported} 条，跳过 ${skipped} 条。`,
+      noRecords: "暂无任务记录",
+      copyFailed: "复制失败，请手动选择 JSON。",
+      loadFailed: "任务记录加载失败。",
+    },
     inspector: {
       title: "运行控制",
       model: "模型",
@@ -143,6 +183,26 @@ export const translations: Record<Language, TranslationSet> = {
       title: "Operations Briefing Workbench",
       summary:
         "The first runnable slice proves the desktop shell, policy controls, DeepSeek routing defaults, and local kernel boundary.",
+    },
+    package: {
+      title: "Task Records and Work Packages",
+      taskTitle: "Task title",
+      taskSummary: "Task summary",
+      addRecord: "Add record",
+      exportPackage: "Export package",
+      copyPackage: "Copy",
+      importPackage: "Import",
+      packageJson: "Work package JSON",
+      importJson: "Import JSON",
+      emptyTitle: "Add a task title first.",
+      emptyImport: "Paste work package JSON first.",
+      created: "Task record saved to the local event store.",
+      exported: "Work package generated.",
+      copied: "Work package JSON copied.",
+      imported: (imported, skipped) => `Import complete: ${imported} added, ${skipped} skipped.`,
+      noRecords: "No task records yet",
+      copyFailed: "Copy failed. Select the JSON manually.",
+      loadFailed: "Task records failed to load.",
     },
     inspector: {
       title: "Runtime Controls",

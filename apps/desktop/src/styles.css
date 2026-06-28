@@ -74,8 +74,14 @@ body {
 }
 
 button,
+input,
 select {
   font: inherit;
+}
+
+textarea {
+  font: inherit;
+  resize: vertical;
 }
 
 .app-shell {
@@ -238,6 +244,7 @@ select {
 
 .timeline,
 .inspector {
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-bg);
@@ -267,6 +274,155 @@ h1 {
   color: var(--body-text);
   font-size: 15px;
   line-height: 1.6;
+}
+
+.package-panel {
+  display: grid;
+  gap: 14px;
+  margin-top: 28px;
+  border-top: 1px solid var(--border);
+  padding-top: 20px;
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.section-heading svg {
+  color: var(--accent);
+}
+
+h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.task-form {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: stretch;
+}
+
+input,
+textarea {
+  min-width: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface-control);
+  color: var(--text);
+  padding: 9px 10px;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--muted);
+}
+
+input:focus,
+select:focus,
+textarea:focus,
+button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
+}
+
+button {
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface-control);
+  color: var(--text);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.primary-action,
+.package-actions button,
+.import-row button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 12px;
+  white-space: nowrap;
+}
+
+.primary-action {
+  justify-self: start;
+  background: var(--surface-accent);
+}
+
+.task-list {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--border);
+}
+
+.task-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0;
+}
+
+.task-row strong,
+.task-row p {
+  overflow-wrap: anywhere;
+}
+
+.task-row strong {
+  display: block;
+  font-size: 14px;
+}
+
+.task-row p,
+.empty-state,
+.package-message,
+.package-error {
+  margin: 5px 0 0;
+  color: var(--body-text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.task-row time {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.package-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.package-json {
+  min-height: 112px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+}
+
+.import-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.package-message {
+  color: var(--accent);
+}
+
+.package-error {
+  color: #f08f8f;
 }
 
 .inspector {
@@ -320,6 +476,11 @@ dd {
   }
 
   .workbench {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .task-form,
+  .import-row {
     grid-template-columns: minmax(0, 1fr);
   }
 

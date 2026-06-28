@@ -1,9 +1,29 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Brain, Database, FolderOpen, Languages, ShieldCheck } from "lucide-react";
+import {
+  ArchiveRestore,
+  Brain,
+  Clipboard,
+  Database,
+  FolderOpen,
+  Languages,
+  PackageOpen,
+  Plus,
+  ShieldCheck,
+} from "lucide-react";
 import { useEffect, useState } from "react";
-import type { ChangeEvent } from "react";
+import type { ChangeEvent, FormEvent } from "react";
 import { translations } from "./i18n";
-import type { AccessMode, FoundationState, Language, ModelRoute, ThemeStyle, ThinkingLevel } from "./types";
+import type {
+  AccessMode,
+  FoundationState,
+  Language,
+  ModelRoute,
+  TaskRecord,
+  ThemeStyle,
+  ThinkingLevel,
+  WorkPackage,
+  WorkPackageImportSummary,
+} from "./types";
 
 const fallbackState: FoundationState = {
   app_name: "DeepSeek Agent OS",
@@ -37,10 +57,27 @@ function readInitialThemeStyle(): ThemeStyle {
   return "deep";
 }
 
+function formatTaskDate(value: string, language: Language) {
+  return new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
 export function App() {
   const [state, setState] = useState<FoundationState>(fallbackState);
   const [language, setLanguage] = useState<Language>(readInitialLanguage);
   const [themeStyle, setThemeStyle] = useState<ThemeStyle>(readInitialThemeStyle);
+  const [taskRecords, setTaskRecords] = useState<TaskRecord[]>([]);
+  const [taskTitle, setTaskTitle] = useState("");
+  const [taskSummary, setTaskSummary] = useState("");
+  const [exportedPackageJson, setExportedPackageJson] = useState("");
+  const [importPackageJson, setImportPackageJson] = useState("");
+  const [packageNotice, setPackageNotice] = useState("");
+  const [packageError, setPackageError] = useState("");
+  const [packagePending, setPackagePending] = useState(false);
   const copy = translations[language];
 
   useEffect(() => {
@@ -48,6 +85,12 @@ export function App() {
       .then(setState)
       .catch(() => setState(fallbackState));
   }, []);
+
+  useEffect(() => {
+    void invoke<TaskRecord[]>("list_task_records")
+      .then(setTaskRecords)
+      .catch(() => setPackageError(copy.package.loadFailed));
+  }, [copy.package.loadFailed]);
 
   useEffect(() => {
     document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
@@ -86,6 +129,94 @@ export function App() {
 
   const switchLanguage = (nextLanguage: Language) => {
     setLanguage(nextLanguage);
+  };
+
+  const clearPackageStatus = () => {
+    setPackageNotice("");
+    setPackageError("");
+  };
+
+  const createTaskRecord = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    clearPackageStatus();
+
+    if (!taskTitle.trim()) {
+      setPackageError(copy.package.emptyTitle);
+      return;
+    }
+
+    setPackagePending(true);
+    try {
+      const record = await invoke<TaskRecord>("create_task_record", {
+        title: taskTitle,
+        summary: taskSummary,
+      });
+      setTaskRecords((currentRecords) => [record, ...currentRecords]);
+      setTaskTitle("");
+      setTaskSummary("");
+      setPackageNotice(copy.package.created);
+    } catch (error) {
+      setPackageError(String(error));
+    } finally {
+      setPackagePending(false);
+    }
+  };
+
+  const exportCurrentWorkPackage = async () => {
+    clearPackageStatus();
+    setPackagePending(true);
+    try {
+      const workPackage = await invoke<WorkPackage>("export_work_package");
+      setExportedPackageJson(JSON.stringify(workPackage, null, 2));
+      setPackageNotice(copy.package.exported);
+    } catch (error) {
+      setPackageError(String(error));
+    } finally {
+      setPackagePending(false);
+    }
+  };
+
+  const copyCurrentWorkPackage = async () => {
+    clearPackageStatus();
+    setPackagePending(true);
+    try {
+      let packageJson = exportedPackageJson;
+      if (!packageJson) {
+        const workPackage = await invoke<WorkPackage>("export_work_package");
+        packageJson = JSON.stringify(workPackage, null, 2);
+        setExportedPackageJson(packageJson);
+      }
+      await navigator.clipboard.writeText(packageJson);
+      setPackageNotice(copy.package.copied);
+    } catch {
+      setPackageError(copy.package.copyFailed);
+    } finally {
+      setPackagePending(false);
+    }
+  };
+
+  const importWorkPackageJson = async () => {
+    clearPackageStatus();
+
+    if (!importPackageJson.trim()) {
+      setPackageError(copy.package.emptyImport);
+      return;
+    }
+
+    setPackagePending(true);
+    try {
+      const summary = await invoke<WorkPackageImportSummary>("import_work_package", {
+        package_json: importPackageJson,
+      });
+      const records = await invoke<TaskRecord[]>("list_task_records");
+      setTaskRecords(records);
+      setImportPackageJson("");
+      setPackageNotice(copy.package.imported(summary.imported, summary.skipped));
+    } catch (error) {
+      setPackageError(String(error));
+    } finally {
+      setPackagePending(false);
+    }
   };
 
   return (
@@ -163,6 +294,86 @@ export function App() {
             <p className="eyebrow">{copy.workbench.stage}</p>
             <h1>{copy.workbench.title}</h1>
             <p className="summary">{copy.workbench.summary}</p>
+
+            <section className="package-panel" aria-labelledby="work-package-title">
+              <div className="section-heading">
+                <PackageOpen size={18} aria-hidden="true" />
+                <h2 id="work-package-title">{copy.package.title}</h2>
+              </div>
+
+              <form className="task-form" onSubmit={createTaskRecord}>
+                <input
+                  value={taskTitle}
+                  aria-label={copy.package.taskTitle}
+                  placeholder={copy.package.taskTitle}
+                  onChange={(event) => setTaskTitle(event.target.value)}
+                />
+                <textarea
+                  value={taskSummary}
+                  aria-label={copy.package.taskSummary}
+                  placeholder={copy.package.taskSummary}
+                  rows={3}
+                  onChange={(event) => setTaskSummary(event.target.value)}
+                />
+                <button className="primary-action" type="submit" disabled={packagePending}>
+                  <Plus size={16} aria-hidden="true" />
+                  {copy.package.addRecord}
+                </button>
+              </form>
+
+              <div className="task-list" aria-live="polite">
+                {taskRecords.length === 0 ? (
+                  <p className="empty-state">{copy.package.noRecords}</p>
+                ) : (
+                  taskRecords.map((record) => (
+                    <article className="task-row" key={record.id}>
+                      <div>
+                        <strong>{record.title}</strong>
+                        {record.summary ? <p>{record.summary}</p> : null}
+                      </div>
+                      <time dateTime={record.created_at}>{formatTaskDate(record.created_at, language)}</time>
+                    </article>
+                  ))
+                )}
+              </div>
+
+              <div className="package-actions">
+                <button type="button" onClick={exportCurrentWorkPackage} disabled={packagePending}>
+                  <PackageOpen size={16} aria-hidden="true" />
+                  {copy.package.exportPackage}
+                </button>
+                <button type="button" onClick={copyCurrentWorkPackage} disabled={packagePending}>
+                  <Clipboard size={16} aria-hidden="true" />
+                  {copy.package.copyPackage}
+                </button>
+              </div>
+
+              <textarea
+                className="package-json"
+                value={exportedPackageJson}
+                aria-label={copy.package.packageJson}
+                placeholder={copy.package.packageJson}
+                rows={5}
+                readOnly
+              />
+
+              <div className="import-row">
+                <textarea
+                  value={importPackageJson}
+                  aria-label={copy.package.importJson}
+                  placeholder={copy.package.importJson}
+                  rows={4}
+                  onChange={(event) => setImportPackageJson(event.target.value)}
+                />
+                <button type="button" onClick={importWorkPackageJson} disabled={packagePending}>
+                  <ArchiveRestore size={16} aria-hidden="true" />
+                  {copy.package.importPackage}
+                </button>
+              </div>
+
+              {packageNotice ? <p className="package-message">{packageNotice}</p> : null}
+              {packageError ? <p className="package-error">{packageError}</p> : null}
+            </section>
           </div>
           <aside className="inspector">
             <div className="inspector-header">

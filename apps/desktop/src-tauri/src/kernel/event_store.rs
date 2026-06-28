@@ -7,7 +7,10 @@ use rusqlite::{params, Connection};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::kernel::models::KernelEvent;
+use crate::kernel::models::{KernelEvent, TaskRecord};
+use crate::kernel::work_package::WorkPackageImportSummary;
+
+pub const TASK_RECORD_CREATED_EVENT: &str = "task_record.created";
 
 #[derive(Debug, Error)]
 pub enum EventStoreError {
@@ -19,6 +22,9 @@ pub enum EventStoreError {
 
     #[error("uuid parse error: {0}")]
     Uuid(#[from] uuid::Error),
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub type EventStoreResult<T> = Result<T, EventStoreError>;
@@ -110,12 +116,90 @@ impl EventStore {
 
         Ok(events)
     }
+
+    pub fn append_task_record(&self, record: &TaskRecord) -> EventStoreResult<()> {
+        let event = KernelEvent::new(TASK_RECORD_CREATED_EVENT, record)?;
+        self.append(&event)
+    }
+
+    pub fn list_task_records(&self) -> EventStoreResult<Vec<TaskRecord>> {
+        let events = self.list_by_type(TASK_RECORD_CREATED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<TaskRecord>(&event.payload_json).map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn import_task_records(
+        &self,
+        records: &[TaskRecord],
+    ) -> EventStoreResult<WorkPackageImportSummary> {
+        let mut existing_ids = self
+            .list_task_records()?
+            .into_iter()
+            .map(|record| record.id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut summary = WorkPackageImportSummary {
+            imported: 0,
+            skipped: 0,
+        };
+
+        for record in records {
+            if existing_ids.contains(&record.id) {
+                summary.skipped += 1;
+                continue;
+            }
+
+            self.append_task_record(record)?;
+            existing_ids.insert(record.id);
+            summary.imported += 1;
+        }
+
+        Ok(summary)
+    }
+
+    fn list_by_type(&self, event_type: &str, limit: usize) -> EventStoreResult<Vec<KernelEvent>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, event_type, payload_json, created_at
+            FROM kernel_events
+            WHERE event_type = ?1
+            ORDER BY created_at DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![event_type, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for (id, event_type, payload_json, created_at) in rows {
+            events.push(KernelEvent {
+                id: Uuid::parse_str(&id)?,
+                event_type,
+                payload_json,
+                created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+            });
+        }
+
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::EventStore;
-    use crate::kernel::models::KernelEvent;
+    use crate::kernel::models::{KernelEvent, TaskRecord};
 
     #[test]
     fn appends_and_lists_recent_kernel_event() {
@@ -132,5 +216,51 @@ mod tests {
         assert_eq!(events[0].id, event.id);
         assert_eq!(events[0].event_type, event.event_type);
         assert_eq!(events[0].payload_json, event.payload_json);
+    }
+
+    #[test]
+    fn appends_and_lists_task_records() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let record = TaskRecord::new(
+            "Review finance inbox".to_string(),
+            "Collect evidence for the operations briefing.".to_string(),
+        )
+        .expect("record is valid");
+
+        store
+            .append_task_record(&record)
+            .expect("task record appends");
+        let records = store.list_task_records().expect("records load");
+
+        assert_eq!(records, vec![record]);
+    }
+
+    #[test]
+    fn imports_task_records_and_skips_existing_ids() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let existing = TaskRecord::new(
+            "Review finance inbox".to_string(),
+            "Collect evidence for the operations briefing.".to_string(),
+        )
+        .expect("record is valid");
+        let incoming = TaskRecord::new(
+            "Prepare weekly work package".to_string(),
+            "Export task records for handoff.".to_string(),
+        )
+        .expect("record is valid");
+        store
+            .append_task_record(&existing)
+            .expect("existing record appends");
+
+        let summary = store
+            .import_task_records(&[existing.clone(), incoming.clone()])
+            .expect("records import");
+        let records = store.list_task_records().expect("records load");
+
+        assert_eq!(summary.imported, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(records.len(), 2);
+        assert!(records.contains(&existing));
+        assert!(records.contains(&incoming));
     }
 }

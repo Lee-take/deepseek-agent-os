@@ -36,6 +36,43 @@ pub enum WorkspaceScope {
     Workspace,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRecordStatus {
+    Active,
+    Done,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskRecord {
+    pub id: Uuid,
+    pub title: String,
+    pub summary: String,
+    pub status: TaskRecordStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TaskRecord {
+    pub fn new(title: String, summary: String) -> Result<Self, String> {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return Err("task title is required".to_string());
+        }
+
+        let now = Utc::now();
+        Ok(Self {
+            id: Uuid::new_v4(),
+            title,
+            summary: summary.trim().to_string(),
+            status: TaskRecordStatus::Active,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FoundationState {
     pub app_name: String,
@@ -82,7 +119,8 @@ impl KernelEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessMode, FoundationState, KernelEvent, ModelRoute, ThinkingLevel, WorkspaceScope,
+        AccessMode, FoundationState, KernelEvent, ModelRoute, TaskRecord, TaskRecordStatus,
+        ThinkingLevel, WorkspaceScope,
     };
 
     #[test]
@@ -110,5 +148,28 @@ mod tests {
         assert_eq!(event.event_type, "foundation.ready");
         assert_eq!(event.payload_json, r#"{"ready":true}"#);
         assert!(event.created_at <= chrono::Utc::now());
+    }
+
+    #[test]
+    fn task_record_trims_title_and_defaults_to_active() {
+        let record = TaskRecord::new(
+            "  Draft weekly operations brief  ".to_string(),
+            "  Pull mail, drive, and browser findings. ".to_string(),
+        )
+        .expect("record is valid");
+
+        assert_eq!(record.title, "Draft weekly operations brief");
+        assert_eq!(record.summary, "Pull mail, drive, and browser findings.");
+        assert_eq!(record.status, TaskRecordStatus::Active);
+        assert!(record.created_at <= chrono::Utc::now());
+        assert_eq!(record.created_at, record.updated_at);
+    }
+
+    #[test]
+    fn task_record_rejects_blank_title() {
+        let error = TaskRecord::new("   ".to_string(), "summary".to_string())
+            .expect_err("blank title should fail");
+
+        assert_eq!(error, "task title is required");
     }
 }
