@@ -52,6 +52,12 @@ type TranslationSet = {
     copyFailed: string;
     loadFailed: string;
   };
+  memory: {
+    title: string;
+    autoCapture: string;
+    noMemories: string;
+    loadFailed: string;
+  };
   inspector: {
     title: string;
     model: string;
@@ -129,6 +135,12 @@ export const translations: Record<Language, TranslationSet> = {
       copyFailed: "复制失败，请手动选择 JSON。",
       loadFailed: "任务记录加载失败。",
     },
+    memory: {
+      title: "自动记忆",
+      autoCapture: "由任务记录自动沉淀",
+      noMemories: "暂无自动记忆",
+      loadFailed: "记忆加载失败。",
+    },
     inspector: {
       title: "运行控制",
       model: "模型",
@@ -203,6 +215,12 @@ export const translations: Record<Language, TranslationSet> = {
       noRecords: "No task records yet",
       copyFailed: "Copy failed. Select the JSON manually.",
       loadFailed: "Task records failed to load.",
+    },
+    memory: {
+      title: "Auto Memory",
+      autoCapture: "Captured from task records",
+      noMemories: "No auto memories yet",
+      loadFailed: "Memories failed to load.",
     },
     inspector: {
       title: "Runtime Controls",

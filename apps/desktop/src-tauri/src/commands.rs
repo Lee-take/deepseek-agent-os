@@ -4,6 +4,7 @@ use tauri::State;
 
 use crate::kernel::event_store::EventStore;
 use crate::kernel::models::FoundationState;
+use crate::kernel::models::MemoryRecord;
 use crate::kernel::models::TaskRecord;
 use crate::kernel::work_package::{
     export_work_package as build_work_package, parse_work_package_json, WorkPackage,
@@ -42,6 +43,12 @@ pub fn list_task_records(state: State<'_, AppState>) -> Result<Vec<TaskRecord>, 
 }
 
 #[tauri::command]
+pub fn list_memory_records(state: State<'_, AppState>) -> Result<Vec<MemoryRecord>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store.list_memory_records().map_err(event_store_error)
+}
+
+#[tauri::command]
 pub fn create_task_record(
     title: String,
     summary: String,
@@ -51,6 +58,10 @@ pub fn create_task_record(
     let store = state.event_store.lock().map_err(|_| lock_error())?;
     store
         .append_task_record(&record)
+        .map_err(event_store_error)?;
+    let memory = MemoryRecord::from_task_record(&record);
+    store
+        .append_memory_record(&memory)
         .map_err(event_store_error)?;
     Ok(record)
 }

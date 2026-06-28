@@ -3,7 +3,7 @@ mod kernel;
 
 use commands::{
     create_task_record, export_work_package, get_foundation_state, import_work_package,
-    list_task_records, AppState,
+    list_memory_records, list_task_records, AppState,
 };
 use kernel::event_store::EventStore;
 use tauri::Manager;
@@ -20,6 +20,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_foundation_state,
             list_task_records,
+            list_memory_records,
             create_task_record,
             export_work_package,
             import_work_package

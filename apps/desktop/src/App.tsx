@@ -17,6 +17,7 @@ import type {
   AccessMode,
   FoundationState,
   Language,
+  MemoryRecord,
   ModelRoute,
   TaskRecord,
   ThemeStyle,
@@ -71,12 +72,14 @@ export function App() {
   const [language, setLanguage] = useState<Language>(readInitialLanguage);
   const [themeStyle, setThemeStyle] = useState<ThemeStyle>(readInitialThemeStyle);
   const [taskRecords, setTaskRecords] = useState<TaskRecord[]>([]);
+  const [memoryRecords, setMemoryRecords] = useState<MemoryRecord[]>([]);
   const [taskTitle, setTaskTitle] = useState("");
   const [taskSummary, setTaskSummary] = useState("");
   const [exportedPackageJson, setExportedPackageJson] = useState("");
   const [importPackageJson, setImportPackageJson] = useState("");
   const [packageNotice, setPackageNotice] = useState("");
   const [packageError, setPackageError] = useState("");
+  const [memoryError, setMemoryError] = useState("");
   const [packagePending, setPackagePending] = useState(false);
   const copy = translations[language];
 
@@ -87,10 +90,19 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    void invoke<TaskRecord[]>("list_task_records")
-      .then(setTaskRecords)
-      .catch(() => setPackageError(copy.package.loadFailed));
-  }, [copy.package.loadFailed]);
+    void Promise.all([
+      invoke<TaskRecord[]>("list_task_records"),
+      invoke<MemoryRecord[]>("list_memory_records"),
+    ])
+      .then(([records, memories]) => {
+        setTaskRecords(records);
+        setMemoryRecords(memories);
+      })
+      .catch(() => {
+        setPackageError(copy.package.loadFailed);
+        setMemoryError(copy.memory.loadFailed);
+      });
+  }, [copy.memory.loadFailed, copy.package.loadFailed]);
 
   useEffect(() => {
     document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
@@ -151,7 +163,9 @@ export function App() {
         title: taskTitle,
         summary: taskSummary,
       });
+      const memories = await invoke<MemoryRecord[]>("list_memory_records");
       setTaskRecords((currentRecords) => [record, ...currentRecords]);
+      setMemoryRecords(memories);
       setTaskTitle("");
       setTaskSummary("");
       setPackageNotice(copy.package.created);
@@ -320,6 +334,29 @@ export function App() {
                   {copy.package.addRecord}
                 </button>
               </form>
+
+              <section className="memory-panel inline" aria-labelledby="memory-panel-title">
+                <div className="inspector-header compact">
+                  <Database size={18} aria-hidden="true" />
+                  <strong id="memory-panel-title">{copy.memory.title}</strong>
+                </div>
+                {memoryError ? <p className="package-error">{memoryError}</p> : null}
+                {memoryRecords.length === 0 ? (
+                  <p className="empty-state">{copy.memory.noMemories}</p>
+                ) : (
+                  <div className="memory-list">
+                    {memoryRecords.slice(0, 3).map((memory) => (
+                      <article className="memory-row" key={memory.id}>
+                        <strong>{memory.title}</strong>
+                        <p>{memory.body}</p>
+                        <span>
+                          {copy.memory.autoCapture} · {formatTaskDate(memory.created_at, language)}
+                        </span>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </section>
 
               <div className="task-list" aria-live="polite">
                 {taskRecords.length === 0 ? (

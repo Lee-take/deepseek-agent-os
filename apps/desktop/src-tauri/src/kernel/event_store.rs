@@ -7,9 +7,10 @@ use rusqlite::{params, Connection};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::kernel::models::{KernelEvent, TaskRecord};
+use crate::kernel::models::{KernelEvent, MemoryRecord, TaskRecord};
 use crate::kernel::work_package::WorkPackageImportSummary;
 
+pub const MEMORY_RECORD_CREATED_EVENT: &str = "memory_record.created";
 pub const TASK_RECORD_CREATED_EVENT: &str = "task_record.created";
 
 #[derive(Debug, Error)]
@@ -160,6 +161,31 @@ impl EventStore {
         Ok(summary)
     }
 
+    pub fn append_memory_record(&self, record: &MemoryRecord) -> EventStoreResult<bool> {
+        if let Some(source_id) = record.source_id {
+            let existing = self.list_memory_records()?.into_iter().any(|memory| {
+                memory.source == record.source && memory.source_id == Some(source_id)
+            });
+            if existing {
+                return Ok(false);
+            }
+        }
+
+        let event = KernelEvent::new(MEMORY_RECORD_CREATED_EVENT, record)?;
+        self.append(&event)?;
+        Ok(true)
+    }
+
+    pub fn list_memory_records(&self) -> EventStoreResult<Vec<MemoryRecord>> {
+        let events = self.list_by_type(MEMORY_RECORD_CREATED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<MemoryRecord>(&event.payload_json).map_err(Into::into)
+            })
+            .collect()
+    }
+
     fn list_by_type(&self, event_type: &str, limit: usize) -> EventStoreResult<Vec<KernelEvent>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self.conn.prepare(
@@ -199,7 +225,7 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::EventStore;
-    use crate::kernel::models::{KernelEvent, TaskRecord};
+    use crate::kernel::models::{KernelEvent, MemoryRecord, TaskRecord};
 
     #[test]
     fn appends_and_lists_recent_kernel_event() {
@@ -262,5 +288,25 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records.contains(&existing));
         assert!(records.contains(&incoming));
+    }
+
+    #[test]
+    fn captures_memory_from_task_record_once() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let task = TaskRecord::new(
+            "Prepare executive summary".to_string(),
+            "Remember the report needs source links and approval history.".to_string(),
+        )
+        .expect("task is valid");
+        let memory = MemoryRecord::from_task_record(&task);
+
+        store.append_memory_record(&memory).expect("memory appends");
+        let duplicate = store
+            .append_memory_record(&MemoryRecord::from_task_record(&task))
+            .expect("duplicate memory is skipped");
+        let memories = store.list_memory_records().expect("memories load");
+
+        assert!(!duplicate);
+        assert_eq!(memories, vec![memory]);
     }
 }

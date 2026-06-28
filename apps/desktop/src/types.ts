@@ -12,6 +12,8 @@ export type ThemeStyle = "deep" | "ink" | "porcelain";
 
 export type TaskRecordStatus = "active" | "done" | "blocked";
 
+export type MemoryRecordSource = "task_record";
+
 export type FoundationState = {
   app_name: string;
   model_route: ModelRoute;
@@ -25,6 +27,17 @@ export type TaskRecord = {
   title: string;
   summary: string;
   status: TaskRecordStatus;
+  created_at: string;
+  updated_at: string;
+};
+
+export type MemoryRecord = {
+  id: string;
+  title: string;
+  body: string;
+  source: MemoryRecordSource;
+  source_id: string | null;
+  pinned: boolean;
   created_at: string;
   updated_at: string;
 };

@@ -73,6 +73,46 @@ impl TaskRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRecordSource {
+    TaskRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryRecord {
+    pub id: Uuid,
+    pub title: String,
+    pub body: String,
+    pub source: MemoryRecordSource,
+    pub source_id: Option<Uuid>,
+    pub pinned: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl MemoryRecord {
+    pub fn from_task_record(record: &TaskRecord) -> Self {
+        let now = Utc::now();
+        let body = if record.summary.is_empty() {
+            record.title.clone()
+        } else {
+            record.summary.clone()
+        };
+
+        Self {
+            id: Uuid::new_v4(),
+            title: record.title.clone(),
+            body,
+            source: MemoryRecordSource::TaskRecord,
+            source_id: Some(record.id),
+            pinned: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FoundationState {
     pub app_name: String,
@@ -119,8 +159,8 @@ impl KernelEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessMode, FoundationState, KernelEvent, ModelRoute, TaskRecord, TaskRecordStatus,
-        ThinkingLevel, WorkspaceScope,
+        AccessMode, FoundationState, KernelEvent, MemoryRecord, MemoryRecordSource, ModelRoute,
+        TaskRecord, TaskRecordStatus, ThinkingLevel, WorkspaceScope,
     };
 
     #[test]
@@ -171,5 +211,27 @@ mod tests {
             .expect_err("blank title should fail");
 
         assert_eq!(error, "task title is required");
+    }
+
+    #[test]
+    fn memory_record_from_task_record_preserves_source_and_content() {
+        let task = TaskRecord::new(
+            "Prepare investor briefing".to_string(),
+            "Remember that the briefing depends on inbox and drive evidence.".to_string(),
+        )
+        .expect("task is valid");
+
+        let memory = MemoryRecord::from_task_record(&task);
+
+        assert_eq!(memory.title, "Prepare investor briefing");
+        assert_eq!(
+            memory.body,
+            "Remember that the briefing depends on inbox and drive evidence."
+        );
+        assert_eq!(memory.source, MemoryRecordSource::TaskRecord);
+        assert_eq!(memory.source_id, Some(task.id));
+        assert!(!memory.pinned);
+        assert!(memory.created_at <= chrono::Utc::now());
+        assert_eq!(memory.created_at, memory.updated_at);
     }
 }
