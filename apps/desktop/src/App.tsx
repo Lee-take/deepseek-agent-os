@@ -5,11 +5,11 @@ import type { ChangeEvent } from "react";
 import type { AccessMode, FoundationState, ModelRoute, ThinkingLevel } from "./types";
 
 const fallbackState: FoundationState = {
-  appName: "DeepSeek Agent OS",
-  modelRoute: "auto",
-  thinkingLevel: "auto",
-  accessMode: "ask_on_risk",
-  workspaceScope: "workspace",
+  app_name: "DeepSeek Agent OS",
+  model_route: "auto",
+  thinking_level: "auto",
+  access_mode: "ask_on_risk",
+  workspace_scope: "workspace",
 };
 
 export function App() {
@@ -24,21 +24,21 @@ export function App() {
   const updateModelRoute = (event: ChangeEvent<HTMLSelectElement>) => {
     setState((currentState) => ({
       ...currentState,
-      modelRoute: event.target.value as ModelRoute,
+      model_route: event.target.value as ModelRoute,
     }));
   };
 
   const updateAccessMode = (event: ChangeEvent<HTMLSelectElement>) => {
     setState((currentState) => ({
       ...currentState,
-      accessMode: event.target.value as AccessMode,
+      access_mode: event.target.value as AccessMode,
     }));
   };
 
   const updateThinkingLevel = (event: ChangeEvent<HTMLSelectElement>) => {
     setState((currentState) => ({
       ...currentState,
-      thinkingLevel: event.target.value as ThinkingLevel,
+      thinking_level: event.target.value as ThinkingLevel,
     }));
   };
 
@@ -48,7 +48,7 @@ export function App() {
         <div className="brand">
           <div className="brand-mark">D</div>
           <div>
-            <strong>{state.appName}</strong>
+            <strong>{state.app_name}</strong>
             <span>Local-first Agent OS</span>
           </div>
         </div>
@@ -67,18 +67,18 @@ export function App() {
 
       <section className="workspace">
         <header className="toolbar">
-          <select value={state.modelRoute} aria-label="Model route" onChange={updateModelRoute}>
+          <select value={state.model_route} aria-label="Model route" onChange={updateModelRoute}>
             <option value="auto">DeepSeek Auto</option>
-            <option value="deepseek-v4-flash">DeepSeek Flash</option>
-            <option value="deepseek-v4-pro">DeepSeek Pro</option>
+            <option value="flash">DeepSeek Flash</option>
+            <option value="pro">DeepSeek Pro</option>
           </select>
-          <select value={state.accessMode} aria-label="Access mode" onChange={updateAccessMode}>
+          <select value={state.access_mode} aria-label="Access mode" onChange={updateAccessMode}>
             <option value="ask_every_step">Every step asks</option>
             <option value="ask_on_risk">Ask on risk</option>
             <option value="limited_auto">Limited auto</option>
             <option value="full_access">Full access</option>
           </select>
-          <select value={state.thinkingLevel} aria-label="Thinking level" onChange={updateThinkingLevel}>
+          <select value={state.thinking_level} aria-label="Thinking level" onChange={updateThinkingLevel}>
             <option value="auto">Thinking auto</option>
             <option value="fast">Fast</option>
             <option value="standard">Standard</option>
@@ -103,19 +103,19 @@ export function App() {
             <dl>
               <div>
                 <dt>Model</dt>
-                <dd>{state.modelRoute}</dd>
+                <dd>{state.model_route}</dd>
               </div>
               <div>
                 <dt>Access</dt>
-                <dd>{state.accessMode}</dd>
+                <dd>{state.access_mode}</dd>
               </div>
               <div>
                 <dt>Thinking</dt>
-                <dd>{state.thinkingLevel}</dd>
+                <dd>{state.thinking_level}</dd>
               </div>
               <div>
                 <dt>Scope</dt>
-                <dd>{state.workspaceScope}</dd>
+                <dd>{state.workspace_scope}</dd>
               </div>
             </dl>
           </aside>
