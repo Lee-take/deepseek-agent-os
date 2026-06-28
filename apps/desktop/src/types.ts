@@ -6,6 +6,8 @@ export type AccessMode = "ask_every_step" | "ask_on_risk" | "limited_auto" | "fu
 
 export type WorkspaceScope = "workspace";
 
+export type Language = "zh" | "en";
+
 export type FoundationState = {
   app_name: string;
   model_route: ModelRoute;

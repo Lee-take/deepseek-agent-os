@@ -112,6 +112,42 @@ select {
   padding: 0 10px;
 }
 
+.language-switch {
+  display: grid;
+  grid-template-columns: 22px 34px 34px;
+  align-items: center;
+  gap: 4px;
+  height: 34px;
+  margin-left: auto;
+  border: 1px solid #3a3f45;
+  border-radius: 7px;
+  background: #1a1d20;
+  color: #a7adb5;
+  padding: 0 5px 0 8px;
+}
+
+.language-switch svg {
+  color: #8fd0bc;
+}
+
+.language-option {
+  display: grid;
+  width: 34px;
+  height: 24px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #a7adb5;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.language-option.active {
+  background: #243531;
+  color: #f4f1ea;
+}
+
 .workbench {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 360px;
