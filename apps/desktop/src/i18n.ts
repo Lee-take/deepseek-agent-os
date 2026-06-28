@@ -1,4 +1,11 @@
-import type { AccessMode, Language, ModelRoute, ThinkingLevel, WorkspaceScope } from "./types";
+import type {
+  AccessMode,
+  Language,
+  ModelRoute,
+  ThemeStyle,
+  ThinkingLevel,
+  WorkspaceScope,
+} from "./types";
 
 type TranslationSet = {
   brandTagline: string;
@@ -12,12 +19,14 @@ type TranslationSet = {
     modelRoute: string;
     accessMode: string;
     thinkingLevel: string;
+    themeStyle: string;
     language: string;
   };
   modelOptions: Record<ModelRoute, string>;
   accessOptions: Record<AccessMode, string>;
   thinkingOptions: Record<ThinkingLevel, string>;
   scopeOptions: Record<WorkspaceScope, string>;
+  themeOptions: Record<ThemeStyle, string>;
   workbench: {
     stage: string;
     title: string;
@@ -29,6 +38,7 @@ type TranslationSet = {
     access: string;
     thinking: string;
     scope: string;
+    theme: string;
   };
 };
 
@@ -45,6 +55,7 @@ export const translations: Record<Language, TranslationSet> = {
       modelRoute: "模型路线",
       accessMode: "访问权限",
       thinkingLevel: "思考强度",
+      themeStyle: "界面风格",
       language: "界面语言",
     },
     modelOptions: {
@@ -67,6 +78,11 @@ export const translations: Record<Language, TranslationSet> = {
     scopeOptions: {
       workspace: "工作区",
     },
+    themeOptions: {
+      deep: "深色默认",
+      ink: "水墨山水",
+      porcelain: "青花瓷",
+    },
     workbench: {
       stage: "基础 MVP",
       title: "运营简报工作台",
@@ -79,6 +95,7 @@ export const translations: Record<Language, TranslationSet> = {
       access: "权限",
       thinking: "思考",
       scope: "范围",
+      theme: "风格",
     },
   },
   en: {
@@ -93,6 +110,7 @@ export const translations: Record<Language, TranslationSet> = {
       modelRoute: "Model route",
       accessMode: "Access mode",
       thinkingLevel: "Thinking level",
+      themeStyle: "Interface style",
       language: "Interface language",
     },
     modelOptions: {
@@ -115,6 +133,11 @@ export const translations: Record<Language, TranslationSet> = {
     scopeOptions: {
       workspace: "Workspace",
     },
+    themeOptions: {
+      deep: "Deep default",
+      ink: "Ink landscape",
+      porcelain: "Blue porcelain",
+    },
     workbench: {
       stage: "Foundation MVP",
       title: "Operations Briefing Workbench",
@@ -127,6 +150,7 @@ export const translations: Record<Language, TranslationSet> = {
       access: "Access",
       thinking: "Thinking",
       scope: "Scope",
+      theme: "Style",
     },
   },
 };

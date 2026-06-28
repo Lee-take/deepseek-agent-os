@@ -2,8 +2,64 @@
   color-scheme: dark;
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #111315;
-  color: #f4f1ea;
+  --app-bg: #111315;
+  --sidebar-bg: #17191c;
+  --surface-bg: #17191c;
+  --surface-control: #1a1d20;
+  --surface-active: #202b28;
+  --surface-accent: #243531;
+  --brand-mark-bg: #202327;
+  --border: #2c3034;
+  --border-strong: #3a3f45;
+  --border-active: #3a4c48;
+  --text: #f4f1ea;
+  --muted: #a7adb5;
+  --body-text: #b8bec5;
+  --accent: #8fd0bc;
+  --theme-wash: transparent;
+  background: var(--app-bg);
+  color: var(--text);
+}
+
+:root[data-theme="ink"] {
+  --app-bg: #101211;
+  --sidebar-bg: #151817;
+  --surface-bg: #171b19;
+  --surface-control: #1c211f;
+  --surface-active: #1f2a25;
+  --surface-accent: #26372f;
+  --brand-mark-bg: #1d2420;
+  --border: #2d3632;
+  --border-strong: #45534d;
+  --border-active: #597067;
+  --text: #f5f1e7;
+  --muted: #b0b3aa;
+  --body-text: #c5c6ba;
+  --accent: #a8c8aa;
+  --theme-wash:
+    linear-gradient(155deg, transparent 0 48%, rgba(126, 150, 130, 0.11) 49% 57%, transparent 58%),
+    linear-gradient(168deg, transparent 0 55%, rgba(238, 232, 215, 0.06) 56% 64%, transparent 65%);
+}
+
+:root[data-theme="porcelain"] {
+  color-scheme: light;
+  --app-bg: #f6f8f6;
+  --sidebar-bg: #eef3f2;
+  --surface-bg: #fbfcfb;
+  --surface-control: #edf4f6;
+  --surface-active: #dceaf2;
+  --surface-accent: #d7e8f1;
+  --brand-mark-bg: #e4eff4;
+  --border: #cddbe1;
+  --border-strong: #9fb8c7;
+  --border-active: #2d6fa8;
+  --text: #132033;
+  --muted: #617081;
+  --body-text: #425466;
+  --accent: #1f66a8;
+  --theme-wash:
+    repeating-linear-gradient(135deg, rgba(31, 102, 168, 0.06) 0 1px, transparent 1px 22px),
+    radial-gradient(circle at 88% 18%, rgba(31, 102, 168, 0.1), transparent 30%);
 }
 
 * {
@@ -12,9 +68,9 @@
 
 body {
   margin: 0;
-  min-width: 960px;
+  min-width: 920px;
   min-height: 720px;
-  background: #111315;
+  background: var(--app-bg);
 }
 
 button,
@@ -29,8 +85,8 @@ select {
 }
 
 .sidebar {
-  border-right: 1px solid #2c3034;
-  background: #17191c;
+  border-right: 1px solid var(--border);
+  background: var(--sidebar-bg);
   padding: 18px 14px;
 }
 
@@ -38,7 +94,7 @@ select {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 26px;
+  margin-bottom: 14px;
 }
 
 .brand-mark {
@@ -46,10 +102,10 @@ select {
   width: 38px;
   height: 38px;
   place-items: center;
-  border: 1px solid #3a3f45;
+  border: 1px solid var(--border-strong);
   border-radius: 8px;
-  background: #202327;
-  color: #8fd0bc;
+  background: var(--brand-mark-bg);
+  color: var(--accent);
   font-weight: 700;
 }
 
@@ -60,8 +116,13 @@ select {
 
 .brand span {
   margin-top: 2px;
-  color: #a7adb5;
+  color: var(--muted);
   font-size: 12px;
+}
+
+.sidebar-preferences {
+  display: flex;
+  margin-bottom: 24px;
 }
 
 .nav-list {
@@ -78,56 +139,76 @@ select {
   border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
-  color: #c7ccd2;
+  color: var(--body-text);
   padding: 0 10px;
   text-align: left;
 }
 
 .nav-item.active {
-  border-color: #3a4c48;
-  background: #202b28;
-  color: #f4f1ea;
+  border-color: var(--border-active);
+  background: var(--surface-active);
+  color: var(--text);
 }
 
 .workspace {
+  position: relative;
   min-width: 0;
-  background: #111315;
+  overflow: hidden;
+  background: var(--app-bg);
+}
+
+.workspace::before {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  content: "";
+  background: var(--theme-wash);
+}
+
+.toolbar,
+.workbench {
+  position: relative;
+  z-index: 1;
 }
 
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  align-content: center;
   gap: 10px;
   min-height: 58px;
-  border-bottom: 1px solid #2c3034;
-  padding: 0 18px;
+  border-bottom: 1px solid var(--border);
+  padding: 10px 18px;
 }
 
 .toolbar select {
+  min-width: 0;
+  max-width: 168px;
   height: 34px;
-  border: 1px solid #3a3f45;
+  border: 1px solid var(--border-strong);
   border-radius: 7px;
-  background: #1a1d20;
-  color: #f4f1ea;
+  background: var(--surface-control);
+  color: var(--text);
   padding: 0 10px;
 }
 
 .language-switch {
+  flex: 0 0 auto;
   display: grid;
   grid-template-columns: 22px 34px 34px;
   align-items: center;
   gap: 4px;
   height: 34px;
-  margin-left: auto;
-  border: 1px solid #3a3f45;
+  border: 1px solid var(--border-strong);
   border-radius: 7px;
-  background: #1a1d20;
-  color: #a7adb5;
+  background: var(--surface-control);
+  color: var(--muted);
   padding: 0 5px 0 8px;
 }
 
 .language-switch svg {
-  color: #8fd0bc;
+  color: var(--accent);
 }
 
 .language-option {
@@ -138,14 +219,14 @@ select {
   border: 0;
   border-radius: 5px;
   background: transparent;
-  color: #a7adb5;
+  color: var(--muted);
   font-size: 12px;
   font-weight: 700;
 }
 
 .language-option.active {
-  background: #243531;
-  color: #f4f1ea;
+  background: var(--surface-accent);
+  color: var(--text);
 }
 
 .workbench {
@@ -157,9 +238,9 @@ select {
 
 .timeline,
 .inspector {
-  border: 1px solid #2c3034;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background: #17191c;
+  background: var(--surface-bg);
 }
 
 .timeline {
@@ -169,7 +250,7 @@ select {
 
 .eyebrow {
   margin: 0 0 10px;
-  color: #8fd0bc;
+  color: var(--accent);
   font-size: 12px;
   font-weight: 700;
   text-transform: uppercase;
@@ -183,7 +264,7 @@ h1 {
 
 .summary {
   max-width: 680px;
-  color: #b8bec5;
+  color: var(--body-text);
   font-size: 15px;
   line-height: 1.6;
 }
@@ -210,17 +291,39 @@ dl div {
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  border-top: 1px solid #2c3034;
+  border-top: 1px solid var(--border);
   padding-top: 10px;
 }
 
 dt {
-  color: #a7adb5;
+  color: var(--muted);
 }
 
 dd {
   margin: 0;
-  color: #f4f1ea;
+  color: var(--text);
   font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
   font-size: 12px;
+}
+
+@media (max-width: 1100px) {
+  body {
+    min-width: 0;
+  }
+
+  .app-shell {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .toolbar select {
+    max-width: 154px;
+  }
+
+  .workbench {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .timeline {
+    min-height: 360px;
+  }
 }

@@ -8,6 +8,8 @@ export type WorkspaceScope = "workspace";
 
 export type Language = "zh" | "en";
 
+export type ThemeStyle = "deep" | "ink" | "porcelain";
+
 export type FoundationState = {
   app_name: string;
   model_route: ModelRoute;

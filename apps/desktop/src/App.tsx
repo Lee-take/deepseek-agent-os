@@ -3,7 +3,7 @@ import { Brain, Database, FolderOpen, Languages, ShieldCheck } from "lucide-reac
 import { useEffect, useState } from "react";
 import type { ChangeEvent } from "react";
 import { translations } from "./i18n";
-import type { AccessMode, FoundationState, Language, ModelRoute, ThinkingLevel } from "./types";
+import type { AccessMode, FoundationState, Language, ModelRoute, ThemeStyle, ThinkingLevel } from "./types";
 
 const fallbackState: FoundationState = {
   app_name: "DeepSeek Agent OS",
@@ -14,6 +14,7 @@ const fallbackState: FoundationState = {
 };
 
 const LANGUAGE_STORAGE_KEY = "deepseek-agent-os:ui-language:v1";
+const THEME_STORAGE_KEY = "deepseek-agent-os:theme-style:v1";
 
 function readInitialLanguage(): Language {
   if (typeof window === "undefined") {
@@ -24,9 +25,22 @@ function readInitialLanguage(): Language {
   return storedLanguage === "en" ? "en" : "zh";
 }
 
+function readInitialThemeStyle(): ThemeStyle {
+  if (typeof window === "undefined") {
+    return "deep";
+  }
+
+  const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+  if (storedTheme === "ink" || storedTheme === "porcelain") {
+    return storedTheme;
+  }
+  return "deep";
+}
+
 export function App() {
   const [state, setState] = useState<FoundationState>(fallbackState);
   const [language, setLanguage] = useState<Language>(readInitialLanguage);
+  const [themeStyle, setThemeStyle] = useState<ThemeStyle>(readInitialThemeStyle);
   const copy = translations[language];
 
   useEffect(() => {
@@ -39,6 +53,11 @@ export function App() {
     document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
     window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
   }, [language]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeStyle;
+    window.localStorage.setItem(THEME_STORAGE_KEY, themeStyle);
+  }, [themeStyle]);
 
   const updateModelRoute = (event: ChangeEvent<HTMLSelectElement>) => {
     setState((currentState) => ({
@@ -61,6 +80,10 @@ export function App() {
     }));
   };
 
+  const updateThemeStyle = (event: ChangeEvent<HTMLSelectElement>) => {
+    setThemeStyle(event.target.value as ThemeStyle);
+  };
+
   const switchLanguage = (nextLanguage: Language) => {
     setLanguage(nextLanguage);
   };
@@ -73,6 +96,27 @@ export function App() {
           <div>
             <strong>{state.app_name}</strong>
             <span>{copy.brandTagline}</span>
+          </div>
+        </div>
+        <div className="sidebar-preferences">
+          <div className="language-switch" role="group" aria-label={copy.controls.language}>
+            <Languages size={16} aria-hidden="true" />
+            <button
+              className={language === "zh" ? "language-option active" : "language-option"}
+              type="button"
+              aria-pressed={language === "zh"}
+              onClick={() => switchLanguage("zh")}
+            >
+              中
+            </button>
+            <button
+              className={language === "en" ? "language-option active" : "language-option"}
+              type="button"
+              aria-pressed={language === "en"}
+              onClick={() => switchLanguage("en")}
+            >
+              EN
+            </button>
           </div>
         </div>
         <nav className="nav-list" aria-label={copy.navLabel}>
@@ -107,25 +151,11 @@ export function App() {
             <option value="standard">{copy.thinkingOptions.standard}</option>
             <option value="deep">{copy.thinkingOptions.deep}</option>
           </select>
-          <div className="language-switch" role="group" aria-label={copy.controls.language}>
-            <Languages size={16} aria-hidden="true" />
-            <button
-              className={language === "zh" ? "language-option active" : "language-option"}
-              type="button"
-              aria-pressed={language === "zh"}
-              onClick={() => switchLanguage("zh")}
-            >
-              中
-            </button>
-            <button
-              className={language === "en" ? "language-option active" : "language-option"}
-              type="button"
-              aria-pressed={language === "en"}
-              onClick={() => switchLanguage("en")}
-            >
-              EN
-            </button>
-          </div>
+          <select value={themeStyle} aria-label={copy.controls.themeStyle} onChange={updateThemeStyle}>
+            <option value="deep">{copy.themeOptions.deep}</option>
+            <option value="ink">{copy.themeOptions.ink}</option>
+            <option value="porcelain">{copy.themeOptions.porcelain}</option>
+          </select>
         </header>
 
         <section className="workbench">
@@ -155,6 +185,10 @@ export function App() {
               <div>
                 <dt>{copy.inspector.scope}</dt>
                 <dd>{copy.scopeOptions[state.workspace_scope]}</dd>
+              </div>
+              <div>
+                <dt>{copy.inspector.theme}</dt>
+                <dd>{copy.themeOptions[themeStyle]}</dd>
               </div>
             </dl>
           </aside>
