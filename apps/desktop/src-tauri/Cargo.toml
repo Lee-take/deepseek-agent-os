@@ -4,10 +4,6 @@ version = "0.1.0"
 description = "DeepSeek Agent OS desktop shell"
 edition = "2021"
 
-[lib]
-name = "deepseek_agent_os_desktop"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
 

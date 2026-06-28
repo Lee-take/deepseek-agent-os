@@ -1,7 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Brain, Database, FolderOpen, ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { FoundationState } from "./types";
+import type { ChangeEvent } from "react";
+import type { AccessMode, FoundationState, ModelRoute, ThinkingLevel } from "./types";
 
 const fallbackState: FoundationState = {
   appName: "DeepSeek Agent OS",
@@ -13,13 +14,33 @@ const fallbackState: FoundationState = {
 
 export function App() {
   const [state, setState] = useState<FoundationState>(fallbackState);
-  const keepInitialControl = () => undefined;
 
   useEffect(() => {
     void invoke<FoundationState>("get_foundation_state")
       .then(setState)
       .catch(() => setState(fallbackState));
   }, []);
+
+  const updateModelRoute = (event: ChangeEvent<HTMLSelectElement>) => {
+    setState((currentState) => ({
+      ...currentState,
+      modelRoute: event.target.value as ModelRoute,
+    }));
+  };
+
+  const updateAccessMode = (event: ChangeEvent<HTMLSelectElement>) => {
+    setState((currentState) => ({
+      ...currentState,
+      accessMode: event.target.value as AccessMode,
+    }));
+  };
+
+  const updateThinkingLevel = (event: ChangeEvent<HTMLSelectElement>) => {
+    setState((currentState) => ({
+      ...currentState,
+      thinkingLevel: event.target.value as ThinkingLevel,
+    }));
+  };
 
   return (
     <main className="app-shell">
@@ -46,18 +67,18 @@ export function App() {
 
       <section className="workspace">
         <header className="toolbar">
-          <select value={state.modelRoute} aria-label="Model route" onChange={keepInitialControl}>
+          <select value={state.modelRoute} aria-label="Model route" onChange={updateModelRoute}>
             <option value="auto">DeepSeek Auto</option>
             <option value="deepseek-v4-flash">DeepSeek Flash</option>
             <option value="deepseek-v4-pro">DeepSeek Pro</option>
           </select>
-          <select value={state.accessMode} aria-label="Access mode" onChange={keepInitialControl}>
+          <select value={state.accessMode} aria-label="Access mode" onChange={updateAccessMode}>
             <option value="ask_every_step">Every step asks</option>
             <option value="ask_on_risk">Ask on risk</option>
             <option value="limited_auto">Limited auto</option>
             <option value="full_access">Full access</option>
           </select>
-          <select value={state.thinkingLevel} aria-label="Thinking level" onChange={keepInitialControl}>
+          <select value={state.thinkingLevel} aria-label="Thinking level" onChange={updateThinkingLevel}>
             <option value="auto">Thinking auto</option>
             <option value="fast">Fast</option>
             <option value="standard">Standard</option>
