@@ -9,4 +9,5 @@ target/
 !.env.example
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/.tauri/
+apps/desktop/src-tauri/gen/
 _reference_repos/

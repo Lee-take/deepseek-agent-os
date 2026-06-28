@@ -8,7 +8,15 @@ Design an open-source desktop Agent OS optimized for DeepSeek, with a beautiful 
 
 ## Current Stage
 
-Architecture/design stage. Do not start implementation until the design spec has been reviewed and approved.
+Foundation MVP implementation has started and is completed through the current approved slice:
+
+- Repository baseline
+- Tauri/React desktop shell
+- Rust kernel models
+- DeepSeek route defaults
+- SQLite event store
+- Policy foundation
+- UI/workbench state wiring
 
 ## Must Read First in a New Conversation
 
@@ -45,6 +53,18 @@ Indexed projects:
 - learn-claude-code: 108 files, 2,693 nodes, 6,015 edges.
 - Hermes Agent Desktop: only 1 indexed source file, useful mainly as a lightweight UI/reference artifact.
 
+## Foundation MVP Commands
+
+```powershell
+pnpm install
+npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop build
+$env:CARGO_TARGET_DIR = Join-Path $env:TEMP 'deepseek_ui_cargo_target'
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+pnpm dev
+```
+
+Set `CARGO_TARGET_DIR` before Rust verification on Windows to avoid the local MinGW `dlltool` path-with-space issue under `D:\deepseek UI`.
+
 ## Confirmed Architecture Direction
 
 - Build Agent OS Kernel plus Workflow Packs.
@@ -64,13 +84,14 @@ Indexed projects:
 
 ## Next Actions
 
-1. User reviews the design spec.
-2. If approved, create implementation plan using a separate planning step.
-3. Before coding, initialize or choose the repository structure if the user approves.
-4. Then scaffold the desktop app and local kernel with minimal verifiable slices.
+1. Implement the memory kernel and Memory Studio plan.
+2. Add connector capability adapters for email, drive, browser, and computer-use behind policy.
+3. Implement the Operations Briefing workflow pack.
+4. Add import/export packages and read-only run archives.
+5. Integrate the DeepSeek provider, caching, and latency controller.
 
 ## Open Questions
 
-- Decide whether to initialize `D:\deepseek UI` as the git repository root before implementation planning.
-- Decide whether the first open-source repo should start as a monorepo.
 - Decide the exact sample input files for the Operations Briefing workflow.
+- Confirm connector implementation priority across email, drive, browser, and computer-use.
+- Define the Memory Studio review UX for candidate memories, conflicts, and approvals.
