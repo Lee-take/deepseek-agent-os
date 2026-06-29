@@ -1,13 +1,41 @@
 # DeepSeek Agent OS
 
-Local-first desktop Agent OS optimized for DeepSeek.
+Independent local-first desktop Agent OS for DeepSeek model support.
 
-DeepSeek Agent OS is an independent open-source project for making DeepSeek more
-useful in local desktop agent workflows: permissioned tools, auditable memory,
-source traceability, local files, and operations workflow packs.
+## Project Introduction / 项目介绍
 
-This project is not an official DeepSeek product and is not affiliated with
-DeepSeek.
+### English
+
+DeepSeek Agent OS, also called DS Agent OS in short, is an independent
+open-source desktop project written to help colleagues use DeepSeek large
+language models more conveniently in daily work. It focuses on local desktop
+agent workflows, permissioned tools, auditable memory, source traceability,
+local files, and operations workflow packs.
+
+This project is not an official DeepSeek product, is not affiliated with
+DeepSeek, and does not claim any DeepSeek ownership, authorization, or
+endorsement. The DeepSeek name is used only to describe compatibility and
+support for DeepSeek models.
+
+The project is shared publicly under the Apache-2.0 license. Friends,
+colleagues, and anyone who finds it useful are welcome to use it, study it,
+fork it, and adapt it within the license terms. When convenient, please open an
+issue, discussion, or pull request with suggestions, corrections, criticism, or
+other feedback. All advice is welcome.
+
+### 中文
+
+DeepSeek Agent OS，也可以简称 DS Agent OS，是一个独立开源的桌面端项目。写这个项目
+的初衷，是为了让同事们在日常工作中更方便地使用 DeepSeek 大模型。项目重点放在本地
+桌面 Agent 工作流、可授权工具、可审计记忆、来源追溯、本地文件和经营管理工作流包。
+
+本项目不是 DeepSeek 官方产品，也不隶属于 DeepSeek；项目不主张任何 DeepSeek 的所有
+权、授权或官方背书。这里使用 DeepSeek 名称，只是为了说明项目面向 DeepSeek 模型做
+兼容和支持。
+
+本项目按照 Apache-2.0 许可证对外开源。有需要的同事、朋友和开发者，都可以在许可证
+范围内自由使用、学习、fork 和改造。大家方便或有空的时候，也欢迎通过 issue、讨论或
+pull request 提出意见建议；批评指正都非常欢迎。
 
 ## Alpha Status
 
