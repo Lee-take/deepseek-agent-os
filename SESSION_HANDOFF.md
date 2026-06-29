@@ -1161,6 +1161,28 @@ Result: focused Memory Studio merge/replace tests passed; focused Codex bridge r
 - Added `scripts/deepseek-smoke.mjs` and `pnpm test:deepseek` to run a local Chat Completions smoke test that prints only secret-safe metadata.
 - Added `pnpm test` as the local desktop verification command for frontend build plus Rust tests.
 
+2026-06-29 Local DeepSeek Operations Briefing smoke test v1:
+
+- Added `scripts/deepseek-operations-briefing-smoke.mjs` and `pnpm test:deepseek:briefing`.
+- The script reads `DEEPSEEK_API_KEY` from the local environment, sends the Operations Briefing sample evidence manifest to DeepSeek, validates the returned JSON contract, and prints only secret-safe counts/token metadata by default.
+- Absolute local evidence directory paths are redacted from the model prompt and script output.
+- The workflow smoke test is local-only and is not run in GitHub CI.
+- `DEEPSEEK_BRIEFING_EVIDENCE_DIR` can point at another local evidence folder for maintainer testing, but private evidence must not be committed or uploaded.
+
+Verification:
+
+```powershell
+npx pnpm@9.15.9 test
+npx pnpm@9.15.9 test:deepseek
+npx pnpm@9.15.9 test:deepseek:briefing
+$env:DEEPSEEK_BRIEFING_EVIDENCE_DIR=(Resolve-Path 'docs/templates/operations-briefing-evidence').Path; npx pnpm@9.15.9 test:deepseek:briefing; Remove-Item Env:DEEPSEEK_BRIEFING_EVIDENCE_DIR
+rg -n --pcre2 '(?<![A-Za-z0-9])sk-[A-Za-z0-9]{16,}(?![A-Za-z0-9])' . -g '!node_modules' -g '!target' -g '!dist' -g '!src-tauri/target'
+rg -n 'DEEPSEEK_API_KEY\s*=\s*["''][^"'']+["'']' . -g '!node_modules' -g '!target' -g '!dist' -g '!src-tauri/target'
+git diff --check
+```
+
+Result: desktop build and all 218 Rust tests passed; both DeepSeek live smoke tests returned `ok=true`; absolute evidence path output was redacted as `[local evidence directory]`; both secret scans had no matches; `git diff --check` passed with only LF-to-CRLF warnings.
+
 ## Confirmed Architecture Direction
 
 - Build Agent OS Kernel plus Workflow Packs.
@@ -1185,7 +1207,7 @@ Result: focused Memory Studio merge/replace tests passed; focused Codex bridge r
 ## Next Actions
 
 1. Keep implementing within the confirmed DeepSeek-first scope; avoid broad new product lanes unless the maintainer confirms them.
-2. Strengthen test coverage and local verification first, especially live DeepSeek API paths that must remain secret-safe.
+2. Strengthen test coverage and local verification first, especially live DeepSeek API and Operations Briefing paths that must remain secret-safe.
 3. Continue improving the existing desktop Agent OS workflows, permissions, memory, and Operations Briefing pack without uploading local secrets.
 4. Before public pushes, run local verification and secret scans.
 

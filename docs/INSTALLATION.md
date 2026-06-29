@@ -74,6 +74,19 @@ Completions request, and prints secret-safe metadata such as model, finish
 reason, token usage, and elapsed time. It does not print the API key and is not
 run in GitHub CI.
 
+To verify the local Operations Briefing synthesis path against the sample
+evidence templates, run:
+
+```powershell
+npx pnpm@9.15.9 test:deepseek:briefing
+```
+
+This workflow smoke test uses `docs/templates/operations-briefing-evidence` by
+default, validates the returned JSON shape, and prints counts plus token
+metadata. Set `DEEPSEEK_BRIEFING_EVIDENCE_DIR` to point at another local
+evidence folder. Absolute local evidence paths are redacted from the model prompt
+and script output. Keep private evidence local and do not commit it.
+
 ## DeepSeek Pricing
 
 Cost estimates are optional. The app does not hardcode public DeepSeek prices.

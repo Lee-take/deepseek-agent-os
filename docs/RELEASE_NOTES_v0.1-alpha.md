@@ -70,6 +70,7 @@ Optional live DeepSeek smoke test:
 ```powershell
 $env:DEEPSEEK_API_KEY = Read-Host "DeepSeek API key"
 npx pnpm@9.15.9 test:deepseek
+npx pnpm@9.15.9 test:deepseek:briefing
 ```
 
 Do not commit API keys, `.env` files, local app data, local evidence folders, or

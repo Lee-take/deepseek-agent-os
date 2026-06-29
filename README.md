@@ -60,6 +60,16 @@ used by GitHub CI:
 npx pnpm@9.15.9 test:deepseek
 ```
 
+`test:deepseek:briefing` is the optional local workflow smoke test. It sends the
+Operations Briefing sample evidence manifest to DeepSeek, validates that the
+response matches the workflow JSON contract, and prints only counts and token
+metadata by default. When a custom evidence directory is an absolute local path,
+the script redacts that path from both the prompt and the output:
+
+```powershell
+npx pnpm@9.15.9 test:deepseek:briefing
+```
+
 Windows builds automatically merge `apps/desktop/src-tauri/tauri.windows.conf.json`
 and produce an NSIS installer under the configured Cargo target directory,
 for example `debug/bundle/nsis/DeepSeek Agent OS_0.1.0_x64-setup.exe`.
