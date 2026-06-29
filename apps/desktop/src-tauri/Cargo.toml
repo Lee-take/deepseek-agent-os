@@ -1,7 +1,7 @@
 [package]
 name = "deepseek-agent-os-desktop"
-version = "0.1.0"
-description = "DeepSeek Agent OS desktop shell"
+version = "0.0.1"
+description = "DeepSeek Agent OS desktop preview"
 edition = "2021"
 license = "Apache-2.0"
 

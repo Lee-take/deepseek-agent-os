@@ -50,7 +50,7 @@ Workflow Packs provide scenario-specific forms, prompts, templates, tool permiss
 - First Operations Management workflow is Operations Briefing: local evidence folder to management brief, anomaly table, action plan, and report package.
 - MVP import is preview-first: full export, import preview, template/workflow import, read-only run archive replay, and memory candidates requiring review.
 - Computer Use is behind an experimental high-risk flag in MVP.
-- v0.1-alpha is feature-frozen for GitHub open-source release preparation. Do not add new capabilities before release; limit work to documentation, packaging, verification, safety clarification, and bug fixes inside the existing scope.
+- v0.0.1 is the current GitHub open-source preview version. The immediate priority is to make the project reliably build, install, launch, and run on Windows before adding more product surface.
 - Public release policy: Apache-2.0 license, GitHub repository name `deepseek-agent-os`, and source-only first alpha.
 
 ## Important Boundaries

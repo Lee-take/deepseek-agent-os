@@ -1,7 +1,7 @@
 # Contributing
 
-DeepSeek Agent OS is in a v0.1-alpha feature freeze while the project is prepared
-for its first public GitHub release.
+DeepSeek Agent OS is in a `0.0.1` Windows-first preview stage. The project is
+public, but it is not a finished agent product yet.
 
 ## Project Direction
 
@@ -14,16 +14,18 @@ DeepSeek.
 
 ## Current Contribution Policy
 
-During the v0.1-alpha freeze, accepted changes should stay within:
+During the `0.0.1` preview, accepted changes should prioritize:
 
 - build, packaging, and installation fixes;
 - documentation and examples;
 - security, privacy, and permission-boundary fixes;
 - test coverage for existing behavior;
-- bug fixes that preserve the current product scope.
+- bug fixes that preserve the current product scope;
+- Windows launch, installer, and first-run reliability.
 
 Please avoid opening PRs for new capabilities, new workflow packs, new provider
-integrations, or broader automation until the freeze is lifted.
+integrations, or broader automation until the Windows baseline is genuinely
+usable.
 
 ## Development Setup
 

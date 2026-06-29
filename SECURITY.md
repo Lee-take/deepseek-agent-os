@@ -8,7 +8,7 @@ Computer Use boundaries, and package import/export behavior.
 
 | Version | Supported |
 | --- | --- |
-| 0.1-alpha | Security reports accepted; no stability guarantee |
+| 0.0.1 | Security reports accepted; no stability guarantee |
 
 ## Reporting A Vulnerability
 

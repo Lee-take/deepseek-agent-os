@@ -1,9 +1,9 @@
 {
   "name": "deepseek-agent-os",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.1",
   "license": "Apache-2.0",
-  "description": "Local-first desktop Agent OS optimized for DeepSeek.",
+  "description": "Independent desktop Agent OS preview for DeepSeek model support.",
   "scripts": {
     "dev": "node scripts/require-desktop-workspace.mjs && pnpm --filter @deepseek-agent-os/desktop dev",
     "build": "node scripts/require-desktop-workspace.mjs && pnpm --filter @deepseek-agent-os/desktop build",

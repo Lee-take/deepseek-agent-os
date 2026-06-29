@@ -9,7 +9,7 @@ project does not depend on the maintainer's local directories.
 The Windows build produces a normal NSIS setup executable:
 
 ```text
-DeepSeek Agent OS_0.1.0_x64-setup.exe
+DeepSeek Agent OS_0.0.1_x64-setup.exe
 ```
 
 The installer-selected application directory is only for program files. It is

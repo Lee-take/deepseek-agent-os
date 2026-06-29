@@ -130,11 +130,11 @@ Reason: Memory conflicts should not be silently collapsed. The user needs a visi
 
 Status: Accepted.
 
-## D017: v0.1-alpha feature freeze for open-source release
+## D017: v0.0.1 Windows-first open-source preview
 
-Decision: Stop adding new product capabilities before the first GitHub open-source release. Work is limited to release hygiene, documentation, safety clarification, verification, packaging, and bug fixes required to keep the existing scope buildable and honest.
+Decision: Treat `v0.0.1` as the current public preview version. Stop broad feature expansion and prioritize making the desktop app build, install, launch, and run reliably on Windows, while keeping the existing scope honest and documented.
 
-Reason: The project exists to provide serious DeepSeek-first domestic model support, not to become a feature pile. A credible GitHub alpha needs clear positioning, reproducible builds, safety boundaries, and transparent limitations more than additional features.
+Reason: The project exists to provide serious DeepSeek-first domestic model support, not to become a feature pile. A credible GitHub preview needs a real Windows running baseline, clear positioning, reproducible builds, safety boundaries, and transparent limitations more than additional features.
 
 Status: Accepted.
 
@@ -146,9 +146,9 @@ Reason: The project is infrastructure-style open source for DeepSeek-first agent
 
 Status: Accepted.
 
-## D019: Source-only first alpha
+## D019: Source-first 0.0.1 preview
 
-Decision: Publish v0.1-alpha as source-only release material first. Do not attach unsigned Windows debug installer artifacts unless the maintainer explicitly approves that later.
+Decision: Publish `v0.0.1` as the current source-first release material. Do not attach unsigned Windows debug installer artifacts unless the maintainer explicitly approves that later.
 
 Reason: The current Windows installer is useful for local validation, but a public open-source alpha should avoid distributing unsigned binaries before signing, artifact provenance, and release packaging policy are mature. Source build instructions are enough for the first credible GitHub baseline.
 

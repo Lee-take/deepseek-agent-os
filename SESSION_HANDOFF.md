@@ -1253,6 +1253,16 @@ git diff --check
 
 Result: focused fake bridge health test passed 5 consecutive times; `pnpm test` passed with secret scan, desktop build, and all 218 Rust tests; both live DeepSeek smoke tests returned `ok=true`; `git diff --check` passed with only LF-to-CRLF warnings.
 
+2026-06-30 v0.0.1 Windows-first release positioning v1:
+
+- Maintainer clarified that the project is not complete and the public GitHub release version should be `0.0.1`, not `0.1.0` or the historical `v0.1-alpha` label.
+- Current development priority is to make the project genuinely build, install, launch, and run on Windows before expanding product surface.
+- Maintainer clarified that macOS should come after the Windows version is running reliably.
+- README now explains the bilingual project introduction, basic functions, current limits, and GitHub open-source acknowledgements.
+- Public positioning thanks GitHub open-source founders, maintainers, and contributors for the engineering ecosystem this project learns from, while explicitly prohibiting copying private, leaked, or non-authorized code.
+- Project version metadata is `0.0.1` in `package.json`, `apps/desktop/package.json`, `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/Cargo.lock`, and `apps/desktop/src-tauri/tauri.conf.json`.
+- `docs/RELEASE_NOTES_v0.0.1.md` is the current release note source. `docs/RELEASE_NOTES_v0.1-alpha.md` is historical only.
+
 ## Confirmed Architecture Direction
 
 - Build Agent OS Kernel plus Workflow Packs.
@@ -1271,14 +1281,14 @@ Result: focused fake bridge health test passed 5 consecutive times; `pnpm test` 
 - Treat imported memories as reviewable candidates, not automatic writes.
 - Put Computer Use behind an experimental high-risk flag in MVP.
 - Local short-window unlock is implemented for ComputerControl; a stronger local agent token or OS credential prompt remains future hardening.
-- v0.1-alpha is feature-frozen for GitHub open-source release preparation; do not add new capabilities before release.
-- Public release policy is Apache-2.0 and source-only for the first alpha.
+- v0.0.1 is the current GitHub open-source preview version. The next priority is Windows build/install/launch/run reliability, not broad new features.
+- Public release policy is Apache-2.0 and source-first for the 0.0.1 preview.
 
 ## Next Actions
 
-1. Keep implementing within the confirmed DeepSeek-first scope; avoid broad new product lanes unless the maintainer confirms them.
-2. Strengthen test coverage and local verification first, especially live DeepSeek API and Operations Briefing paths that must remain secret-safe.
-3. Continue improving the existing desktop Agent OS workflows, permissions, memory, and Operations Briefing pack without uploading local secrets.
+1. Finish publishing the `v0.0.1` GitHub release from the current source-first release notes.
+2. Start the Windows run-reliability push: build installer, install/launch locally where possible, and fix blockers before adding broad new features.
+3. Keep improving only the existing DeepSeek-first desktop Agent OS workflows, permissions, memory, and Operations Briefing pack without uploading local secrets.
 4. Before public pushes, run local verification and secret scans.
 
 ## Open Questions

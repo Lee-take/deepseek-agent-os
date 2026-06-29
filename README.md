@@ -23,6 +23,13 @@ fork it, and adapt it within the license terms. When convenient, please open an
 issue, discussion, or pull request with suggestions, corrections, criticism, or
 other feedback. All advice is welcome.
 
+This project also benefits from the broader GitHub open-source ecosystem. Its
+architecture and engineering direction were informed by public open-source
+work in desktop apps, agent tooling, workflow systems, permission design,
+auditing, and local-first software. We sincerely thank the founders,
+maintainers, and contributors of those open-source projects. Their work makes
+projects like this possible.
+
 ### 中文
 
 DeepSeek Agent OS，也可以简称 DS Agent OS，是一个独立开源的桌面端项目。写这个项目
@@ -37,17 +44,94 @@ DeepSeek Agent OS，也可以简称 DS Agent OS，是一个独立开源的桌面
 范围内自由使用、学习、fork 和改造。大家方便或有空的时候，也欢迎通过 issue、讨论或
 pull request 提出意见建议；批评指正都非常欢迎。
 
-## Alpha Status
+这个项目也受益于 GitHub 上广泛的开源生态。项目在桌面应用、Agent 工具、工作流系
+统、权限设计、审计记录和本地优先软件等方面，学习和借鉴了公开开源项目中的工程经验
+和架构思想。我们真诚感谢这些开源项目的创建者、维护者和贡献者。正是他们长期开放和
+分享，才让类似项目有机会继续向前。
 
-The project is in a v0.1-alpha feature freeze before the first public GitHub
-release. Current work is limited to release hygiene, documentation, packaging,
-verification, and bug fixes inside the existing scope.
+No private, leaked, or non-authorized source code should be copied into this
+repository. Public open-source references are used as learning material and
+engineering inspiration, with respect for their licenses and maintainers.
+
+本仓库不应复制任何私有、泄露或未授权代码。公开开源项目仅作为学习材料和工程参考，
+并尊重原项目许可证和维护者权益。
+
+## 0.0.1 Status / 0.0.1 状态
+
+Version `0.0.1` is an early Windows-first open-source preview. The codebase is
+not a finished agent product yet. The immediate development priority is to make
+the desktop app reliably build, install, launch, and run on Windows before
+expanding the product surface.
+
+After the Windows version is running reliably, the next platform target is
+macOS. A macOS Tauri packaging config already exists in the repository, but
+macOS validation and release work will come after the Windows baseline is
+stable.
+
+`0.0.1` 是早期 Windows 优先的开源预览版本，还不是完整成熟的 Agent 产品。当前最
+重要的开发目标，是先让桌面应用在 Windows 系统下稳定完成构建、安装、启动和运行，然
+后再逐步完善产品能力。
+
+Windows 版本真正跑通并稳定后，下一步会推进 macOS 版本。仓库里已经保留了 macOS 的
+Tauri 打包配置，但 macOS 的验证和发布会放在 Windows 基线稳定之后。
 
 License: Apache-2.0.
 
-The first public v0.1-alpha release is source-only. Windows debug installer
-artifacts are build outputs for local validation and are not attached to the
-public alpha unless explicitly approved later.
+The public `v0.0.1` release is source-first. Windows installer artifacts can be
+built locally for validation, but public binary distribution should stay
+conservative until signing, packaging, and provenance are ready.
+
+## Basic Functions / 基本功能
+
+### English
+
+The current codebase is intended to provide these basic functions:
+
+- Windows desktop shell built with Tauri, React, TypeScript, and Rust.
+- Local-first workspace setup for a workspace folder, evidence folder, and
+  export folder.
+- DeepSeek route readiness through a local `DEEPSEEK_API_KEY` environment
+  variable without storing or showing the key value.
+- Optional local DeepSeek smoke tests for Chat Completions and Operations
+  Briefing synthesis.
+- Permissioned tool surfaces for file, network, browser, terminal, drive,
+  email, and Computer Use operations.
+- Append-only local audit records for access requests, approvals, tool
+  attempts, workflow runs, memory records, and work packages.
+- Memory Studio for reviewable memories, edits, deletion, expiration, and
+  explicit conflict handling.
+- Operations Briefing workflow that reads local evidence, drafts a management
+  brief, and can use DeepSeek synthesis when configured.
+- Local report and package export paths for Markdown, HTML, lightweight PDF,
+  and work-package JSON.
+- Windows NSIS debug installer build path for local validation.
+
+Current limits are intentional: real mailbox connectors, real cloud-drive
+connectors, managed bridge sidecars, hosted sync, broad plugin execution, and
+polished signed installers are not complete in `0.0.1`.
+
+### 中文
+
+当前代码库的基础功能目标如下：
+
+- 基于 Tauri、React、TypeScript 和 Rust 的 Windows 桌面应用外壳。
+- 本地优先的工作目录设置，包括工作区、证据目录和导出目录。
+- 通过本地 `DEEPSEEK_API_KEY` 环境变量检测 DeepSeek 可用性，但不保存、不展示密钥
+  明文。
+- 可选的本地 DeepSeek 联调脚本，用于 Chat Completions 和经营简报合成验证。
+- 面向文件、网络、浏览器、终端、网盘、本地邮件边界和 Computer Use 的权限化工具
+  入口。
+- 本地追加式审计记录，用于记录授权请求、审批、工具调用、工作流运行、记忆记录和工
+  作包。
+- Memory Studio，用于记忆候选、编辑、删除、过期和冲突处理。
+- Operations Briefing 经营简报工作流，可读取本地证据、生成管理简报，并在配置
+  DeepSeek 后调用模型合成。
+- 本地报告和工作包导出，包括 Markdown、HTML、轻量 PDF 和 work-package JSON。
+- Windows NSIS debug installer 构建路径，便于本地验证安装和运行。
+
+当前限制也要说清楚：`0.0.1` 还没有完成真实邮箱连接器、真实云盘连接器、托管式桥接
+sidecar、云同步、广泛插件执行和正式签名安装包。这一版先把 Windows 本地可运行和
+DeepSeek 基础支持打牢。
 
 Read first:
 
@@ -56,7 +140,7 @@ Read first:
 - `SESSION_HANDOFF.md`
 - `docs/INSTALLATION.md`
 - `docs/OPEN_SOURCE_RELEASE.md`
-- `docs/RELEASE_NOTES_v0.1-alpha.md`
+- `docs/RELEASE_NOTES_v0.0.1.md`
 - `docs/superpowers/specs/2026-06-28-deepseek-agent-os-architecture-design.md`
 - `CONTRIBUTING.md`
 - `SECURITY.md`
@@ -107,7 +191,7 @@ npx pnpm@9.15.9 test:deepseek:briefing
 
 Windows builds automatically merge `apps/desktop/src-tauri/tauri.windows.conf.json`
 and produce an NSIS installer under the configured Cargo target directory,
-for example `debug/bundle/nsis/DeepSeek Agent OS_0.1.0_x64-setup.exe`.
+for example `debug/bundle/nsis/DeepSeek Agent OS_0.0.1_x64-setup.exe`.
 
 macOS builds have a separate platform config at
 `apps/desktop/src-tauri/tauri.macos.conf.json` for `.app` and `.dmg` packaging.

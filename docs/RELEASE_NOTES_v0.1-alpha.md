@@ -1,5 +1,8 @@
 # DeepSeek Agent OS v0.1-alpha Release Notes
 
+Historical note: this release label is superseded by the current `v0.0.1`
+Windows-first preview. Do not treat `v0.1-alpha` as the current project version.
+
 Status: first public source-only alpha.
 
 ## Positioning
