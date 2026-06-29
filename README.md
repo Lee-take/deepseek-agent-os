@@ -40,16 +40,25 @@ Foundation MVP desktop commands:
 
 ```powershell
 npx pnpm@9.15.9 install
-npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop build
-$env:CARGO_TARGET_DIR = Join-Path $env:TEMP 'deepseek_ui_cargo_target'
-cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+npx pnpm@9.15.9 test
 npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop tauri build --debug
 npx pnpm@9.15.9 dev
 ```
 
-On Windows, set `CARGO_TARGET_DIR` before Rust/Tauri verification. Keeping Rust
-build output out of a repo path with spaces avoids the local MinGW `dlltool`
-path parsing issue.
+`pnpm test` runs the desktop frontend build and Rust tests. On Windows, the
+test helper automatically keeps Rust build output out of the repository path to
+avoid local MinGW path parsing issues when the checkout path contains spaces.
+Set `CARGO_TARGET_DIR` yourself only when you need a specific build cache
+location.
+
+`test:deepseek` is an optional local smoke test. It reads `DEEPSEEK_API_KEY`
+from the local environment, calls DeepSeek Chat Completions, and prints only
+secret-safe metadata such as model, finish reason, and token usage. It is not
+used by GitHub CI:
+
+```powershell
+npx pnpm@9.15.9 test:deepseek
+```
 
 Windows builds automatically merge `apps/desktop/src-tauri/tauri.windows.conf.json`
 and produce an NSIS installer under the configured Cargo target directory,

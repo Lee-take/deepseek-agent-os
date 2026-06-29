@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "node scripts/require-desktop-workspace.mjs && pnpm --filter @deepseek-agent-os/desktop dev",
     "build": "node scripts/require-desktop-workspace.mjs && pnpm --filter @deepseek-agent-os/desktop build",
-    "tauri": "node scripts/require-desktop-workspace.mjs && pnpm --filter @deepseek-agent-os/desktop tauri"
+    "tauri": "node scripts/require-desktop-workspace.mjs && pnpm --filter @deepseek-agent-os/desktop tauri",
+    "test": "node scripts/desktop-test.mjs",
+    "test:deepseek": "node scripts/deepseek-smoke.mjs"
   },
   "packageManager": "pnpm@9.15.9"
 }

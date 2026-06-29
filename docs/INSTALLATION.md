@@ -32,15 +32,14 @@ Install dependencies and verify the desktop package:
 
 ```powershell
 npx pnpm@9.15.9 install
-npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop build
-$env:CARGO_TARGET_DIR = Join-Path $env:TEMP 'deepseek_agent_os_cargo_target'
-cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+npx pnpm@9.15.9 test
 npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop tauri build --debug
 ```
 
-Use a `CARGO_TARGET_DIR` outside a repo path with spaces on Windows. A temp
-directory works for most local builds and avoids local MinGW `dlltool` path
-parsing issues.
+`pnpm test` runs the desktop frontend build and Rust tests. On Windows, the
+test helper sets a temporary Cargo target directory when `CARGO_TARGET_DIR` is
+not already configured, which avoids local MinGW path parsing issues when the
+checkout path contains spaces.
 
 macOS packaging has a committed Tauri config for `.app` and `.dmg`, but it still
 needs verification on a macOS host.
@@ -63,6 +62,17 @@ For a persistent Windows user environment variable:
 Restart the desktop app after setting the variable. The runtime inspector only
 shows whether the key is configured; it never displays, stores, exports, or
 serializes the key value.
+
+To verify the local key without launching the app, run:
+
+```powershell
+npx pnpm@9.15.9 test:deepseek
+```
+
+The smoke test reads only local environment variables, sends a minimal Chat
+Completions request, and prints secret-safe metadata such as model, finish
+reason, token usage, and elapsed time. It does not print the API key and is not
+run in GitHub CI.
 
 ## DeepSeek Pricing
 

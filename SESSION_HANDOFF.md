@@ -1146,6 +1146,21 @@ Result: focused Memory Studio merge/replace tests passed; focused Codex bridge r
 - User confirmed Apache-2.0, the GitHub repository name `deepseek-agent-os`, and a source-only first alpha.
 - Added Apache-2.0 license metadata and source-only release policy docs.
 
+2026-06-29 Public GitHub release v0.1-alpha:
+
+- Public repository is `https://github.com/Lee-take/deepseek-agent-os` under the `Lee-take` account.
+- Default branch is `main`.
+- Public release `v0.1-alpha` is a prerelease with no binary assets attached.
+- Release policy remains source-only for the first alpha.
+- Final GitHub CI for `main` completed successfully on commit `8b5f377`.
+
+2026-06-29 Local DeepSeek smoke test v1:
+
+- User confirmed the DeepSeek API key is for local `D:\deepseek UI` project testing only.
+- Store and use the key only through local environment variables such as `DEEPSEEK_API_KEY`; do not write the key into source, docs, `.env`, logs, commits, GitHub Actions, or release assets.
+- Added `scripts/deepseek-smoke.mjs` and `pnpm test:deepseek` to run a local Chat Completions smoke test that prints only secret-safe metadata.
+- Added `pnpm test` as the local desktop verification command for frontend build plus Rust tests.
+
 ## Confirmed Architecture Direction
 
 - Build Agent OS Kernel plus Workflow Packs.
@@ -1169,12 +1184,12 @@ Result: focused Memory Studio merge/replace tests passed; focused Codex bridge r
 
 ## Next Actions
 
-1. Run final release verification on the current branch.
-2. Inspect GitHub remote/auth state and publish to the approved repository name `deepseek-agent-os` if available.
-3. Commit and push the release branch.
-4. Prepare a source-only v0.1-alpha GitHub release or draft release using `docs/RELEASE_NOTES_v0.1-alpha.md`.
+1. Keep implementing within the confirmed DeepSeek-first scope; avoid broad new product lanes unless the maintainer confirms them.
+2. Strengthen test coverage and local verification first, especially live DeepSeek API paths that must remain secret-safe.
+3. Continue improving the existing desktop Agent OS workflows, permissions, memory, and Operations Briefing pack without uploading local secrets.
+4. Before public pushes, run local verification and secret scans.
 
 ## Open Questions
 
 - Public repository owner and security contact channel can be filled from the authenticated GitHub account unless the maintainer gives a dedicated contact.
-- Do not use or persist the maintainer-provided DeepSeek API key unless a live smoke test becomes necessary; local verification should avoid secrets by default.
+- The maintainer has approved storing the DeepSeek test API key locally for this project. It must stay local-only and must not be uploaded.
