@@ -3384,6 +3384,7 @@ function checkGitHubReleaseHygiene() {
     ["pnpm@9.15.9", "CI pinned pnpm"],
     ["node scripts/secret-scan.mjs", "CI secret scan"],
     ["pnpm --filter @deepseek-agent-os/desktop build", "CI desktop frontend build"],
+    ["pnpm stage:webview2-loader", "CI WebView2 loader staging"],
     ["cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml", "CI Rust tests"],
     ["pnpm test:release-source", "CI source-only release guard"],
   ];

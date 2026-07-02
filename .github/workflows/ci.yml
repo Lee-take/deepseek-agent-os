@@ -41,6 +41,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Stage WebView2 loader
+        run: pnpm stage:webview2-loader
+
       - name: Build desktop frontend
         run: pnpm --filter @deepseek-agent-os/desktop build
 
