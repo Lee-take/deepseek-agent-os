@@ -1607,6 +1607,12 @@ function checkPublicReleaseCopyPositioning() {
     "v0.1.0-rc.4 Update (local source, not yet published)",
     "release notes rc.4 local-source update heading",
   );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/commands.rs",
+    readText("apps/desktop/src-tauri/src/commands.rs"),
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.4"',
+    "app updater current release tag rc.4",
+  );
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.1.0.md",
     releaseNotes,
