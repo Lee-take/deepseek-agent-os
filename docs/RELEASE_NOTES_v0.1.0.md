@@ -1,6 +1,6 @@
 # DeepSeek Agent OS v0.1.0 Candidate Notes
 
-Status: Windows-first release candidate. The `v0.1.0-rc.1` prerelease is
+Status: Windows-first release candidate. The `v0.1.0-rc.3` prerelease is
 intended for colleague testing through a GitHub release asset after the final
 local gates pass.
 
@@ -10,6 +10,19 @@ so Windows may show an unknown-publisher warning, but it embeds the Microsoft
 WebView2 bootstrapper and runs it silently when the target machine needs the
 WebView2 runtime. Ordinary users do not need Node.js, pnpm, Rust, or a source
 checkout to run the installed app.
+
+## v0.1.0-rc.3 Update
+
+- Adds audited Windows local file actions from chat: create file, update file,
+  delete file, and rename file with absolute local paths.
+- Adds audited Windows local directory actions from chat: create directory,
+  rename directory, and delete directory with absolute local paths.
+- Routes these file and directory mutations through the `FileWrite` capability
+  boundary so access policy, permission audit records, and capability
+  invocations stay visible.
+- Fixes the local directory listing path that could leave the UI waiting for a
+  second terminal-output step after DeepSeek had already planned a bounded
+  directory read.
 
 Maintainer handoff notes, decision logs, and internal planning files are kept as
 local-only continuation material and are intentionally excluded from public
@@ -64,6 +77,8 @@ Windows preview continues to pass local release gates.
 - Permissioned tool surfaces for file, network, browser, terminal,
   local-folder read/export, email read/draft/send approval records, and
   Computer Use operations.
+- Audited Windows local filesystem mutations from chat for explicit create,
+  update, delete, and rename requests on files and directories.
 - Append-only local audit records for access requests, approvals, tool
   attempts, workflow runs, memory records, and work packages.
 - Computer Use remains experimental and high-risk: screen capture follows the

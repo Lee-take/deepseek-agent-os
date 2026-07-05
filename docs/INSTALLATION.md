@@ -12,11 +12,11 @@ The Windows build produces a normal NSIS setup executable:
 DS Agent_0.1.0_x64-setup.exe
 ```
 
-The `v0.1.0-rc.1` prerelease attaches this Windows installer for colleague
-testing. It is unsigned, so Windows may show an unknown-publisher warning. The
-installer embeds the Microsoft WebView2 bootstrapper and runs it silently when
-the target machine needs the WebView2 runtime; users do not need Node.js, pnpm,
-Rust, or a source checkout to run the installed app.
+The `v0.1.0` release-candidate prereleases attach this Windows installer for
+colleague testing. It is unsigned, so Windows may show an unknown-publisher
+warning. The installer embeds the Microsoft WebView2 bootstrapper and runs it
+silently when the target machine needs the WebView2 runtime; users do not need
+Node.js, pnpm, Rust, or a source checkout to run the installed app.
 
 The installer-selected application directory is only for program files. It is
 not the workspace, evidence folder, export folder, or event database location.

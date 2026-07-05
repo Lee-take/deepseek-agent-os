@@ -100,6 +100,28 @@ pub struct FileWriteRequest {
     pub approval_granted: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSystemMutationOperation {
+    CreateFile,
+    UpdateFile,
+    DeleteFile,
+    RenameFile,
+    CreateDirectory,
+    RenameDirectory,
+    DeleteDirectory,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FileSystemMutationRequest {
+    pub access_mode: AccessMode,
+    pub operation: FileSystemMutationOperation,
+    pub path: String,
+    pub destination: Option<String>,
+    pub content: Option<String>,
+    pub approval_granted: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FileContent {
     pub path: String,
@@ -129,6 +151,24 @@ pub struct FileWriteResult {
 
 pub trait FileWriteClient {
     fn write_file(&self, path: &str, content: &str) -> Result<FileWriteResult, String>;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FileSystemMutationResult {
+    pub path: String,
+    pub destination: Option<String>,
+    pub bytes: u64,
+    pub summary: String,
+}
+
+pub trait FileSystemMutationClient {
+    fn mutate(
+        &self,
+        operation: FileSystemMutationOperation,
+        path: &str,
+        destination: Option<&str>,
+        content: Option<&str>,
+    ) -> Result<FileSystemMutationResult, String>;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -496,6 +536,150 @@ impl FileWriteClient for LocalWorkspaceFileWriteClient {
     }
 }
 
+pub struct LocalFileSystemMutationClient;
+
+impl FileSystemMutationClient for LocalFileSystemMutationClient {
+    fn mutate(
+        &self,
+        operation: FileSystemMutationOperation,
+        path: &str,
+        destination: Option<&str>,
+        content: Option<&str>,
+    ) -> Result<FileSystemMutationResult, String> {
+        let path = PathBuf::from(path);
+        reject_root_mutation_path(&path)?;
+
+        match operation {
+            FileSystemMutationOperation::CreateFile => {
+                if path.exists() {
+                    return Err("local file already exists".to_string());
+                }
+                let body = content.unwrap_or_default();
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!("local file parent directory could not be created: {error}")
+                    })?;
+                }
+                std::fs::write(&path, body)
+                    .map_err(|error| format!("local file could not be created: {error}"))?;
+                Ok(FileSystemMutationResult {
+                    path: path.to_string_lossy().to_string(),
+                    destination: None,
+                    bytes: body.len() as u64,
+                    summary: "created local file".to_string(),
+                })
+            }
+            FileSystemMutationOperation::UpdateFile => {
+                let metadata = std::fs::metadata(&path)
+                    .map_err(|error| format!("local file metadata could not be read: {error}"))?;
+                if !metadata.is_file() {
+                    return Err("local file update target is not a file".to_string());
+                }
+                let body = content.unwrap_or_default();
+                std::fs::write(&path, body)
+                    .map_err(|error| format!("local file could not be updated: {error}"))?;
+                Ok(FileSystemMutationResult {
+                    path: path.to_string_lossy().to_string(),
+                    destination: None,
+                    bytes: body.len() as u64,
+                    summary: "updated local file".to_string(),
+                })
+            }
+            FileSystemMutationOperation::DeleteFile => {
+                let metadata = std::fs::metadata(&path)
+                    .map_err(|error| format!("local file metadata could not be read: {error}"))?;
+                if !metadata.is_file() {
+                    return Err("local file delete target is not a file".to_string());
+                }
+                let bytes = metadata.len();
+                std::fs::remove_file(&path)
+                    .map_err(|error| format!("local file could not be deleted: {error}"))?;
+                Ok(FileSystemMutationResult {
+                    path: path.to_string_lossy().to_string(),
+                    destination: None,
+                    bytes,
+                    summary: "deleted local file".to_string(),
+                })
+            }
+            FileSystemMutationOperation::RenameFile => {
+                let destination = destination
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "local file rename destination is required".to_string())?;
+                reject_root_mutation_path(&destination)?;
+                let metadata = std::fs::metadata(&path)
+                    .map_err(|error| format!("local file metadata could not be read: {error}"))?;
+                if !metadata.is_file() {
+                    return Err("local file rename target is not a file".to_string());
+                }
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!("local file destination directory could not be created: {error}")
+                    })?;
+                }
+                std::fs::rename(&path, &destination)
+                    .map_err(|error| format!("local file could not be renamed: {error}"))?;
+                Ok(FileSystemMutationResult {
+                    path: path.to_string_lossy().to_string(),
+                    destination: Some(destination.to_string_lossy().to_string()),
+                    bytes: metadata.len(),
+                    summary: "renamed local file".to_string(),
+                })
+            }
+            FileSystemMutationOperation::CreateDirectory => {
+                std::fs::create_dir_all(&path)
+                    .map_err(|error| format!("local directory could not be created: {error}"))?;
+                Ok(FileSystemMutationResult {
+                    path: path.to_string_lossy().to_string(),
+                    destination: None,
+                    bytes: 0,
+                    summary: "created local directory".to_string(),
+                })
+            }
+            FileSystemMutationOperation::RenameDirectory => {
+                let destination = destination
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "local directory rename destination is required".to_string())?;
+                reject_root_mutation_path(&destination)?;
+                let metadata = std::fs::metadata(&path).map_err(|error| {
+                    format!("local directory metadata could not be read: {error}")
+                })?;
+                if !metadata.is_dir() {
+                    return Err("local directory rename target is not a directory".to_string());
+                }
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!("local directory destination parent could not be created: {error}")
+                    })?;
+                }
+                std::fs::rename(&path, &destination)
+                    .map_err(|error| format!("local directory could not be renamed: {error}"))?;
+                Ok(FileSystemMutationResult {
+                    path: path.to_string_lossy().to_string(),
+                    destination: Some(destination.to_string_lossy().to_string()),
+                    bytes: 0,
+                    summary: "renamed local directory".to_string(),
+                })
+            }
+            FileSystemMutationOperation::DeleteDirectory => {
+                let metadata = std::fs::metadata(&path).map_err(|error| {
+                    format!("local directory metadata could not be read: {error}")
+                })?;
+                if !metadata.is_dir() {
+                    return Err("local directory delete target is not a directory".to_string());
+                }
+                std::fs::remove_dir_all(&path)
+                    .map_err(|error| format!("local directory could not be deleted: {error}"))?;
+                Ok(FileSystemMutationResult {
+                    path: path.to_string_lossy().to_string(),
+                    destination: None,
+                    bytes: 0,
+                    summary: "deleted local directory".to_string(),
+                })
+            }
+        }
+    }
+}
+
 pub struct LocalEvidenceFolderClient {
     max_files: usize,
     max_file_bytes: u64,
@@ -692,6 +876,9 @@ pub struct LocalTerminalReadClient {
     max_output_chars: usize,
 }
 
+const TERMINAL_READ_DIRECTORY_LIST_PREFIX: &str = "ds-agent:list-directory ";
+const TERMINAL_READ_DIRECTORY_ENTRY_LIMIT: usize = 100;
+
 impl LocalTerminalReadClient {
     pub fn new(working_dir: std::path::PathBuf, max_output_chars: usize) -> Self {
         Self {
@@ -699,10 +886,69 @@ impl LocalTerminalReadClient {
             max_output_chars,
         }
     }
+
+    fn list_directory(&self, location: &str) -> Result<TerminalCommandOutput, String> {
+        let folder = PathBuf::from(location);
+        let metadata = std::fs::metadata(&folder)
+            .map_err(|error| format!("local directory metadata could not be read: {error}"))?;
+        if !metadata.is_dir() {
+            return Err("local directory listing target is not a directory".to_string());
+        }
+
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&folder)
+            .map_err(|error| format!("local directory could not be listed: {error}"))?
+        {
+            if entries.len() >= TERMINAL_READ_DIRECTORY_ENTRY_LIMIT {
+                break;
+            }
+
+            let entry = entry
+                .map_err(|error| format!("local directory entry could not be read: {error}"))?;
+            let metadata = entry.metadata().map_err(|error| {
+                format!("local directory entry metadata could not be read: {error}")
+            })?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let kind = if metadata.is_dir() { "dir" } else { "file" };
+            let bytes = if metadata.is_file() {
+                metadata.len().to_string()
+            } else {
+                "-".to_string()
+            };
+            entries.push((name, kind.to_string(), bytes));
+        }
+        entries.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
+
+        let mut lines = vec!["Name\tType\tBytes".to_string()];
+        if entries.is_empty() {
+            lines.push("(empty directory)\tdir\t-".to_string());
+        } else {
+            lines.extend(
+                entries
+                    .into_iter()
+                    .map(|(name, kind, bytes)| format!("{name}\t{kind}\t{bytes}")),
+            );
+        }
+        lines.push(format!(
+            "Limit\tInfo\t{} entries shown",
+            TERMINAL_READ_DIRECTORY_ENTRY_LIMIT
+        ));
+
+        Ok(TerminalCommandOutput {
+            command: format!("{TERMINAL_READ_DIRECTORY_LIST_PREFIX}{location}"),
+            stdout: truncate_chars(&lines.join("\n"), self.max_output_chars),
+            stderr: String::new(),
+            exit_code: 0,
+        })
+    }
 }
 
 impl TerminalReadClient for LocalTerminalReadClient {
     fn run_readonly_command(&self, command: &str) -> Result<TerminalCommandOutput, String> {
+        if let Some(location) = command.strip_prefix(TERMINAL_READ_DIRECTORY_LIST_PREFIX) {
+            return self.list_directory(location.trim());
+        }
+
         let output = if cfg!(windows) {
             std::process::Command::new("powershell")
                 .args(["-NoProfile", "-NonInteractive", "-Command", command])
@@ -1821,6 +2067,111 @@ pub fn run_file_write_boundary(
                 excerpt_text(&summary),
                 file_write_result_encoding(&write_result),
                 write_result.bytes
+            )),
+            warnings: Vec::new(),
+            elapsed_ms: started_at.elapsed().as_millis(),
+            created_at: Utc::now(),
+        },
+        access_request,
+    })
+}
+
+pub fn run_filesystem_mutation_boundary(
+    request: FileSystemMutationRequest,
+    client: &impl FileSystemMutationClient,
+) -> Result<FileWriteOutcome, String> {
+    let path = normalize_filesystem_path_field(&request.path, "filesystem path")?;
+    let destination = request
+        .destination
+        .as_deref()
+        .map(|value| normalize_filesystem_path_field(value, "filesystem destination"))
+        .transpose()?;
+    let content = match request.operation {
+        FileSystemMutationOperation::CreateFile | FileSystemMutationOperation::UpdateFile => Some(
+            validate_filesystem_mutation_content(request.content.as_deref())?,
+        ),
+        _ => None,
+    };
+    validate_filesystem_mutation_request(request.operation, &path, destination.as_deref())?;
+    let started_at = Instant::now();
+    let access_request = request_capability_access(request.access_mode, CapabilityKind::FileWrite)?;
+    let operation_label = filesystem_mutation_operation_label(request.operation);
+    let target_summary = filesystem_mutation_target_summary(&path, destination.as_deref());
+
+    if access_request.decision == PolicyDecision::Ask && !request.approval_granted {
+        return Ok(FileWriteOutcome {
+            invocation: CapabilityInvocation {
+                id: Uuid::new_v4(),
+                capability: CapabilityKind::FileWrite,
+                status: CapabilityInvocationStatus::PendingApproval,
+                policy_decision: access_request.decision,
+                approval_request_id: None,
+                requested_resource: Some(path.clone()),
+                evidence_ref: Some(path),
+                requested_url: None,
+                evidence_url: None,
+                title: Some(format!("File system request: {operation_label}")),
+                excerpt: Some(excerpt_text(&target_summary)),
+                warnings: vec![
+                    "file system mutation requires explicit approval in this access mode"
+                        .to_string(),
+                ],
+                elapsed_ms: started_at.elapsed().as_millis(),
+                created_at: Utc::now(),
+            },
+            access_request,
+        });
+    }
+
+    let mutation_result = match client.mutate(
+        request.operation,
+        &path,
+        destination.as_deref(),
+        content.as_deref(),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(FileWriteOutcome {
+                invocation: CapabilityInvocation {
+                    id: Uuid::new_v4(),
+                    capability: CapabilityKind::FileWrite,
+                    status: CapabilityInvocationStatus::Failed,
+                    policy_decision: access_request.decision,
+                    approval_request_id: None,
+                    requested_resource: Some(path.clone()),
+                    evidence_ref: destination.clone().or(Some(path.clone())),
+                    requested_url: None,
+                    evidence_url: None,
+                    title: Some(format!("File system mutation failed: {operation_label}")),
+                    excerpt: Some(excerpt_text(&target_summary)),
+                    warnings: vec![error],
+                    elapsed_ms: started_at.elapsed().as_millis(),
+                    created_at: Utc::now(),
+                },
+                access_request,
+            });
+        }
+    };
+
+    let evidence_ref = mutation_result
+        .destination
+        .clone()
+        .unwrap_or_else(|| mutation_result.path.clone());
+    Ok(FileWriteOutcome {
+        invocation: CapabilityInvocation {
+            id: Uuid::new_v4(),
+            capability: CapabilityKind::FileWrite,
+            status: CapabilityInvocationStatus::Succeeded,
+            policy_decision: access_request.decision,
+            approval_request_id: None,
+            requested_resource: Some(path),
+            evidence_ref: Some(evidence_ref),
+            requested_url: None,
+            evidence_url: None,
+            title: Some(format!("File system mutation: {operation_label}")),
+            excerpt: Some(format!(
+                "{} ({} bytes)",
+                mutation_result.summary, mutation_result.bytes
             )),
             warnings: Vec::new(),
             elapsed_ms: started_at.elapsed().as_millis(),
@@ -3036,6 +3387,70 @@ fn validate_file_write_content(content: &str) -> Result<String, String> {
     Ok(content.to_string())
 }
 
+fn normalize_filesystem_path_field(value: &str, label: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    if !Path::new(trimmed).is_absolute() {
+        return Err(format!("{label} must be an absolute local path"));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn validate_filesystem_mutation_content(content: Option<&str>) -> Result<String, String> {
+    content
+        .map(ToString::to_string)
+        .ok_or_else(|| "filesystem file content is required".to_string())
+}
+
+fn validate_filesystem_mutation_request(
+    operation: FileSystemMutationOperation,
+    path: &str,
+    destination: Option<&str>,
+) -> Result<(), String> {
+    reject_root_mutation_path(Path::new(path))?;
+    match operation {
+        FileSystemMutationOperation::RenameFile | FileSystemMutationOperation::RenameDirectory => {
+            let destination = destination.ok_or_else(|| {
+                "filesystem rename destination is required before dispatch".to_string()
+            })?;
+            reject_root_mutation_path(Path::new(destination))?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn reject_root_mutation_path(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() || path.file_name().is_none() {
+        return Err("filesystem mutation refuses to target a filesystem root".to_string());
+    }
+
+    Ok(())
+}
+
+fn filesystem_mutation_operation_label(operation: FileSystemMutationOperation) -> &'static str {
+    match operation {
+        FileSystemMutationOperation::CreateFile => "create_file",
+        FileSystemMutationOperation::UpdateFile => "update_file",
+        FileSystemMutationOperation::DeleteFile => "delete_file",
+        FileSystemMutationOperation::RenameFile => "rename_file",
+        FileSystemMutationOperation::CreateDirectory => "create_directory",
+        FileSystemMutationOperation::RenameDirectory => "rename_directory",
+        FileSystemMutationOperation::DeleteDirectory => "delete_directory",
+    }
+}
+
+fn filesystem_mutation_target_summary(path: &str, destination: Option<&str>) -> String {
+    match destination {
+        Some(destination) => format!("{path} -> {destination}"),
+        None => path.to_string(),
+    }
+}
+
 fn normalize_browser_url(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
@@ -3060,7 +3475,16 @@ fn normalize_file_path(path: &str) -> Result<String, String> {
 }
 
 fn normalize_terminal_read_command(command: &str) -> Result<String, String> {
-    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err("terminal command is required".to_string());
+    }
+
+    if let Some(path) = normalize_terminal_directory_listing_target(trimmed) {
+        return Ok(format!("{TERMINAL_READ_DIRECTORY_LIST_PREFIX}{path}"));
+    }
+
+    let normalized = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
         return Err("terminal command is required".to_string());
     }
@@ -3071,6 +3495,115 @@ fn normalize_terminal_read_command(command: &str) -> Result<String, String> {
         Err(format!(
             "terminal command is not in the TerminalRead allowlist: {normalized}"
         ))
+    }
+}
+
+fn normalize_terminal_directory_listing_target(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let explicit = trimmed
+        .strip_prefix("list_directory:")
+        .or_else(|| trimmed.strip_prefix("list-directory:"))
+        .or_else(|| trimmed.strip_prefix(TERMINAL_READ_DIRECTORY_LIST_PREFIX));
+    if let Some(path) = explicit.and_then(clean_terminal_directory_path) {
+        return Some(path);
+    }
+
+    if let Some(path) =
+        clean_terminal_directory_path(trimmed).filter(|path| looks_like_local_directory_path(path))
+    {
+        return Some(path);
+    }
+
+    let tokens = split_terminal_command_tokens(trimmed)?;
+    let command_name = tokens.first()?.to_ascii_lowercase();
+    match command_name.as_str() {
+        "dir" | "ls" if tokens.len() == 2 => clean_terminal_directory_path(&tokens[1]),
+        "get-childitem" | "gci" => terminal_get_child_item_path(&tokens),
+        _ => None,
+    }
+}
+
+fn terminal_get_child_item_path(tokens: &[String]) -> Option<String> {
+    match tokens {
+        [_, path] => clean_terminal_directory_path(path),
+        [_, option, path]
+            if matches!(
+                option.to_ascii_lowercase().as_str(),
+                "-literalpath" | "-path"
+            ) =>
+        {
+            clean_terminal_directory_path(path)
+        }
+        _ => None,
+    }
+}
+
+fn clean_terminal_directory_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let unquoted = if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    let unquoted = unquoted.trim();
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted.to_string())
+    }
+}
+
+fn looks_like_local_directory_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with("\\\\")
+        || path.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[1] == b':'
+            && bytes[0].is_ascii_alphabetic()
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
+fn split_terminal_command_tokens(command: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for character in command.chars() {
+        match (quote, character) {
+            (Some(active_quote), value) if value == active_quote => {
+                quote = None;
+            }
+            (Some(_), value) => current.push(value),
+            (None, '\'' | '"') => {
+                quote = Some(character);
+            }
+            (None, value) if value.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+            }
+            (None, value) => current.push(value),
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
     }
 }
 
@@ -3483,6 +4016,8 @@ fn decode_basic_entity(entity: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{LocalTerminalReadClient, TERMINAL_READ_DIRECTORY_LIST_PREFIX};
+
     use std::cell::{Cell, RefCell};
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3497,9 +4032,9 @@ mod tests {
         run_computer_control_boundary, run_computer_screenshot, run_drive_read_boundary,
         run_drive_write_boundary, run_email_draft_boundary, run_email_read_boundary,
         run_email_send_boundary, run_evidence_folder_ingest, run_file_read,
-        run_file_write_boundary, run_network_search_boundary, run_terminal_read,
-        run_terminal_write_boundary, BrowserBrowseRequest, BrowserPage, BrowserPageClient,
-        BrowserSubmitRequest, CapabilityInvocation, CapabilityInvocationStatus,
+        run_file_write_boundary, run_filesystem_mutation_boundary, run_network_search_boundary,
+        run_terminal_read, run_terminal_write_boundary, BrowserBrowseRequest, BrowserPage,
+        BrowserPageClient, BrowserSubmitRequest, CapabilityInvocation, CapabilityInvocationStatus,
         CapturedScreenshotImage, CodexBridgeComputerControlClient,
         CodexBridgeComputerScreenshotClient, CodexBridgeNetworkSearchClient, ComputerControlAction,
         ComputerControlClient, ComputerControlExecution, ComputerControlMouseButton,
@@ -3507,9 +4042,10 @@ mod tests {
         ComputerScreenshotRequest, DriveFolderEntry, DriveReadRequest, DriveWriteExportFile,
         DriveWriteRequest, EmailDraftRequest, EmailReadRequest, EmailSendRequest,
         EvidenceFolderClient, EvidenceFolderFile, EvidenceFolderRequest, FileContent,
-        FileContentClient, FileReadRequest, FileWriteRequest, FileWriteResult,
-        HttpBrowserPageClient, LocalComputerControlClient, LocalComputerControlInputBackend,
-        LocalComputerScreenshotClient, LocalDriveFolderClient, LocalScreenshotCaptureBackend,
+        FileContentClient, FileReadRequest, FileSystemMutationOperation, FileSystemMutationRequest,
+        FileWriteRequest, FileWriteResult, HttpBrowserPageClient, LocalComputerControlClient,
+        LocalComputerControlInputBackend, LocalComputerScreenshotClient, LocalDriveFolderClient,
+        LocalFileSystemMutationClient, LocalScreenshotCaptureBackend,
         LocalWorkspaceFileWriteClient, NetworkSearchClient, NetworkSearchRequest,
         NetworkSearchResult, NetworkSearchResultItem, TerminalCommandOutput, TerminalReadClient,
         TerminalReadRequest, TerminalWriteRequest,
@@ -4329,6 +4865,49 @@ mod tests {
             .expect("excerpt exists")
             .contains("README.md"));
         assert_eq!(client.calls.get(), 1);
+    }
+
+    #[test]
+    fn terminal_read_lists_local_directory_without_running_shell() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let listed_dir = temp_dir.path().join("folder with spaces");
+        std::fs::create_dir(&listed_dir).expect("create listed dir");
+        std::fs::write(listed_dir.join("alpha.txt"), "Alpha evidence").expect("write file");
+        std::fs::create_dir(listed_dir.join("nested")).expect("create nested dir");
+        let client = LocalTerminalReadClient::new(temp_dir.path().to_path_buf(), 4_000);
+        let command = format!(
+            "Get-ChildItem -LiteralPath '{}'",
+            listed_dir.to_string_lossy()
+        );
+
+        let outcome = run_terminal_read(
+            TerminalReadRequest {
+                access_mode: AccessMode::FullAccess,
+                command,
+                approval_granted: false,
+            },
+            &client,
+        )
+        .expect("directory listing command is normalized safely");
+
+        assert_eq!(outcome.access_request.decision, PolicyDecision::Allow);
+        assert_eq!(
+            outcome.invocation.status,
+            CapabilityInvocationStatus::Succeeded
+        );
+        assert!(outcome
+            .invocation
+            .requested_resource
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with(TERMINAL_READ_DIRECTORY_LIST_PREFIX));
+        let excerpt = outcome
+            .invocation
+            .excerpt
+            .as_deref()
+            .expect("directory excerpt exists");
+        assert!(excerpt.contains("alpha.txt"));
+        assert!(excerpt.contains("nested"));
     }
 
     #[test]
@@ -5840,5 +6419,170 @@ mod tests {
         .expect_err("blank file write should fail validation");
 
         assert!(error.contains("file write path is required"));
+    }
+
+    #[test]
+    fn filesystem_mutation_creates_updates_deletes_file_on_local_windows_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let client = LocalFileSystemMutationClient;
+        let file_path = temp_dir.path().join("notes").join("daily.txt");
+
+        let create = run_filesystem_mutation_boundary(
+            FileSystemMutationRequest {
+                access_mode: AccessMode::FullAccess,
+                operation: FileSystemMutationOperation::CreateFile,
+                path: file_path.to_string_lossy().to_string(),
+                destination: None,
+                content: Some("first draft".to_string()),
+                approval_granted: false,
+            },
+            &client,
+        )
+        .expect("file create succeeds");
+
+        assert_eq!(create.access_request.decision, PolicyDecision::Allow);
+        assert_eq!(
+            create.invocation.status,
+            CapabilityInvocationStatus::Succeeded
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("created file"),
+            "first draft"
+        );
+
+        let update = run_filesystem_mutation_boundary(
+            FileSystemMutationRequest {
+                access_mode: AccessMode::FullAccess,
+                operation: FileSystemMutationOperation::UpdateFile,
+                path: file_path.to_string_lossy().to_string(),
+                destination: None,
+                content: Some("second draft".to_string()),
+                approval_granted: false,
+            },
+            &client,
+        )
+        .expect("file update succeeds");
+
+        assert_eq!(
+            update.invocation.status,
+            CapabilityInvocationStatus::Succeeded
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("updated file"),
+            "second draft"
+        );
+
+        let delete = run_filesystem_mutation_boundary(
+            FileSystemMutationRequest {
+                access_mode: AccessMode::FullAccess,
+                operation: FileSystemMutationOperation::DeleteFile,
+                path: file_path.to_string_lossy().to_string(),
+                destination: None,
+                content: None,
+                approval_granted: false,
+            },
+            &client,
+        )
+        .expect("file delete succeeds");
+
+        assert_eq!(
+            delete.invocation.status,
+            CapabilityInvocationStatus::Succeeded
+        );
+        assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn filesystem_mutation_creates_renames_deletes_directory_on_local_windows_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let client = LocalFileSystemMutationClient;
+        let source_dir = temp_dir.path().join("incoming");
+        let renamed_dir = temp_dir.path().join("processed");
+
+        let create = run_filesystem_mutation_boundary(
+            FileSystemMutationRequest {
+                access_mode: AccessMode::FullAccess,
+                operation: FileSystemMutationOperation::CreateDirectory,
+                path: source_dir.to_string_lossy().to_string(),
+                destination: None,
+                content: None,
+                approval_granted: false,
+            },
+            &client,
+        )
+        .expect("directory create succeeds");
+
+        assert_eq!(
+            create.invocation.status,
+            CapabilityInvocationStatus::Succeeded
+        );
+        assert!(source_dir.is_dir());
+        std::fs::write(source_dir.join("entry.txt"), "directory body").expect("seed nested file");
+
+        let rename = run_filesystem_mutation_boundary(
+            FileSystemMutationRequest {
+                access_mode: AccessMode::FullAccess,
+                operation: FileSystemMutationOperation::RenameDirectory,
+                path: source_dir.to_string_lossy().to_string(),
+                destination: Some(renamed_dir.to_string_lossy().to_string()),
+                content: None,
+                approval_granted: false,
+            },
+            &client,
+        )
+        .expect("directory rename succeeds");
+
+        assert_eq!(
+            rename.invocation.status,
+            CapabilityInvocationStatus::Succeeded
+        );
+        assert!(!source_dir.exists());
+        assert!(renamed_dir.join("entry.txt").is_file());
+
+        let delete = run_filesystem_mutation_boundary(
+            FileSystemMutationRequest {
+                access_mode: AccessMode::FullAccess,
+                operation: FileSystemMutationOperation::DeleteDirectory,
+                path: renamed_dir.to_string_lossy().to_string(),
+                destination: None,
+                content: None,
+                approval_granted: false,
+            },
+            &client,
+        )
+        .expect("directory delete succeeds");
+
+        assert_eq!(
+            delete.invocation.status,
+            CapabilityInvocationStatus::Succeeded
+        );
+        assert!(!renamed_dir.exists());
+    }
+
+    #[test]
+    fn filesystem_mutation_waits_for_approval_without_mutating() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let client = LocalFileSystemMutationClient;
+        let file_path = temp_dir.path().join("pending.txt");
+
+        let outcome = run_filesystem_mutation_boundary(
+            FileSystemMutationRequest {
+                access_mode: AccessMode::AskOnRisk,
+                operation: FileSystemMutationOperation::CreateFile,
+                path: file_path.to_string_lossy().to_string(),
+                destination: None,
+                content: Some("pending body".to_string()),
+                approval_granted: false,
+            },
+            &client,
+        )
+        .expect("filesystem mutation waits for approval");
+
+        assert_eq!(outcome.access_request.decision, PolicyDecision::Ask);
+        assert_eq!(
+            outcome.invocation.status,
+            CapabilityInvocationStatus::PendingApproval
+        );
+        assert!(!file_path.exists());
     }
 }

@@ -166,6 +166,7 @@ export type AgentChatActionProposal = {
   requires_confirmation: boolean;
   target: string | null;
   target_location: string | null;
+  destination: string | null;
   preferred_browser: string | null;
   content: string | null;
   capability: CapabilityKind | null;

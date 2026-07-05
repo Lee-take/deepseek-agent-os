@@ -471,12 +471,17 @@ function userFacingAgentActionDetail(action: AgentChatActionProposal): string {
     return blockedReason;
   }
 
+  const target = action.target?.trim();
+  const destination = action.destination?.trim();
+  if (target && destination) {
+    return `${target} -> ${destination}`;
+  }
+
   const reason = action.reason?.trim();
   if (reason) {
     return reason;
   }
 
-  const target = action.target?.trim();
   if (target) {
     return target;
   }

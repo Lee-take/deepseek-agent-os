@@ -37,7 +37,7 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
 - Confirm repository visibility and project owner name.
 - Keep the already-published `v0.0.1` source snapshot, tag, and release
   unchanged.
-- For `v0.1.0-rc.1`, publish a new prerelease with the Windows installer
+- For the `v0.1.0` RC line, publish a new prerelease with the Windows installer
   attached after final verification passes.
 - The Windows installer should embed the Microsoft WebView2 bootstrapper so
   ordinary users do not need a developer toolchain or a separate WebView2 setup
@@ -55,7 +55,7 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
 - If post-release hardening commits should become a released snapshot, create a
   new prerelease tag instead of rewriting an old tag.
 - The older source-only publication decision is superseded by the
-  `v0.1.0-rc.1` Windows installer prerelease plan.
+  `v0.1.0` Windows installer prerelease plan.
 - Keep patch prereleases focused on release hygiene, security checks,
   documentation corrections, Windows run reliability, or DeepSeek compatibility
   verification. Do not use patch releases to add broad new product capabilities

@@ -18,18 +18,20 @@ use crate::kernel::capability::{
     run_computer_screenshot, run_drive_read_boundary, run_drive_write_boundary,
     run_email_draft_boundary, run_email_read_boundary, run_email_send_boundary,
     run_evidence_folder_ingest, run_file_read, run_file_write_boundary,
-    run_network_search_boundary, run_terminal_read as run_terminal_read_capability,
-    run_terminal_write_boundary, BrowserBrowseRequest, BrowserPageClient, BrowserSubmitRequest,
-    CapabilityInvocation, CapabilityInvocationStatus, CodexBridgeComputerControlClient,
+    run_filesystem_mutation_boundary, run_network_search_boundary,
+    run_terminal_read as run_terminal_read_capability, run_terminal_write_boundary,
+    BrowserBrowseRequest, BrowserPageClient, BrowserSubmitRequest, CapabilityInvocation,
+    CapabilityInvocationStatus, CodexBridgeComputerControlClient,
     CodexBridgeComputerScreenshotClient, CodexBridgeNetworkSearchClient, ComputerControlClient,
     ComputerControlRequest, ComputerScreenshotRequest, DriveReadRequest, DriveWriteExportFile,
     DriveWriteRequest, EmailDraftRequest, EmailReadRequest, EmailSendRequest,
-    EvidenceFolderRequest, FileContentClient, FileReadRequest, FileWriteClient, FileWriteRequest,
-    FileWriteResult, HttpBrowserPageClient, HttpNetworkSearchClient, LocalComputerControlClient,
+    EvidenceFolderRequest, FileContentClient, FileReadRequest, FileSystemMutationOperation,
+    FileSystemMutationRequest, FileWriteClient, FileWriteRequest, FileWriteResult,
+    HttpBrowserPageClient, HttpNetworkSearchClient, LocalComputerControlClient,
     LocalComputerScreenshotClient, LocalDriveFolderClient, LocalEvidenceFolderClient,
-    LocalFileContentClient, LocalTerminalReadClient, LocalWorkspaceFileWriteClient,
-    NetworkSearchClient, NetworkSearchRequest, NetworkSearchResult, TerminalReadRequest,
-    TerminalWriteRequest,
+    LocalFileContentClient, LocalFileSystemMutationClient, LocalTerminalReadClient,
+    LocalWorkspaceFileWriteClient, NetworkSearchClient, NetworkSearchRequest, NetworkSearchResult,
+    TerminalReadRequest, TerminalWriteRequest,
 };
 use crate::kernel::computer_use::{
     computer_use_backend_status_for_strategy, ComputerUseBackendStatus,
@@ -210,13 +212,19 @@ pub struct AgentChatActionProposal {
         alias = "command"
     )]
     pub target: Option<String>,
+    #[serde(default, alias = "targetLocation", alias = "location")]
+    pub target_location: Option<String>,
     #[serde(
         default,
-        alias = "targetLocation",
-        alias = "location",
-        alias = "destination"
+        alias = "to",
+        alias = "dest",
+        alias = "destination",
+        alias = "newPath",
+        alias = "new_path",
+        alias = "newName",
+        alias = "new_name"
     )]
-    pub target_location: Option<String>,
+    pub destination: Option<String>,
     #[serde(default, alias = "preferredBrowser", alias = "browser")]
     pub preferred_browser: Option<String>,
     #[serde(
@@ -1299,6 +1307,7 @@ fn agent_action_from_artifact_target(
         requires_confirmation: artifact.requires_confirmation,
         target: Some(target),
         target_location: None,
+        destination: None,
         preferred_browser: None,
         content: Some(content),
         capability: None,
@@ -1370,13 +1379,15 @@ fn normalize_agent_action_proposal(
     action.policy_decision = action.capability.map(|capability| {
         agent_action_policy_decision(access_mode, &action.action_type, capability)
     });
+    let risk_requires_confirmation = action_risk_requires_confirmation(action.risk.as_deref())
+        && !is_agent_filesystem_mutation_action(&action.action_type);
 
     action.execution_state = if !is_supported_agent_action_type(&action.action_type) {
         action.blocked_reason = Some(unsupported_agent_action_reason(&action.action_type));
         "blocked".to_string()
     } else if matches!(action.policy_decision, Some(PolicyDecision::Ask))
         || action.requires_confirmation
-        || action_risk_requires_confirmation(action.risk.as_deref())
+        || risk_requires_confirmation
     {
         action.dispatch_note =
             Some("local capability policy requires confirmation before dispatch".to_string());
@@ -1402,6 +1413,10 @@ fn normalize_agent_action_type(action_type: &str) -> String {
 }
 
 fn normalize_agent_action_alias(action: &mut AgentChatActionProposal) {
+    if normalize_agent_filesystem_mutation_alias(action) {
+        return;
+    }
+
     if is_office_create_action_type(&action.action_type) {
         action.action_type = "office_create".to_string();
         action.risk = Some("low".to_string());
@@ -1464,6 +1479,39 @@ fn normalize_agent_action_alias(action: &mut AgentChatActionProposal) {
             action.requires_confirmation = false;
         }
     }
+}
+
+fn normalize_agent_filesystem_mutation_alias(action: &mut AgentChatActionProposal) -> bool {
+    let normalized = match action.action_type.as_str() {
+        "file_create" | "create_file" | "new_file" | "write_file" => "file_create",
+        "file_update" | "update_file" | "modify_file" | "edit_file" | "overwrite_file" => {
+            "file_update"
+        }
+        "file_delete" | "delete_file" | "remove_file" => "file_delete",
+        "file_rename" | "rename_file" | "move_file" | "file_move" => "file_rename",
+        "directory_create" | "create_directory" | "create_folder" | "new_directory"
+        | "new_folder" | "mkdir" | "make_directory" => "directory_create",
+        "directory_rename" | "rename_directory" | "rename_folder" | "move_directory"
+        | "move_folder" | "directory_move" | "folder_move" => "directory_rename",
+        "directory_delete" | "delete_directory" | "delete_folder" | "remove_directory"
+        | "remove_folder" | "rmdir" => "directory_delete",
+        _ => return false,
+    };
+
+    action.action_type = normalized.to_string();
+    action.requires_confirmation = false;
+    action.risk.get_or_insert_with(|| {
+        if matches!(
+            normalized,
+            "file_delete" | "file_rename" | "directory_delete" | "directory_rename"
+        ) {
+            "medium"
+        } else {
+            "low"
+        }
+        .to_string()
+    });
+    true
 }
 
 fn agent_action_policy_decision(
@@ -1741,6 +1789,23 @@ fn unsupported_agent_action_reason(action_type: &str) -> String {
     }
 }
 
+fn agent_filesystem_mutation_operation(action_type: &str) -> Option<FileSystemMutationOperation> {
+    match action_type {
+        "file_create" => Some(FileSystemMutationOperation::CreateFile),
+        "file_update" => Some(FileSystemMutationOperation::UpdateFile),
+        "file_delete" => Some(FileSystemMutationOperation::DeleteFile),
+        "file_rename" => Some(FileSystemMutationOperation::RenameFile),
+        "directory_create" => Some(FileSystemMutationOperation::CreateDirectory),
+        "directory_rename" => Some(FileSystemMutationOperation::RenameDirectory),
+        "directory_delete" => Some(FileSystemMutationOperation::DeleteDirectory),
+        _ => None,
+    }
+}
+
+fn is_agent_filesystem_mutation_action(action_type: &str) -> bool {
+    agent_filesystem_mutation_operation(action_type).is_some()
+}
+
 fn agent_action_capability(action_type: &str) -> Option<CapabilityKind> {
     match action_type {
         "browser_open" => Some(CapabilityKind::BrowserBrowse),
@@ -1753,6 +1818,7 @@ fn agent_action_capability(action_type: &str) -> Option<CapabilityKind> {
         "email_send" => Some(CapabilityKind::EmailSend),
         "file_read" => Some(CapabilityKind::FileRead),
         "file_write" | "create_report" => Some(CapabilityKind::FileWrite),
+        _ if is_agent_filesystem_mutation_action(action_type) => Some(CapabilityKind::FileWrite),
         "network_search" => Some(CapabilityKind::NetworkSearch),
         "office_open" => Some(CapabilityKind::FileRead),
         "office_create" => Some(CapabilityKind::FileWrite),
@@ -1779,6 +1845,13 @@ fn is_supported_agent_action_type(action_type: &str) -> bool {
             | "email_send"
             | "file_read"
             | "file_write"
+            | "file_create"
+            | "file_update"
+            | "file_delete"
+            | "file_rename"
+            | "directory_create"
+            | "directory_rename"
+            | "directory_delete"
             | "memory_candidate"
             | "network_search"
             | "office_create"
@@ -1824,12 +1897,14 @@ fn build_agent_chat_protocol_user_prompt(
          - If local files, artifacts, or workflow state are needed and workspace_ready is not ready, return missing_prerequisites with kind workspace before proposing local file actions.\n\
          - Return exactly one structured agent envelope as JSON.\n\
          - Required JSON fields: protocol_version, reply_to_user, agent_actions, missing_prerequisites.\n\
-         - Supported agent_actions action_type values are browser_open, browser_browse, computer_control, computer_screenshot, file_read, file_write, create_report, office_create, office_update, office_open, network_search, operations_briefing, terminal_read, terminal_write, workspace_setup, deepseek_key_setup, and search_setup.\n\
+         - Supported agent_actions action_type values are browser_open, browser_browse, computer_control, computer_screenshot, file_read, file_write, file_create, file_update, file_delete, file_rename, directory_create, directory_rename, directory_delete, create_report, office_create, office_update, office_open, network_search, operations_briefing, terminal_read, terminal_write, workspace_setup, deepseek_key_setup, and search_setup.\n\
          - Do not use run_shell. For opening a website in the user's browser, use action_type browser_open with target set to the exact http:// or https:// URL. For reading or inspecting a web page as evidence, use browser_browse. If the user asked to log in, open the site only and ask the user to enter credentials manually.\n\
+         - For local directory listing requests, use exactly one terminal_read action with target set to the exact local folder path. DS Agent will run a bounded non-recursive directory listing without executing arbitrary shell. Do not add a second action to read terminal output.\n\
+         - For Windows local filesystem create, update, delete, or rename requests, use file_create, file_update, file_delete, file_rename, directory_create, directory_rename, or directory_delete with exact absolute local paths. Use content for file_create and file_update. Use destination for file_rename and directory_rename. Do not use run_shell for Windows file or directory mutation.\n\
          - browser_open may include preferred_browser=chrome only when the user explicitly asks for Chrome. DS Agent will fall back to the system default browser if Chrome is unavailable.\n\
          - For Word, Excel, and PowerPoint creation requests, prefer the built-in Office control plugin path: use action_type office_create and let DS Agent generate a real .docx, .xlsx, or .pptx before using desktop UI control. If the user asks for the Desktop, set target_location=\"desktop\" and target to the file name or desktop-relative path. If the user asks for the DS Agent workspace, set target_location=\"workspace\" or omit it. Do not infer or hide the location: express the user's location intent in target_location. Set content to either plain body text or JSON with app=word|excel|powerpoint, title, body, rows, slides, and optional target_location. Use office_create for tasks like creating a Word document containing requested text, creating a simple Excel workbook, or creating a PowerPoint deck. For updating an existing Office file, use action_type office_update with target set to the existing file and content as plain body text or JSON with app=word|excel|powerpoint, body, rows, and slides. DS Agent can append Word paragraphs, Excel rows, and PowerPoint slides deterministically. If the user asks to open the created or existing Office file, add a separate office_open action with the same target and target_location; DS Agent will prefer the matching Microsoft Office app and fall back to the system default app if it is unavailable.\n\
          - For desktop UI automation, use computer_screenshot to inspect the current desktop before planning screen-dependent clicks. Use computer_control only for one validated structured input action at a time. Set target to the app or window, set risk=critical, set requires_confirmation=true, and set content to exactly one of: click:x,y[,button], move:x,y, type:text, press:key, hotkey:key+key, or scroll:delta[,axis]. For multi-step desktop tasks such as editing an already open Word document, do not claim completion until DS Agent has actually completed the required local actions.\n\
-         - Each agent_actions item may include action_type, title, reason, risk, requires_confirmation, target, target_location, preferred_browser, and content.\n\
+         - Each agent_actions item may include action_type, title, reason, risk, requires_confirmation, target, destination, target_location, preferred_browser, and content.\n\
          - For file_write or create_report, target must be a relative workspace path and content must be the exact UTF-8 text DS Agent should write after local validation. For office_create, office_update, or office_open, target must be a .docx, .xlsx, or .pptx path when supplied; use target_location=\"desktop\" only when the user explicitly asks for the Desktop.\n\
          - reply_to_user must describe the intended plan, not local completion. Do not say a file was created, opened, edited, or saved until DS Agent returns execution evidence.\n\
          - DS Agent will validate schema, permissions, risk, workspace paths, and confirmations before executing any action.\n\n\
@@ -2670,6 +2745,14 @@ fn dispatch_agent_action_proposals(
                         true,
                         Some(approval_request_id),
                     )?;
+                } else if is_agent_filesystem_mutation_action(&action.action_type) {
+                    dispatch_agent_filesystem_mutation_action(
+                        store,
+                        access_mode,
+                        action,
+                        true,
+                        Some(approval_request_id),
+                    )?;
                 } else {
                     dispatch_agent_file_write_action(
                         store,
@@ -2691,6 +2774,19 @@ fn dispatch_agent_action_proposals(
                     access_mode,
                     action,
                     search_client,
+                    true,
+                    Some(approval_request_id),
+                )?;
+            }
+            (
+                Some(CapabilityKind::TerminalRead),
+                Some(PolicyDecision::Ask),
+                AgentActionApprovalState::Approved(approval_request_id),
+            ) => {
+                dispatch_agent_terminal_read_action(
+                    store,
+                    access_mode,
+                    action,
                     true,
                     Some(approval_request_id),
                 )?;
@@ -2756,6 +2852,14 @@ fn dispatch_agent_action_proposals(
                         false,
                         None,
                     )?;
+                } else if is_agent_filesystem_mutation_action(&action.action_type) {
+                    dispatch_agent_filesystem_mutation_action(
+                        store,
+                        access_mode,
+                        action,
+                        false,
+                        None,
+                    )?;
                 } else {
                     dispatch_agent_file_write_action(
                         store,
@@ -2776,6 +2880,9 @@ fn dispatch_agent_action_proposals(
                     false,
                     None,
                 )?;
+            }
+            (Some(CapabilityKind::TerminalRead), Some(PolicyDecision::Allow), _) => {
+                dispatch_agent_terminal_read_action(store, access_mode, action, false, None)?;
             }
             (Some(CapabilityKind::BrowserBrowse), Some(PolicyDecision::Allow), _) => {
                 dispatch_agent_browser_action(
@@ -2880,6 +2987,28 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                         Some(approval_request_id),
                     )?;
                 }
+            }
+            (Some(CapabilityKind::TerminalRead), Some(PolicyDecision::Allow), _) => {
+                dispatch_agent_terminal_read_action_with_store_mutex(
+                    store_mutex,
+                    access_mode,
+                    action,
+                    false,
+                    None,
+                )?;
+            }
+            (
+                Some(CapabilityKind::TerminalRead),
+                Some(PolicyDecision::Ask),
+                AgentActionApprovalState::Approved(approval_request_id),
+            ) => {
+                dispatch_agent_terminal_read_action_with_store_mutex(
+                    store_mutex,
+                    access_mode,
+                    action,
+                    true,
+                    Some(approval_request_id),
+                )?;
             }
             _ => {
                 let mut single_response = AgentChatResponse {
@@ -3245,6 +3374,129 @@ fn dispatch_agent_file_read_action_with_store_mutex(
     let mut invocation = outcome.invocation;
     invocation.approval_request_id = approval_request_id;
     let entry = PermissionAuditEntry::evaluate(access_mode, CapabilityKind::FileRead);
+
+    {
+        let store = store_mutex.lock().map_err(|_| lock_error())?;
+        if !approval_granted || outcome.access_request.decision == PolicyDecision::Allow {
+            store
+                .append_capability_access_request(&outcome.access_request)
+                .map_err(event_store_error)?;
+        }
+        store
+            .append_permission_audit_entry(&entry)
+            .map_err(event_store_error)?;
+        store
+            .append_capability_invocation(&invocation)
+            .map_err(event_store_error)?;
+    }
+
+    action.capability_invocation_id = Some(invocation.id);
+    action.execution_state = agent_action_state_from_invocation(invocation.status);
+    action.dispatch_note = agent_action_dispatch_note(&invocation);
+    Ok(())
+}
+
+fn agent_terminal_read_client() -> Result<LocalTerminalReadClient, String> {
+    let working_dir = std::env::current_dir().map_err(event_store_error)?;
+    Ok(LocalTerminalReadClient::new(working_dir, 4_000))
+}
+
+fn dispatch_agent_terminal_read_action(
+    store: &EventStore,
+    access_mode: AccessMode,
+    action: &mut AgentChatActionProposal,
+    approval_granted: bool,
+    approval_request_id: Option<Uuid>,
+) -> Result<(), String> {
+    let Some(command) = action
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        action.execution_state = "blocked".to_string();
+        action.blocked_reason =
+            Some("terminal_read target or command is required before dispatch".to_string());
+        return Ok(());
+    };
+
+    let client = agent_terminal_read_client()?;
+    let outcome = match run_terminal_read_capability(
+        TerminalReadRequest {
+            access_mode,
+            command: command.to_string(),
+            approval_granted,
+        },
+        &client,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            action.execution_state = "failed".to_string();
+            action.blocked_reason = Some(error.clone());
+            action.dispatch_note = Some(error);
+            return Ok(());
+        }
+    };
+    let mut invocation = outcome.invocation;
+    invocation.approval_request_id = approval_request_id;
+    let entry = PermissionAuditEntry::evaluate(access_mode, CapabilityKind::TerminalRead);
+    if !approval_granted || outcome.access_request.decision == PolicyDecision::Allow {
+        store
+            .append_capability_access_request(&outcome.access_request)
+            .map_err(event_store_error)?;
+    }
+    store
+        .append_permission_audit_entry(&entry)
+        .map_err(event_store_error)?;
+    store
+        .append_capability_invocation(&invocation)
+        .map_err(event_store_error)?;
+
+    action.capability_invocation_id = Some(invocation.id);
+    action.execution_state = agent_action_state_from_invocation(invocation.status);
+    action.dispatch_note = agent_action_dispatch_note(&invocation);
+    Ok(())
+}
+
+fn dispatch_agent_terminal_read_action_with_store_mutex(
+    store_mutex: &Mutex<EventStore>,
+    access_mode: AccessMode,
+    action: &mut AgentChatActionProposal,
+    approval_granted: bool,
+    approval_request_id: Option<Uuid>,
+) -> Result<(), String> {
+    let Some(command) = action
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        action.execution_state = "blocked".to_string();
+        action.blocked_reason =
+            Some("terminal_read target or command is required before dispatch".to_string());
+        return Ok(());
+    };
+
+    let client = agent_terminal_read_client()?;
+    let outcome = match run_terminal_read_capability(
+        TerminalReadRequest {
+            access_mode,
+            command: command.to_string(),
+            approval_granted,
+        },
+        &client,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            action.execution_state = "failed".to_string();
+            action.blocked_reason = Some(error.clone());
+            action.dispatch_note = Some(error);
+            return Ok(());
+        }
+    };
+    let mut invocation = outcome.invocation;
+    invocation.approval_request_id = approval_request_id;
+    let entry = PermissionAuditEntry::evaluate(access_mode, CapabilityKind::TerminalRead);
 
     {
         let store = store_mutex.lock().map_err(|_| lock_error())?;
@@ -3741,6 +3993,115 @@ fn dispatch_agent_file_write_action(
         },
         file_write_client,
     )?;
+    let mut invocation = outcome.invocation;
+    invocation.approval_request_id = approval_request_id;
+    let entry = PermissionAuditEntry::evaluate(access_mode, CapabilityKind::FileWrite);
+    if !approval_granted || outcome.access_request.decision == PolicyDecision::Allow {
+        store
+            .append_capability_access_request(&outcome.access_request)
+            .map_err(event_store_error)?;
+    }
+    store
+        .append_permission_audit_entry(&entry)
+        .map_err(event_store_error)?;
+    store
+        .append_capability_invocation(&invocation)
+        .map_err(event_store_error)?;
+
+    action.capability_invocation_id = Some(invocation.id);
+    action.execution_state = agent_action_state_from_invocation(invocation.status);
+    action.dispatch_note = agent_action_dispatch_note(&invocation);
+    Ok(())
+}
+
+fn agent_action_destination(action: &AgentChatActionProposal) -> Option<String> {
+    let direct = action.destination.as_deref();
+    let content_fallback = action
+        .content
+        .as_deref()
+        .filter(|value| Path::new(value.trim()).is_absolute());
+
+    direct
+        .or(content_fallback)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn dispatch_agent_filesystem_mutation_action(
+    store: &EventStore,
+    access_mode: AccessMode,
+    action: &mut AgentChatActionProposal,
+    approval_granted: bool,
+    approval_request_id: Option<Uuid>,
+) -> Result<(), String> {
+    let Some(operation) = agent_filesystem_mutation_operation(&action.action_type) else {
+        action.execution_state = "blocked".to_string();
+        action.blocked_reason =
+            Some("filesystem mutation action_type is required before dispatch".to_string());
+        return Ok(());
+    };
+    let Some(target) = action
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    else {
+        action.execution_state = "blocked".to_string();
+        action.blocked_reason =
+            Some("filesystem mutation target is required before dispatch".to_string());
+        return Ok(());
+    };
+    let destination = if matches!(
+        operation,
+        FileSystemMutationOperation::RenameFile | FileSystemMutationOperation::RenameDirectory
+    ) {
+        let Some(destination) = agent_action_destination(action) else {
+            action.execution_state = "blocked".to_string();
+            action.blocked_reason =
+                Some("filesystem rename destination is required before dispatch".to_string());
+            return Ok(());
+        };
+        Some(destination)
+    } else {
+        None
+    };
+    let content = if matches!(
+        operation,
+        FileSystemMutationOperation::CreateFile | FileSystemMutationOperation::UpdateFile
+    ) {
+        let Some(content) = action.content.clone() else {
+            action.execution_state = "blocked".to_string();
+            action.blocked_reason =
+                Some("filesystem file content is required before dispatch".to_string());
+            return Ok(());
+        };
+        Some(content)
+    } else {
+        None
+    };
+
+    let client = LocalFileSystemMutationClient;
+    let outcome = match run_filesystem_mutation_boundary(
+        FileSystemMutationRequest {
+            access_mode,
+            operation,
+            path: target,
+            destination,
+            content,
+            approval_granted,
+        },
+        &client,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            action.execution_state = "blocked".to_string();
+            action.blocked_reason = Some(error.clone());
+            action.dispatch_note = Some(error);
+            return Ok(());
+        }
+    };
     let mut invocation = outcome.invocation;
     invocation.approval_request_id = approval_request_id;
     let entry = PermissionAuditEntry::evaluate(access_mode, CapabilityKind::FileWrite);
@@ -6289,9 +6650,10 @@ mod tests {
         COMPUTER_CONTROL_UNLOCK_TTL_MINUTES,
     };
     use crate::kernel::capability::{
-        BrowserPage, BrowserPageClient, ComputerControlAction, ComputerControlClient,
-        ComputerControlExecution, FileContentClient, FileWriteClient, FileWriteResult,
-        LocalFileContentClient, NetworkSearchClient, NetworkSearchResult, NetworkSearchResultItem,
+        BrowserPage, BrowserPageClient, CapabilityInvocationStatus, ComputerControlAction,
+        ComputerControlClient, ComputerControlExecution, FileContentClient, FileWriteClient,
+        FileWriteResult, LocalFileContentClient, NetworkSearchClient, NetworkSearchResult,
+        NetworkSearchResultItem,
     };
     use crate::kernel::deepseek::{
         DeepSeekChatCacheStatus, DeepSeekChatCompletionRequest, DeepSeekChatCompletionResponse,
@@ -7978,6 +8340,7 @@ mod tests {
             requires_confirmation: true,
             target: Some("office/test.docx".to_string()),
             target_location: None,
+            destination: None,
             preferred_browser: None,
             content: Some("我在测试".to_string()),
             capability: Some(CapabilityKind::FileWrite),
@@ -8081,6 +8444,7 @@ mod tests {
             requires_confirmation: false,
             target: Some("office/test.xlsx".to_string()),
             target_location: None,
+            destination: None,
             preferred_browser: None,
             content: None,
             capability: Some(CapabilityKind::FileRead),
@@ -8361,6 +8725,7 @@ mod tests {
             requires_confirmation: true,
             target: Some("office/test.docx".to_string()),
             target_location: None,
+            destination: None,
             preferred_browser: None,
             content: Some("追加内容".to_string()),
             capability: Some(CapabilityKind::FileWrite),
@@ -8421,6 +8786,7 @@ mod tests {
             requires_confirmation: true,
             target: Some("Microsoft Word".to_string()),
             target_location: None,
+            destination: None,
             preferred_browser: None,
             content: Some("type:我在测试".to_string()),
             capability: Some(CapabilityKind::ComputerControl),
@@ -8482,6 +8848,7 @@ mod tests {
             requires_confirmation: true,
             target: Some("Microsoft Word".to_string()),
             target_location: None,
+            destination: None,
             preferred_browser: None,
             content: Some("create a Word document and type 我在测试".to_string()),
             capability: Some(CapabilityKind::ComputerControl),
@@ -8883,6 +9250,256 @@ mod tests {
     }
 
     #[test]
+    fn agent_chat_dispatches_directory_terminal_read_action_and_follows_up() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp_dir.path().join("alpha.txt"), "Alpha evidence")
+            .expect("write source file");
+        std::fs::create_dir(temp_dir.path().join("nested")).expect("create nested folder");
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope-v1",
+            "reply_to_user": "我将列出目录内容。正在执行命令...",
+            "agent_actions": [
+                {
+                    "action_type": "terminal_read",
+                    "title": "List directory contents",
+                    "reason": "用户提供了本地目录路径，要求查看目录里有什么。",
+                    "risk": "low",
+                    "requires_confirmation": false,
+                    "target": temp_dir.path().to_string_lossy()
+                }
+            ],
+            "missing_prerequisites": []
+        });
+        let transport = SequencedDeepSeekTransport::new(vec![
+            model_envelope.to_string(),
+            "目录中包含 alpha.txt 和 nested。".to_string(),
+        ]);
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let response = run_agent_chat_with_clients(
+            &store,
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "看一下这个目录里面有什么。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::FullAccess,
+            },
+            AgentChatRuntimeContext::default(),
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("agent chat should dispatch local directory listing");
+
+        assert_eq!(response.content, "目录中包含 alpha.txt 和 nested。");
+        assert_eq!(response.proposed_actions.len(), 1);
+        assert_eq!(response.proposed_actions[0].execution_state, "succeeded");
+        assert!(response.proposed_actions[0]
+            .capability_invocation_id
+            .is_some());
+        let invocations = store
+            .lock()
+            .expect("store lock")
+            .list_capability_invocations()
+            .expect("invocations load");
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].capability, CapabilityKind::TerminalRead);
+        assert_eq!(invocations[0].status, CapabilityInvocationStatus::Succeeded);
+        assert!(invocations[0]
+            .excerpt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("alpha.txt"));
+        let recorded_requests = transport.recorded_requests();
+        assert_eq!(recorded_requests.len(), 2);
+        let followup_user_message = recorded_requests[1]
+            .messages
+            .iter()
+            .find(|message| {
+                matches!(
+                    message.role,
+                    crate::kernel::deepseek::DeepSeekChatRole::User
+                )
+            })
+            .expect("follow-up user message should exist");
+        assert!(followup_user_message.content.contains("alpha.txt"));
+        assert!(followup_user_message.content.contains("nested"));
+    }
+
+    #[test]
+    fn agent_chat_dispatches_windows_file_mutation_actions() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let source_path = temp_dir.path().join("draft.txt");
+        let renamed_path = temp_dir.path().join("final.txt");
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope-v1",
+            "reply_to_user": "我会创建、修改、重命名并删除这个本地文件。",
+            "agent_actions": [
+                {
+                    "action_type": "file_create",
+                    "title": "Create file",
+                    "target": source_path.to_string_lossy(),
+                    "content": "first draft"
+                },
+                {
+                    "action_type": "file_update",
+                    "title": "Update file",
+                    "target": source_path.to_string_lossy(),
+                    "content": "second draft"
+                },
+                {
+                    "action_type": "file_rename",
+                    "title": "Rename file",
+                    "target": source_path.to_string_lossy(),
+                    "destination": renamed_path.to_string_lossy()
+                },
+                {
+                    "action_type": "file_delete",
+                    "title": "Delete file",
+                    "target": renamed_path.to_string_lossy()
+                }
+            ],
+            "missing_prerequisites": []
+        });
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let store =
+            crate::kernel::event_store::EventStore::open_memory().expect("memory store opens");
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let (mut reply, _) = agent_chat_with_transport(
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "在 Windows 本地路径上测试文件创建、修改、重命名和删除。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::FullAccess,
+            },
+            None,
+        )
+        .expect("agent chat should return file mutation proposals");
+        dispatch_agent_action_proposals(
+            &store,
+            AccessMode::FullAccess,
+            &mut reply,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("file mutation actions dispatch");
+
+        assert_eq!(reply.proposed_actions.len(), 4);
+        assert!(reply
+            .proposed_actions
+            .iter()
+            .all(|action| action.execution_state == "succeeded"));
+        assert!(!source_path.exists());
+        assert!(!renamed_path.exists());
+        let invocations = store
+            .list_capability_invocations()
+            .expect("invocations load");
+        assert_eq!(invocations.len(), 4);
+        assert!(invocations.iter().all(|invocation| {
+            invocation.capability == CapabilityKind::FileWrite
+                && invocation.status == CapabilityInvocationStatus::Succeeded
+        }));
+    }
+
+    #[test]
+    fn agent_chat_dispatches_windows_directory_mutation_actions() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp_dir.path().join("incoming");
+        let renamed_dir = temp_dir.path().join("processed");
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope-v1",
+            "reply_to_user": "我会创建、重命名并删除这个本地目录。",
+            "agent_actions": [
+                {
+                    "action_type": "directory_create",
+                    "title": "Create directory",
+                    "target": source_dir.to_string_lossy()
+                },
+                {
+                    "action_type": "directory_rename",
+                    "title": "Rename directory",
+                    "target": source_dir.to_string_lossy(),
+                    "destination": renamed_dir.to_string_lossy()
+                },
+                {
+                    "action_type": "directory_delete",
+                    "title": "Delete directory",
+                    "target": renamed_dir.to_string_lossy()
+                }
+            ],
+            "missing_prerequisites": []
+        });
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let store =
+            crate::kernel::event_store::EventStore::open_memory().expect("memory store opens");
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let (mut reply, _) = agent_chat_with_transport(
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "在 Windows 本地路径上测试目录创建、重命名和删除。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::FullAccess,
+            },
+            None,
+        )
+        .expect("agent chat should return directory mutation proposals");
+        dispatch_agent_action_proposals(
+            &store,
+            AccessMode::FullAccess,
+            &mut reply,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("directory mutation actions dispatch");
+
+        assert_eq!(reply.proposed_actions.len(), 3);
+        assert!(reply
+            .proposed_actions
+            .iter()
+            .all(|action| action.execution_state == "succeeded"));
+        assert!(!source_dir.exists());
+        assert!(!renamed_dir.exists());
+        let invocations = store
+            .list_capability_invocations()
+            .expect("invocations load");
+        assert_eq!(invocations.len(), 3);
+        assert!(invocations.iter().all(|invocation| {
+            invocation.capability == CapabilityKind::FileWrite
+                && invocation.status == CapabilityInvocationStatus::Succeeded
+        }));
+    }
+
+    #[test]
     fn agent_chat_dispatches_allowed_network_search_action_and_records_invocation() {
         let model_envelope = serde_json::json!({
             "protocol_version": "ds-agent-envelope-v1",
@@ -9067,6 +9684,7 @@ mod tests {
             requires_confirmation: false,
             target: Some("https://github.com".to_string()),
             target_location: None,
+            destination: None,
             preferred_browser: Some("chrome".to_string()),
             content: None,
             capability: Some(CapabilityKind::BrowserBrowse),

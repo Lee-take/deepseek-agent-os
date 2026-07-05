@@ -3321,7 +3321,7 @@ function checkOpenSourceReleaseStatus() {
   checkTextIncludesCollapsed(
     "docs/OPEN_SOURCE_RELEASE.md",
     openSourceRelease,
-    "For `v0.1.0-rc.1`, publish a new prerelease with the Windows installer attached",
+    "For the `v0.1.0` RC line, publish a new prerelease with the Windows installer attached after final verification passes",
     "open-source release Windows installer prerelease strategy",
   );
   checkTextIncludesCollapsed(

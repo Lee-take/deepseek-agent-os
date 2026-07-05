@@ -61,9 +61,9 @@ engineering inspiration, with respect for their licenses and maintainers.
 Version `0.1.0` is the current Windows-first release-candidate line. The
 codebase is not a finished agent product yet. The current Windows
 build/install/launch/run path is verified through the repeatable release gate
-and installed UI workflow smoke before each prerelease. The `v0.1.0-rc.1`
-prerelease is intended to include a Windows NSIS installer for ordinary
-colleagues to download and test.
+and installed UI workflow smoke before each prerelease. The `v0.1.0` candidate
+prereleases include a Windows NSIS installer for ordinary colleagues to
+download and test.
 
 After the Windows preview continues to pass local release gates, the next
 platform target is macOS. A macOS Tauri packaging config already exists in the
@@ -72,7 +72,7 @@ preview continues to pass local release gates.
 
 `0.1.0` 是当前 Windows 优先 release-candidate 版本线，还不是完整成熟的 Agent 产品。
 每次 prerelease 前，当前 Windows 构建、安装、启动和运行路径都要通过本地 release gate
-与 installed UI workflow smoke 验证。`v0.1.0-rc.1` prerelease 计划附带 Windows
+与 installed UI workflow smoke 验证。`v0.1.0` candidate prerelease 附带 Windows
 NSIS 安装包，方便普通同事直接下载测试。
 
 Windows 预览版持续通过本地 release gates 后，下一步会推进 macOS 版本。仓库里已经保
@@ -81,11 +81,11 @@ release gates 后推进。
 
 License: Apache-2.0.
 
-The public `v0.0.1` release remains unchanged. The `v0.1.0-rc.1` prerelease is
-the first Windows installer candidate for colleague testing. The installer is
-unsigned, so Windows may show an unknown-publisher warning, but the NSIS package
-is built with the Microsoft WebView2 bootstrapper embedded and run silently so
-ordinary Windows users do not need a developer toolchain.
+The public `v0.0.1` release remains unchanged. The `v0.1.0` prerelease line is
+the first Windows installer candidate line for colleague testing. The installer
+is unsigned, so Windows may show an unknown-publisher warning, but the NSIS
+package is built with the Microsoft WebView2 bootstrapper embedded and run
+silently so ordinary Windows users do not need a developer toolchain.
 
 ## Basic Functions / 基本功能
 
@@ -103,6 +103,8 @@ The current codebase is intended to provide these basic functions:
 - Permissioned tool surfaces for file, network, browser, terminal,
   local-folder read/export, email read/draft/send approval records, and
   Computer Use operations.
+- Audited Windows local filesystem mutations from chat for explicit file and
+  directory create, update, delete, and rename requests.
 - Append-only local audit records for access requests, approvals, tool
   attempts, workflow runs, memory records, and work packages.
 - Memory Studio for reviewable memories, edits, deletion, expiration, linked
@@ -139,6 +141,8 @@ plugin execution, and polished signed installers are not complete in `0.1.0`.
 - 可选的本地 DeepSeek 联调脚本，用于 Chat Completions 和经营简报合成验证。
 - 面向文件、网络、浏览器、终端、本地文件夹读取/导出、邮件读取/草稿/发送审批记录和
   Computer Use 的权限化工具入口。
+- 从聊天中执行经过审计的 Windows 本地文件系统变更，包括明确提出的文件/目录创建、
+  修改、删除和重命名。
 - 本地追加式审计记录，用于记录授权请求、审批、工具调用、工作流运行、记忆记录和工
   作包。
 - Memory Studio，用于记忆候选、编辑、删除、过期、关联记忆标题/正文搜索、关联记忆搜索命中来源、
