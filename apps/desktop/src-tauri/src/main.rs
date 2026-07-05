@@ -28,7 +28,7 @@ use commands::{
     write_file_boundary, AppState,
 };
 use kernel::event_store::EventStore;
-use tauri::Manager;
+use tauri::{image::Image, Manager};
 
 fn main() {
     tauri::Builder::default()
@@ -38,6 +38,9 @@ fn main() {
             std::fs::create_dir_all(&app_data_dir)?;
             let event_store = EventStore::open(app_data_dir.join("kernel-events.sqlite3"))?;
             app.manage(AppState::new(event_store));
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_icon(Image::from_bytes(include_bytes!("../icons/icon.ico"))?)?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

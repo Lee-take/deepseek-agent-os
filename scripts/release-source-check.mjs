@@ -441,6 +441,7 @@ checkJsonField(
   "bundle.resources.generated/windows/WebView2Loader.dll",
   "WebView2Loader.dll",
 );
+checkWindowsAppIconPackaging();
 checkCargoLicense();
 checkPackageScripts();
 checkSecretScanHygiene();
@@ -547,6 +548,48 @@ function getJsonPathValue(value, segments) {
     return getJsonPathValue(value[head], tail);
   }
   return undefined;
+}
+
+function checkWindowsAppIconPackaging() {
+  checkJsonField(
+    "apps/desktop/src-tauri/tauri.windows.conf.json",
+    "bundle.windows.nsis.installerHooks",
+    "nsis/shortcut-icons.nsh",
+  );
+
+  const mainSource = readText("apps/desktop/src-tauri/src/main.rs");
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/main.rs",
+    mainSource,
+    'include_bytes!("../icons/icon.ico")',
+    "desktop runtime window icon embeds checked-in app icon",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/main.rs",
+    mainSource,
+    ".set_icon(",
+    "desktop runtime window icon is applied at startup",
+  );
+
+  const hooks = readText("apps/desktop/src-tauri/nsis/shortcut-icons.nsh");
+  checkTextIncludes(
+    "apps/desktop/src-tauri/nsis/shortcut-icons.nsh",
+    hooks,
+    "!macro NSIS_HOOK_POSTINSTALL",
+    "NSIS postinstall hook refreshes shortcut icons",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/nsis/shortcut-icons.nsh",
+    hooks,
+    'CreateShortcut "$SMPROGRAMS\\${PRODUCTNAME}.lnk" "$INSTDIR\\${MAINBINARYNAME}.exe" "" "$INSTDIR\\${MAINBINARYNAME}.exe" 0',
+    "start menu shortcut explicitly uses executable icon",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/nsis/shortcut-icons.nsh",
+    hooks,
+    'CreateShortcut "$DESKTOP\\${PRODUCTNAME}.lnk" "$INSTDIR\\${MAINBINARYNAME}.exe" "" "$INSTDIR\\${MAINBINARYNAME}.exe" 0',
+    "desktop shortcut explicitly uses executable icon",
+  );
 }
 
 function checkRequiredDocs() {

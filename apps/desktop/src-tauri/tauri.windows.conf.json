@@ -11,6 +11,9 @@
       "webviewInstallMode": {
         "type": "embedBootstrapper",
         "silent": true
+      },
+      "nsis": {
+        "installerHooks": "nsis/shortcut-icons.nsh"
       }
     },
     "resources": {
