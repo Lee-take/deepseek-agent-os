@@ -1,4 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
@@ -20,6 +21,7 @@ import {
   MousePointerClick,
   Network,
   PackageOpen,
+  Paperclip,
   Pencil,
   Pin,
   Play,
@@ -30,7 +32,7 @@ import {
   TerminalSquare,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, MouseEvent } from "react";
 import {
   derivePersistedConversationTitle,
@@ -47,6 +49,15 @@ import {
   agentChatPendingStageIndex,
 } from "./agentChatPending";
 import { summarizeAgentContextReceipt } from "./agentContextReceipt";
+import {
+  conversationAttachmentMetadata,
+  formatAgentPromptWithAttachments,
+  isAgentAttachmentDropInsideComposer,
+  prepareAgentAttachmentPaths,
+  readyAgentAttachments,
+  summarizeAttachmentsForDisplay,
+} from "./agentAttachments";
+import type { AgentAttachment } from "./agentAttachments";
 import {
   deepSeekApiKeyCandidates,
   settingsPanelItems,
@@ -298,6 +309,7 @@ type AgentConversationMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  attachments?: AgentAttachment[];
   model?: string;
   protocol_version?: string;
   proposed_actions?: AgentChatActionProposal[];
@@ -684,6 +696,7 @@ export function App() {
   const memorySectionRef = useRef<HTMLElement | null>(null);
   const approvalsSectionRef = useRef<HTMLDivElement | null>(null);
   const chatThreadRef = useRef<HTMLDivElement | null>(null);
+  const chatComposerRef = useRef<HTMLFormElement | null>(null);
   const [taskRecords, setTaskRecords] = useState<TaskRecord[]>([]);
   const [memoryRecords, setMemoryRecords] = useState<MemoryRecord[]>([]);
   const [memoryCandidateRecords, setMemoryCandidateRecords] = useState<MemoryCandidateRecord[]>([]);
@@ -752,6 +765,9 @@ export function App() {
   const [taskTitle, setTaskTitle] = useState("");
   const [taskSummary, setTaskSummary] = useState("");
   const [agentPrompt, setAgentPrompt] = useState("");
+  const [agentAttachments, setAgentAttachments] = useState<AgentAttachment[]>([]);
+  const [agentAttachmentError, setAgentAttachmentError] = useState("");
+  const [agentAttachmentDragActive, setAgentAttachmentDragActive] = useState(false);
   const [agentConversations, setAgentConversations] = useState<AgentConversationSession[]>(
     readInitialAgentConversations,
   );
@@ -892,9 +908,11 @@ export function App() {
       : agentGuidanceStatus === "queued"
         ? copy.chatWorkbench.guidanceQueued
         : agentChatPendingBaseStatus;
+  const readyAgentAttachmentCount = readyAgentAttachments(agentAttachments).length;
   const agentComposerAction = agentChatComposerAction({
     pending: agentChatPending,
     draft: agentPrompt,
+    attachmentCount: readyAgentAttachmentCount,
   });
   const networkSearchSourceModelMissing =
     modelToolStrategy.network_search_source_model_required &&
@@ -1207,21 +1225,28 @@ export function App() {
     agentStopRequestedRef.current = value;
   };
 
-  const queueAgentGuidance = (guidanceValue: string) => {
-    const guidance = guidanceValue.trim();
-    if (!guidance) {
+  const queueAgentGuidance = (
+    guidanceValue: string,
+    attachments: AgentAttachment[] = [],
+  ) => {
+    const readyAttachments = readyAgentAttachments(attachments);
+    const guidance = guidanceValue.trim() || (readyAttachments.length > 0 ? copy.chatWorkbench.attachmentsOnlyPrompt : "");
+    if (!guidance && readyAttachments.length === 0) {
       setAgentChatError(copy.chatWorkbench.emptyPrompt);
       return;
     }
+    const guidanceWithAttachments = formatAgentPromptWithAttachments(guidance, readyAttachments);
 
     setAgentPrompt("");
+    setAgentAttachments([]);
+    setAgentAttachmentError("");
     setAgentChatError("");
     setAgentChatNotice(copy.chatWorkbench.guidanceQueuedFeedback);
     setAgentGuidanceStatus("queued");
     setQueuedAgentGuidanceValue(
       queuedAgentGuidanceRef.current
-        ? `${queuedAgentGuidanceRef.current}\n\n${guidance}`
-        : guidance,
+        ? `${queuedAgentGuidanceRef.current}\n\n${guidanceWithAttachments}`
+        : guidanceWithAttachments,
     );
   };
 
@@ -1234,6 +1259,126 @@ export function App() {
     agentChatRunTokenRef.current += 1;
     setAgentChatPending(false);
   };
+
+  const addAgentAttachmentPaths = useCallback(async (paths: string[]) => {
+    setAgentAttachmentError("");
+    if (!hasDesktopRuntime()) {
+      setAgentAttachmentError(copy.chatWorkbench.attachmentDesktopOnly);
+      return;
+    }
+
+    const preparedPaths = prepareAgentAttachmentPaths(paths, agentAttachments);
+    if (preparedPaths.length === 0) {
+      return;
+    }
+
+    try {
+      const readyAttachments = readyAgentAttachments(agentAttachments);
+      const stagedAttachments = await invoke<AgentAttachment[]>("stage_agent_attachments", {
+        paths: preparedPaths,
+        existingCount: readyAttachments.length,
+        existingTotalBytes: readyAttachments.reduce(
+          (total, attachment) => total + attachment.byte_size,
+          0,
+        ),
+      });
+      setAgentAttachments((currentAttachments) => [
+        ...currentAttachments,
+        ...stagedAttachments,
+      ]);
+      const blockedReasons = stagedAttachments
+        .filter((attachment) => attachment.status === "blocked" && attachment.blocked_reason)
+        .map((attachment) => `${attachment.name}: ${attachment.blocked_reason}`);
+      setAgentAttachmentError(blockedReasons.join(" "));
+    } catch (error) {
+      setAgentAttachmentError(String(error) || copy.chatWorkbench.attachmentAddFailed);
+    }
+  }, [
+    agentAttachments,
+    copy.chatWorkbench.attachmentAddFailed,
+    copy.chatWorkbench.attachmentDesktopOnly,
+  ]);
+
+  const selectAgentAttachments = async () => {
+    try {
+      const selected = await open({
+        multiple: true,
+        directory: false,
+      });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      await addAgentAttachmentPaths(paths);
+    } catch (error) {
+      setAgentAttachmentError(String(error) || copy.chatWorkbench.attachmentAddFailed);
+    }
+  };
+
+  const removeAgentAttachment = (attachmentId: string) => {
+    setAgentAttachments((currentAttachments) =>
+      currentAttachments.filter((attachment) => attachment.id !== attachmentId),
+    );
+    setAgentAttachmentError("");
+  };
+
+  useEffect(() => {
+    if (!hasDesktopRuntime()) {
+      return;
+    }
+
+    let disposed = false;
+    let unlistenDragDrop: (() => void) | null = null;
+    const isInsideComposer = (position: { x: number; y: number }) => {
+      const composer = chatComposerRef.current;
+      if (!composer) {
+        return false;
+      }
+
+      return isAgentAttachmentDropInsideComposer(
+        position,
+        composer.getBoundingClientRect(),
+        window.devicePixelRatio,
+      );
+    };
+
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const payload = event.payload;
+        if (payload.type === "leave") {
+          setAgentAttachmentDragActive(false);
+          return;
+        }
+
+        if (payload.type === "enter" || payload.type === "over") {
+          setAgentAttachmentDragActive(isInsideComposer(payload.position));
+          return;
+        }
+
+        if (payload.type === "drop") {
+          const shouldAddDroppedFiles = isInsideComposer(payload.position);
+          setAgentAttachmentDragActive(false);
+          if (shouldAddDroppedFiles) {
+            void addAgentAttachmentPaths(payload.paths);
+          }
+        }
+      })
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        unlistenDragDrop = unlisten;
+      })
+      .catch(() => {
+        setAgentAttachmentDragActive(false);
+      });
+
+    return () => {
+      disposed = true;
+      setAgentAttachmentDragActive(false);
+      if (unlistenDragDrop) {
+        unlistenDragDrop();
+      }
+    };
+  }, [addAgentAttachmentPaths]);
 
   const startNewAgentConversation = () => {
     const conversation = createEmptyAgentConversation();
@@ -2812,13 +2957,16 @@ export function App() {
       skipNetworkSearchSetup?: boolean;
       isGuidanceContinuation?: boolean;
       displayPrompt?: string;
+      attachments?: AgentAttachment[];
     } = {},
   ) => {
-    const prompt = promptValue.trim();
-    if (!prompt) {
+    const readyAttachments = readyAgentAttachments(options.attachments ?? []);
+    const prompt = promptValue.trim() || (readyAttachments.length > 0 ? copy.chatWorkbench.attachmentsOnlyPrompt : "");
+    if (!prompt && readyAttachments.length === 0) {
       setAgentChatError(copy.chatWorkbench.emptyPrompt);
       return;
     }
+    const promptWithAttachments = formatAgentPromptWithAttachments(prompt, readyAttachments);
 
     setAgentChatError("");
     if (options.isGuidanceContinuation) {
@@ -2839,6 +2987,9 @@ export function App() {
           id: createClientId("user"),
           role: "user",
           content: displayPrompt,
+          attachments: options.attachments
+            ? conversationAttachmentMetadata(options.attachments)
+            : undefined,
           created_at: new Date().toISOString(),
         },
         {
@@ -2876,15 +3027,20 @@ export function App() {
       id: createClientId("user"),
       role: "user",
       content: displayPrompt,
+      attachments: options.attachments
+        ? conversationAttachmentMetadata(options.attachments)
+        : undefined,
       created_at: new Date().toISOString(),
     };
 
     setAgentPrompt("");
+    setAgentAttachments([]);
+    setAgentAttachmentError("");
     updateActiveAgentMessages((currentMessages) => [...currentMessages, userMessage], displayPrompt);
     setAgentChatPending(true);
 
     try {
-      const contextPacket = buildAgentConversationContextPrompt(prompt, priorMessages);
+      const contextPacket = buildAgentConversationContextPrompt(promptWithAttachments, priorMessages);
       const response = await invoke<AgentChatResponse>("run_agent_chat", {
         prompt: contextPacket.prompt,
         largeModelProvider: state.large_model_provider,
@@ -3090,12 +3246,18 @@ export function App() {
       return;
     }
 
+    const attachmentsForSubmit = agentAttachments;
+    const readyAttachmentsForSubmit = readyAgentAttachments(attachmentsForSubmit);
+    const promptForSubmit =
+      agentPrompt.trim() ||
+      (readyAttachmentsForSubmit.length > 0 ? copy.chatWorkbench.attachmentsOnlyPrompt : agentPrompt);
+
     if (agentComposerAction === "send_guidance") {
-      queueAgentGuidance(agentPrompt);
+      queueAgentGuidance(promptForSubmit, attachmentsForSubmit);
       return;
     }
 
-    await sendAgentPrompt(agentPrompt);
+    await sendAgentPrompt(promptForSubmit, { attachments: attachmentsForSubmit });
   };
 
   const continueAgentAfterDeepSeekKey = async (event: FormEvent<HTMLFormElement>) => {
@@ -3107,7 +3269,10 @@ export function App() {
     }
     setSessionDeepSeekApiKey(trimmedKey);
     setAgentSetupPrompt(null);
-    await sendAgentPrompt(pendingAgentPrompt, { apiKeyOverride: trimmedKey });
+    await sendAgentPrompt(pendingAgentPrompt, {
+      apiKeyOverride: trimmedKey,
+      attachments: agentAttachments,
+    });
     setPendingAgentPrompt("");
     setDeepSeekApiKeyDraft("");
   };
@@ -3121,7 +3286,10 @@ export function App() {
     const prompt = pendingAgentPrompt;
     setAgentSetupPrompt(null);
     setPendingAgentPrompt("");
-    await sendAgentPrompt(prompt, { skipWorkspaceSetup: true });
+    await sendAgentPrompt(prompt, {
+      skipWorkspaceSetup: true,
+      attachments: agentAttachments,
+    });
   };
 
   const continueAgentAfterNetworkSearchSetup = async (event: FormEvent<HTMLFormElement>) => {
@@ -3133,7 +3301,10 @@ export function App() {
     const prompt = pendingAgentPrompt;
     setAgentSetupPrompt(null);
     setPendingAgentPrompt("");
-    await sendAgentPrompt(prompt, { skipNetworkSearchSetup: true });
+    await sendAgentPrompt(prompt, {
+      skipNetworkSearchSetup: true,
+      attachments: agentAttachments,
+    });
   };
 
   const exportCurrentWorkPackage = async () => {
@@ -3258,6 +3429,19 @@ export function App() {
   const latestAgentActions = latestAgentEnvelopeMessage?.proposed_actions ?? [];
   const latestAgentMissingPrerequisites =
     latestAgentEnvelopeMessage?.missing_prerequisites ?? [];
+  const latestUserMessageWithAttachments = [...agentMessages]
+    .reverse()
+    .find((message) => message.role === "user" && (message.attachments?.length ?? 0) > 0);
+  const visibleAgentAttachments = agentChatPending
+    ? latestUserMessageWithAttachments?.attachments ?? []
+    : agentAttachments;
+  const visibleReadyAttachments = readyAgentAttachments(visibleAgentAttachments);
+  const visibleMetadataOnlyAttachmentCount = visibleReadyAttachments.filter(
+    (attachment) => !attachment.content_included,
+  ).length;
+  const visibleBlockedAttachmentCount = visibleAgentAttachments.filter(
+    (attachment) => attachment.status === "blocked",
+  ).length;
   const latestAgentHasExecutionPlan =
     latestAgentActions.length > 0 || latestAgentMissingPrerequisites.length > 0;
   const showAgentEnvelopeStatus =
@@ -3314,7 +3498,29 @@ export function App() {
             : copy.runStatus.readyBody;
   const latestRunContextReceipt = latestOperationsBriefingRun?.context_receipt;
   const renderLegacyCenterManagementPanels = false;
-  const agentPendingSteps: WorkflowStep[] = agentChatLoopSteps({
+  const agentAttachmentSteps: WorkflowStep[] =
+    visibleAgentAttachments.length > 0
+      ? [
+          {
+            key: "agent-chat-attachments",
+            label: copy.runStatus.steps.attachments,
+            detail: copy.runStatus.stepDetails.attachments(
+              visibleReadyAttachments.length,
+              visibleMetadataOnlyAttachmentCount,
+              visibleBlockedAttachmentCount,
+            ),
+            state:
+              visibleBlockedAttachmentCount > 0
+                ? "needs_action"
+                : agentChatPending
+                  ? "done"
+                  : "current",
+          },
+        ]
+      : [];
+  const agentPendingSteps: WorkflowStep[] = [
+    ...agentAttachmentSteps,
+    ...agentChatLoopSteps({
     pending: agentChatPending,
     pendingStage: agentChatPendingStage,
     pendingStatus: agentChatPendingStatus,
@@ -3330,7 +3536,8 @@ export function App() {
       goal: copy.chatWorkbench.loopGoalDetail,
       verify: copy.chatWorkbench.loopVerifyDetail,
     },
-  });
+  }),
+  ];
   const agentErrorSteps: WorkflowStep[] = showAgentErrorStatus
     ? [
         {
@@ -3466,6 +3673,7 @@ export function App() {
   const shouldShowRunInspector =
     showAgentEnvelopeStatus ||
     showAgentErrorStatus ||
+    visibleAgentAttachments.length > 0 ||
     agentChatPending ||
     briefingPending ||
     latestRunNeedsApproval ||
@@ -4371,6 +4579,34 @@ export function App() {
                           responseReadFailed: copy.chatWorkbench.deepSeekResponseReadFailed,
                         })}
                       </p>
+                      {message.attachments?.length ? (
+                        <div className="attachment-strip sent">
+                          {message.attachments.map((attachment) => (
+                            <div
+                              className={`attachment-chip ${attachment.kind} ${attachment.status}`}
+                              key={`${message.id}-${attachment.id}`}
+                              title={attachment.blocked_reason ?? attachment.name}
+                            >
+                              <span className="attachment-thumbnail" aria-hidden="true">
+                                {attachment.kind === "image" && attachment.status === "ready" ? (
+                                  <img src={convertFileSrc(attachment.local_path)} alt="" />
+                                ) : (
+                                  <FileText size={15} aria-hidden="true" />
+                                )}
+                              </span>
+                              <span className="attachment-details">
+                                <strong>{attachment.name}</strong>
+                                <small>
+                                  {attachment.kind} / {Math.ceil(attachment.byte_size / 1024)} KB
+                                  {!attachment.content_included
+                                    ? ` / ${copy.chatWorkbench.attachmentMetadataOnly}`
+                                    : ""}
+                                </small>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
                       {message.role === "assistant" && message.missing_prerequisites?.length ? (
                         <div className="agent-action-list">
                           <strong>{copy.chatWorkbench.missingPrerequisitesLabel}</strong>
@@ -4492,7 +4728,50 @@ export function App() {
               </div>
 
               <div className="chat-input-dock">
-                <form className="chat-composer" onSubmit={sendAgentMessage}>
+                <form
+                  className={`chat-composer${agentAttachmentDragActive ? " drag-active" : ""}`}
+                  ref={chatComposerRef}
+                  onSubmit={sendAgentMessage}
+                >
+                  {agentAttachments.length > 0 ? (
+                    <div className="attachment-strip composer">
+                      {agentAttachments.map((attachment) => (
+                        <div
+                          className={`attachment-chip ${attachment.kind} ${attachment.status}`}
+                          key={attachment.id}
+                          title={attachment.blocked_reason ?? attachment.name}
+                        >
+                          <span className="attachment-thumbnail" aria-hidden="true">
+                            {attachment.kind === "image" && attachment.status === "ready" ? (
+                              <img src={convertFileSrc(attachment.local_path)} alt="" />
+                            ) : (
+                              <FileText size={15} aria-hidden="true" />
+                            )}
+                          </span>
+                          <span className="attachment-details">
+                            <strong>{attachment.name}</strong>
+                            <small>
+                              {attachment.status === "blocked"
+                                ? copy.chatWorkbench.attachmentBlocked
+                                : `${attachment.kind} / ${Math.ceil(attachment.byte_size / 1024)} KB${
+                                    !attachment.content_included
+                                      ? ` / ${copy.chatWorkbench.attachmentMetadataOnly}`
+                                      : ""
+                                  }`}
+                            </small>
+                          </span>
+                          <button
+                            type="button"
+                            className="attachment-remove"
+                            aria-label={`${copy.chatWorkbench.removeAttachment}: ${attachment.name}`}
+                            onClick={() => removeAgentAttachment(attachment.id)}
+                          >
+                            <X size={12} aria-hidden="true" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                   <textarea
                     value={agentPrompt}
                     aria-label={copy.chatWorkbench.composerPlaceholder}
@@ -4525,13 +4804,27 @@ export function App() {
                         return;
                       }
                       event.preventDefault();
-                      if (!agentChatPending || agentPrompt.trim()) {
+                      if (!agentChatPending || agentPrompt.trim() || readyAgentAttachmentCount > 0) {
                         event.currentTarget.form?.requestSubmit();
                       }
                     }}
                   />
                   <div className="composer-actions">
-                    {agentChatPending ? <span>{agentChatPendingStatus}</span> : null}
+                    {agentChatPending || readyAgentAttachmentCount > 0 ? (
+                      <span>
+                        {agentChatPending
+                          ? agentChatPendingStatus
+                          : summarizeAttachmentsForDisplay(agentAttachments)}
+                      </span>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="secondary-action attachment-add"
+                      onClick={() => void selectAgentAttachments()}
+                    >
+                      <Paperclip size={15} aria-hidden="true" />
+                      {copy.chatWorkbench.addAttachment}
+                    </button>
                     <button
                       className={`primary-action composer-submit ${agentComposerAction}`}
                       type="submit"
@@ -4549,6 +4842,9 @@ export function App() {
                 </form>
                 {agentChatNotice ? (
                   <p className="package-message chat-feedback">{agentChatNotice}</p>
+                ) : null}
+                {agentAttachmentError ? (
+                  <p className="package-error chat-feedback">{agentAttachmentError}</p>
                 ) : null}
                 {agentChatError ? <p className="package-error chat-feedback">{agentChatError}</p> : null}
               </div>

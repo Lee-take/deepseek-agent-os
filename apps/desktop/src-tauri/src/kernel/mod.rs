@@ -1,4 +1,5 @@
 pub mod agent_context;
+pub mod attachments;
 pub mod capability;
 pub mod codex_bridge_contract;
 pub mod codex_bridge_http;

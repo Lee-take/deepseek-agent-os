@@ -200,6 +200,13 @@ type TranslationSet = {
     quickAnalyze: string;
     saveTask: string;
     stopTask: string;
+    addAttachment: string;
+    removeAttachment: string;
+    attachmentBlocked: string;
+    attachmentMetadataOnly: string;
+    attachmentDesktopOnly: string;
+    attachmentAddFailed: string;
+    attachmentsOnlyPrompt: string;
     guidanceQueued: string;
     guidanceRunning: string;
     guidanceQueuedFeedback: string;
@@ -264,6 +271,7 @@ type TranslationSet = {
     routeDetails: string;
     steps: {
       understand: string;
+      attachments: string;
       evidence: string;
       memory: string;
       deepseek: string;
@@ -273,6 +281,7 @@ type TranslationSet = {
     };
     stepDetails: {
       understand: string;
+      attachments: (ready: number, metadataOnly: number, blocked: number) => string;
       evidence: string;
       memory: string;
       deepseek: string;
@@ -999,6 +1008,13 @@ export const translations: Record<Language, TranslationSet> = {
       quickAnalyze: "分析这段材料",
       saveTask: "发送",
       stopTask: "停止",
+      addAttachment: "添加文件",
+      removeAttachment: "移除附件",
+      attachmentBlocked: "已阻止",
+      attachmentMetadataOnly: "仅元数据",
+      attachmentDesktopOnly: "请在 DS Agent 桌面窗口中添加本地文件或图片。",
+      attachmentAddFailed: "附件添加失败，请重新选择文件。",
+      attachmentsOnlyPrompt: "请根据本次附加的文件和图片继续处理。",
       guidanceQueued: "补充说明已收到，当前小节点完成后会继续引导",
       guidanceRunning: "正在引导补充指令，并入同一任务继续执行",
       guidanceQueuedFeedback: "已收到补充说明，当前小节点完成后会并入同一任务。",
@@ -1072,6 +1088,7 @@ export const translations: Record<Language, TranslationSet> = {
       routeDetails: "模型与路线详情",
       steps: {
         understand: "理解任务",
+        attachments: "附件证据",
         evidence: "读取证据",
         memory: "选择记忆",
         deepseek: "调用 DeepSeek",
@@ -1081,6 +1098,8 @@ export const translations: Record<Language, TranslationSet> = {
       },
       stepDetails: {
         understand: "等待你在对话框输入问题或指令。",
+        attachments: (ready, metadataOnly, blocked) =>
+          `当前任务附件：${ready} 个可用，${metadataOnly} 个仅元数据，${blocked} 个已阻止。`,
         evidence: "需要时会在工作目录中读取或生成证据。",
         memory: "需要时会从本地记忆中选择上下文。",
         deepseek: "等待 DeepSeek Chat 就绪。",
@@ -1854,6 +1873,13 @@ export const translations: Record<Language, TranslationSet> = {
       quickAnalyze: "Analyze this text",
       saveTask: "Send",
       stopTask: "Stop",
+      addAttachment: "Add files",
+      removeAttachment: "Remove attachment",
+      attachmentBlocked: "Blocked",
+      attachmentMetadataOnly: "metadata only",
+      attachmentDesktopOnly: "Add local files or images from the DS Agent desktop window.",
+      attachmentAddFailed: "Attachment add failed. Choose the file again.",
+      attachmentsOnlyPrompt: "Please use the attached files and images for this task.",
       guidanceQueued: "Supplement received; DS Agent will guide it after the current step",
       guidanceRunning: "Guiding the supplement into the same running task",
       guidanceQueuedFeedback: "Supplement received. DS Agent will fold it into the same task after the current step.",
@@ -1927,6 +1953,7 @@ export const translations: Record<Language, TranslationSet> = {
       routeDetails: "Model and route details",
       steps: {
         understand: "Understand task",
+        attachments: "Attachment evidence",
         evidence: "Read evidence",
         memory: "Select memory",
         deepseek: "Call DeepSeek",
@@ -1936,6 +1963,8 @@ export const translations: Record<Language, TranslationSet> = {
       },
       stepDetails: {
         understand: "Waiting for a question or instruction in the chat.",
+        attachments: (ready, metadataOnly, blocked) =>
+          `Current task attachments: ${ready} ready, ${metadataOnly} metadata only, ${blocked} blocked.`,
         evidence: "Evidence is read or generated inside the workspace when needed.",
         memory: "Local memory will be selected when useful.",
         deepseek: "Waiting for DeepSeek Chat readiness.",

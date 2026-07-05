@@ -24,8 +24,8 @@ use commands::{
     run_agent_chat, run_operations_briefing, run_terminal_read, run_terminal_write,
     save_deepseek_pricing_settings, save_local_directory_settings, search_memory_records,
     search_network_boundary, seed_operations_briefing_evidence_templates, send_email_boundary,
-    submit_browser_boundary, unlock_computer_control, update_memory_record, write_drive_boundary,
-    write_file_boundary, AppState,
+    stage_agent_attachments, submit_browser_boundary, unlock_computer_control,
+    update_memory_record, write_drive_boundary, write_file_boundary, AppState,
 };
 use kernel::event_store::EventStore;
 use tauri::{image::Image, Manager};
@@ -163,6 +163,7 @@ fn main() {
             clear_deepseek_chat_cache,
             list_deepseek_chat_telemetry,
             list_agent_context_receipts,
+            stage_agent_attachments,
             get_deepseek_pricing_state,
             save_deepseek_pricing_settings,
             unlock_computer_control,

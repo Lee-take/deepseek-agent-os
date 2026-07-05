@@ -26,6 +26,10 @@ test("returns to stop action after submitted guidance clears the draft", () => {
   assert.equal(agentChatComposerAction({ pending: true, draft: "" }), "stop");
 });
 
+test("uses send-guidance action when attachments are added during a running task", () => {
+  assert.equal(agentChatComposerAction({ pending: true, draft: "", attachmentCount: 1 }), "send_guidance");
+});
+
 test("keeps normal send action when no agent task is running", () => {
   assert.equal(agentChatComposerAction({ pending: false, draft: "新任务" }), "send");
 });

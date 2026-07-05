@@ -1657,14 +1657,26 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.1.0.md",
     releaseNotes,
-    "v0.1.0-rc.5 Update",
-    "release notes rc.5 update heading",
+    "v0.1.0-rc.6 Update",
+    "release notes rc.6 update heading",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",
     readText("apps/desktop/src-tauri/src/commands.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.5"',
-    "app updater current release tag rc.5",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.6"',
+    "app updater current release tag rc.6",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.1.0.md",
+    releaseNotes,
+    "Lets users drag local files onto the input box",
+    "release notes attachment drag-drop update",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.1.0.md",
+    releaseNotes,
+    "shows compact attachment cards above the input",
+    "release notes attachment composer card update",
   );
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.1.0.md",
@@ -1955,7 +1967,7 @@ function checkChatFirstCenterWorkbenchUi() {
     "aria-label={copy.chatWorkbench.title}",
     "className=\"chat-thread\"",
     "className=\"chat-message assistant pending\"",
-    "className=\"chat-composer\"",
+    'className={`chat-composer${agentAttachmentDragActive ? " drag-active" : ""}`}',
     "className=\"sidebar-record-list\"",
     "onSubmit={sendAgentMessage}",
     "agentMessages.map",

@@ -1,6 +1,6 @@
 # DeepSeek Agent OS v0.1.0 Candidate Notes
 
-Status: Windows-first release candidate. The `v0.1.0-rc.5` prerelease is
+Status: Windows-first release candidate. The `v0.1.0-rc.6` prerelease is
 intended for colleague testing through a GitHub release asset after the final
 local gates pass.
 
@@ -10,6 +10,19 @@ so Windows may show an unknown-publisher warning, but it embeds the Microsoft
 WebView2 bootstrapper and runs it silently when the target machine needs the
 WebView2 runtime. Ordinary users do not need Node.js, pnpm, Rust, or a source
 checkout to run the installed app.
+
+## v0.1.0-rc.6 Update
+
+- Adds task-scoped file and image attachments to the DS Agent chat composer.
+- Lets users drag local files onto the input box, keeps the dropped file order,
+  removes duplicate paths, and shows compact attachment cards above the input.
+- Adds small image thumbnails or file icons for attachments, plus an `x` control
+  to remove mistaken files before sending.
+- Sends bounded attachment context with the current instruction, including text
+  snippets when safe and metadata-only image/file evidence when content is not
+  included in DeepSeek context.
+- Surfaces attachment evidence in the right-side run status so users can see
+  ready, metadata-only, and blocked attachments.
 
 ## v0.1.0-rc.5 Update
 

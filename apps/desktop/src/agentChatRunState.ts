@@ -14,12 +14,13 @@ export type AgentChatLoopStep = {
 export function agentChatComposerAction(input: {
   pending: boolean;
   draft: string;
+  attachmentCount?: number;
 }): AgentChatComposerAction {
   if (!input.pending) {
     return "send";
   }
 
-  return input.draft.trim() ? "send_guidance" : "stop";
+  return input.draft.trim() || (input.attachmentCount ?? 0) > 0 ? "send_guidance" : "stop";
 }
 
 export function agentChatGuidanceStepState(status: AgentChatGuidanceStatus): "waiting" | "current" {

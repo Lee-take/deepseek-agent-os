@@ -999,12 +999,25 @@ h1 {
 }
 
 .chat-composer {
+  position: relative;
   display: grid;
   gap: 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-bg);
   padding: 12px;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.chat-composer.drag-active {
+  border-color: var(--surface-accent);
+  background: color-mix(in srgb, var(--surface-accent) 7%, var(--surface-bg));
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--surface-accent) 18%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--surface-accent) 24%, transparent);
 }
 
 .chat-composer textarea {
@@ -1012,6 +1025,106 @@ h1 {
   max-height: 160px;
   resize: none;
   overflow-y: auto;
+}
+
+.attachment-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.attachment-strip.composer {
+  align-items: flex-start;
+}
+
+.attachment-strip.sent {
+  margin-top: 8px;
+}
+
+.attachment-chip {
+  position: relative;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  max-width: min(100%, 340px);
+  min-height: 50px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-bg) 82%, var(--surface-control));
+}
+
+.attachment-strip.sent .attachment-chip {
+  grid-template-columns: 36px minmax(0, 1fr);
+}
+
+.attachment-chip.blocked {
+  border-color: color-mix(in srgb, #f08f8f 45%, var(--border));
+  background: color-mix(in srgb, #f08f8f 8%, var(--surface-bg));
+}
+
+.attachment-thumbnail {
+  display: inline-grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--surface-control);
+}
+
+.attachment-thumbnail img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.attachment-thumbnail svg {
+  width: 100%;
+  height: 100%;
+  padding: 8px;
+  color: var(--muted);
+}
+
+.attachment-details {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.attachment-details strong,
+.attachment-details small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-details strong {
+  font-size: 12px;
+}
+
+.attachment-details small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.attachment-remove,
+.attachment-add {
+  min-height: 32px;
+}
+
+.attachment-remove {
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-bg);
+  color: var(--muted);
 }
 
 .composer-actions {
@@ -1033,6 +1146,13 @@ h1 {
 .composer-actions .primary-action {
   flex: 0 0 auto;
   min-width: 128px;
+}
+
+.composer-actions .attachment-add {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  background: var(--surface-bg);
+  color: var(--body-text);
 }
 
 .composer-actions .primary-action.stop {

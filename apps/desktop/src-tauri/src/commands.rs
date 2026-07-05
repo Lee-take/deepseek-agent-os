@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::kernel::agent_context::{
     agent_loop_mode_descriptor, classify_agent_action_loop_mode, AgentContextReceipt, AgentLoopMode,
 };
+use crate::kernel::attachments::{stage_agent_attachment_paths, AgentAttachment};
 use crate::kernel::capability::{
     run_browser_browse, run_browser_submit_boundary, run_computer_control_boundary,
     run_computer_screenshot, run_drive_read_boundary, run_drive_write_boundary,
@@ -128,7 +129,7 @@ const APP_UPDATE_RELEASES_API_URL: &str =
 const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
 const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.1.0";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.5";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.6";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentChatRequest {
@@ -5002,6 +5003,15 @@ pub fn install_app_update() -> Result<AppUpdateInstallResult, String> {
 #[tauri::command]
 pub fn get_deepseek_credential_status() -> DeepSeekCredentialStatus {
     current_deepseek_credential_status()
+}
+
+#[tauri::command]
+pub fn stage_agent_attachments(
+    paths: Vec<String>,
+    existing_count: usize,
+    existing_total_bytes: u64,
+) -> Vec<AgentAttachment> {
+    stage_agent_attachment_paths(paths, existing_count, existing_total_bytes)
 }
 
 #[tauri::command]
