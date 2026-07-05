@@ -151,6 +151,7 @@ struct AgentChatRuntimeContext {
     network_search_ready: AgentChatReadiness,
     network_search_note: String,
     network_search_source_model: Option<NetworkSearchSourceModel>,
+    desktop_dir: Option<PathBuf>,
 }
 
 impl Default for AgentChatRuntimeContext {
@@ -162,6 +163,7 @@ impl Default for AgentChatRuntimeContext {
             network_search_note: "network search readiness unavailable in this test context"
                 .to_string(),
             network_search_source_model: None,
+            desktop_dir: None,
         }
     }
 }
@@ -2269,7 +2271,7 @@ fn agent_chat_with_dispatch_and_tool_followup(
         pricing_settings,
     )?;
     mark_agent_workspace_actions_waiting_if_needed(&runtime_context, &mut response);
-    dispatch_agent_action_proposals(
+    dispatch_agent_action_proposals_with_desktop_dir(
         store,
         request.access_mode,
         &mut response,
@@ -2277,6 +2279,7 @@ fn agent_chat_with_dispatch_and_tool_followup(
         file_write_client,
         search_client,
         browser_client,
+        runtime_context.desktop_dir.as_deref(),
     )?;
 
     let mut telemetry = vec![first_telemetry];
@@ -2402,6 +2405,7 @@ fn run_agent_chat_with_clients_and_api_keys(
             file_write_client,
             search_client,
             browser_client,
+            runtime_context.desktop_dir.as_deref(),
         )?;
     }
 
@@ -2911,6 +2915,28 @@ fn dispatch_agent_action_proposals(
     search_client: &impl NetworkSearchClient,
     browser_client: &impl BrowserPageClient,
 ) -> Result<(), String> {
+    dispatch_agent_action_proposals_with_desktop_dir(
+        store,
+        access_mode,
+        response,
+        file_client,
+        file_write_client,
+        search_client,
+        browser_client,
+        None,
+    )
+}
+
+fn dispatch_agent_action_proposals_with_desktop_dir(
+    store: &EventStore,
+    access_mode: AccessMode,
+    response: &mut AgentChatResponse,
+    file_client: &impl FileContentClient,
+    file_write_client: &impl AgentWritableArtifactClient,
+    search_client: &impl NetworkSearchClient,
+    browser_client: &impl BrowserPageClient,
+    desktop_dir: Option<&Path>,
+) -> Result<(), String> {
     if !response.missing_prerequisites.is_empty() {
         mark_agent_actions_waiting_for_prerequisites(response);
         return Ok(());
@@ -3078,6 +3104,7 @@ fn dispatch_agent_action_proposals(
                     action,
                     true,
                     Some(approval_request_id),
+                    desktop_dir,
                 )?;
             }
             (
@@ -3171,7 +3198,14 @@ fn dispatch_agent_action_proposals(
                 )?;
             }
             (Some(CapabilityKind::TerminalRead), Some(PolicyDecision::Allow), _) => {
-                dispatch_agent_terminal_read_action(store, access_mode, action, false, None)?;
+                dispatch_agent_terminal_read_action(
+                    store,
+                    access_mode,
+                    action,
+                    false,
+                    None,
+                    desktop_dir,
+                )?;
             }
             (Some(CapabilityKind::BrowserBrowse), Some(PolicyDecision::Allow), _) => {
                 dispatch_agent_browser_action(
@@ -3204,6 +3238,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
     file_write_client: &impl AgentWritableArtifactClient,
     search_client: &impl NetworkSearchClient,
     browser_client: &impl BrowserPageClient,
+    desktop_dir: Option<&Path>,
 ) -> Result<(), String> {
     if !response.missing_prerequisites.is_empty() {
         mark_agent_actions_waiting_for_prerequisites(response);
@@ -3284,6 +3319,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                     action,
                     false,
                     None,
+                    desktop_dir,
                 )?;
             }
             (
@@ -3297,6 +3333,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                     action,
                     true,
                     Some(approval_request_id),
+                    desktop_dir,
                 )?;
             }
             _ => {
@@ -3319,7 +3356,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                 };
                 {
                     let store = store_mutex.lock().map_err(|_| lock_error())?;
-                    dispatch_agent_action_proposals(
+                    dispatch_agent_action_proposals_with_desktop_dir(
                         &store,
                         access_mode,
                         &mut single_response,
@@ -3327,6 +3364,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                         file_write_client,
                         search_client,
                         browser_client,
+                        desktop_dir,
                     )?;
                 }
                 if let Some(updated_action) = single_response.proposed_actions.into_iter().next() {
@@ -3347,6 +3385,7 @@ fn resume_agent_chat_action_with_clients(
     file_write_client: &impl AgentWritableArtifactClient,
     search_client: &impl NetworkSearchClient,
     browser_client: &impl BrowserPageClient,
+    desktop_dir: Option<&Path>,
 ) -> Result<AgentChatActionProposal, String> {
     let mut response = AgentChatResponse {
         id: Uuid::new_v4(),
@@ -3365,7 +3404,7 @@ fn resume_agent_chat_action_with_clients(
         estimated_cost_micro_usd: None,
         created_at: Utc::now(),
     };
-    dispatch_agent_action_proposals(
+    dispatch_agent_action_proposals_with_desktop_dir(
         store,
         access_mode,
         &mut response,
@@ -3373,6 +3412,7 @@ fn resume_agent_chat_action_with_clients(
         file_write_client,
         search_client,
         browser_client,
+        desktop_dir,
     )?;
     response
         .proposed_actions
@@ -3690,12 +3730,51 @@ fn agent_terminal_read_client() -> Result<LocalTerminalReadClient, String> {
     Ok(LocalTerminalReadClient::new(working_dir, 4_000))
 }
 
+fn agent_terminal_read_command_from_target(
+    target: &str,
+    desktop_dir: Option<&Path>,
+) -> Result<String, String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err("terminal_read target or command is required before dispatch".to_string());
+    }
+
+    let normalized = trimmed.replace('\\', "/");
+    let normalized_lower = normalized.trim_end_matches('/').to_ascii_lowercase();
+    if matches!(
+        normalized_lower.as_str(),
+        "desktop" | "user_desktop" | "windows_desktop" | "桌面"
+    ) {
+        let desktop_dir = desktop_dir
+            .ok_or_else(|| "desktop directory is unavailable on this machine".to_string())?;
+        return Ok(format!("ds-agent:list-directory {}", desktop_dir.display()));
+    }
+
+    for prefix in ["desktop/", "user_desktop/", "windows_desktop/", "桌面/"] {
+        if normalized_lower.starts_with(prefix) {
+            let desktop_dir = desktop_dir
+                .ok_or_else(|| "desktop directory is unavailable on this machine".to_string())?;
+            let relative = normalized[prefix.len()..].trim_matches('/');
+            if relative.is_empty() {
+                return Ok(format!("ds-agent:list-directory {}", desktop_dir.display()));
+            }
+            return Ok(format!(
+                "ds-agent:list-directory {}",
+                desktop_dir.join(relative).display()
+            ));
+        }
+    }
+
+    Ok(trimmed.to_string())
+}
+
 fn dispatch_agent_terminal_read_action(
     store: &EventStore,
     access_mode: AccessMode,
     action: &mut AgentChatActionProposal,
     approval_granted: bool,
     approval_request_id: Option<Uuid>,
+    desktop_dir: Option<&Path>,
 ) -> Result<(), String> {
     let Some(command) = action
         .target
@@ -3709,11 +3788,21 @@ fn dispatch_agent_terminal_read_action(
         return Ok(());
     };
 
+    let command = match agent_terminal_read_command_from_target(command, desktop_dir) {
+        Ok(command) => command,
+        Err(error) => {
+            action.execution_state = "blocked".to_string();
+            action.blocked_reason = Some(error.clone());
+            action.dispatch_note = Some(error);
+            return Ok(());
+        }
+    };
+
     let client = agent_terminal_read_client()?;
     let outcome = match run_terminal_read_capability(
         TerminalReadRequest {
             access_mode,
-            command: command.to_string(),
+            command,
             approval_granted,
         },
         &client,
@@ -3753,6 +3842,7 @@ fn dispatch_agent_terminal_read_action_with_store_mutex(
     action: &mut AgentChatActionProposal,
     approval_granted: bool,
     approval_request_id: Option<Uuid>,
+    desktop_dir: Option<&Path>,
 ) -> Result<(), String> {
     let Some(command) = action
         .target
@@ -3766,11 +3856,21 @@ fn dispatch_agent_terminal_read_action_with_store_mutex(
         return Ok(());
     };
 
+    let command = match agent_terminal_read_command_from_target(command, desktop_dir) {
+        Ok(command) => command,
+        Err(error) => {
+            action.execution_state = "blocked".to_string();
+            action.blocked_reason = Some(error.clone());
+            action.dispatch_note = Some(error);
+            return Ok(());
+        }
+    };
+
     let client = agent_terminal_read_client()?;
     let outcome = match run_terminal_read_capability(
         TerminalReadRequest {
             access_mode,
-            command: command.to_string(),
+            command,
             approval_granted,
         },
         &client,
@@ -5107,6 +5207,7 @@ fn agent_chat_runtime_context(
         network_search_ready,
         network_search_note: network_status.note,
         network_search_source_model: tool_strategy.network_search_source_model,
+        desktop_dir: app.path().desktop_dir().ok(),
     }
 }
 
@@ -5204,7 +5305,7 @@ pub fn run_agent_chat(
     let transport = HttpDeepSeekChatCompletionTransport::new()?;
     let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
-    let desktop_dir = app.path().desktop_dir().ok();
+    let desktop_dir = runtime_context.desktop_dir.clone();
     let file_client = LocalFileContentClient::new(512 * 1024);
     let file_write_client = agent_file_write_client(&directory_state, desktop_dir)?;
     let browser_client = HttpBrowserPageClient::new()?;
@@ -5353,7 +5454,7 @@ pub fn resume_agent_chat_action(
         return Ok(computer_action);
     }
     let file_client = LocalFileContentClient::new(512 * 1024);
-    let file_write_client = agent_file_write_client(&directory_state, desktop_dir)?;
+    let file_write_client = agent_file_write_client(&directory_state, desktop_dir.clone())?;
     let browser_client = HttpBrowserPageClient::new()?;
     let search_client =
         agent_network_search_client(large_model_provider, network_search_source_model);
@@ -5367,6 +5468,7 @@ pub fn resume_agent_chat_action(
         &file_write_client,
         &search_client,
         &browser_client,
+        desktop_dir.as_deref(),
     )
 }
 
@@ -6938,9 +7040,9 @@ pub fn preview_work_package_import(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_newer_version, is_windows_installer_asset, release_installable_asset,
-        silent_update_install_command, update_status_from_release, update_status_from_releases,
-        GithubRelease, GithubReleaseAsset,
+        agent_terminal_read_command_from_target, is_newer_version, is_windows_installer_asset,
+        release_installable_asset, silent_update_install_command, update_status_from_release,
+        update_status_from_releases, GithubRelease, GithubReleaseAsset,
     };
     use crate::commands::{
         agent_chat_api_key_candidates_from_sources, agent_chat_api_key_from_sources,
@@ -7000,6 +7102,19 @@ mod tests {
         assert!(!is_newer_version("v0.1.0-rc.3", "v0.1.0"));
         assert!(!is_newer_version("v0.1.0", "0.1.0"));
         assert!(!is_newer_version("v0.0.9", "0.1.0"));
+    }
+
+    #[test]
+    fn agent_terminal_read_desktop_target_uses_runtime_desktop_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let desktop_dir = temp_dir.path().join("Desktop");
+        let command = agent_terminal_read_command_from_target("desktop", Some(&desktop_dir))
+            .expect("desktop target should resolve to a safe directory listing command");
+
+        assert_eq!(
+            command,
+            format!("ds-agent:list-directory {}", desktop_dir.display())
+        );
     }
 
     #[test]
@@ -9550,6 +9665,7 @@ mod tests {
             &file_write_client,
             &search_client,
             &browser_client,
+            None,
         )
         .expect("resume helper should dispatch approved action");
 
@@ -9728,6 +9844,103 @@ mod tests {
             .expect("follow-up user message should exist");
         assert!(followup_user_message.content.contains("alpha.txt"));
         assert!(followup_user_message.content.contains("nested"));
+    }
+
+    #[test]
+    fn agent_chat_resolves_desktop_terminal_read_target_to_safe_directory_listing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let desktop_dir = temp_dir.path().join("Desktop");
+        std::fs::create_dir(&desktop_dir).expect("create fake desktop");
+        std::fs::write(
+            desktop_dir.join("关于开展安保人员及安全管理人员普查工作的通知（无附件新版）.docx"),
+            "word placeholder",
+        )
+        .expect("write desktop file");
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope-v1",
+            "reply_to_user": "我先列出桌面文件确认目标文档。",
+            "agent_actions": [
+                {
+                    "action_type": "terminal_read",
+                    "title": "列出桌面文件，确认目标文档",
+                    "reason": "用户要求处理刚生成在桌面的 Word 文档。",
+                    "risk": "low",
+                    "requires_confirmation": false,
+                    "target": "desktop"
+                }
+            ],
+            "missing_prerequisites": []
+        });
+        let transport = SequencedDeepSeekTransport::new(vec![
+            model_envelope.to_string(),
+            "桌面中包含目标 Word 文档。".to_string(),
+        ]);
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let response = run_agent_chat_with_clients(
+            &store,
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "列出桌面文件，确认目标文档。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::FullAccess,
+            },
+            AgentChatRuntimeContext {
+                desktop_dir: Some(desktop_dir.clone()),
+                ..AgentChatRuntimeContext::default()
+            },
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("agent chat should resolve desktop target to directory listing");
+
+        assert_eq!(response.content, "桌面中包含目标 Word 文档。");
+        assert_eq!(response.proposed_actions.len(), 1);
+        assert_eq!(response.proposed_actions[0].execution_state, "succeeded");
+        let invocations = store
+            .lock()
+            .expect("store lock")
+            .list_capability_invocations()
+            .expect("invocations load");
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].capability, CapabilityKind::TerminalRead);
+        assert_eq!(invocations[0].status, CapabilityInvocationStatus::Succeeded);
+        assert!(!invocations[0]
+            .excerpt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("terminal command is not in the TerminalRead allowlist"));
+        assert!(invocations[0]
+            .excerpt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("关于开展安保人员及安全管理人员普查工作的通知"));
+        let recorded_requests = transport.recorded_requests();
+        assert_eq!(recorded_requests.len(), 2);
+        let followup_user_message = recorded_requests[1]
+            .messages
+            .iter()
+            .find(|message| {
+                matches!(
+                    message.role,
+                    crate::kernel::deepseek::DeepSeekChatRole::User
+                )
+            })
+            .expect("follow-up user message should exist");
+        assert!(followup_user_message
+            .content
+            .contains("关于开展安保人员及安全管理人员普查工作的通知"));
     }
 
     #[test]
@@ -10777,6 +10990,7 @@ mod tests {
                 network_search_ready: AgentChatReadiness::Ready,
                 network_search_note: "network search ready".to_string(),
                 network_search_source_model: None,
+                desktop_dir: None,
             },
             None,
             &file_client,
