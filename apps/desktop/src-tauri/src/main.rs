@@ -30,6 +30,108 @@ use commands::{
 use kernel::event_store::EventStore;
 use tauri::{image::Image, Manager};
 
+const APP_ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
+
+fn apply_main_window_icon(window: &tauri::WebviewWindow) -> Result<(), Box<dyn std::error::Error>> {
+    window.set_icon(Image::from_bytes(APP_ICON_BYTES)?)?;
+    #[cfg(windows)]
+    apply_windows_window_icons(window)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn apply_windows_window_icons(
+    window: &tauri::WebviewWindow,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateIconFromResourceEx, GetSystemMetrics, SendMessageW, ICON_BIG, ICON_SMALL,
+        ICON_SMALL2, LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, WM_SETICON,
+    };
+
+    let hwnd = window.hwnd()?;
+    let big_size = unsafe { GetSystemMetrics(SM_CXICON) }.max(32);
+    let small_size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+
+    for (slot, desired_size) in [
+        (ICON_BIG, big_size),
+        (ICON_SMALL, small_size),
+        (ICON_SMALL2, small_size),
+    ] {
+        let icon_resource = select_ico_resource(APP_ICON_BYTES, desired_size as u32)
+            .ok_or_else(|| format!("app icon is missing a usable {desired_size}px frame"))?;
+        let hicon = unsafe {
+            CreateIconFromResourceEx(
+                icon_resource,
+                true,
+                0x0003_0000,
+                desired_size,
+                desired_size,
+                LR_DEFAULTCOLOR,
+            )?
+        };
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                Some(WPARAM(slot as usize)),
+                Some(LPARAM(hicon.0 as isize)),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn select_ico_resource(icon_bytes: &[u8], desired_size: u32) -> Option<&[u8]> {
+    if read_u16_le(icon_bytes, 0)? != 0 || read_u16_le(icon_bytes, 2)? != 1 {
+        return None;
+    }
+    let count = read_u16_le(icon_bytes, 4)? as usize;
+    let mut best: Option<(u32, u32, usize, usize)> = None;
+
+    for index in 0..count {
+        let entry_offset = 6 + index * 16;
+        let width = match *icon_bytes.get(entry_offset)? {
+            0 => 256,
+            value => value as u32,
+        };
+        let height = match *icon_bytes.get(entry_offset + 1)? {
+            0 => 256,
+            value => value as u32,
+        };
+        if width != height {
+            continue;
+        }
+        let resource_size = read_u32_le(icon_bytes, entry_offset + 8)? as usize;
+        let resource_offset = read_u32_le(icon_bytes, entry_offset + 12)? as usize;
+        if resource_offset.checked_add(resource_size)? > icon_bytes.len() {
+            continue;
+        }
+        let distance = width.abs_diff(desired_size);
+        let is_downscale = u32::from(width < desired_size);
+        let candidate = (distance, is_downscale, resource_offset, resource_size);
+        if best.map_or(true, |current| candidate < current) {
+            best = Some(candidate);
+        }
+    }
+
+    let (_, _, resource_offset, resource_size) = best?;
+    icon_bytes.get(resource_offset..resource_offset + resource_size)
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -39,7 +141,7 @@ fn main() {
             let event_store = EventStore::open(app_data_dir.join("kernel-events.sqlite3"))?;
             app.manage(AppState::new(event_store));
             if let Some(window) = app.get_webview_window("main") {
-                window.set_icon(Image::from_bytes(include_bytes!("../icons/icon.ico"))?)?;
+                apply_main_window_icon(&window)?;
             }
             Ok(())
         })
@@ -116,4 +218,24 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run DS Agent desktop app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_ico_resource, APP_ICON_BYTES};
+
+    #[test]
+    fn app_icon_embeds_windows_shell_sizes() {
+        for size in [16, 32, 48, 256] {
+            assert!(
+                select_ico_resource(APP_ICON_BYTES, size).is_some(),
+                "app icon should include a usable {size}px frame"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_ico_bytes_do_not_select_resource() {
+        assert!(select_ico_resource(b"not an icon", 32).is_none());
+    }
 }

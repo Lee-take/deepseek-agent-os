@@ -17,7 +17,8 @@
       }
     },
     "resources": {
-      "generated/windows/WebView2Loader.dll": "WebView2Loader.dll"
+      "generated/windows/WebView2Loader.dll": "WebView2Loader.dll",
+      "icons/icon.ico": "ds-agent-icon.ico"
     }
   }
 }

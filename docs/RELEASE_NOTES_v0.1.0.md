@@ -1,6 +1,6 @@
 # DeepSeek Agent OS v0.1.0 Candidate Notes
 
-Status: Windows-first release candidate. The `v0.1.0-rc.3` prerelease is
+Status: Windows-first release candidate. The `v0.1.0-rc.5` prerelease is
 intended for colleague testing through a GitHub release asset after the final
 local gates pass.
 
@@ -11,7 +11,15 @@ WebView2 bootstrapper and runs it silently when the target machine needs the
 WebView2 runtime. Ordinary users do not need Node.js, pnpm, Rust, or a source
 checkout to run the installed app.
 
-## v0.1.0-rc.4 Update (local source, not yet published)
+## v0.1.0-rc.5 Update
+
+- Fixes the Windows desktop shortcut and taskbar icon refresh path so installed
+  builds use the DS Agent app icon after upgrades instead of keeping a stale
+  cached shortcut icon.
+- Sets both the normal app icon and the Windows large/small window icons at
+  startup, improving taskbar and Alt-Tab icon consistency.
+
+## v0.1.0-rc.4 Update
 
 - Upgrades the central chat run loop so DS Agent sends DeepSeek a goal contract
   context with the user's real goal, constraints, done-when criteria,

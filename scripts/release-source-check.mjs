@@ -556,6 +556,11 @@ function checkWindowsAppIconPackaging() {
     "bundle.windows.nsis.installerHooks",
     "nsis/shortcut-icons.nsh",
   );
+  checkJsonField(
+    "apps/desktop/src-tauri/tauri.windows.conf.json",
+    "bundle.resources.icons/icon.ico",
+    "ds-agent-icon.ico",
+  );
 
   const mainSource = readText("apps/desktop/src-tauri/src/main.rs");
   checkTextIncludes(
@@ -570,6 +575,36 @@ function checkWindowsAppIconPackaging() {
     ".set_icon(",
     "desktop runtime window icon is applied at startup",
   );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/main.rs",
+    mainSource,
+    "apply_windows_window_icons",
+    "desktop runtime window icon applies Windows-specific icon handles",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/main.rs",
+    mainSource,
+    "WM_SETICON",
+    "desktop runtime window icon sets Win32 window icon handles",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/main.rs",
+    mainSource,
+    "ICON_BIG",
+    "desktop runtime window icon sets the large taskbar icon",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/main.rs",
+    mainSource,
+    "ICON_SMALL2",
+    "desktop runtime window icon sets the secondary small icon",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/main.rs",
+    mainSource,
+    "select_ico_resource",
+    "desktop runtime window icon selects an ICO resource frame",
+  );
 
   const hooks = readText("apps/desktop/src-tauri/nsis/shortcut-icons.nsh");
   checkTextIncludes(
@@ -581,14 +616,32 @@ function checkWindowsAppIconPackaging() {
   checkTextIncludes(
     "apps/desktop/src-tauri/nsis/shortcut-icons.nsh",
     hooks,
-    'CreateShortcut "$SMPROGRAMS\\${PRODUCTNAME}.lnk" "$INSTDIR\\${MAINBINARYNAME}.exe" "" "$INSTDIR\\${MAINBINARYNAME}.exe" 0',
-    "start menu shortcut explicitly uses executable icon",
+    'CreateShortcut "$SMPROGRAMS\\${PRODUCTNAME}.lnk" "$INSTDIR\\${MAINBINARYNAME}.exe" "" "$INSTDIR\\ds-agent-icon.ico" 0',
+    "start menu shortcut explicitly uses installed app icon file",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/nsis/shortcut-icons.nsh",
     hooks,
-    'CreateShortcut "$DESKTOP\\${PRODUCTNAME}.lnk" "$INSTDIR\\${MAINBINARYNAME}.exe" "" "$INSTDIR\\${MAINBINARYNAME}.exe" 0',
-    "desktop shortcut explicitly uses executable icon",
+    'CreateShortcut "$SMPROGRAMS\\$AppStartMenuFolder\\${PRODUCTNAME}.lnk" "$INSTDIR\\${MAINBINARYNAME}.exe" "" "$INSTDIR\\ds-agent-icon.ico" 0',
+    "start menu folder shortcut explicitly uses installed app icon file",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/nsis/shortcut-icons.nsh",
+    hooks,
+    'CreateShortcut "$DESKTOP\\${PRODUCTNAME}.lnk" "$INSTDIR\\${MAINBINARYNAME}.exe" "" "$INSTDIR\\ds-agent-icon.ico" 0',
+    "desktop shortcut explicitly uses installed app icon file",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/nsis/shortcut-icons.nsh",
+    hooks,
+    'Delete "$DESKTOP\\${PRODUCTNAME}.lnk"',
+    "desktop shortcut is deleted before recreation to avoid stale icon metadata",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/nsis/shortcut-icons.nsh",
+    hooks,
+    "SHChangeNotify",
+    "installer notifies Windows shell after refreshing shortcut icons",
   );
 }
 
@@ -1604,14 +1657,20 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.1.0.md",
     releaseNotes,
-    "v0.1.0-rc.4 Update (local source, not yet published)",
-    "release notes rc.4 local-source update heading",
+    "v0.1.0-rc.5 Update",
+    "release notes rc.5 update heading",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",
     readText("apps/desktop/src-tauri/src/commands.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.4"',
-    "app updater current release tag rc.4",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.5"',
+    "app updater current release tag rc.5",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.1.0.md",
+    releaseNotes,
+    "Fixes the Windows desktop shortcut and taskbar icon refresh path",
+    "release notes Windows shortcut icon refresh fix",
   );
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.1.0.md",

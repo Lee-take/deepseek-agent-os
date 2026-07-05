@@ -800,6 +800,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "uuid",
+ "windows 0.61.3",
  "xcap",
  "zip",
 ]
