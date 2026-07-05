@@ -2009,10 +2009,16 @@ fn build_agent_chat_protocol_user_prompt(
          - access_mode={access_mode}\n\
          - workspace_ready={workspace_ready}; note={workspace_note}\n\
          - network_search_ready={network_search_ready}; source_model={source_model}; note={network_search_note}\n\
-         - If current web information is needed and network_search_ready is not ready, return missing_prerequisites with kind network_search instead of pretending web evidence exists.\n\
-         - If local files, artifacts, or workflow state are needed and workspace_ready is not ready, return missing_prerequisites with kind workspace before proposing local file actions.\n\
-         - Return exactly one structured agent envelope as JSON.\n\
-         - Required JSON fields: protocol_version, reply_to_user, agent_actions, missing_prerequisites.\n\
+	         - If current web information is needed and network_search_ready is not ready, return missing_prerequisites with kind network_search instead of pretending web evidence exists.\n\
+	         - If local files, artifacts, or workflow state are needed and workspace_ready is not ready, return missing_prerequisites with kind workspace before proposing local file actions.\n\
+	         - Loop engineering boundary: DS Agent optimizes for the shortest reliable loop that satisfies the user's real goal. Do not keep refining after the done_when conditions are met.\n\
+	         - Build an internal goal_contract before answering: user_goal, constraints, done_when, completion_verifier, evidence_needed, and disallowed near-miss results. Use it to avoid returning a similar-looking result that does not complete the user's actual objective.\n\
+	         - completion_verifier: a task is complete only when DS Agent can observe local state, tool evidence, source evidence, test output, or another concrete result that satisfies done_when. Model text alone is not completion evidence for local/browser/file/Office/tool tasks.\n\
+	         - stop_conditions: stop when the verifier passes; pause for missing_prerequisites or user confirmation; switch strategy after the same failure repeats; stop and report a blocker instead of looping when no new evidence or progress is produced.\n\
+	         - near-miss guard: do not substitute advice, explanation, a draft, or a merely related answer when the user asked DS Agent to create, open, edit, inspect, verify, or otherwise complete a concrete outcome.\n\
+	         - completion_advice: when a result is complete or partially complete, end with at most one short next-better suggestion grounded in the task. Keep it secondary and do not imply extra work already ran.\n\
+	         - Return exactly one structured agent envelope as JSON.\n\
+	         - Required JSON fields: protocol_version, reply_to_user, agent_actions, missing_prerequisites.\n\
          - Supported agent_actions action_type values are browser_open, browser_browse, computer_control, computer_screenshot, file_read, file_write, file_create, file_update, file_delete, file_rename, directory_create, directory_rename, directory_delete, create_report, office_create, office_update, office_open, network_search, operations_briefing, terminal_read, terminal_write, workspace_setup, deepseek_key_setup, and search_setup.\n\
          - Do not use run_shell. For opening a website in the user's browser, use action_type browser_open with target set to the exact http:// or https:// URL. For reading or inspecting a web page as evidence, use browser_browse. If the user asked to log in, open the site only and ask the user to enter credentials manually.\n\
          - For local directory listing requests, use exactly one terminal_read action with target set to the exact local folder path. DS Agent will run a bounded non-recursive directory listing without executing arbitrary shell. Do not add a second action to read terminal output.\n\
@@ -2576,9 +2582,34 @@ fn apply_agent_local_completion_summary(response: &mut AgentChatResponse) {
     }
 
     response.content = format!(
-        "DS Agent 已完成本地动作：\n{}",
-        completed_actions.join("\n")
+        "DS Agent 已完成并验证本地动作：\n{}\n\n验证：本地执行器返回成功状态和结果记录。\n建议：{}",
+        completed_actions.join("\n"),
+        agent_local_completion_advice(response)
     );
+}
+
+fn agent_local_completion_advice(response: &AgentChatResponse) -> &'static str {
+    if response.proposed_actions.iter().any(|action| {
+        action.execution_state == "succeeded"
+            && matches!(
+                action.action_type.as_str(),
+                "office_create" | "office_update" | "office_open"
+            )
+    }) {
+        return "如果这份 Office 结果要发给他人，下一步可以让我帮你检查标题、格式和敏感信息。";
+    }
+
+    if response.proposed_actions.iter().any(|action| {
+        action.execution_state == "succeeded"
+            && matches!(
+                action.action_type.as_str(),
+                "file_create" | "file_update" | "file_write" | "create_report"
+            )
+    }) {
+        return "如果这个文件要用于正式场景，下一步可以让我帮你补一次格式和敏感信息检查。";
+    }
+
+    "如果要把这个结果用于正式场景，下一步可以让我帮你补一次复核。"
 }
 
 fn completed_agent_action_dispatch_summaries(response: &AgentChatResponse) -> Vec<String> {
@@ -8080,6 +8111,12 @@ mod tests {
         assert!(user_message.content.contains("structured agent envelope"));
         assert!(user_message.content.contains("reply_to_user"));
         assert!(user_message.content.contains("agent_actions"));
+        assert!(user_message.content.contains("goal_contract"));
+        assert!(user_message.content.contains("done_when"));
+        assert!(user_message.content.contains("completion_verifier"));
+        assert!(user_message.content.contains("stop_conditions"));
+        assert!(user_message.content.contains("near-miss"));
+        assert!(user_message.content.contains("completion_advice"));
     }
 
     #[test]
@@ -10273,6 +10310,11 @@ mod tests {
         assert!(followup_user_message
             .content
             .contains("durable URL evidence"));
+        assert!(followup_user_message.content.contains("done_when"));
+        assert!(followup_user_message
+            .content
+            .contains("completion_verifier"));
+        assert!(followup_user_message.content.contains("completion_advice"));
     }
 
     #[test]
@@ -10415,8 +10457,12 @@ mod tests {
 
         assert_eq!(response.proposed_actions.len(), 1);
         assert_eq!(response.proposed_actions[0].execution_state, "succeeded");
-        assert!(response.content.contains("DS Agent 已完成本地动作"));
+        assert!(response.content.contains("DS Agent 已完成并验证本地动作"));
         assert!(response.content.contains("Word document created"));
+        assert!(response
+            .content
+            .contains("验证：本地执行器返回成功状态和结果记录。"));
+        assert!(response.content.contains("建议："));
         assert!(!response.content.contains("Loop context"));
         assert!(!response.content.contains("loop_mode="));
         assert!(!response.content.contains("matched_stop_conditions="));

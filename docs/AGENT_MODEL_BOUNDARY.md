@@ -93,6 +93,35 @@ useful to provide.
    DS Agent sends the smallest useful follow-up context back to DeepSeek rather
    than replaying the whole conversation.
 
+## Goal Loop Completion Contract
+
+DS Agent should treat a user instruction as a goal-directed run, not as a single
+model response. Before sending work to DeepSeek, DS Agent packages the user's
+message with a lightweight loop contract:
+
+- `user_goal`: the concrete outcome the user is asking DS Agent to achieve.
+- `constraints`: safety, workspace, source, format, permission, and product
+  boundaries that must be respected.
+- `done_when`: observable conditions that must be true before DS Agent can call
+  the task complete.
+- `completion_verifier`: the local state, tool evidence, source evidence, test
+  output, opened artifact, or other concrete observation needed to verify the
+  outcome.
+- `disallowed_near_misses`: answers that are related but do not satisfy the
+  user's real goal, such as explaining how to create a file when the user asked
+  DS Agent to create it.
+
+Completion is not based on model confidence. A local/browser/file/Office/tool
+task is complete only when DS Agent has observable evidence that satisfies the
+`done_when` criteria. If verification fails, DS Agent should repair the smallest
+failed step or switch strategy. If the same failure repeats or no new evidence
+is produced, DS Agent should stop and report the blocker instead of looping.
+
+When a run finishes or partially finishes, DS Agent may add one short
+`completion_advice` sentence that helps the user improve the result. The advice
+must be secondary to the completed result, grounded in the current task, and
+must not imply that extra work has already run.
+
 ## Structured Envelope Contract
 
 DeepSeek should return separated fields so DS Agent can display, validate, and

@@ -5,6 +5,7 @@ import {
   ArchiveRestore,
   Brain,
   Check,
+  CircleStop,
   Clipboard,
   ClipboardList,
   Cloud,
@@ -35,6 +36,12 @@ import {
   derivePersistedConversationTitle,
   summarizeConversationTitleFromText,
 } from "./conversationTitle";
+import {
+  agentChatComposerAction,
+  agentChatLoopSteps,
+  buildAgentGuidancePrompt,
+} from "./agentChatRunState";
+import type { AgentChatGuidanceStatus } from "./agentChatRunState";
 import {
   agentChatPendingStageDelaysMs,
   agentChatPendingStageIndex,
@@ -766,8 +773,12 @@ export function App() {
   const [renameConversationTitle, setRenameConversationTitle] = useState("");
   const [agentChatPending, setAgentChatPending] = useState(false);
   const [agentChatPendingStage, setAgentChatPendingStage] = useState(0);
+  const [agentGuidanceStatus, setAgentGuidanceStatus] =
+    useState<AgentChatGuidanceStatus>("idle");
+  const [queuedAgentGuidance, setQueuedAgentGuidance] = useState("");
   const [agentActionPending, setAgentActionPending] = useState<string | null>(null);
   const [agentChatError, setAgentChatError] = useState("");
+  const [agentChatNotice, setAgentChatNotice] = useState("");
   const [agentSetupPrompt, setAgentSetupPrompt] = useState<AgentChatSetupPrompt | null>(null);
   const [pendingAgentPrompt, setPendingAgentPrompt] = useState("");
   const [sessionDeepSeekApiKey, setSessionDeepSeekApiKey] = useState("");
@@ -864,13 +875,27 @@ export function App() {
   const [deepSeekBalancePending, setDeepSeekBalancePending] = useState(false);
   const [capabilityPending, setCapabilityPending] = useState<CapabilityKind | null>(null);
   const [resolutionPending, setResolutionPending] = useState<string | null>(null);
+  const agentMessagesRef = useRef(agentMessages);
+  const queuedAgentGuidanceRef = useRef("");
+  const agentStopRequestedRef = useRef(false);
+  const agentChatRunTokenRef = useRef(0);
   const copy = translations[language];
   const exposePluginsSidebarEntry = shouldExposePluginsSidebarEntry();
   const settingsPanelItemCount = settingsPanelItems.length;
-  const agentChatPendingStatus =
+  const agentChatPendingBaseStatus =
     copy.chatWorkbench.pendingStages[
       Math.min(agentChatPendingStage, copy.chatWorkbench.pendingStages.length - 1)
     ] ?? copy.chatWorkbench.sendingStatus;
+  const agentChatPendingStatus =
+    agentGuidanceStatus === "guiding"
+      ? copy.chatWorkbench.guidanceRunning
+      : agentGuidanceStatus === "queued"
+        ? copy.chatWorkbench.guidanceQueued
+        : agentChatPendingBaseStatus;
+  const agentComposerAction = agentChatComposerAction({
+    pending: agentChatPending,
+    draft: agentPrompt,
+  });
   const networkSearchSourceModelMissing =
     modelToolStrategy.network_search_source_model_required &&
     !state.network_search_source_model;
@@ -1059,6 +1084,10 @@ export function App() {
   }, [state.large_model_provider, state.network_search_source_model]);
 
   useEffect(() => {
+    agentMessagesRef.current = agentMessages;
+  }, [agentMessages]);
+
+  useEffect(() => {
     const chatThread = chatThreadRef.current;
     if (!chatThread) {
       return;
@@ -1134,6 +1163,7 @@ export function App() {
     setAgentMessages((currentMessages) => {
       const nextMessages =
         typeof updater === "function" ? updater(currentMessages) : updater;
+      agentMessagesRef.current = nextMessages;
       setAgentConversations((currentConversations) =>
         currentConversations
           .map((conversation) => {
@@ -1168,6 +1198,43 @@ export function App() {
     });
   };
 
+  const setQueuedAgentGuidanceValue = (value: string) => {
+    queuedAgentGuidanceRef.current = value;
+    setQueuedAgentGuidance(value);
+  };
+
+  const setAgentStopRequestedValue = (value: boolean) => {
+    agentStopRequestedRef.current = value;
+  };
+
+  const queueAgentGuidance = (guidanceValue: string) => {
+    const guidance = guidanceValue.trim();
+    if (!guidance) {
+      setAgentChatError(copy.chatWorkbench.emptyPrompt);
+      return;
+    }
+
+    setAgentPrompt("");
+    setAgentChatError("");
+    setAgentChatNotice(copy.chatWorkbench.guidanceQueuedFeedback);
+    setAgentGuidanceStatus("queued");
+    setQueuedAgentGuidanceValue(
+      queuedAgentGuidanceRef.current
+        ? `${queuedAgentGuidanceRef.current}\n\n${guidance}`
+        : guidance,
+    );
+  };
+
+  const requestAgentStop = () => {
+    setAgentChatError("");
+    setAgentChatNotice(copy.chatWorkbench.stopRequestedFeedback);
+    setAgentGuidanceStatus("idle");
+    setQueuedAgentGuidanceValue("");
+    setAgentStopRequestedValue(true);
+    agentChatRunTokenRef.current += 1;
+    setAgentChatPending(false);
+  };
+
   const startNewAgentConversation = () => {
     const conversation = createEmptyAgentConversation();
     setAgentConversations((currentConversations) =>
@@ -1175,10 +1242,15 @@ export function App() {
     );
     setActiveAgentConversationId(conversation.id);
     setAgentMessages([]);
+    agentMessagesRef.current = [];
     setAgentPrompt("");
     setAgentChatError("");
+    setAgentChatNotice("");
     setPendingAgentPrompt("");
     setAgentSetupPrompt(null);
+    setAgentGuidanceStatus("idle");
+    setQueuedAgentGuidanceValue("");
+    setAgentStopRequestedValue(false);
     setConversationMenu(null);
     setRenamingConversationId(null);
   };
@@ -1192,8 +1264,13 @@ export function App() {
     }
     setActiveAgentConversationId(conversation.id);
     setAgentMessages(conversation.messages);
+    agentMessagesRef.current = conversation.messages;
     setAgentPrompt("");
     setAgentChatError("");
+    setAgentChatNotice("");
+    setAgentGuidanceStatus("idle");
+    setQueuedAgentGuidanceValue("");
+    setAgentStopRequestedValue(false);
     setConversationMenu(null);
   };
 
@@ -2729,7 +2806,13 @@ export function App() {
 
   const sendAgentPrompt = async (
     promptValue: string,
-    options: { apiKeyOverride?: string; skipWorkspaceSetup?: boolean; skipNetworkSearchSetup?: boolean } = {},
+    options: {
+      apiKeyOverride?: string;
+      skipWorkspaceSetup?: boolean;
+      skipNetworkSearchSetup?: boolean;
+      isGuidanceContinuation?: boolean;
+      displayPrompt?: string;
+    } = {},
   ) => {
     const prompt = promptValue.trim();
     if (!prompt) {
@@ -2738,14 +2821,24 @@ export function App() {
     }
 
     setAgentChatError("");
+    if (options.isGuidanceContinuation) {
+      setAgentChatNotice(copy.chatWorkbench.guidanceRunningFeedback);
+      setAgentGuidanceStatus("guiding");
+    } else {
+      setAgentChatNotice("");
+      setAgentGuidanceStatus("idle");
+      setQueuedAgentGuidanceValue("");
+    }
+    setAgentStopRequestedValue(false);
 
     if (!hasDesktopRuntime()) {
+      const displayPrompt = options.displayPrompt?.trim() || prompt;
       updateActiveAgentMessages((currentMessages) => [
         ...currentMessages,
         {
           id: createClientId("user"),
           role: "user",
-          content: prompt,
+          content: displayPrompt,
           created_at: new Date().toISOString(),
         },
         {
@@ -2759,6 +2852,7 @@ export function App() {
       return;
     }
 
+    const runToken = (agentChatRunTokenRef.current += 1);
     const apiKeyCandidates = deepSeekApiKeyCandidates(
       options.apiKeyOverride ?? sessionDeepSeekApiKey,
       fallbackDeepSeekApiKey,
@@ -2776,19 +2870,21 @@ export function App() {
       return;
     }
 
+    const priorMessages = agentMessagesRef.current;
+    const displayPrompt = options.displayPrompt?.trim() || prompt;
     const userMessage: AgentConversationMessage = {
       id: createClientId("user"),
       role: "user",
-      content: prompt,
+      content: displayPrompt,
       created_at: new Date().toISOString(),
     };
 
     setAgentPrompt("");
-    updateActiveAgentMessages((currentMessages) => [...currentMessages, userMessage], prompt);
+    updateActiveAgentMessages((currentMessages) => [...currentMessages, userMessage], displayPrompt);
     setAgentChatPending(true);
 
     try {
-      const contextPacket = buildAgentConversationContextPrompt(prompt, agentMessages);
+      const contextPacket = buildAgentConversationContextPrompt(prompt, priorMessages);
       const response = await invoke<AgentChatResponse>("run_agent_chat", {
         prompt: contextPacket.prompt,
         largeModelProvider: state.large_model_provider,
@@ -2799,6 +2895,9 @@ export function App() {
         apiKeyOverride: apiKeyCandidates[0] ?? null,
         fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
       });
+      if (runToken !== agentChatRunTokenRef.current || agentStopRequestedRef.current) {
+        return;
+      }
       if (contextPacket.compressed) {
         setAgentConversations((currentConversations) =>
           currentConversations.map((conversation) =>
@@ -2821,7 +2920,7 @@ export function App() {
           memory_candidates: response.memory_candidates,
           created_at: response.created_at,
         },
-      ], prompt);
+      ], displayPrompt);
       const [telemetry, cacheState] = await Promise.all([
         invoke<DeepSeekChatTelemetry[]>("list_deepseek_chat_telemetry"),
         invoke<DeepSeekChatCacheState>("get_deepseek_chat_cache_state"),
@@ -2845,6 +2944,9 @@ export function App() {
         setAgentSetupPrompt("network_search");
       }
     } catch (error) {
+      if (runToken !== agentChatRunTokenRef.current || agentStopRequestedRef.current) {
+        return;
+      }
       const rawMessage = String(error);
       const message =
         rawMessage.includes("deepseek chat response could not be read") ||
@@ -2861,9 +2963,27 @@ export function App() {
           run_error: message,
           created_at: new Date().toISOString(),
         },
-      ], prompt);
+      ], displayPrompt);
     } finally {
+      if (runToken !== agentChatRunTokenRef.current) {
+        return;
+      }
+
+      const nextGuidance = queuedAgentGuidanceRef.current;
+      if (nextGuidance) {
+        setQueuedAgentGuidanceValue("");
+        setAgentGuidanceStatus("guiding");
+        setAgentChatNotice(copy.chatWorkbench.guidanceRunningFeedback);
+        await sendAgentPrompt(buildAgentGuidancePrompt(nextGuidance), {
+          ...options,
+          isGuidanceContinuation: true,
+          displayPrompt: nextGuidance,
+        });
+        return;
+      }
+
       setAgentChatPending(false);
+      setAgentGuidanceStatus("idle");
     }
   };
 
@@ -2965,6 +3085,16 @@ export function App() {
 
   const sendAgentMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (agentComposerAction === "stop") {
+      requestAgentStop();
+      return;
+    }
+
+    if (agentComposerAction === "send_guidance") {
+      queueAgentGuidance(agentPrompt);
+      return;
+    }
+
     await sendAgentPrompt(agentPrompt);
   };
 
@@ -3184,16 +3314,23 @@ export function App() {
             : copy.runStatus.readyBody;
   const latestRunContextReceipt = latestOperationsBriefingRun?.context_receipt;
   const renderLegacyCenterManagementPanels = false;
-  const agentPendingSteps: WorkflowStep[] = agentChatPending
-    ? [
-        {
-          key: "agent-chat-pending",
-          label: copy.runStatus.steps.deepseek,
-          detail: agentChatPendingStatus,
-          state: "current",
-        },
-      ]
-    : [];
+  const agentPendingSteps: WorkflowStep[] = agentChatLoopSteps({
+    pending: agentChatPending,
+    pendingStage: agentChatPendingStage,
+    pendingStatus: agentChatPendingStatus,
+    guidanceStatus: agentGuidanceStatus,
+    queuedGuidance: queuedAgentGuidance,
+    labels: {
+      goal: copy.runStatus.steps.understand,
+      execute: copy.runStatus.steps.deepseek,
+      guidance: copy.runStatus.steps.guidance,
+      verify: copy.runStatus.steps.validate,
+    },
+    details: {
+      goal: copy.chatWorkbench.loopGoalDetail,
+      verify: copy.chatWorkbench.loopVerifyDetail,
+    },
+  });
   const agentErrorSteps: WorkflowStep[] = showAgentErrorStatus
     ? [
         {
@@ -4388,19 +4525,31 @@ export function App() {
                         return;
                       }
                       event.preventDefault();
-                      if (!agentChatPending) {
+                      if (!agentChatPending || agentPrompt.trim()) {
                         event.currentTarget.form?.requestSubmit();
                       }
                     }}
                   />
                   <div className="composer-actions">
                     {agentChatPending ? <span>{agentChatPendingStatus}</span> : null}
-                    <button className="primary-action" type="submit" disabled={agentChatPending}>
-                      <Send size={16} aria-hidden="true" />
-                      {copy.chatWorkbench.saveTask}
+                    <button
+                      className={`primary-action composer-submit ${agentComposerAction}`}
+                      type="submit"
+                    >
+                      {agentComposerAction === "stop" ? (
+                        <CircleStop size={16} aria-hidden="true" />
+                      ) : (
+                        <Send size={16} aria-hidden="true" />
+                      )}
+                      {agentComposerAction === "stop"
+                        ? copy.chatWorkbench.stopTask
+                        : copy.chatWorkbench.saveTask}
                     </button>
                   </div>
                 </form>
+                {agentChatNotice ? (
+                  <p className="package-message chat-feedback">{agentChatNotice}</p>
+                ) : null}
                 {agentChatError ? <p className="package-error chat-feedback">{agentChatError}</p> : null}
               </div>
             </section>

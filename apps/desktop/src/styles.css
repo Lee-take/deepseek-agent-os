@@ -1035,6 +1035,21 @@ h1 {
   min-width: 128px;
 }
 
+.composer-actions .primary-action.stop {
+  gap: 7px;
+  background: var(--body-text);
+  color: var(--surface-bg);
+}
+
+.composer-actions .primary-action.stop svg {
+  fill: currentColor;
+  stroke-width: 2.2;
+}
+
+.composer-actions .primary-action.send_guidance {
+  background: var(--surface-accent);
+}
+
 .setup-modal-backdrop {
   position: fixed;
   inset: 0;

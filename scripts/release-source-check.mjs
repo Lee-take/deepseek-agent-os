@@ -1548,6 +1548,24 @@ function checkPublicReleaseCopyPositioning() {
     "README.md bounded repair loop positioning",
   );
   checkTextIncludesCollapsed(
+    "README.md",
+    readme,
+    "goal loop contract",
+    "README.md goal loop contract positioning",
+  );
+  checkTextIncludesCollapsed(
+    "README.md",
+    readme,
+    "done-when criteria, completion verifier, stop conditions, and near-miss guardrails",
+    "README.md goal completion verifier positioning",
+  );
+  checkTextIncludesCollapsed(
+    "README.md",
+    readme,
+    "one short, task-grounded next-better suggestion",
+    "README.md completion advice positioning",
+  );
+  checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.1.0.md",
     releaseNotes,
     "harness architecture",
@@ -1582,6 +1600,24 @@ function checkPublicReleaseCopyPositioning() {
     releaseNotes,
     "bounded repair loops keep failed-step retries small",
     "release notes bounded repair loop positioning",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.1.0.md",
+    releaseNotes,
+    "v0.1.0-rc.4 Update (local source, not yet published)",
+    "release notes rc.4 local-source update heading",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.1.0.md",
+    releaseNotes,
+    "goal contract context with the user's real goal, constraints, done-when criteria, completion verifier, stop conditions, and near-miss guardrails",
+    "release notes goal loop contract feature",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.1.0.md",
+    releaseNotes,
+    "one short, task-grounded suggestion for a better next step",
+    "release notes completion advice feature",
   );
 
   const workflow = readText("apps/desktop/src-tauri/src/kernel/workflow.rs");

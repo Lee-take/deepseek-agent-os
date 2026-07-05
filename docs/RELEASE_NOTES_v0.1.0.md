@@ -11,6 +11,27 @@ WebView2 bootstrapper and runs it silently when the target machine needs the
 WebView2 runtime. Ordinary users do not need Node.js, pnpm, Rust, or a source
 checkout to run the installed app.
 
+## v0.1.0-rc.4 Update (local source, not yet published)
+
+- Upgrades the central chat run loop so DS Agent sends DeepSeek a goal contract
+  context with the user's real goal, constraints, done-when criteria,
+  completion verifier, stop conditions, and near-miss guardrails.
+- Strengthens completion semantics: local, browser, file, Office, and tool work
+  is treated as complete only after DS Agent has observable evidence that
+  matches the user's goal, rather than a merely similar model answer.
+- Adds bounded loop behavior for ordinary tasks: verification success stops the
+  loop quickly, repeated failures switch strategy or report a blocker, and
+  missing prerequisites pause the run instead of guessing.
+- Supports in-run supplementary guidance as part of the same task. When the user
+  adds more detail during a running task, DS Agent queues it for the next small
+  node and keeps the right-side run status in sync.
+- Adds completion advice: after a completed or partially completed result, DS
+  Agent can add one short, task-grounded suggestion for a better next step
+  without implying extra work was already performed.
+- Updates the right-side run status for chat tasks to show a lightweight goal
+  loop: understand the task, call DeepSeek or run local actions, apply any
+  supplementary guidance, and validate the result.
+
 ## v0.1.0-rc.3 Update
 
 - Adds audited Windows local file actions from chat: create file, update file,

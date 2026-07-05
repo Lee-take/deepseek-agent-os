@@ -199,9 +199,17 @@ type TranslationSet = {
     quickDraft: string;
     quickAnalyze: string;
     saveTask: string;
+    stopTask: string;
+    guidanceQueued: string;
+    guidanceRunning: string;
+    guidanceQueuedFeedback: string;
+    guidanceRunningFeedback: string;
+    stopRequestedFeedback: string;
     readyStatus: string;
     sendingStatus: string;
     pendingStages: string[];
+    loopGoalDetail: string;
+    loopVerifyDetail: string;
     searchPending: string;
     actionPlanLabel: string;
     missingPrerequisitesLabel: string;
@@ -259,6 +267,7 @@ type TranslationSet = {
       evidence: string;
       memory: string;
       deepseek: string;
+      guidance: string;
       validate: string;
       report: string;
     };
@@ -989,6 +998,12 @@ export const translations: Record<Language, TranslationSet> = {
       quickDraft: "帮我写一段",
       quickAnalyze: "分析这段材料",
       saveTask: "发送",
+      stopTask: "停止",
+      guidanceQueued: "补充说明已收到，当前小节点完成后会继续引导",
+      guidanceRunning: "正在引导补充指令，并入同一任务继续执行",
+      guidanceQueuedFeedback: "已收到补充说明，当前小节点完成后会并入同一任务。",
+      guidanceRunningFeedback: "正在引导补充指令，DS Agent 会把它和当前任务统一考虑。",
+      stopRequestedFeedback: "已请求停止当前任务；本轮返回将不再追加到对话。",
       readyStatus: "输入后会先预处理，再连接 DeepSeek",
       sendingStatus: "正在预处理并连接 DeepSeek",
       pendingStages: [
@@ -997,6 +1012,8 @@ export const translations: Record<Language, TranslationSet> = {
         "DeepSeek 仍在生成，DS Agent 会继续等待并校验动作",
         "请求仍在进行中，本地程序没有宕机",
       ],
+      loopGoalDetail: "建立目标契约、完成标准和边界",
+      loopVerifyDetail: "按用户目标验证真实结果",
       searchPending: "我已发起网络搜索权限请求，确认后可以继续。",
       actionPlanLabel: "DS Agent 待处理动作",
       missingPrerequisitesLabel: "需要补充",
@@ -1058,6 +1075,7 @@ export const translations: Record<Language, TranslationSet> = {
         evidence: "读取证据",
         memory: "选择记忆",
         deepseek: "调用 DeepSeek",
+        guidance: "补充指令",
         validate: "校验结果",
         report: "生成与导出",
       },
@@ -1835,6 +1853,12 @@ export const translations: Record<Language, TranslationSet> = {
       quickDraft: "Help me draft",
       quickAnalyze: "Analyze this text",
       saveTask: "Send",
+      stopTask: "Stop",
+      guidanceQueued: "Supplement received; DS Agent will guide it after the current step",
+      guidanceRunning: "Guiding the supplement into the same running task",
+      guidanceQueuedFeedback: "Supplement received. DS Agent will fold it into the same task after the current step.",
+      guidanceRunningFeedback: "Guiding the supplement now. DS Agent will consider it together with the running task.",
+      stopRequestedFeedback: "Stop requested for the current task. This run's reply will not be appended.",
       readyStatus: "Input is preprocessed before DS Agent connects to DeepSeek",
       sendingStatus: "Preprocessing and connecting to DeepSeek",
       pendingStages: [
@@ -1843,6 +1867,8 @@ export const translations: Record<Language, TranslationSet> = {
         "DeepSeek is still generating; DS Agent will keep validating actions",
         "The request is still running; the desktop app has not frozen",
       ],
+      loopGoalDetail: "Build the goal contract, done-when criteria, and boundaries",
+      loopVerifyDetail: "Verify the real result against the user's goal",
       searchPending: "I created a network-search approval request. Confirm it to continue.",
       actionPlanLabel: "DS Agent pending actions",
       missingPrerequisitesLabel: "Needed setup",
@@ -1904,6 +1930,7 @@ export const translations: Record<Language, TranslationSet> = {
         evidence: "Read evidence",
         memory: "Select memory",
         deepseek: "Call DeepSeek",
+        guidance: "Supplement",
         validate: "Validate result",
         report: "Generate and export",
       },

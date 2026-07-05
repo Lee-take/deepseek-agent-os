@@ -346,6 +346,16 @@ Bounded repair loops rerun only the failed step with the smallest useful
 context, so DS Agent can keep ordinary tasks responsive while still leaving a
 reviewable trail for longer workflow runs.
 
+Central chat tasks now carry a goal loop contract through the run: DS Agent
+packages the user's real goal, constraints, done-when criteria, completion
+verifier, stop conditions, and near-miss guardrails before asking DeepSeek for
+reasoning. Local, browser, file, Office, and tool outcomes are treated as
+complete only when DS Agent can observe evidence that matches the user's goal.
+If the user adds supplementary guidance during a running task, DS Agent folds it
+into the same task at the next small node and keeps the right-side run status in
+sync. Completed or partially completed results can include one short,
+task-grounded next-better suggestion.
+
 The current 0.1.0 preview includes the permission loop for built-in local
 tools. Built-in local tools cover file, network, browser, email approval
 records, local folders, terminal diagnostics, and Computer Use surfaces; access
