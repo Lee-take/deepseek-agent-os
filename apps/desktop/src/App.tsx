@@ -5688,6 +5688,34 @@ export function App() {
                               </span>
                             ) : null}
                           </div>
+                          {record.candidate.privacy_review ||
+                          record.candidate.evidence_excerpt ? (
+                            <div className="memory-candidate-gate">
+                              <strong>{copy.memory.candidateGate}</strong>
+                              <div className="memory-meta">
+                                {record.candidate.privacy_review ? (
+                                  <span>
+                                    {copy.memory.candidatePrivacyReview}:{" "}
+                                    {record.candidate.privacy_review}
+                                  </span>
+                                ) : null}
+                                <span>
+                                  {copy.memory.candidateSuggestedAction}:{" "}
+                                  {
+                                    copy.memory.candidateSuggestedActionOptions[
+                                      record.candidate.suggested_action
+                                    ]
+                                  }
+                                </span>
+                              </div>
+                              {record.candidate.evidence_excerpt ? (
+                                <p>
+                                  {copy.memory.candidateEvidenceExcerpt}:{" "}
+                                  {record.candidate.evidence_excerpt}
+                                </p>
+                              ) : null}
+                            </div>
+                          ) : null}
                           {record.conflicting_memory_ids.length > 0 ? (
                             <p className="memory-conflict">
                               {copy.memory.conflictWarning(

@@ -17,6 +17,7 @@ import type {
   MemorySearchMatchSource,
   MemoryScope,
   MemorySensitivity,
+  MemoryCandidateSuggestedAction,
   MemoryCandidateStatus,
   MemoryType,
   ModelRoute,
@@ -528,6 +529,11 @@ type TranslationSet = {
     searchMatchUnknown: string;
     searchMatchOptions: Record<MemorySearchMatchSource, string>;
     updatedAt: string;
+    candidateGate: string;
+    candidatePrivacyReview: string;
+    candidateSuggestedAction: string;
+    candidateEvidenceExcerpt: string;
+    candidateSuggestedActionOptions: Record<MemoryCandidateSuggestedAction, string>;
     candidateStatus: Record<MemoryCandidateStatus, string>;
     typeOptions: Record<MemoryType, string>;
     scopeOptions: Record<MemoryScope, string>;
@@ -1377,6 +1383,17 @@ export const translations: Record<Language, TranslationSet> = {
         linked_memory_body: "关联正文命中",
       },
       updatedAt: "更新于",
+      candidateGate: "候选闸门",
+      candidatePrivacyReview: "隐私检查",
+      candidateSuggestedAction: "建议动作",
+      candidateEvidenceExcerpt: "证据摘录",
+      candidateSuggestedActionOptions: {
+        new: "新增",
+        merge: "合并",
+        replace: "替换",
+        link: "关联",
+        reject_hint: "建议拒绝",
+      },
       candidateStatus: {
         pending: "待确认",
         accepted: "已接受",
@@ -2268,6 +2285,17 @@ export const translations: Record<Language, TranslationSet> = {
         linked_memory_body: "Linked body",
       },
       updatedAt: "Updated",
+      candidateGate: "Candidate gate",
+      candidatePrivacyReview: "Privacy review",
+      candidateSuggestedAction: "Suggested action",
+      candidateEvidenceExcerpt: "Evidence excerpt",
+      candidateSuggestedActionOptions: {
+        new: "New",
+        merge: "Merge",
+        replace: "Replace",
+        link: "Link",
+        reject_hint: "Reject hint",
+      },
       candidateStatus: {
         pending: "Pending",
         accepted: "Accepted",

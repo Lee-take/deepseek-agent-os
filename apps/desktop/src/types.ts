@@ -301,6 +301,13 @@ export type MemoryCandidateSource =
 
 export type MemoryCandidateStatus = "pending" | "accepted" | "rejected";
 
+export type MemoryCandidateSuggestedAction =
+  | "new"
+  | "merge"
+  | "replace"
+  | "link"
+  | "reject_hint";
+
 export type MemoryType =
   | "preference"
   | "project_context"
@@ -461,6 +468,9 @@ export type MemoryCandidate = {
   source: MemoryCandidateSource;
   source_id: string | null;
   rationale: string;
+  evidence_excerpt: string;
+  privacy_review: string;
+  suggested_action: MemoryCandidateSuggestedAction;
   expires_at: string | null;
   created_at: string;
   updated_at: string;

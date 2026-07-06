@@ -70,8 +70,9 @@ use crate::kernel::models::{
 use crate::kernel::models::{
     MemoryCandidate, MemoryCandidateMergePreview, MemoryCandidateRecord,
     MemoryCandidateReplacePreview, MemoryCandidateResolution, MemoryCandidateSource,
-    MemoryCandidateStatus, MemoryLifecycle, MemoryRecord, MemoryRecordDeletion, MemoryRecordLink,
-    MemoryRecordUpdate, MemoryRelationKind, MemoryScope, MemorySensitivity, MemoryType,
+    MemoryCandidateStatus, MemoryCandidateSuggestedAction, MemoryLifecycle, MemoryRecord,
+    MemoryRecordDeletion, MemoryRecordLink, MemoryRecordUpdate, MemoryRelationKind, MemoryScope,
+    MemorySensitivity, MemoryType,
 };
 use crate::kernel::network_search::{
     network_search_route_status_for_strategy, NetworkSearchRouteStatus,
@@ -140,6 +141,9 @@ const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
 const AGENT_MEMORY_CONTEXT_MAX_RECORDS: usize = 3;
 const AGENT_MEMORY_CONTEXT_MAX_BYTES: usize = 1200;
 const AGENT_MEMORY_CONTEXT_SNIPPET_CHARS: usize = 220;
+const AGENT_MEMORY_CANDIDATE_GATE_MAX_RECORDS: usize = 3;
+const AGENT_MEMORY_CANDIDATE_EVIDENCE_CHARS: usize = 180;
+const AGENT_MEMORY_CANDIDATE_REASON_CHARS: usize = 220;
 const AGENT_SOUL_PROFILE_TEMPLATE: &str = "# DS Agent Soul\n\nschema_version: 1\n\n## User\n\n- preferred_name:\n- address_as:\n- language_preferences:\n- default_response_tone:\n- default_response_length:\n- formatting_preferences:\n- initiative_level:\n\n## DS Agent\n\n- user_calls_ds_agent:\n- ds_agent_should_refer_to_itself_as:\n- relationship_boundary:\n\n## Stable Preferences\n\n- workflow_preferences:\n- writing_preferences:\n- confirmation_preferences:\n- privacy_preferences:\n\n## Never Store\n\n- secrets\n- passwords\n- private account identifiers\n- sensitive personal data unless explicitly approved\n";
 #[cfg(windows)]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -3040,6 +3044,7 @@ fn run_agent_chat_with_clients_and_api_keys(
 
     {
         let store = store.lock().map_err(|_| lock_error())?;
+        apply_agent_memory_candidate_gate(&store, &mut response)?;
         record_agent_memory_candidates(&store, &response)?;
         record_agent_context_receipts(
             &store,
@@ -3479,6 +3484,168 @@ fn agent_chat_completed_actions_followup_failed_message(error: &str) -> String {
     format!(
         "DS Agent 已完成本地动作，但 DeepSeek 最终说明读取失败。请查看右侧运行步骤确认已完成动作；如需重新生成说明，可以稍后重试。（原因：{reason}。）"
     )
+}
+
+fn apply_agent_memory_candidate_gate(
+    store: &EventStore,
+    response: &mut AgentChatResponse,
+) -> Result<(), String> {
+    let memories = store.list_memory_records().map_err(event_store_error)?;
+    response.memory_candidates =
+        gate_agent_memory_candidates_for_review(&response.memory_candidates, &memories);
+    Ok(())
+}
+
+fn gate_agent_memory_candidates_for_review(
+    candidates: &[MemoryCandidate],
+    memories: &[MemoryRecord],
+) -> Vec<MemoryCandidate> {
+    candidates
+        .iter()
+        .filter_map(|candidate| gate_agent_memory_candidate_for_review(candidate, memories))
+        .take(AGENT_MEMORY_CANDIDATE_GATE_MAX_RECORDS)
+        .collect()
+}
+
+fn gate_agent_memory_candidate_for_review(
+    candidate: &MemoryCandidate,
+    memories: &[MemoryRecord],
+) -> Option<MemoryCandidate> {
+    if !agent_memory_candidate_is_reviewable(candidate) {
+        return None;
+    }
+
+    let mut candidate = candidate.clone();
+    let conflict_count = agent_memory_candidate_gate_conflict_count(&candidate, memories);
+    candidate.evidence_excerpt =
+        agent_context_truncate_chars(&candidate.body, AGENT_MEMORY_CANDIDATE_EVIDENCE_CHARS);
+    candidate.privacy_review = "normal".to_string();
+    candidate.suggested_action = if conflict_count > 0 {
+        MemoryCandidateSuggestedAction::Merge
+    } else {
+        MemoryCandidateSuggestedAction::New
+    };
+    let original_rationale =
+        agent_context_truncate_chars(&candidate.rationale, AGENT_MEMORY_CANDIDATE_REASON_CHARS);
+    candidate.rationale = format!(
+        "Memory Candidate Gate: why_remember={}; privacy_review={}; suggested_action={}; evidence_excerpt={}; conflict_count={}; original_rationale={}",
+        agent_memory_candidate_gate_why(&candidate),
+        candidate.privacy_review,
+        agent_memory_candidate_suggested_action_label(candidate.suggested_action),
+        candidate.evidence_excerpt,
+        conflict_count,
+        original_rationale
+    );
+    Some(candidate)
+}
+
+fn agent_memory_candidate_is_reviewable(candidate: &MemoryCandidate) -> bool {
+    candidate.sensitivity != MemorySensitivity::Sensitive
+        && candidate.lifecycle != MemoryLifecycle::Archived
+        && !agent_memory_candidate_contains_sensitive_text(candidate)
+        && !agent_memory_candidate_is_transient(candidate)
+}
+
+fn agent_memory_candidate_contains_sensitive_text(candidate: &MemoryCandidate) -> bool {
+    let haystack = agent_memory_candidate_gate_haystack(candidate);
+    [
+        "password",
+        "passcode",
+        "api key",
+        "secret",
+        "token",
+        "hunter2",
+        "sk-",
+        "密码",
+        "密钥",
+        "令牌",
+        "身份证",
+        "手机号",
+        "银行卡",
+    ]
+    .iter()
+    .any(|marker| haystack.contains(marker))
+}
+
+fn agent_memory_candidate_is_transient(candidate: &MemoryCandidate) -> bool {
+    let haystack = agent_memory_candidate_gate_haystack(candidate);
+    [
+        "only for today",
+        "today's",
+        "one-off",
+        "temporary",
+        "for this task",
+        "current task",
+        "本次",
+        "这次",
+        "临时",
+        "一次性",
+        "今天",
+        "只在",
+    ]
+    .iter()
+    .any(|marker| haystack.contains(marker))
+}
+
+fn agent_memory_candidate_gate_conflict_count(
+    candidate: &MemoryCandidate,
+    memories: &[MemoryRecord],
+) -> usize {
+    memories
+        .iter()
+        .filter(|memory| {
+            memory.sensitivity != MemorySensitivity::Sensitive
+                && memory.lifecycle != MemoryLifecycle::Archived
+                && agent_memory_candidate_gate_conflicts_with_memory(candidate, memory)
+        })
+        .count()
+}
+
+fn agent_memory_candidate_gate_conflicts_with_memory(
+    candidate: &MemoryCandidate,
+    memory: &MemoryRecord,
+) -> bool {
+    let candidate_title = candidate.title.trim().to_lowercase();
+    let memory_title = memory.title.trim().to_lowercase();
+    if !candidate_title.is_empty() && candidate_title == memory_title {
+        return true;
+    }
+
+    let candidate_body = candidate.body.trim().to_lowercase();
+    let memory_body = memory.body.trim().to_lowercase();
+    !candidate_body.is_empty()
+        && !memory_body.is_empty()
+        && (candidate_body.contains(&memory_body) || memory_body.contains(&candidate_body))
+}
+
+fn agent_memory_candidate_gate_haystack(candidate: &MemoryCandidate) -> String {
+    format!(
+        "{}\n{}\n{}",
+        candidate.title, candidate.body, candidate.rationale
+    )
+    .to_lowercase()
+}
+
+fn agent_memory_candidate_gate_why(candidate: &MemoryCandidate) -> &'static str {
+    match candidate.memory_type {
+        MemoryType::Preference => "stable_user_preference",
+        MemoryType::ProjectContext => "project_context",
+        MemoryType::WorkflowRule => "workflow_rule",
+        MemoryType::Artifact => "artifact_reference",
+        MemoryType::FailurePattern => "failure_pattern",
+    }
+}
+
+fn agent_memory_candidate_suggested_action_label(
+    action: MemoryCandidateSuggestedAction,
+) -> &'static str {
+    match action {
+        MemoryCandidateSuggestedAction::New => "new",
+        MemoryCandidateSuggestedAction::Merge => "merge",
+        MemoryCandidateSuggestedAction::Replace => "replace",
+        MemoryCandidateSuggestedAction::Link => "link",
+        MemoryCandidateSuggestedAction::RejectHint => "reject_hint",
+    }
 }
 
 fn record_agent_memory_candidates(
@@ -12004,6 +12171,188 @@ schema_version: 1
                 .is_empty(),
             "model memory candidates must not become long-term memory without review"
         );
+    }
+
+    #[test]
+    fn agent_chat_gates_model_memory_candidates_to_three_review_items() {
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope/v1",
+            "reply_to_user": "我会提出候选记忆，等待你复核。",
+            "agent_actions": [],
+            "missing_prerequisites": [],
+            "memory_candidates": [
+                {
+                    "title": "Preferred brief tone",
+                    "body": "Use concise operating language with owners and evidence.",
+                    "rationale": "The user asked for this style repeatedly.",
+                    "memory_type": "preference",
+                    "scope": "user",
+                    "sensitivity": "normal",
+                    "lifecycle": "active"
+                },
+                {
+                    "title": "DS Agent memory boundary",
+                    "body": "DS Agent should propose memory candidates for review, not silently write them.",
+                    "rationale": "The user made this a project boundary.",
+                    "memory_type": "workflow_rule",
+                    "scope": "project",
+                    "sensitivity": "normal",
+                    "lifecycle": "active"
+                },
+                {
+                    "title": "Memory candidate review actions",
+                    "body": "Memory candidates should support accept, merge, replace, link, and reject.",
+                    "rationale": "The user asked for a Codex-like memory review loop.",
+                    "memory_type": "workflow_rule",
+                    "scope": "project",
+                    "sensitivity": "normal",
+                    "lifecycle": "active"
+                },
+                {
+                    "title": "Memory runtime speed boundary",
+                    "body": "Memory retrieval and candidate generation should stay bounded and avoid slow endless optimization.",
+                    "rationale": "The user explicitly warned against memory work slowing the agent.",
+                    "memory_type": "workflow_rule",
+                    "scope": "project",
+                    "sensitivity": "normal",
+                    "lifecycle": "active"
+                },
+                {
+                    "title": "Memory receipt preference",
+                    "body": "Show which memories were used and why in a reviewable receipt.",
+                    "rationale": "The user wants auditability for memory use.",
+                    "memory_type": "preference",
+                    "scope": "user",
+                    "sensitivity": "normal",
+                    "lifecycle": "active"
+                }
+            ]
+        });
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let response = run_agent_chat_with_clients(
+            &store,
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "按我的偏好优化记忆系统。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskOnRisk,
+            },
+            AgentChatRuntimeContext::default(),
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("agent chat should gate memory candidates");
+
+        assert_eq!(
+            response.memory_candidates.len(),
+            3,
+            "candidate gate should keep at most three review items"
+        );
+        assert!(response
+            .memory_candidates
+            .iter()
+            .all(|candidate| candidate.rationale.contains("Memory Candidate Gate")));
+
+        let store = store.lock().expect("store lock");
+        let candidate_records = store
+            .list_memory_candidate_records()
+            .expect("candidate records load");
+        assert_eq!(candidate_records.len(), 3);
+    }
+
+    #[test]
+    fn agent_chat_memory_candidate_gate_filters_sensitive_and_transient_items() {
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope/v1",
+            "reply_to_user": "我会只保留适合复核的候选记忆。",
+            "agent_actions": [],
+            "missing_prerequisites": [],
+            "memory_candidates": [
+                {
+                    "title": "Temporary draft preference",
+                    "body": "Only use this wording for today's one-off draft.",
+                    "rationale": "The user asked for it in this task.",
+                    "memory_type": "preference",
+                    "scope": "user",
+                    "sensitivity": "normal",
+                    "lifecycle": "active"
+                },
+                {
+                    "title": "Private password",
+                    "body": "The user's password is hunter2.",
+                    "rationale": "The user pasted a password.",
+                    "memory_type": "preference",
+                    "scope": "user",
+                    "sensitivity": "sensitive",
+                    "lifecycle": "active"
+                },
+                {
+                    "title": "Default response tone",
+                    "body": "Use concise, warm, direct Chinese unless the user asks otherwise.",
+                    "rationale": "The user wants personalized response tone memory.",
+                    "memory_type": "preference",
+                    "scope": "user",
+                    "sensitivity": "normal",
+                    "lifecycle": "active"
+                }
+            ]
+        });
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let response = run_agent_chat_with_clients(
+            &store,
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "记住我的默认回复语气，但不要保存临时或敏感内容。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskOnRisk,
+            },
+            AgentChatRuntimeContext::default(),
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("agent chat should filter unsafe memory candidates");
+
+        assert_eq!(response.memory_candidates.len(), 1);
+        assert_eq!(response.memory_candidates[0].title, "Default response tone");
+        assert!(response.memory_candidates[0]
+            .rationale
+            .contains("privacy_review=normal"));
+
+        let store = store.lock().expect("store lock");
+        let candidate_records = store
+            .list_memory_candidate_records()
+            .expect("candidate records load");
+        assert_eq!(candidate_records.len(), 1);
+        assert!(store
+            .list_memory_records()
+            .expect("memory records load")
+            .is_empty());
     }
 
     #[test]

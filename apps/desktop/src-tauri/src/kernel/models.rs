@@ -110,6 +110,16 @@ pub enum MemoryCandidateStatus {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum MemoryCandidateSuggestedAction {
+    New,
+    Merge,
+    Replace,
+    Link,
+    RejectHint,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryType {
     Preference,
     ProjectContext,
@@ -258,6 +268,10 @@ fn default_memory_lifecycle() -> MemoryLifecycle {
     MemoryLifecycle::Active
 }
 
+fn default_memory_candidate_suggested_action() -> MemoryCandidateSuggestedAction {
+    MemoryCandidateSuggestedAction::New
+}
+
 fn default_memory_relation_kind() -> MemoryRelationKind {
     MemoryRelationKind::Related
 }
@@ -286,6 +300,12 @@ pub struct MemoryCandidate {
     pub source: MemoryCandidateSource,
     pub source_id: Option<Uuid>,
     pub rationale: String,
+    #[serde(default)]
+    pub evidence_excerpt: String,
+    #[serde(default)]
+    pub privacy_review: String,
+    #[serde(default = "default_memory_candidate_suggested_action")]
+    pub suggested_action: MemoryCandidateSuggestedAction,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -373,6 +393,9 @@ impl MemoryCandidate {
             source,
             source_id,
             rationale: rationale.trim().to_string(),
+            evidence_excerpt: String::new(),
+            privacy_review: String::new(),
+            suggested_action: default_memory_candidate_suggested_action(),
             expires_at: expires_at.filter(|_| lifecycle == MemoryLifecycle::Expires),
             created_at: now,
             updated_at: now,

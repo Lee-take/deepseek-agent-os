@@ -2397,6 +2397,25 @@ dd {
   padding-left: 8px;
 }
 
+.memory-candidate-gate {
+  display: grid;
+  gap: 5px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  margin: 0 0 8px;
+  padding-left: 8px;
+}
+
+.memory-candidate-gate > strong {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.memory-candidate-gate p {
+  color: var(--muted);
+  margin: 0;
+  white-space: pre-wrap;
+}
+
 .memory-conflict-details {
   display: grid;
   gap: 8px;
