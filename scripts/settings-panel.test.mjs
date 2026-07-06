@@ -28,6 +28,7 @@ test("settings panel exposes only the ordinary user configuration items", () => 
       "deepseek_model",
       "deepseek_thinking",
       "interface_style",
+      "soul_profile",
       "workspace_directory",
       "deepseek_balance",
     ],
@@ -41,6 +42,7 @@ test("settings panel exposes only the ordinary user configuration items", () => 
       "select",
       "select",
       "select",
+      "profile_editor",
       "directory_picker",
       "balance_reader",
     ],
@@ -123,6 +125,20 @@ test("compact settings controls use smaller typography than full setup forms", (
     /\.user-settings-controls\s+(?:input,\s*)?\.user-settings-controls\s+select[\s\S]*font-size:\s*13px;/,
   );
   assert.match(styles, /\.compact-settings-form\s+\.setup-field\s+button[\s\S]*min-height:\s*32px;/);
+});
+
+test("settings panel exposes a Soul Profile editor with explicit save", () => {
+  const soulItem = settingsPanelItems.find((item) => item.id === "soul_profile");
+  const appSource = readFileSync(appSourceUrl, "utf8");
+  const i18nSource = readFileSync(i18nSourceUrl, "utf8");
+
+  assert.equal(soulItem?.control, "profile_editor");
+  assert.match(appSource, /invoke<AgentSoulProfileState>\("get_agent_soul_profile"\)/);
+  assert.match(appSource, /invoke<AgentSoulProfileState>\("save_agent_soul_profile",\s*\{/);
+  assert.match(appSource, /value=\{soulProfileDraft\}/);
+  assert.match(appSource, /aria-label=\{copy\.settingsPanel\.soulProfile\}/);
+  assert.match(i18nSource, /soulProfile:\s*"Soul Profile"/);
+  assert.match(i18nSource, /soulProfileSave:\s*"Save Soul Profile"/);
 });
 
 test("plugins are not exposed as a left sidebar entry", () => {

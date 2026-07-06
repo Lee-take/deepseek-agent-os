@@ -21,7 +21,11 @@ test("summarizes agent context receipts for compact inspector display", () => {
     capability_invocation_id: "invocation-1",
     workflow_run_id: null,
     selected_evidence: ["capability_invocation:invocation-1", "target:reports/source.md"],
-    selected_memories: [],
+    selected_memories: [
+      "memory_id=memory-1; title=项目记忆运行规则; match_reason=title_terms=记忆,系统",
+      "memory_id=memory-2; title=用户默认语气偏好; match_reason=body_terms=语气",
+      "memory_id=memory-3; title=lower-ranked memory",
+    ],
     model_route: "auto",
     thinking_level: "fast",
     token_cache_state: "cache: miss",
@@ -54,6 +58,10 @@ test("summarizes agent context receipts for compact inspector display", () => {
     "capability_invocation:invocation-1",
     "target:reports/source.md",
   ]);
+  assert.deepEqual(summary.memories, [
+    "memory_id=memory-1; title=项目记忆运行规则; match_reason=title_terms=记忆,系统",
+    "memory_id=memory-2; title=用户默认语气偏好; match_reason=body_terms=语气",
+  ]);
   assert.deepEqual(summary.validation, [
     "model proposal parsed and normalized",
     "capability invocation recorded",
@@ -78,4 +86,5 @@ test("App wires the context receipt list into the capability inspector", () => {
   assert.match(appSource, /invoke<AgentContextReceipt\[\]>\("list_agent_context_receipts"\)/);
   assert.match(appSource, /agentContextReceipts\.slice\(0,\s*3\)\.map/);
   assert.match(appSource, /summarizeAgentContextReceipt\(receipt\)/);
+  assert.match(appSource, /summary\.memories\.length > 0/);
 });

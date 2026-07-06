@@ -613,6 +613,14 @@ export type AgentContextReceipt = {
   created_at: string;
 };
 
+export type AgentSoulProfileState = {
+  exists: boolean;
+  content: string;
+  summary_lines: string[];
+  used_bytes: number;
+  max_bytes: number;
+};
+
 export type OperationsBriefingAnomaly = {
   area: string;
   signal: string;

@@ -75,6 +75,17 @@ type TranslationSet = {
     apiKeyConfiguredPlaceholder: string;
     apiKeyReady: string;
     fallbackApiKeyPlaceholder: string;
+    soulProfile: string;
+    soulProfilePlaceholder: string;
+    soulProfileSave: string;
+    soulProfileSaving: string;
+    soulProfileSaved: string;
+    soulProfileExists: string;
+    soulProfileTemplate: string;
+    soulProfileSummary: string;
+    soulProfileEmpty: string;
+    soulProfileLoadFailed: string;
+    soulProfileSaveFailed: string;
     workspaceDirectory: string;
     chooseWorkspace: string;
     saveWorkspace: string;
@@ -764,6 +775,17 @@ export const translations: Record<Language, TranslationSet> = {
       apiKeyConfiguredPlaceholder: "••••••••••••••••（已配置）",
       apiKeyReady: "API key 已通过启动检测",
       fallbackApiKeyPlaceholder: "主 key 不可用时自动尝试",
+      soulProfile: "Soul Profile",
+      soulProfilePlaceholder: "编辑 memory/soul.md，记录称呼、DS Agent 称呼和默认回复偏好。",
+      soulProfileSave: "保存 Soul Profile",
+      soulProfileSaving: "保存中",
+      soulProfileSaved: "Soul Profile 已保存。",
+      soulProfileExists: "已启用本机 Soul Profile",
+      soulProfileTemplate: "尚未保存，当前显示模板",
+      soulProfileSummary: "本轮可用摘要",
+      soulProfileEmpty: "Soul Profile 内容不能为空。",
+      soulProfileLoadFailed: "Soul Profile 加载失败。",
+      soulProfileSaveFailed: "Soul Profile 保存失败。",
       workspaceDirectory: "工作目录",
       chooseWorkspace: "选择目录",
       saveWorkspace: "保存目录",
@@ -1633,6 +1655,18 @@ export const translations: Record<Language, TranslationSet> = {
       apiKeyConfiguredPlaceholder: "•••••••••••••••• (configured)",
       apiKeyReady: "API key passed startup check",
       fallbackApiKeyPlaceholder: "Tried automatically if the primary key fails",
+      soulProfile: "Soul Profile",
+      soulProfilePlaceholder:
+        "Edit memory/soul.md for names, DS Agent naming, and default response preferences.",
+      soulProfileSave: "Save Soul Profile",
+      soulProfileSaving: "Saving",
+      soulProfileSaved: "Soul Profile saved.",
+      soulProfileExists: "Local Soul Profile enabled",
+      soulProfileTemplate: "Template shown; not saved yet",
+      soulProfileSummary: "Runtime summary",
+      soulProfileEmpty: "Soul Profile content is required.",
+      soulProfileLoadFailed: "Soul Profile failed to load.",
+      soulProfileSaveFailed: "Soul Profile failed to save.",
       workspaceDirectory: "Workspace directory",
       chooseWorkspace: "Choose folder",
       saveWorkspace: "Save folder",

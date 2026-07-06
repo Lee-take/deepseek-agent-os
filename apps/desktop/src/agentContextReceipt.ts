@@ -5,6 +5,7 @@ export type AgentContextReceiptSummary = {
   status: string;
   meta: string[];
   evidence: string[];
+  memories: string[];
   validation: string[];
   policy: string[];
   omissions: string[];
@@ -20,6 +21,7 @@ export function summarizeAgentContextReceipt(
     status: receipt.execution_state,
     meta: compactList([receipt.model_route, receipt.thinking_level, receipt.token_cache_state]),
     evidence: receipt.selected_evidence.slice(0, MAX_LIST_ITEMS),
+    memories: receipt.selected_memories.slice(0, MAX_LIST_ITEMS),
     validation: receipt.validation_results.slice(0, MAX_LIST_ITEMS),
     policy: compactList([
       labelList("constraints", receipt.policy_constraints ?? []),

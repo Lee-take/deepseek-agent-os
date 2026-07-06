@@ -58,6 +58,7 @@ use crate::kernel::local_directory::{
     load_local_directory_state, local_directory_readiness_from_state,
     save_local_directory_settings as persist_local_directory_settings,
     LocalDirectoryReadinessStatus, LocalDirectorySettings, LocalDirectoryState,
+    LOCAL_MEMORY_DIR_NAME,
 };
 use crate::kernel::models::FoundationState;
 use crate::kernel::models::TaskRecord;
@@ -133,6 +134,13 @@ const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
 const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.1.0";
 const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.6";
+const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
+const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
+const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
+const AGENT_MEMORY_CONTEXT_MAX_RECORDS: usize = 3;
+const AGENT_MEMORY_CONTEXT_MAX_BYTES: usize = 1200;
+const AGENT_MEMORY_CONTEXT_SNIPPET_CHARS: usize = 220;
+const AGENT_SOUL_PROFILE_TEMPLATE: &str = "# DS Agent Soul\n\nschema_version: 1\n\n## User\n\n- preferred_name:\n- address_as:\n- language_preferences:\n- default_response_tone:\n- default_response_length:\n- formatting_preferences:\n- initiative_level:\n\n## DS Agent\n\n- user_calls_ds_agent:\n- ds_agent_should_refer_to_itself_as:\n- relationship_boundary:\n\n## Stable Preferences\n\n- workflow_preferences:\n- writing_preferences:\n- confirmation_preferences:\n- privacy_preferences:\n\n## Never Store\n\n- secrets\n- passwords\n- private account identifiers\n- sensitive personal data unless explicitly approved\n";
 #[cfg(windows)]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -151,6 +159,8 @@ struct AgentChatRuntimeContext {
     network_search_ready: AgentChatReadiness,
     network_search_note: String,
     network_search_source_model: Option<NetworkSearchSourceModel>,
+    soul_profile: Option<AgentSoulProfileContext>,
+    memory_context: AgentMemoryRuntimeContext,
     desktop_dir: Option<PathBuf>,
 }
 
@@ -163,9 +173,58 @@ impl Default for AgentChatRuntimeContext {
             network_search_note: "network search readiness unavailable in this test context"
                 .to_string(),
             network_search_source_model: None,
+            soul_profile: None,
+            memory_context: AgentMemoryRuntimeContext::default(),
             desktop_dir: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentSoulProfileContext {
+    lines: Vec<String>,
+    used_bytes: usize,
+    max_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentSoulProfileState {
+    pub exists: bool,
+    pub content: String,
+    pub summary_lines: Vec<String>,
+    pub used_bytes: usize,
+    pub max_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentMemoryRuntimeContext {
+    selected: Vec<AgentSelectedMemory>,
+    omissions: Vec<String>,
+    used_bytes: usize,
+    max_records: usize,
+    max_bytes: usize,
+}
+
+impl Default for AgentMemoryRuntimeContext {
+    fn default() -> Self {
+        Self {
+            selected: Vec::new(),
+            omissions: Vec::new(),
+            used_bytes: 0,
+            max_records: AGENT_MEMORY_CONTEXT_MAX_RECORDS,
+            max_bytes: AGENT_MEMORY_CONTEXT_MAX_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentSelectedMemory {
+    id: Uuid,
+    title: String,
+    memory_type: MemoryType,
+    scope: MemoryScope,
+    match_reason: String,
+    snippet: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2144,6 +2203,18 @@ fn build_agent_chat_protocol_user_prompt(
         .network_search_source_model
         .map(|model| serialize_agent_chat_context_value(&model))
         .unwrap_or_else(|| "none".to_string());
+    let soul_profile = build_agent_soul_profile_prompt(runtime_context.soul_profile.as_ref());
+    let memory_context = build_agent_memory_context_prompt(&runtime_context.memory_context);
+    let runtime_memory_sections = [soul_profile, memory_context]
+        .into_iter()
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let runtime_memory_section = if runtime_memory_sections.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{runtime_memory_sections}\n")
+    };
     format!(
         "DS Agent protocol context:\n\
          - DS Agent is the deterministic local execution layer.\n\
@@ -2174,6 +2245,7 @@ fn build_agent_chat_protocol_user_prompt(
          - For file_write or create_report, target must be a relative workspace path and content must be the exact UTF-8 text DS Agent should write after local validation. For office_create, office_update, or office_open, target must be a .docx, .xlsx, or .pptx path when supplied; use target_location=\"desktop\" only when the user explicitly asks for the Desktop.\n\
          - reply_to_user must describe the intended plan, not local completion. Do not say a file was created, opened, edited, or saved until DS Agent returns execution evidence.\n\
          - DS Agent will validate schema, permissions, risk, workspace paths, and confirmations before executing any action.\n\n\
+         {runtime_memory_section}\
          Full user message:\n{user_prompt}",
         model_route = serialize_agent_chat_context_value(&request.model_route),
         thinking_level = serialize_agent_chat_context_value(&request.thinking_level),
@@ -2190,6 +2262,526 @@ fn serialize_agent_chat_context_value<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value)
         .map(|serialized| serialized.trim_matches('"').to_string())
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn load_agent_soul_profile_context(
+    app_data_dir: &Path,
+) -> Result<Option<AgentSoulProfileContext>, String> {
+    let soul_path = agent_soul_profile_path(app_data_dir);
+    if !soul_path.exists() {
+        return Ok(None);
+    }
+    let body = fs::read_to_string(&soul_path).map_err(event_store_error)?;
+    Ok(build_agent_soul_profile_context(&body))
+}
+
+fn agent_soul_profile_path(app_data_dir: &Path) -> PathBuf {
+    app_data_dir
+        .join(LOCAL_MEMORY_DIR_NAME)
+        .join(AGENT_SOUL_PROFILE_FILE_NAME)
+}
+
+fn agent_soul_profile_state_from_app_data_dir(
+    app_data_dir: &Path,
+) -> Result<AgentSoulProfileState, String> {
+    let soul_path = agent_soul_profile_path(app_data_dir);
+    if !soul_path.exists() {
+        return Ok(agent_soul_profile_state_from_content(
+            false,
+            AGENT_SOUL_PROFILE_TEMPLATE.to_string(),
+        ));
+    }
+    let content = fs::read_to_string(&soul_path).map_err(event_store_error)?;
+    Ok(agent_soul_profile_state_from_content(true, content))
+}
+
+fn save_agent_soul_profile_content(
+    app_data_dir: &Path,
+    content: &str,
+) -> Result<AgentSoulProfileState, String> {
+    if content.trim().is_empty() {
+        return Err("soul profile content is required".to_string());
+    }
+    if content.len() > AGENT_SOUL_PROFILE_MAX_BYTES {
+        return Err(format!(
+            "soul profile must be {} bytes or less",
+            AGENT_SOUL_PROFILE_MAX_BYTES
+        ));
+    }
+    let soul_path = agent_soul_profile_path(app_data_dir);
+    if let Some(parent) = soul_path.parent() {
+        fs::create_dir_all(parent).map_err(event_store_error)?;
+    }
+    fs::write(&soul_path, content).map_err(event_store_error)?;
+    Ok(agent_soul_profile_state_from_content(
+        true,
+        content.to_string(),
+    ))
+}
+
+fn agent_soul_profile_state_from_content(exists: bool, content: String) -> AgentSoulProfileState {
+    let profile_context = build_agent_soul_profile_context(&content);
+    AgentSoulProfileState {
+        exists,
+        content,
+        summary_lines: profile_context
+            .as_ref()
+            .map(|profile| profile.lines.clone())
+            .unwrap_or_default(),
+        used_bytes: profile_context
+            .as_ref()
+            .map(|profile| profile.used_bytes)
+            .unwrap_or(0),
+        max_bytes: AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES,
+    }
+}
+
+fn build_agent_soul_profile_context(body: &str) -> Option<AgentSoulProfileContext> {
+    let fields = parse_agent_soul_profile_fields(body);
+    let candidate_lines = agent_soul_profile_candidate_lines(&fields);
+    if candidate_lines.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    let mut used_bytes = 0usize;
+    for line in candidate_lines {
+        let compacted = agent_memory_compact_text(&line, 220);
+        let line_bytes = compacted.len();
+        if used_bytes + line_bytes > AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES {
+            continue;
+        }
+        used_bytes += line_bytes;
+        lines.push(compacted);
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    Some(AgentSoulProfileContext {
+        lines,
+        used_bytes,
+        max_bytes: AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES,
+    })
+}
+
+fn parse_agent_soul_profile_fields(body: &str) -> std::collections::BTreeMap<String, String> {
+    let mut fields = std::collections::BTreeMap::new();
+    let mut section = String::new();
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if let Some(heading) = line.strip_prefix("## ") {
+            section = heading.trim().to_ascii_lowercase();
+            continue;
+        }
+        if section == "never store" {
+            continue;
+        }
+        if !matches!(section.as_str(), "user" | "ds agent" | "stable preferences") {
+            continue;
+        }
+        let Some(item) = line.strip_prefix("- ") else {
+            continue;
+        };
+        let Some((key, value)) = item.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if value.is_empty()
+            || !agent_soul_profile_allowed_key(&key)
+            || agent_soul_profile_value_looks_sensitive(value)
+        {
+            continue;
+        }
+        fields.insert(key, value.to_string());
+    }
+    fields
+}
+
+fn agent_soul_profile_candidate_lines(
+    fields: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(address) = fields
+        .get("address_as")
+        .or_else(|| fields.get("preferred_name"))
+    {
+        lines.push(format!("user preferred address: {address}"));
+    }
+    if let Some(preferred_name) = fields.get("preferred_name") {
+        lines.push(format!("user preferred name: {preferred_name}"));
+    }
+    if let Some(name) = fields.get("user_calls_ds_agent") {
+        lines.push(format!("user calls this app: {name}"));
+    }
+    if let Some(name) = fields.get("ds_agent_should_refer_to_itself_as") {
+        lines.push(format!("DS Agent self-reference: {name}"));
+    }
+
+    let response_defaults = [
+        ("language", "language_preferences"),
+        ("tone", "default_response_tone"),
+        ("length", "default_response_length"),
+        ("formatting", "formatting_preferences"),
+        ("initiative", "initiative_level"),
+    ]
+    .into_iter()
+    .filter_map(|(label, key)| fields.get(key).map(|value| format!("{label}={value}")))
+    .collect::<Vec<_>>();
+    if !response_defaults.is_empty() {
+        lines.push(format!(
+            "response defaults: {}",
+            response_defaults.join("; ")
+        ));
+    }
+
+    let stable_preferences = [
+        ("workflow", "workflow_preferences"),
+        ("writing", "writing_preferences"),
+        ("confirmation", "confirmation_preferences"),
+        ("privacy", "privacy_preferences"),
+    ]
+    .into_iter()
+    .filter_map(|(label, key)| fields.get(key).map(|value| format!("{label}={value}")))
+    .collect::<Vec<_>>();
+    if !stable_preferences.is_empty() {
+        lines.push(format!(
+            "stable preferences: {}",
+            stable_preferences.join("; ")
+        ));
+    }
+
+    if let Some(boundary) = fields.get("relationship_boundary") {
+        lines.push(format!("relationship boundary: {boundary}"));
+    }
+
+    lines
+}
+
+fn agent_soul_profile_allowed_key(key: &str) -> bool {
+    matches!(
+        key,
+        "preferred_name"
+            | "address_as"
+            | "language_preferences"
+            | "default_response_tone"
+            | "default_response_length"
+            | "formatting_preferences"
+            | "initiative_level"
+            | "user_calls_ds_agent"
+            | "ds_agent_should_refer_to_itself_as"
+            | "relationship_boundary"
+            | "workflow_preferences"
+            | "writing_preferences"
+            | "confirmation_preferences"
+            | "privacy_preferences"
+    )
+}
+
+fn agent_soul_profile_value_looks_sensitive(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    ["secret", "password", "api key", "token", "private key"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn build_agent_soul_profile_prompt(profile: Option<&AgentSoulProfileContext>) -> String {
+    let Some(profile) = profile else {
+        return String::new();
+    };
+    let mut lines = vec!["DS Agent identity profile:".to_string()];
+    lines.extend(profile.lines.iter().map(|line| format!("- {line}")));
+    lines.push(format!(
+        "Profile limits: soul.md compact summary, raw file body omitted. bytes={}/{}",
+        profile.used_bytes, profile.max_bytes
+    ));
+    lines.join("\n")
+}
+
+fn agent_soul_profile_receipt_line(profile: &AgentSoulProfileContext) -> String {
+    format!(
+        "soul_profile=memory/soul.md; reason=identity_profile; bytes={}/{}; lines={}",
+        profile.used_bytes,
+        profile.max_bytes,
+        agent_context_truncate_chars(&profile.lines.join(" | "), 180)
+    )
+}
+
+struct AgentMemoryCandidateMatch {
+    record: MemoryRecord,
+    score: i32,
+    match_reason: String,
+}
+
+fn load_agent_memory_runtime_context(
+    store: &EventStore,
+    prompt: &str,
+) -> Result<AgentMemoryRuntimeContext, String> {
+    let memories = store.list_memory_records().map_err(event_store_error)?;
+    Ok(select_agent_memory_runtime_context(prompt, &memories))
+}
+
+fn select_agent_memory_runtime_context(
+    prompt: &str,
+    memories: &[MemoryRecord],
+) -> AgentMemoryRuntimeContext {
+    let query_terms = agent_memory_query_terms(prompt);
+    let mut context = AgentMemoryRuntimeContext::default();
+    let mut sensitive_omitted = 0usize;
+    let mut archived_omitted = 0usize;
+    let mut candidates = Vec::new();
+
+    if query_terms.is_empty() {
+        return context;
+    }
+
+    for memory in memories {
+        if memory.sensitivity == MemorySensitivity::Sensitive {
+            sensitive_omitted += 1;
+            continue;
+        }
+        if memory.lifecycle == MemoryLifecycle::Archived {
+            archived_omitted += 1;
+            continue;
+        }
+        if let Some(candidate) = agent_memory_candidate_match(memory, &query_terms) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| right.record.pinned.cmp(&left.record.pinned))
+            .then_with(|| right.record.updated_at.cmp(&left.record.updated_at))
+    });
+
+    let mut budget_omitted = 0usize;
+    for candidate in candidates {
+        if context.selected.len() >= context.max_records {
+            budget_omitted += 1;
+            continue;
+        }
+        let selected = AgentSelectedMemory {
+            id: candidate.record.id,
+            title: agent_memory_compact_text(&candidate.record.title, 120),
+            memory_type: candidate.record.memory_type,
+            scope: candidate.record.scope,
+            match_reason: candidate.match_reason,
+            snippet: agent_memory_compact_text(
+                &candidate.record.body,
+                AGENT_MEMORY_CONTEXT_SNIPPET_CHARS,
+            ),
+        };
+        let block_bytes = agent_selected_memory_prompt_block(&selected).len();
+        if context.used_bytes + block_bytes > context.max_bytes {
+            budget_omitted += 1;
+            continue;
+        }
+        context.used_bytes += block_bytes;
+        context.selected.push(selected);
+    }
+
+    if sensitive_omitted > 0 {
+        context.omissions.push(format!(
+            "{sensitive_omitted} sensitive memories omitted from prompt context"
+        ));
+    }
+    if archived_omitted > 0 {
+        context.omissions.push(format!(
+            "{archived_omitted} archived memories omitted from prompt context"
+        ));
+    }
+    if budget_omitted > 0 {
+        context.omissions.push(format!(
+            "{budget_omitted} lower-ranked memories omitted by context budget"
+        ));
+    }
+
+    context
+}
+
+fn agent_memory_candidate_match(
+    memory: &MemoryRecord,
+    query_terms: &[String],
+) -> Option<AgentMemoryCandidateMatch> {
+    let title = memory.title.to_lowercase();
+    let body = memory.body.to_lowercase();
+    let linked_titles = memory
+        .linked_memories
+        .iter()
+        .map(|linked| linked.title.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut score = 0i32;
+    let mut title_terms = Vec::new();
+    let mut body_terms = Vec::new();
+    let mut linked_terms = Vec::new();
+
+    for term in query_terms {
+        if title.contains(term) {
+            score += 6;
+            title_terms.push(term.clone());
+        }
+        if body.contains(term) {
+            score += 3;
+            body_terms.push(term.clone());
+        }
+        if !linked_titles.is_empty() && linked_titles.contains(term) {
+            score += 1;
+            linked_terms.push(term.clone());
+        }
+    }
+
+    if score <= 0 {
+        return None;
+    }
+    if memory.pinned {
+        score += 2;
+    }
+
+    Some(AgentMemoryCandidateMatch {
+        record: memory.clone(),
+        score,
+        match_reason: agent_memory_match_reason(&title_terms, &body_terms, &linked_terms),
+    })
+}
+
+fn agent_memory_match_reason(
+    title_terms: &[String],
+    body_terms: &[String],
+    linked_terms: &[String],
+) -> String {
+    if !title_terms.is_empty() {
+        return format!("title_terms={}", agent_memory_join_terms(title_terms, 4));
+    }
+    if !body_terms.is_empty() {
+        return format!("body_terms={}", agent_memory_join_terms(body_terms, 4));
+    }
+    format!(
+        "linked_memory_terms={}",
+        agent_memory_join_terms(linked_terms, 4)
+    )
+}
+
+fn agent_memory_join_terms(terms: &[String], max_terms: usize) -> String {
+    terms
+        .iter()
+        .take(max_terms)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn agent_memory_query_terms(prompt: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut ascii = String::new();
+    let mut cjk = String::new();
+
+    for character in prompt.chars() {
+        if character.is_ascii_alphanumeric() {
+            agent_memory_flush_cjk_terms(&mut terms, &mut cjk);
+            ascii.push(character.to_ascii_lowercase());
+        } else if agent_memory_is_cjk(character) {
+            agent_memory_flush_ascii_term(&mut terms, &mut ascii);
+            cjk.push(character);
+        } else {
+            agent_memory_flush_ascii_term(&mut terms, &mut ascii);
+            agent_memory_flush_cjk_terms(&mut terms, &mut cjk);
+        }
+    }
+    agent_memory_flush_ascii_term(&mut terms, &mut ascii);
+    agent_memory_flush_cjk_terms(&mut terms, &mut cjk);
+    terms.truncate(32);
+    terms
+}
+
+fn agent_memory_flush_ascii_term(terms: &mut Vec<String>, ascii: &mut String) {
+    if ascii.len() >= 2 {
+        agent_memory_push_unique_term(terms, ascii.clone());
+    }
+    ascii.clear();
+}
+
+fn agent_memory_flush_cjk_terms(terms: &mut Vec<String>, cjk: &mut String) {
+    let characters = cjk.chars().collect::<Vec<_>>();
+    if characters.len() >= 2 {
+        for window in characters.windows(2) {
+            agent_memory_push_unique_term(terms, window.iter().copied().collect());
+        }
+    }
+    cjk.clear();
+}
+
+fn agent_memory_push_unique_term(terms: &mut Vec<String>, term: String) {
+    if !terms.iter().any(|existing| existing == &term) {
+        terms.push(term);
+    }
+}
+
+fn agent_memory_is_cjk(character: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&character)
+        || ('\u{3400}'..='\u{4dbf}').contains(&character)
+        || ('\u{f900}'..='\u{faff}').contains(&character)
+}
+
+fn agent_memory_compact_text(value: &str, max_chars: usize) -> String {
+    let compacted = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    agent_context_truncate_chars(&compacted, max_chars)
+}
+
+fn build_agent_memory_context_prompt(memory_context: &AgentMemoryRuntimeContext) -> String {
+    if memory_context.selected.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![
+        "Selected reviewed DS Agent memories for this run (bounded, read-only):".to_string(),
+        format!(
+            "- selection_policy=max_records:{} max_bytes:{} used_bytes:{}; use only when relevant; current user message wins; do not write memories silently",
+            memory_context.max_records, memory_context.max_bytes, memory_context.used_bytes
+        ),
+    ];
+    lines.extend(
+        memory_context
+            .selected
+            .iter()
+            .map(agent_selected_memory_prompt_block),
+    );
+    if !memory_context.omissions.is_empty() {
+        lines.push(format!(
+            "- omissions={}",
+            memory_context.omissions.join("; ")
+        ));
+    }
+    lines.join("\n")
+}
+
+fn agent_selected_memory_prompt_block(memory: &AgentSelectedMemory) -> String {
+    format!(
+        "- memory_id={}; type={}; scope={}; match_reason={}\n  title: {}\n  snippet: {}",
+        memory.id,
+        serialize_agent_chat_context_value(&memory.memory_type),
+        serialize_agent_chat_context_value(&memory.scope),
+        memory.match_reason,
+        memory.title,
+        memory.snippet
+    )
+}
+
+fn agent_selected_memory_receipt_line(memory: &AgentSelectedMemory) -> String {
+    format!(
+        "memory_id={}; title={}; type={}; scope={}; match_reason={}; snippet={}",
+        memory.id,
+        memory.title,
+        serialize_agent_chat_context_value(&memory.memory_type),
+        serialize_agent_chat_context_value(&memory.scope),
+        memory.match_reason,
+        agent_context_truncate_chars(&memory.snippet, 160)
+    )
 }
 
 pub fn agent_chat_with_transport(
@@ -2385,6 +2977,12 @@ fn run_agent_chat_with_clients_and_api_keys(
     browser_client: &impl BrowserPageClient,
 ) -> Result<AgentChatResponse, String> {
     let original_user_prompt = request.prompt.clone();
+    let memory_context = {
+        let store = store.lock().map_err(|_| lock_error())?;
+        load_agent_memory_runtime_context(&store, &original_user_prompt)?
+    };
+    let mut runtime_context = runtime_context;
+    runtime_context.memory_context = memory_context;
     let (mut response, first_telemetry, followup_api_key) =
         agent_chat_with_transport_and_runtime_context_with_api_key_fallback(
             transport,
@@ -2424,7 +3022,7 @@ fn run_agent_chat_with_clients_and_api_keys(
                 prompt: followup_prompt,
                 ..request
             },
-            runtime_context,
+            runtime_context.clone(),
             pricing_settings,
         );
         match followup_result {
@@ -2449,6 +3047,8 @@ fn run_agent_chat_with_clients_and_api_keys(
             &model_route_context,
             &thinking_level_context,
             &access_mode_context,
+            runtime_context.soul_profile.as_ref(),
+            &runtime_context.memory_context,
             &telemetry,
         )?;
         for entry in telemetry {
@@ -2490,6 +3090,8 @@ fn record_agent_context_receipts(
     model_route: &str,
     thinking_level: &str,
     access_mode: &str,
+    soul_profile: Option<&AgentSoulProfileContext>,
+    memory_context: &AgentMemoryRuntimeContext,
     telemetry: &[DeepSeekChatTelemetry],
 ) -> Result<(), String> {
     let token_cache_state = operations_briefing_token_cache_context(telemetry);
@@ -2504,6 +3106,8 @@ fn record_agent_context_receipts(
             thinking_level,
             access_mode,
             &token_cache_state,
+            soul_profile,
+            memory_context,
         );
         store
             .append_agent_context_receipt(&receipt)
@@ -2522,6 +3126,8 @@ fn agent_context_receipt_for_action(
     thinking_level: &str,
     access_mode: &str,
     token_cache_state: &str,
+    soul_profile: Option<&AgentSoulProfileContext>,
+    memory_context: &AgentMemoryRuntimeContext,
 ) -> AgentContextReceipt {
     let mut receipt = AgentContextReceipt::new(
         action.action_type.clone(),
@@ -2567,6 +3173,16 @@ fn agent_context_receipt_for_action(
     receipt.confirmation_rule = loop_mode_descriptor.confirmation_rule.to_string();
     receipt.policy_constraints = agent_context_policy_constraints(action, access_mode);
     receipt.selected_evidence = agent_context_selected_evidence(action);
+    receipt.selected_memories = soul_profile
+        .map(agent_soul_profile_receipt_line)
+        .into_iter()
+        .chain(
+            memory_context
+                .selected
+                .iter()
+                .map(agent_selected_memory_receipt_line),
+        )
+        .collect();
     receipt.validation_results = agent_context_validation_results(action);
     receipt
         .validation_results
@@ -2581,8 +3197,12 @@ fn agent_context_receipt_for_action(
         "Raw user prompt is not stored in the context receipt.".to_string(),
         "Raw tool result bodies are omitted; use evidence refs and excerpts instead.".to_string(),
         "API keys and local secrets are omitted.".to_string(),
-        "Memory selection is not wired for central chat context receipts v1.".to_string(),
+        "Full memory bodies are omitted; selected memories use bounded reviewed snippets."
+            .to_string(),
     ];
+    receipt
+        .intentional_omissions
+        .extend(memory_context.omissions.iter().cloned());
     receipt
 }
 
@@ -5166,10 +5786,13 @@ fn agent_chat_runtime_context(
     network_search_source_model: Option<NetworkSearchSourceModel>,
     deepseek_chat_ready: bool,
 ) -> AgentChatRuntimeContext {
-    let (workspace_ready, workspace_note) = app
-        .path()
-        .app_data_dir()
-        .ok()
+    let app_data_dir = app.path().app_data_dir().ok();
+    let soul_profile = app_data_dir
+        .as_deref()
+        .and_then(|app_data_dir| load_agent_soul_profile_context(app_data_dir).ok())
+        .flatten();
+    let (workspace_ready, workspace_note) = app_data_dir
+        .as_deref()
         .and_then(|app_data_dir| load_local_directory_state(app_data_dir).ok())
         .map(|state| local_directory_readiness_from_state(&state))
         .map(|readiness| {
@@ -5207,6 +5830,8 @@ fn agent_chat_runtime_context(
         network_search_ready,
         network_search_note: network_status.note,
         network_search_source_model: tool_strategy.network_search_source_model,
+        soul_profile,
+        memory_context: AgentMemoryRuntimeContext::default(),
         desktop_dir: app.path().desktop_dir().ok(),
     }
 }
@@ -5615,6 +6240,21 @@ pub fn get_model_driven_tool_strategy(
 pub fn get_local_directory_state(app: AppHandle) -> Result<LocalDirectoryState, String> {
     let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
     load_local_directory_state(app_data_dir).map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn get_agent_soul_profile(app: AppHandle) -> Result<AgentSoulProfileState, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    agent_soul_profile_state_from_app_data_dir(&app_data_dir)
+}
+
+#[tauri::command]
+pub fn save_agent_soul_profile(
+    app: AppHandle,
+    content: String,
+) -> Result<AgentSoulProfileState, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    save_agent_soul_profile_content(&app_data_dir, &content)
 }
 
 #[tauri::command]
@@ -7080,8 +7720,9 @@ mod tests {
     use crate::kernel::models::{
         AccessMode, ComputerControlBackend, ComputerScreenshotBackend, LargeModelProvider,
         MemoryCandidate, MemoryCandidateRecord, MemoryCandidateResolution, MemoryCandidateSource,
-        MemoryCandidateStatus, MemoryRecord, MemoryRelationKind, ModelRoute,
-        NetworkSearchSourceModel, TaskRecord, ThinkingLevel,
+        MemoryCandidateStatus, MemoryLifecycle, MemoryRecord, MemoryRecordSource,
+        MemoryRelationKind, MemoryScope, MemorySearchMatch, MemorySensitivity, MemoryType,
+        ModelRoute, NetworkSearchSourceModel, TaskRecord, ThinkingLevel,
     };
     use crate::kernel::office::{
         build_office_artifact, OfficeApp, OfficeArtifactClient, OfficeCreateResult,
@@ -7752,7 +8393,6 @@ mod tests {
         let file_write_client = RecordingFileWriteClient::new();
         let search_client = RecordingNetworkSearchClient::new();
         let browser_client = RecordingBrowserPageClient::new();
-
         let response = run_agent_chat_with_clients(
             &store,
             &transport,
@@ -7790,6 +8430,29 @@ mod tests {
     #[test]
     fn agent_chat_records_context_receipt_for_completed_evidence_action() {
         let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "项目记忆运行规则".to_string(),
+            body: "用户要求 DS Agent 记忆系统要对标 Codex 和 Claude Code，避免用户说过就忘。"
+                .to_string(),
+            memory_type: MemoryType::WorkflowRule,
+            scope: MemoryScope::Project,
+            sensitivity: MemorySensitivity::Normal,
+            lifecycle: MemoryLifecycle::Active,
+            source: MemoryRecordSource::MemoryCandidate,
+            source_id: None,
+            pinned: false,
+            expires_at: None,
+            linked_memory_ids: Vec::new(),
+            linked_memories: Vec::new(),
+            search_match: MemorySearchMatch::direct(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        {
+            let store = store.lock().expect("store locks");
+            store.append_memory_record(&memory).expect("memory appends");
+        }
         let transport = SequencedDeepSeekTransport::new(vec![
             r#"{
                 "protocol_version": "ds-agent-envelope/v1",
@@ -7820,6 +8483,14 @@ mod tests {
         let file_write_client = RecordingFileWriteClient::new();
         let search_client = RecordingNetworkSearchClient::new();
         let browser_client = RecordingBrowserPageClient::new();
+        let runtime_context = AgentChatRuntimeContext {
+            soul_profile: Some(super::AgentSoulProfileContext {
+                lines: vec!["user preferred address: 李总".to_string()],
+                used_bytes: 35,
+                max_bytes: super::AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES,
+            }),
+            ..AgentChatRuntimeContext::default()
+        };
 
         let response = run_agent_chat_with_clients(
             &store,
@@ -7827,12 +8498,14 @@ mod tests {
             &cache,
             "test-api-key",
             AgentChatRequest {
-                prompt: "Read reports/source.md. SECRET_CONTEXT_RECEIPT_TEST".to_string(),
+                prompt:
+                    "Read reports/source.md，并遵循记忆系统对标规则。SECRET_CONTEXT_RECEIPT_TEST"
+                        .to_string(),
                 model_route: ModelRoute::Auto,
                 thinking_level: ThinkingLevel::Fast,
                 access_mode: AccessMode::FullAccess,
             },
-            AgentChatRuntimeContext::default(),
+            runtime_context,
             None,
             &file_client,
             &file_write_client,
@@ -7873,6 +8546,10 @@ mod tests {
         assert!(payload.contains("\"policy_decision=allow\""));
         assert!(payload.contains("permission_request="));
         assert!(payload.contains("reports/source.md"));
+        assert!(payload.contains("\"selected_memories\""));
+        assert!(payload.contains("项目记忆运行规则"));
+        assert!(payload.contains("soul_profile=memory/soul.md"));
+        assert!(payload.contains("match_reason="));
         assert!(!payload.contains("SECRET_CONTEXT_RECEIPT_TEST"));
         assert!(!payload.contains("test-api-key"));
 
@@ -8411,6 +9088,244 @@ mod tests {
         assert!(user_message.content.contains("stop_conditions"));
         assert!(user_message.content.contains("near-miss"));
         assert!(user_message.content.contains("completion_advice"));
+    }
+
+    #[test]
+    fn agent_chat_selects_relevant_reviewed_memory_for_protocol_prompt() {
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let now = Utc::now();
+        let reviewed_memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "用户默认语气偏好".to_string(),
+            body: "用户希望 DS Agent 默认用简洁、温暖、直接的中文语气回复。".to_string(),
+            memory_type: MemoryType::Preference,
+            scope: MemoryScope::User,
+            sensitivity: MemorySensitivity::Normal,
+            lifecycle: MemoryLifecycle::Active,
+            source: MemoryRecordSource::MemoryCandidate,
+            source_id: None,
+            pinned: false,
+            expires_at: None,
+            linked_memory_ids: Vec::new(),
+            linked_memories: Vec::new(),
+            search_match: MemorySearchMatch::direct(),
+            created_at: now,
+            updated_at: now,
+        };
+        let sensitive_memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "敏感 API 信息".to_string(),
+            body: "SECRET_MEMORY_SHOULD_NOT_APPEAR".to_string(),
+            sensitivity: MemorySensitivity::Sensitive,
+            ..reviewed_memory.clone()
+        };
+        let archived_memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "旧称呼偏好".to_string(),
+            body: "ARCHIVED_MEMORY_SHOULD_NOT_APPEAR".to_string(),
+            lifecycle: MemoryLifecycle::Archived,
+            ..reviewed_memory.clone()
+        };
+        {
+            let store = store.lock().expect("store locks");
+            store
+                .append_memory_record(&reviewed_memory)
+                .expect("reviewed memory appends");
+            store
+                .append_memory_record(&sensitive_memory)
+                .expect("sensitive memory appends");
+            store
+                .append_memory_record(&archived_memory)
+                .expect("archived memory appends");
+        }
+
+        let transport = RecordingDeepSeekTransport::new("普通回复");
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let file_client = StoreLockCheckingFileContentClient::new(&store);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        run_agent_chat_with_clients(
+            &store,
+            &transport,
+            &cache,
+            "test-api-key",
+            AgentChatRequest {
+                prompt: "请按我喜欢的默认语气总结这个项目。".to_string(),
+                model_route: ModelRoute::Auto,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskOnRisk,
+            },
+            AgentChatRuntimeContext::default(),
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("agent chat succeeds");
+
+        let recorded = transport.recorded_requests();
+        assert_eq!(recorded.len(), 1);
+        let user_message = recorded[0]
+            .messages
+            .iter()
+            .find(|message| {
+                matches!(
+                    message.role,
+                    crate::kernel::deepseek::DeepSeekChatRole::User
+                )
+            })
+            .expect("user message is sent");
+        assert!(user_message
+            .content
+            .contains("Selected reviewed DS Agent memories"));
+        assert!(user_message.content.contains("用户默认语气偏好"));
+        assert!(user_message.content.contains("match_reason="));
+        assert!(user_message
+            .content
+            .contains("用户希望 DS Agent 默认用简洁"));
+        assert!(!user_message
+            .content
+            .contains("SECRET_MEMORY_SHOULD_NOT_APPEAR"));
+        assert!(!user_message
+            .content
+            .contains("ARCHIVED_MEMORY_SHOULD_NOT_APPEAR"));
+    }
+
+    #[test]
+    fn soul_profile_loader_builds_compact_identity_packet_without_never_store() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let memory_dir = temp_dir
+            .path()
+            .join(crate::kernel::local_directory::LOCAL_MEMORY_DIR_NAME);
+        std::fs::create_dir_all(&memory_dir).expect("memory dir");
+        std::fs::write(
+            memory_dir.join(super::AGENT_SOUL_PROFILE_FILE_NAME),
+            r#"# DS Agent Soul
+
+schema_version: 1
+
+## User
+
+- preferred_name: 李总
+- address_as: 李总
+- default_response_tone: 简洁、温暖、直接
+- default_response_length: concise
+
+## DS Agent
+
+- user_calls_ds_agent: 小 D
+- ds_agent_should_refer_to_itself_as: DS Agent
+
+## Never Store
+
+- SECRET_SOUL_SHOULD_NOT_APPEAR
+- passwords
+"#,
+        )
+        .expect("write soul profile");
+
+        let profile = super::load_agent_soul_profile_context(temp_dir.path())
+            .expect("soul profile loads")
+            .expect("soul profile exists");
+        let packet = profile.lines.join("\n");
+
+        assert!(packet.contains("user preferred address: 李总"));
+        assert!(packet.contains("user calls this app: 小 D"));
+        assert!(packet.contains("response defaults:"));
+        assert!(profile.used_bytes <= super::AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES);
+        assert!(!packet.contains("SECRET_SOUL_SHOULD_NOT_APPEAR"));
+        assert!(!packet.contains("passwords"));
+    }
+
+    #[test]
+    fn soul_profile_state_returns_template_without_writing_missing_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+
+        let state = super::agent_soul_profile_state_from_app_data_dir(temp_dir.path())
+            .expect("soul profile state loads");
+
+        assert!(!state.exists);
+        assert!(state.content.contains("# DS Agent Soul"));
+        assert!(state.summary_lines.is_empty());
+        assert!(!temp_dir
+            .path()
+            .join(crate::kernel::local_directory::LOCAL_MEMORY_DIR_NAME)
+            .join(super::AGENT_SOUL_PROFILE_FILE_NAME)
+            .exists());
+    }
+
+    #[test]
+    fn saving_soul_profile_is_explicit_and_returns_safe_summary() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let content = r#"# DS Agent Soul
+
+## User
+
+- preferred_name: 李总
+- default_response_tone: 简洁、温暖、直接
+
+## DS Agent
+
+- user_calls_ds_agent: 小 D
+
+## Never Store
+
+- SECRET_PROFILE_SHOULD_NOT_APPEAR
+"#;
+
+        let state = super::save_agent_soul_profile_content(temp_dir.path(), content)
+            .expect("soul profile saves");
+
+        assert!(state.exists);
+        assert_eq!(state.content, content);
+        assert!(state.summary_lines.join("\n").contains("李总"));
+        assert!(state.summary_lines.join("\n").contains("小 D"));
+        assert!(!state
+            .summary_lines
+            .join("\n")
+            .contains("SECRET_PROFILE_SHOULD_NOT_APPEAR"));
+        assert_eq!(
+            std::fs::read_to_string(
+                temp_dir
+                    .path()
+                    .join(crate::kernel::local_directory::LOCAL_MEMORY_DIR_NAME)
+                    .join(super::AGENT_SOUL_PROFILE_FILE_NAME),
+            )
+            .expect("saved profile reads"),
+            content
+        );
+    }
+
+    #[test]
+    fn agent_chat_protocol_prompt_includes_soul_profile_context() {
+        let mut runtime_context = AgentChatRuntimeContext::default();
+        runtime_context.soul_profile = Some(super::AgentSoulProfileContext {
+            lines: vec![
+                "user preferred address: 李总".to_string(),
+                "user calls this app: 小 D".to_string(),
+                "response defaults: 简洁、温暖、直接".to_string(),
+            ],
+            used_bytes: 112,
+            max_bytes: super::AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES,
+        });
+
+        let prompt = super::build_agent_chat_protocol_user_prompt(
+            &AgentChatRequest {
+                prompt: "帮我写一段项目总结。".to_string(),
+                model_route: ModelRoute::Auto,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskOnRisk,
+            },
+            &runtime_context,
+        );
+
+        assert!(prompt.contains("DS Agent identity profile"));
+        assert!(prompt.contains("user preferred address: 李总"));
+        assert!(prompt.contains("user calls this app: 小 D"));
+        assert!(prompt.contains("Profile limits: soul.md compact summary, raw file body omitted."));
     }
 
     #[test]
@@ -10990,6 +11905,8 @@ mod tests {
                 network_search_ready: AgentChatReadiness::Ready,
                 network_search_note: "network search ready".to_string(),
                 network_search_source_model: None,
+                soul_profile: None,
+                memory_context: super::AgentMemoryRuntimeContext::default(),
                 desktop_dir: None,
             },
             None,

@@ -70,6 +70,7 @@ import type {
   AgentChatMissingPrerequisite,
   AgentChatResponse,
   AgentContextReceipt,
+  AgentSoulProfileState,
   AppUpdateDownloadResult,
   AppUpdateInstallResult,
   AppUpdateStatus,
@@ -246,6 +247,14 @@ const fallbackLocalDirectoryState: LocalDirectoryState = {
   settings_file: "",
   settings: null,
   needs_setup: true,
+};
+
+const fallbackAgentSoulProfileState: AgentSoulProfileState = {
+  exists: false,
+  content: "",
+  summary_lines: [],
+  used_bytes: 0,
+  max_bytes: 800,
 };
 
 const fallbackAppUpdateStatus: AppUpdateStatus = {
@@ -687,6 +696,8 @@ export function App() {
     useState<ModelDrivenToolStrategy>(fallbackModelDrivenToolStrategy);
   const [localDirectoryState, setLocalDirectoryState] =
     useState<LocalDirectoryState>(fallbackLocalDirectoryState);
+  const [soulProfileState, setSoulProfileState] =
+    useState<AgentSoulProfileState>(fallbackAgentSoulProfileState);
   const [appUpdateStatus, setAppUpdateStatus] =
     useState<AppUpdateStatus>(fallbackAppUpdateStatus);
   const [deepSeekPricingState, setDeepSeekPricingState] =
@@ -758,6 +769,7 @@ export function App() {
   const [computerControlUnlockToken, setComputerControlUnlockToken] = useState("");
   const [setupWorkspaceName, setSetupWorkspaceName] = useState("");
   const [setupWorkspaceDir, setSetupWorkspaceDir] = useState("");
+  const [soulProfileDraft, setSoulProfileDraft] = useState("");
   const [deepSeekPricingEnabled, setDeepSeekPricingEnabled] = useState(false);
   const [deepSeekFlashPromptPrice, setDeepSeekFlashPromptPrice] = useState("");
   const [deepSeekFlashCompletionPrice, setDeepSeekFlashCompletionPrice] = useState("");
@@ -849,6 +861,8 @@ export function App() {
   const [briefingError, setBriefingError] = useState("");
   const [setupNotice, setSetupNotice] = useState("");
   const [setupError, setSetupError] = useState("");
+  const [soulProfileNotice, setSoulProfileNotice] = useState("");
+  const [soulProfileError, setSoulProfileError] = useState("");
   const [appUpdateNotice, setAppUpdateNotice] = useState("");
   const [appUpdateError, setAppUpdateError] = useState("");
   const [downloadedAppUpdate, setDownloadedAppUpdate] =
@@ -888,6 +902,7 @@ export function App() {
   const [computerControlUnlockPending, setComputerControlUnlockPending] = useState(false);
   const [briefingPending, setBriefingPending] = useState(false);
   const [setupPending, setSetupPending] = useState(false);
+  const [soulProfilePending, setSoulProfilePending] = useState(false);
   const [appUpdateDownloadPending, setAppUpdateDownloadPending] = useState(false);
   const [appUpdateInstallPending, setAppUpdateInstallPending] = useState(false);
   const [deepSeekCachePending, setDeepSeekCachePending] = useState(false);
@@ -1012,6 +1027,11 @@ export function App() {
     );
   };
 
+  const applySoulProfileState = (profileState: AgentSoulProfileState) => {
+    setSoulProfileState(profileState);
+    setSoulProfileDraft(profileState.content);
+  };
+
   useEffect(() => {
     if (!hasDesktopRuntime()) {
       setState(fallbackState);
@@ -1020,6 +1040,7 @@ export function App() {
       setDeepSeekTelemetry([]);
       setComputerControlUnlockStatus(fallbackComputerControlUnlockStatus);
       setLocalDirectoryState(fallbackLocalDirectoryState);
+      applySoulProfileState(fallbackAgentSoulProfileState);
       setAppUpdateStatus(fallbackAppUpdateStatus);
       setDeepSeekPricingState(fallbackDeepSeekPricingState);
       return;
@@ -1048,6 +1069,12 @@ export function App() {
       .catch(() => {
         setLocalDirectoryState(fallbackLocalDirectoryState);
         setSetupError(copy.localSetup.loadFailed);
+      });
+    void invoke<AgentSoulProfileState>("get_agent_soul_profile")
+      .then(applySoulProfileState)
+      .catch(() => {
+        applySoulProfileState(fallbackAgentSoulProfileState);
+        setSoulProfileError(copy.settingsPanel.soulProfileLoadFailed);
       });
     void invoke<AppUpdateStatus>("check_app_update")
       .then(setAppUpdateStatus)
@@ -1774,6 +1801,28 @@ export function App() {
   const saveLocalDirectorySetup = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     await persistLocalDirectorySetup();
+  };
+
+  const saveSoulProfile = async () => {
+    if (!soulProfileDraft.trim()) {
+      setSoulProfileError(copy.settingsPanel.soulProfileEmpty);
+      return;
+    }
+    setSoulProfilePending(true);
+    setSoulProfileNotice("");
+    setSoulProfileError("");
+
+    try {
+      const profileState = await invoke<AgentSoulProfileState>("save_agent_soul_profile", {
+        content: soulProfileDraft,
+      });
+      applySoulProfileState(profileState);
+      setSoulProfileNotice(copy.settingsPanel.soulProfileSaved);
+    } catch (error) {
+      setSoulProfileError(String(error) || copy.settingsPanel.soulProfileSaveFailed);
+    } finally {
+      setSoulProfilePending(false);
+    }
   };
 
   const saveDeepSeekPricingSetup = async (event: FormEvent<HTMLFormElement>) => {
@@ -4003,6 +4052,46 @@ export function App() {
                     <option value="ink">{copy.themeOptions.ink}</option>
                   </select>
                 </label>
+                <div className="soul-profile-settings">
+                  <label>
+                    <span>{copy.settingsPanel.soulProfile}</span>
+                    <textarea
+                      value={soulProfileDraft}
+                      aria-label={copy.settingsPanel.soulProfile}
+                      placeholder={copy.settingsPanel.soulProfilePlaceholder}
+                      onChange={(event) => setSoulProfileDraft(event.target.value)}
+                    />
+                  </label>
+                  <div className="soul-profile-settings-actions">
+                    <span>
+                      {soulProfileState.exists
+                        ? copy.settingsPanel.soulProfileExists
+                        : copy.settingsPanel.soulProfileTemplate}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void saveSoulProfile()}
+                      disabled={soulProfilePending}
+                    >
+                      <Brain size={14} aria-hidden="true" />
+                      {soulProfilePending
+                        ? copy.settingsPanel.soulProfileSaving
+                        : copy.settingsPanel.soulProfileSave}
+                    </button>
+                  </div>
+                  {soulProfileState.summary_lines.length > 0 ? (
+                    <p className="setup-status">
+                      {copy.settingsPanel.soulProfileSummary}:{" "}
+                      {soulProfileState.summary_lines.join(" · ")}
+                    </p>
+                  ) : null}
+                  {soulProfileNotice ? (
+                    <p className="package-message">{soulProfileNotice}</p>
+                  ) : null}
+                  {soulProfileError ? (
+                    <p className="package-error">{soulProfileError}</p>
+                  ) : null}
+                </div>
                 <div className="setup-form compact-settings-form">
                   <label>
                     <span>{copy.settingsPanel.workspaceDirectory}</span>
@@ -6647,6 +6736,12 @@ export function App() {
                             <p>
                               {copy.operationsBriefing.contextSelectedEvidence}:{" "}
                               {summary.evidence.join(" · ")}
+                            </p>
+                          ) : null}
+                          {summary.memories.length > 0 ? (
+                            <p>
+                              {copy.operationsBriefing.contextSelectedMemories}:{" "}
+                              {summary.memories.join(" · ")}
                             </p>
                           ) : null}
                           {summary.validation.length > 0 ? (

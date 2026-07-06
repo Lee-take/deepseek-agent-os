@@ -1455,6 +1455,15 @@ h1 {
   line-height: 1.35;
 }
 
+.user-settings-controls textarea {
+  min-height: 132px;
+  max-height: 220px;
+  padding: 8px 9px;
+  font-size: 12px;
+  line-height: 1.4;
+  resize: vertical;
+}
+
 .api-key-input-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 18px;
@@ -1480,6 +1489,36 @@ h1 {
 .compact-settings-form {
   border-top: 1px solid var(--border);
   padding-top: 10px;
+}
+
+.soul-profile-settings {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.soul-profile-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.soul-profile-settings-actions span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.soul-profile-settings-actions button {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 13px;
 }
 
 .compact-settings-form .setup-field button {
