@@ -14,6 +14,10 @@ small, deterministic, inspectable, and easy to disable.
 
 Memory Runtime v1 should let DS Agent:
 
+- keep a small long-lived `soul.md` profile for names, forms of address, and
+  stable user preferences;
+- remember personalized response defaults such as tone, verbosity, language,
+  formatting, and how much initiative DS Agent should take;
 - select a few relevant reviewed memories before calling DeepSeek;
 - record why each memory was selected;
 - inject only compact, safe memory snippets into the model packet;
@@ -35,6 +39,11 @@ systems into the first implementation.
 - Codex `AGENTS.md` guidance shows a useful split between durable project rules
   and runtime memory. It favors small, practical repository instructions:
   <https://developers.openai.com/codex/guides/agents-md>
+- OpenClaw's `SOUL.md` template treats identity, boundaries, tone, and
+  continuity as a persistent workspace file. DS Agent should borrow the idea of
+  an explicit, inspectable identity file, but narrow it to a practical local
+  profile rather than a hidden personality system:
+  <https://docs.openclaw.ai/reference/templates/SOUL>
 - mem0 is a broad memory layer for AI agents and assistants. DS Agent can learn
   from its SDK-style memory primitives and evaluation mindset, but should not
   add an external memory dependency in v1:
@@ -67,11 +76,21 @@ Current source already has the important foundation:
 Memory Runtime v1 should reuse these pieces instead of adding a second memory
 store.
 
+The main missing piece is a tiny always-available identity profile. Existing
+`MemoryRecord` objects are good for project context and workflow facts, but the
+user also needs DS Agent to remember stable relationship-level facts: what the
+user wants to be called, how the user calls DS Agent, preferred language and
+tone, and durable interaction preferences. These facts should live in a
+separate, user-visible `soul.md` profile so they are not buried among task
+memories.
+
 ## 4. Non-Goals
 
 Memory Runtime v1 must not:
 
 - add embeddings, a vector database, or a knowledge graph dependency;
+- turn `soul.md` into a persona marketplace, roleplay layer, or hidden identity
+  prompt;
 - call a model just to select memory before every task;
 - write long-term memory silently from a model response;
 - load all memory records into the DeepSeek prompt;
@@ -144,6 +163,75 @@ The selector does not mutate memory.
 
 ## 7. Data Shapes
 
+### Soul Memory Profile
+
+`soul.md` is a small local Markdown profile owned by the user and DS Agent
+together. It is loaded before ordinary memory selection because it carries
+stable identity and preference context, not task-specific evidence.
+
+Default storage:
+
+- machine-local DS Agent app data: `memory/soul.md`;
+- not exported in work packages by default;
+- not committed to the DS Agent source repository;
+- editable from Memory Studio or an advanced local file action.
+
+The file should stay human-readable. Suggested shape:
+
+```markdown
+# DS Agent Soul
+
+schema_version: 1
+updated_at: 2026-07-06T00:00:00Z
+
+## User
+
+- preferred_name:
+- address_as:
+- language_preferences:
+- default_response_tone:
+- default_response_length:
+- formatting_preferences:
+- initiative_level:
+
+## DS Agent
+
+- user_calls_ds_agent:
+- ds_agent_should_refer_to_itself_as:
+- relationship_boundary:
+
+## Stable Preferences
+
+- workflow_preferences:
+- writing_preferences:
+- confirmation_preferences:
+- privacy_preferences:
+
+## Never Store
+
+- secrets
+- passwords
+- private account identifiers
+- sensitive personal data unless the user explicitly approves
+```
+
+The profile is intentionally boring. It should remember useful continuity such
+as "call the user Mr. Li", "the user calls the app DS Agent", "prefer Chinese
+for business writing", "default to concise direct replies", "use detailed
+technical explanations only when asked", or "ask before external sends". It
+should not invent a fictional identity, claim emotions, impersonate the user,
+or store intimate private facts by default.
+
+Explicit user settings are stronger than inferred memory. If DS Agent later
+adds settings such as "default response tone", "default reply length", or
+"default language", those values should write through to the profile as
+user-approved personalization fields. Model-inferred candidates may suggest
+changes, but they must not overwrite explicit settings without review.
+
+DS Agent may propose updates to `soul.md`, but the user must review and accept
+the patch. Accepted updates should be recorded as append-only events or file
+history notes so users can inspect what changed and why.
+
 ### Selected Memory Context
 
 Rust model, JSON-serializable:
@@ -175,6 +263,7 @@ pub enum MemoryInclusionMode {
 ```rust
 pub struct AgentMemorySelectionReceipt {
     pub query: String,
+    pub soul_profile_used: bool,
     pub selected: Vec<AgentSelectedMemory>,
     pub omitted: Vec<String>,
     pub max_memories: usize,
@@ -187,10 +276,28 @@ This receipt is projected into `AgentContextReceipt.selected_memories` as compac
 human-readable lines for v1. A richer typed receipt can become its own event in
 v2 if the UI needs drill-down.
 
+### Soul Profile Context
+
+The prompt packet should include a compact identity section before selected task
+memories when `soul.md` exists:
+
+```text
+DS Agent identity profile:
+- user preferred address: Mr. Li
+- user calls this app: DS Agent
+- response defaults: Chinese for business writing; concise and factual; avoid
+  unsolicited long explanations
+Profile limits: soul.md compact summary, raw file body omitted.
+```
+
+This section has its own small budget, separate from task memory retrieval. The
+default budget is `800` bytes.
+
 ## 8. Selection Rules
 
 Default limits:
 
+- max `soul.md` profile packet: `800` bytes;
 - max selected memories: `3`;
 - max memory context packet: `1200` bytes;
 - max snippet per memory: `280` characters;
@@ -208,6 +315,16 @@ Filters:
 - never include source-machine-only path handles unless the current task and
   capability need them.
 
+`soul.md` rules:
+
+- load only the compact profile summary, not arbitrary Markdown body text;
+- include user naming and DS Agent naming fields by default when present;
+- include stable language, response tone, verbosity, formatting, initiative,
+  workflow, and confirmation preferences only when they fit the profile budget;
+- omit anything listed under `Never Store` or marked sensitive;
+- if the newest user message conflicts with `soul.md`, the newest user message
+  wins and the receipt records the conflict.
+
 Ranking:
 
 - direct title match;
@@ -224,7 +341,15 @@ release`.
 ## 9. Prompt Packet
 
 `build_agent_chat_protocol_user_prompt` should include a compact section only
-when memories are selected:
+when the soul profile or task memories are selected:
+
+```text
+DS Agent identity profile:
+- user preferred address: Mr. Li
+- user calls this app: DS Agent
+- response defaults: Chinese for business writing; concise and factual; direct
+  answer first
+```
 
 ```text
 Selected reviewed DS Agent memories for this run:
@@ -235,6 +360,7 @@ Memory selection limits: 1 selected, 392 bytes used, sensitive memories omitted.
 ```
 
 If no memory is selected, the prompt should not carry a large empty section.
+If no `soul.md` profile exists, the prompt should not mention it.
 
 If memory was omitted, the prompt can include a compact line such as:
 
@@ -300,17 +426,23 @@ Central chat:
 
 Right run/status rail:
 
+- show whether the `soul.md` profile was used;
 - show a memory step with the first selected memory or `No memory selected`;
 - show recent context receipts with selected memory lines;
 - show omission lines when sensitive or over-budget memory was not included.
 
 Memory Studio:
 
+- add a small `Soul profile` section for user address, DS Agent name, language,
+  default response tone, default response length, formatting, initiative,
+  workflow, confirmation, and privacy preferences;
 - keep candidate review as the main long-term write surface;
 - add filters later for `Used recently`, `Sensitive`, and `Candidate source`.
 
 Future `/memory`-style command:
 
+- show the current `soul.md` summary;
+- offer `edit soul profile`;
 - list memory files/records influencing the current run;
 - toggle memory retrieval for the session;
 - open Memory Studio;
@@ -324,6 +456,8 @@ Memory Runtime v1 must defend against:
 
 - secret leakage into model context;
 - private local path leakage;
+- over-personalized or fictional `soul.md` content drifting DS Agent away from
+  its product boundary;
 - memory poisoning from model output or imported packages;
 - stale memory overriding newer user instruction;
 - sensitive memories entering ordinary chat packets;
@@ -332,8 +466,14 @@ Memory Runtime v1 must defend against:
 Rules:
 
 - user prompt and explicit current task override memory;
+- `soul.md` is a profile, not a higher-priority system prompt;
 - policy and capability checks override memory;
 - sensitive memory requires explicit inclusion logic;
+- user address, DS Agent naming, and stable preferences may be stored; secrets,
+  passwords, payment data, private identifiers, and intimate sensitive details
+  must not be stored without explicit user approval;
+- explicit personalization settings such as default response tone or verbosity
+  win over model-inferred candidates;
 - candidate writes are review-only;
 - imported candidates remain pending review;
 - receipts record omissions without revealing omitted content.
@@ -357,6 +497,9 @@ should be SQLite FTS or BM25-style ranking before embeddings or graph retrieval.
 
 ### Slice 1: Central Chat Memory Context v1
 
+- Add `soul.md` profile loading with an `800` byte compact identity packet.
+- Include explicit personalization settings such as default response tone,
+  response length, language, formatting, and initiative level in that packet.
 - Add selector data types and constants.
 - Select up to three non-sensitive active memories before DeepSeek chat.
 - Add compact selected memory packet to the protocol prompt.
@@ -373,6 +516,8 @@ should be SQLite FTS or BM25-style ranking before embeddings or graph retrieval.
 
 ### Slice 3: UI Receipt Polish
 
+- Add a compact Memory Studio `Soul profile` editor for naming and stable
+  preferences, including default tone and response length.
 - Surface selected memories and omissions in the right rail.
 - Add compact copy for no-memory, selected-memory, and omitted-sensitive states.
 - Keep the central chat uncluttered.
@@ -393,6 +538,13 @@ should be SQLite FTS or BM25-style ranking before embeddings or graph retrieval.
 
 Focused Rust tests:
 
+- `soul.md` profile fields appear in the DeepSeek prompt packet within budget;
+- explicit default response tone and verbosity settings appear in the compact
+  identity packet when present;
+- newest user instruction overrides conflicting `soul.md` preferences;
+- inferred personalization candidates cannot overwrite explicit settings
+  without review;
+- `soul.md` never injects secrets or fields from the `Never Store` section;
 - selected memory appears in the DeepSeek prompt packet;
 - sensitive memory is omitted and only an omission reason is included;
 - archived and expired memories are excluded;
@@ -420,6 +572,11 @@ Frontend checks after UI slice:
 
 Memory Runtime v1 is successful when:
 
+- DS Agent remembers the user's preferred form of address, the user's name for
+  DS Agent, and stable language/tone/workflow preferences through a visible
+  `soul.md` profile;
+- DS Agent honors user-approved personalization defaults such as response tone
+  and response length without requiring the user to restate them in every task;
 - a simple chat task can use relevant reviewed memory without any extra user
   setup;
 - the model packet contains only compact selected memory snippets;
@@ -433,6 +590,8 @@ Memory Runtime v1 is successful when:
 
 ## 18. Open Questions
 
+- Should `soul.md` live only under app data, or should advanced users be able to
+  bind a workspace-specific profile file?
 - Should v1 expose a user-visible session toggle for memory retrieval, or should
   that wait for the later `/memory`-style control?
 - Should selected memory receipts remain embedded in `AgentContextReceipt`, or
