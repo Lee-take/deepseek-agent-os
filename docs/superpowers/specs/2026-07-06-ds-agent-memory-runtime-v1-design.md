@@ -52,10 +52,31 @@ systems into the first implementation.
   DS Agent should borrow the ideas of lifecycle, provenance, and replacement
   without adding graph infrastructure in v1:
   <https://github.com/getzep/graphiti>
+- agentmemory is a coding-agent memory project with hooks, hybrid retrieval,
+  token budgets, visible replay, and many skills. DS Agent should borrow the
+  lifecycle coverage and observability ideas, while avoiding silent capture and
+  always-on injection:
+  <https://github.com/rohitg00/agentmemory>
+- Basic Memory shows the value of local-first, human-readable Markdown, graph
+  links, MCP tool annotations, and notes that people can edit. DS Agent should
+  keep `soul.md` and memory receipts inspectable, but v1 should not add a
+  separate Markdown knowledge-base server:
+  <https://github.com/basicmachines-co/basic-memory>
 - LangMem separates memory primitives from storage and supports agent learning
   over time. DS Agent should borrow the hot-path versus background-management
   split:
   <https://github.com/langchain-ai/langmem>
+
+Downloaded review snapshots on 2026-07-06:
+
+- `mem0ai/mem0`: 60,152 stars, updated 2026-07-06.
+- `getzep/graphiti`: 28,395 stars, updated 2026-07-06.
+- `topoteretes/cognee`: 27,137 stars, updated 2026-07-06.
+- `rohitg00/agentmemory`: 24,599 stars, updated 2026-07-06.
+- `basicmachines-co/basic-memory`: 3,379 stars, updated 2026-07-05.
+
+Temporary local research path:
+`%TEMP%/dsagent-memory-research-20260706`.
 
 ## 3. Existing DS Agent Baseline
 
@@ -72,6 +93,15 @@ Current source already has the important foundation:
 - `AgentContextReceipt` already has a `selected_memories` field, but central
   chat currently records that memory selection is not wired into context
   receipts.
+- `build_agent_chat_protocol_user_prompt` currently includes protocol,
+  capability, and loop-contract instructions, but does not include selected
+  memory or `soul.md` context.
+- The frontend receipt summary currently shows evidence, validation, policy,
+  and omissions, but does not surface `selected_memories` as a first-class line
+  in the right rail.
+- Codegraph marks `MemoryRecord`, `MemoryCandidate`, `list_memory_records`, and
+  `AgentContextReceipt` as high-blast-radius symbols with weak focused test
+  coverage. Memory Runtime v1 should add tests before broad behavior changes.
 
 Memory Runtime v1 should reuse these pieces instead of adding a second memory
 store.
@@ -136,6 +166,31 @@ path checks, approve actions, or override the user's newest instruction.
 
 Every selected memory should leave a short receipt: what was selected, why it
 was selected, what was sent, what was omitted, and what budget was applied.
+
+### Recall Must Be Provable
+
+Users should not have to trust a vague claim that DS Agent "has memory." The
+runtime must make recall visible and measurable:
+
+- if memory was used, show the selected memory lines and reasons;
+- if no memory was used, show `No relevant reviewed memory selected`;
+- if memory was omitted, show a safe omission reason;
+- if the user explicitly says "remember this", open a reviewable candidate or
+  `soul.md` patch instead of silently burying the fact;
+- keep a small golden recall fixture so future changes can prove that common
+  repeated preferences, project facts, and workflow decisions are recalled.
+
+### Local Files Beat Black Boxes
+
+Codex, Claude Code, OpenClaw, and Basic Memory all point to the same user
+expectation: durable context should be inspectable. DS Agent should keep the
+runtime store structured, but users need a plain surface for the most personal
+facts:
+
+- `soul.md` for identity and stable preferences;
+- Memory Studio for reviewed operational/project memories;
+- context receipts for "what influenced this run";
+- work-package or handoff records for long-running project continuity.
 
 ## 6. Runtime Architecture
 
@@ -231,6 +286,28 @@ changes, but they must not overwrite explicit settings without review.
 DS Agent may propose updates to `soul.md`, but the user must review and accept
 the patch. Accepted updates should be recorded as append-only events or file
 history notes so users can inspect what changed and why.
+
+### Explicit Remember Requests
+
+When the newest user message contains an explicit memory intent such as
+`remember`, `记住`, `以后默认`, or `下次不要忘了`, DS Agent should treat it as a
+memory-capture request in addition to answering the task.
+
+Default v1 behavior:
+
+- classify whether the fact belongs in `soul.md` or a normal `MemoryRecord`;
+- produce a prefilled review card or `soul.md` patch;
+- show why DS Agent thinks the fact is durable;
+- require review before the long-term write is committed;
+- for low-risk explicit preferences, the UI may offer a one-click `Remember`
+  action, but the action must still be visible and auditable;
+- for sensitive facts, secrets, private identifiers, account data, health,
+  finance, or intimate personal details, require explicit confirmation and
+  mark the candidate as sensitive or reject it as not storable.
+
+The product promise is: if a user says something should be remembered, DS Agent
+should visibly capture it as a candidate unless safety rules block it. The
+runtime should never let an explicit remember request vanish silently.
 
 ### Selected Memory Context
 
@@ -478,6 +555,28 @@ Rules:
 - imported candidates remain pending review;
 - receipts record omissions without revealing omitted content.
 
+Common memory-system failures to avoid:
+
+- **Forgotten explicit preference:** user says "remember this" and no visible
+  candidate appears. Fix: explicit remember requests always create a review
+  surface or a safe refusal.
+- **Silent capture:** background jobs store facts the user never saw. Fix: all
+  long-term writes go through candidate review or an explicit one-click
+  remember action.
+- **Context flooding:** the model receives too many memories and loses the task.
+  Fix: top-k, byte budgets, and receipt-backed omissions.
+- **Stale override:** an old memory beats the newest user message. Fix: newest
+  user instruction always wins and conflict is recorded.
+- **Poisoned memory:** model output or imported packages inject instructions.
+  Fix: memory is quoted context, never a system/developer instruction or
+  permission source.
+- **Private path or secret leakage:** raw local evidence enters the model
+  packet unnecessarily. Fix: safe snippets and omission lines by default.
+- **Unbounded optimization:** memory maintenance becomes the task. Fix: no
+  recursive summarization or retrieval-repair loop on the hot path.
+- **No proof of usefulness:** memory exists but users cannot see it working.
+  Fix: selected-memory receipts, small recall fixtures, and UI summaries.
+
 ## 14. Performance Budget
 
 Memory should not make DS Agent feel slower.
@@ -493,7 +592,40 @@ Targets for v1 on a normal local store:
 If the store grows beyond the simple contains search envelope, the next upgrade
 should be SQLite FTS or BM25-style ranking before embeddings or graph retrieval.
 
+### Memory Quality Gates
+
+Before shipping a retrieval upgrade beyond simple matching, DS Agent should keep
+a small local fixture suite:
+
+- explicit user preference recall, such as response tone and preferred name;
+- project fact recall, such as the current branch or release boundary;
+- workflow pitfall recall, such as a known Windows or Office failure mode;
+- stale-conflict recall, where the newest user message overrides old memory;
+- sensitive omission, where a matching secret-like memory is not injected;
+- budget pressure, where only the best top-k memories are selected.
+
+Suggested metrics:
+
+- `recall_at_3` for the expected memory id or title;
+- `wrong_injection_count` for memories that should not enter the packet;
+- `packet_bytes` for `soul.md` and selected task memories;
+- `selection_latency_ms`;
+- `receipt_completeness`, meaning selected, omitted, reason, and budget lines
+  are present.
+
+These checks should run without network access, embeddings, or a model call.
+They are the guardrail that prevents memory work from becoming slow, expensive,
+or unverifiable.
+
 ## 15. Implementation Slices
+
+### Slice 0: Research-Derived Spec Tightening
+
+- Keep external reference ideas mapped to DS Agent objects: selector, packet,
+  receipt, candidate, `soul.md`, and Memory Studio.
+- Do not add mem0, Graphiti, agentmemory, or Basic Memory as runtime
+  dependencies in v1.
+- Use downloaded external projects as design input only; no vendored code.
 
 ### Slice 1: Central Chat Memory Context v1
 
@@ -505,6 +637,9 @@ should be SQLite FTS or BM25-style ranking before embeddings or graph retrieval.
 - Add compact selected memory packet to the protocol prompt.
 - Fill `AgentContextReceipt.selected_memories`.
 - Replace the current central-chat omission saying memory is not wired.
+- Make `selected_memories` visible in the frontend receipt summary.
+- Add an explicit remember-intent detector that creates a prefilled candidate
+  or `soul.md` patch for review.
 - Add focused Rust tests for selection, omission, prompt packet, receipt, and
   candidate review-only behavior.
 
@@ -530,9 +665,19 @@ should be SQLite FTS or BM25-style ranking before embeddings or graph retrieval.
 
 ### Slice 5: Retrieval Upgrade
 
-- Add SQLite FTS/BM25 only if tests show simple contains search is too weak.
-- Revisit embeddings or temporal graph memory only after real local data volume
-  requires it.
+- Add SQLite FTS/BM25 and simple recency/temporal weighting only if fixtures or
+  real usage show simple contains search is too weak.
+- Keep graph traversal limited to existing `linked_memory_ids` before adding a
+  dedicated knowledge graph.
+- Revisit embeddings only after local data volume requires semantic recall and
+  the user can inspect, disable, and rebuild the index.
+
+### Slice 6: Recall Evaluation Harness
+
+- Add fixture memories and deterministic queries for `recall_at_3`,
+  wrong-injection, sensitivity omission, stale override, and budget pressure.
+- Run the harness in Rust tests first; add UI smoke only after the receipt
+  surface exists.
 
 ## 16. Test Plan
 
@@ -545,12 +690,18 @@ Focused Rust tests:
 - inferred personalization candidates cannot overwrite explicit settings
   without review;
 - `soul.md` never injects secrets or fields from the `Never Store` section;
+- explicit `remember this` requests create a reviewable candidate or `soul.md`
+  patch instead of disappearing silently;
 - selected memory appears in the DeepSeek prompt packet;
 - sensitive memory is omitted and only an omission reason is included;
 - archived and expired memories are excluded;
 - linked memory matches produce explainable reasons;
 - selection respects top-k and byte limits;
 - context receipts record selected memory lines;
+- frontend receipt summaries surface selected memory lines when present;
+- stale memories lose to the newest user message and record the conflict;
+- golden recall fixtures pass `recall_at_3`, wrong-injection, sensitivity
+  omission, stale-override, and budget-pressure checks;
 - model `memory_candidates` remain pending review and do not create records;
 - model candidate flood is capped.
 
@@ -577,14 +728,20 @@ Memory Runtime v1 is successful when:
   `soul.md` profile;
 - DS Agent honors user-approved personalization defaults such as response tone
   and response length without requiring the user to restate them in every task;
+- when the user explicitly asks DS Agent to remember a durable fact, DS Agent
+  creates a visible reviewable memory candidate or `soul.md` patch;
 - a simple chat task can use relevant reviewed memory without any extra user
   setup;
 - the model packet contains only compact selected memory snippets;
 - the user can inspect which memories influenced the task;
+- the user can tell when no memory was selected and why;
 - sensitive and over-budget memories are omitted visibly but safely;
 - DeepSeek memory suggestions remain pending review;
 - memory selection does not add a second model call or noticeably slow ordinary
   chat;
+- deterministic recall fixtures demonstrate that common preferences, project
+  facts, and known pitfalls are recalled while stale or sensitive memories are
+  handled safely;
 - all changes stay within the DS Agent versus DeepSeek boundary defined in
   `docs/AGENT_MODEL_BOUNDARY.md`.
 
