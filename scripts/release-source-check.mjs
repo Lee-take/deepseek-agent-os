@@ -1682,14 +1682,14 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.1.0.md",
     releaseNotes,
-    "v0.1.0-rc.8 Update",
-    "release notes rc.8 update heading",
+    "v0.1.0-rc.9 Update",
+    "release notes rc.9 update heading",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",
     readText("apps/desktop/src-tauri/src/commands.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.8"',
-    "app updater current release tag rc.8",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.9"',
+    "app updater current release tag rc.9",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",

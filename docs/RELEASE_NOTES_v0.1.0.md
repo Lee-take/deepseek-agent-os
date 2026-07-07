@@ -1,6 +1,6 @@
 # DeepSeek Agent OS v0.1.0 Candidate Notes
 
-Status: Windows-first release candidate. The `v0.1.0-rc.8` prerelease is
+Status: Windows-first release candidate. The `v0.1.0-rc.9` prerelease is
 intended for colleague testing through a GitHub release asset after the final
 local gates pass.
 
@@ -10,6 +10,23 @@ so Windows may show an unknown-publisher warning, but it embeds the Microsoft
 WebView2 bootstrapper and runs it silently when the target machine needs the
 WebView2 runtime. Ordinary users do not need Node.js, pnpm, Rust, or a source
 checkout to run the installed app.
+
+## v0.1.0-rc.9 Update
+
+- Keeps the Settings Soul entry compact while preserving Soul bootstrap context
+  for each new conversation and during chat-history compression.
+- Adds installed UI smoke coverage for selected-memory feedback so release
+  checks can exercise the installed Tauri command bridge without mutating local
+  app data.
+- Uses selected-memory feedback for feedback-informed retrieval scoring:
+  useful feedback can lift later recall, while irrelevant, stale, conflicting,
+  or should_update feedback can lower recall with an inspectable score
+  breakdown.
+- Adds Memory Studio feedback review so selected-memory feedback records can be
+  inspected by memory, including compact counts and review-needed flags.
+- Adds Memory maintenance strategy v1: repeated irrelevant feedback flags
+  retrieval review, repeated stale feedback flags update/archive review, and
+  neither path silently deletes or rewrites long-term memory.
 
 ## v0.1.0-rc.8 Update
 
