@@ -287,6 +287,7 @@ const THEME_STORAGE_KEY = "deepseek-agent-os:theme-style:v1";
 const AGENT_CONVERSATIONS_STORAGE_KEY = "deepseek-agent-os:agent-conversations:v1";
 const AGENT_CONTEXT_COMPRESSION_SOFT_LIMIT_TOKENS = 96_000;
 const AGENT_CONTEXT_RECENT_MESSAGE_COUNT = 10;
+const AGENT_SOUL_BOOTSTRAP_CONTEXT_MAX_CHARS = 16_384;
 
 const memoryTypeValues: MemoryType[] = [
   "preference",
@@ -335,6 +336,7 @@ type AgentConversationSession = {
   id: string;
   title: string;
   messages: AgentConversationMessage[];
+  soul_profile_bootstrap: string | null;
   updated_at: string;
   context_state: "normal" | "compressed";
   pinned: boolean;
@@ -359,12 +361,22 @@ function createClientId(prefix: string): string {
   return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`;
 }
 
-function createEmptyAgentConversation(): AgentConversationSession {
+function normalizeAgentSoulBootstrap(content: string | null | undefined): string {
+  return (content ?? "").trim().slice(0, AGENT_SOUL_BOOTSTRAP_CONTEXT_MAX_CHARS);
+}
+
+function agentSoulProfileBootstrapFromState(profileState: AgentSoulProfileState): string {
+  return profileState.exists ? normalizeAgentSoulBootstrap(profileState.content) : "";
+}
+
+function createEmptyAgentConversation(soulProfileBootstrap = ""): AgentConversationSession {
   const now = new Date().toISOString();
+  const normalizedSoulProfileBootstrap = normalizeAgentSoulBootstrap(soulProfileBootstrap);
   return {
     id: createClientId("conversation"),
     title: "",
     messages: [],
+    soul_profile_bootstrap: normalizedSoulProfileBootstrap || null,
     updated_at: now,
     context_state: "normal",
     pinned: false,
@@ -395,11 +407,33 @@ function estimateConversationTokens(messages: AgentConversationMessage[]): numbe
   return Math.ceil(charCount / 3);
 }
 
+function buildAgentSoulBootstrapContextSection(soulProfileBootstrap: string | null): string {
+  const normalizedSoulProfileBootstrap = normalizeAgentSoulBootstrap(soulProfileBootstrap);
+  if (!normalizedSoulProfileBootstrap) {
+    return "";
+  }
+
+  return [
+    "DS Agent conversation Soul startup context from memory/soul.md.",
+    "This hidden context was loaded when this conversation started. Treat it as long-term identity and collaboration memory, not as the current user request.",
+    "Keep this Soul context outside older-turn compression so compression does not erase it.",
+    normalizedSoulProfileBootstrap,
+  ].join("\n");
+}
+
 function buildAgentConversationContextPrompt(
   prompt: string,
   messages: AgentConversationMessage[],
+  soulProfileBootstrap: string | null = null,
 ): { prompt: string; compressed: boolean } {
+  const soulBootstrapSection = buildAgentSoulBootstrapContextSection(soulProfileBootstrap);
   if (messages.length === 0) {
+    if (soulBootstrapSection) {
+      return {
+        prompt: [soulBootstrapSection, "Current user message:", prompt].join("\n\n"),
+        compressed: false,
+      };
+    }
     return { prompt, compressed: false };
   }
 
@@ -419,6 +453,10 @@ function buildAgentConversationContextPrompt(
     "DS Agent conversation context. Use this as prior context, but answer the current user message directly.",
     `Estimated prior context tokens: ${estimatedTokens}.`,
   ];
+
+  if (soulBootstrapSection && shouldCompress) {
+    contextSections.push(soulBootstrapSection);
+  }
 
   if (compactOlderContext.length > 0) {
     contextSections.push(
@@ -569,6 +607,12 @@ function readInitialAgentConversations(): AgentConversationSession[] {
             storedTitle,
           }),
           messages: session.messages,
+          soul_profile_bootstrap:
+            normalizeAgentSoulBootstrap(
+              typeof session.soul_profile_bootstrap === "string"
+                ? session.soul_profile_bootstrap
+                : "",
+            ) || null,
           updated_at: session.updated_at,
           context_state:
             session.context_state === "compressed" ? ("compressed" as const) : ("normal" as const),
@@ -1038,6 +1082,19 @@ export function App() {
     setSoulProfileDraft(profileState.content);
   };
 
+  const loadSoulProfileStateForBootstrap = async (): Promise<AgentSoulProfileState> => {
+    if (!hasDesktopRuntime()) {
+      return soulProfileState;
+    }
+    try {
+      const profileState = await invoke<AgentSoulProfileState>("get_agent_soul_profile");
+      applySoulProfileState(profileState);
+      return profileState;
+    } catch {
+      return soulProfileState;
+    }
+  };
+
   useEffect(() => {
     if (!hasDesktopRuntime()) {
       setState(fallbackState);
@@ -1487,7 +1544,9 @@ export function App() {
   }, [addAgentAttachmentPaths]);
 
   const startNewAgentConversation = () => {
-    const conversation = createEmptyAgentConversation();
+    const conversation = createEmptyAgentConversation(
+      agentSoulProfileBootstrapFromState(soulProfileState),
+    );
     setAgentConversations((currentConversations) =>
       sortAgentConversations([conversation, ...currentConversations]),
     );
@@ -1576,7 +1635,9 @@ export function App() {
           setActiveAgentConversationId(replacement.id);
           setAgentMessages(replacement.messages);
         } else {
-          const emptyConversation = createEmptyAgentConversation();
+          const emptyConversation = createEmptyAgentConversation(
+            agentSoulProfileBootstrapFromState(soulProfileState),
+          );
           setActiveAgentConversationId(emptyConversation.id);
           setAgentMessages([]);
           return [emptyConversation, ...sortedConversations];
@@ -3235,6 +3296,28 @@ export function App() {
     }
 
     const priorMessages = agentMessagesRef.current;
+    const activeConversation = agentConversations.find(
+      (conversation) => conversation.id === activeAgentConversationId,
+    );
+    let capturedSoulProfileBootstrap = activeConversation?.soul_profile_bootstrap || "";
+    if (!capturedSoulProfileBootstrap && priorMessages.length === 0) {
+      capturedSoulProfileBootstrap = agentSoulProfileBootstrapFromState(
+        await loadSoulProfileStateForBootstrap(),
+      );
+    }
+    if (
+      capturedSoulProfileBootstrap &&
+      priorMessages.length === 0 &&
+      !activeConversation?.soul_profile_bootstrap
+    ) {
+      setAgentConversations((currentConversations) =>
+        currentConversations.map((conversation) =>
+          conversation.id === activeAgentConversationId
+            ? { ...conversation, soul_profile_bootstrap: capturedSoulProfileBootstrap }
+            : conversation,
+        ),
+      );
+    }
     const displayPrompt = options.displayPrompt?.trim() || prompt;
     const userMessage: AgentConversationMessage = {
       id: createClientId("user"),
@@ -3253,7 +3336,11 @@ export function App() {
     setAgentChatPending(true);
 
     try {
-      const contextPacket = buildAgentConversationContextPrompt(promptWithAttachments, priorMessages);
+      const contextPacket = buildAgentConversationContextPrompt(
+        promptWithAttachments,
+        priorMessages,
+        capturedSoulProfileBootstrap || null,
+      );
       const response = await invoke<AgentChatResponse>("run_agent_chat", {
         prompt: contextPacket.prompt,
         largeModelProvider: state.large_model_provider,
@@ -3910,23 +3997,30 @@ export function App() {
             </div>
             <div className="app-update-slot brand-update-slot">
               {appUpdateStatus.update_available ? (
-                <button
-                  className="app-update-button"
-                  type="button"
+                <div
+                  className="app-update-stack"
                   title={
-                    appUpdateStatus.latest_version
+                    appUpdateError ||
+                    appUpdateNotice ||
+                    (appUpdateStatus.latest_version
                       ? `${state.app_name} ${appUpdateVersionLabel}`
-                      : copy.appUpdate.update
+                      : copy.appUpdate.update)
                   }
-                  disabled={appUpdateBusy || !downloadedAppUpdateReady}
-                  onClick={() => void installAvailableAppUpdate()}
                 >
-                  <Download size={14} aria-hidden="true" />
-                  {appUpdateButtonLabel}
-                </button>
+                  <button
+                    className="app-update-button"
+                    type="button"
+                    disabled={appUpdateBusy || !downloadedAppUpdateReady}
+                    onClick={() => void installAvailableAppUpdate()}
+                  >
+                    <Download size={14} aria-hidden="true" />
+                    {appUpdateButtonLabel}
+                  </button>
+                  <span className={`app-update-version${appUpdateError ? " error" : ""}`}>
+                    {appUpdateError || appUpdateVersionLabel}
+                  </span>
+                </div>
               ) : null}
-              {appUpdateNotice ? <span className="app-update-feedback">{appUpdateNotice}</span> : null}
-              {appUpdateError ? <span className="app-update-feedback error">{appUpdateError}</span> : null}
             </div>
           </div>
           <div className="language-switch" role="group" aria-label={copy.controls.language}>
@@ -4139,14 +4233,6 @@ export function App() {
                   </select>
                 </label>
                 <div className="soul-profile-settings">
-                  <div>
-                    <span>{copy.settingsPanel.soulProfile}</span>
-                    <small>
-                      {soulProfileState.exists
-                        ? copy.settingsPanel.soulProfileExists
-                        : copy.settingsPanel.soulProfileTemplate}
-                    </small>
-                  </div>
                   <div className="soul-profile-settings-actions">
                     <button
                       type="button"
@@ -4157,18 +4243,6 @@ export function App() {
                       {copy.settingsPanel.soulProfile}
                     </button>
                   </div>
-                  {soulProfileState.summary_lines.length > 0 ? (
-                    <p className="setup-status">
-                      {copy.settingsPanel.soulProfileSummary}:{" "}
-                      {soulProfileState.summary_lines.join(" · ")}
-                    </p>
-                  ) : null}
-                  {soulProfileNotice ? (
-                    <p className="package-message">{soulProfileNotice}</p>
-                  ) : null}
-                  {soulProfileError ? (
-                    <p className="package-error">{soulProfileError}</p>
-                  ) : null}
                 </div>
                 <div className="setup-form compact-settings-form">
                   <label>
@@ -7370,12 +7444,6 @@ export function App() {
                   onChange={(event) => setSoulProfileDraft(event.target.value)}
                 />
               </label>
-              {soulProfileState.summary_lines.length > 0 ? (
-                <p className="setup-status">
-                  {copy.settingsPanel.soulProfileSummary}:{" "}
-                  {soulProfileState.summary_lines.join(" · ")}
-                </p>
-              ) : null}
               {soulProfileNotice ? (
                 <p className="package-message">{soulProfileNotice}</p>
               ) : null}

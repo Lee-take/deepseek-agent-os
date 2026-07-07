@@ -143,7 +143,16 @@ test("settings panel exposes Soul as a modal button with annotated editor", () =
   assert.match(appSource, /copy\.settingsPanel\.soulProfileGuides\.map/);
   assert.match(appSource, /value=\{soulProfileDraft\}/);
   assert.match(appSource, /aria-label=\{copy\.settingsPanel\.soulProfile\}/);
-  assert.doesNotMatch(appSource, /className="soul-profile-settings"[\s\S]{0,800}<textarea/);
+  const inlineSoulSettings =
+    appSource.match(
+      /<div className="soul-profile-settings">[\s\S]*?<div className="setup-form compact-settings-form">/,
+    )?.[0] ?? "";
+  assert.match(inlineSoulSettings, /copy\.settingsPanel\.soulProfile/);
+  assert.doesNotMatch(inlineSoulSettings, /<textarea/);
+  assert.doesNotMatch(
+    inlineSoulSettings,
+    /soulProfileState\.summary_lines|soulProfileNotice|soulProfileError|soulProfileExists|soulProfileTemplate|soulProfileSummary/,
+  );
   assert.match(i18nSource, /soulProfile:\s*"Soul"/);
   assert.match(i18nSource, /soulProfileModalTitle:\s*"Soul Profile"/);
   assert.match(i18nSource, /soulProfileGuides:\s*\[/);
@@ -154,6 +163,25 @@ test("settings panel exposes Soul as a modal button with annotated editor", () =
     /\.soul-profile-modal \.setup-modal-actions \{[\s\S]*position:\s*sticky/,
   );
   assert.match(styles, /\.soul-profile-guide/);
+});
+
+test("new conversations keep Soul bootstrap outside compressed chat history", () => {
+  const appSource = readFileSync(appSourceUrl, "utf8");
+
+  assert.match(appSource, /soul_profile_bootstrap:\s*string \| null/);
+  assert.match(appSource, /function buildAgentSoulBootstrapContextSection/);
+  assert.match(appSource, /const loadSoulProfileStateForBootstrap = async/);
+  assert.match(appSource, /await loadSoulProfileStateForBootstrap\(\)/);
+  assert.match(
+    appSource,
+    /function buildAgentConversationContextPrompt\(\s*prompt: string,\s*messages: AgentConversationMessage\[\],\s*soulProfileBootstrap: string \| null = null,/,
+  );
+  assert.match(appSource, /messages\.length === 0[\s\S]*soulBootstrapSection/);
+  assert.match(appSource, /if \(soulBootstrapSection && shouldCompress\)/);
+  assert.match(
+    appSource,
+    /createEmptyAgentConversation\(\s*agentSoulProfileBootstrapFromState\(soulProfileState\),?\s*\)/,
+  );
 });
 
 test("plugins are not exposed as a left sidebar entry", () => {

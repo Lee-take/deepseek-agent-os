@@ -154,6 +154,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 6px;
+  max-width: 132px;
   min-height: 0;
   min-width: 0;
 }
@@ -163,7 +164,16 @@ textarea {
 }
 
 .brand-update-slot {
-  flex: 0 1 auto;
+  flex: 0 1 132px;
+}
+
+.app-update-stack {
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 2px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .app-update-button {
@@ -188,17 +198,18 @@ textarea {
   color: var(--accent);
 }
 
-.app-update-feedback {
+.app-update-version {
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   color: var(--muted);
-  font-size: 11px;
-  line-height: 1.3;
+  font-size: 10px;
+  line-height: 1.1;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.app-update-feedback.error {
+.app-update-version.error {
   color: #f08f8f;
 }
 

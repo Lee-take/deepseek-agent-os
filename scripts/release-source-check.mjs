@@ -468,6 +468,7 @@ checkWindowsValidationStatusDocs();
 checkReleaseGateDocs();
 checkComputerUseDocs();
 checkMemoryStudioDocs();
+checkSoulProfileSettingsAndBootstrap();
 checkOperationsBriefingArchiveReplayUi();
 checkWorkPackageImportPreviewUi();
 checkOperationsBriefingSmokeEvidence();
@@ -2018,6 +2019,8 @@ function checkChatFirstCenterWorkbenchUi() {
     "className=\"skill-plugin-card\"",
     "className=\"brand-row\"",
     "className=\"app-update-slot brand-update-slot\"",
+    "className=\"app-update-stack\"",
+    "className={`app-update-version${appUpdateError ? \" error\" : \"\"}`}",
     "renderLegacyCenterManagementPanels",
     "className=\"agent-chat-panel\"",
     "aria-label={copy.chatWorkbench.title}",
@@ -2055,6 +2058,8 @@ function checkChatFirstCenterWorkbenchUi() {
     ".sidebar-controls",
     ".brand-row",
     ".brand-update-slot",
+    ".app-update-stack",
+    ".app-update-version",
     ".sidebar-tools",
     ".sidebar-tool",
     ".sidebar-record-row",
@@ -3033,6 +3038,73 @@ function checkWorkPackageImportPreviewUi() {
     "previewWorkflowTemplateImportSupported",
     "import preview copy includes workflow template import support",
   );
+}
+
+function checkSoulProfileSettingsAndBootstrap() {
+  const app = readText("apps/desktop/src/App.tsx");
+
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "soul_profile_bootstrap: string | null;",
+    "Soul bootstrap is stored as conversation-level context",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "function buildAgentSoulBootstrapContextSection",
+    "Soul bootstrap has a dedicated prompt section",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "const loadSoulProfileStateForBootstrap = async",
+    "new conversation first-send path refreshes Soul profile state",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "await loadSoulProfileStateForBootstrap()",
+    "new conversation first send reads current Soul profile",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "Keep this Soul context outside older-turn compression so compression does not erase it.",
+    "Soul bootstrap is protected from chat-history compression",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "if (soulBootstrapSection && shouldCompress)",
+    "compressed conversation prompts preserve Soul bootstrap",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "createEmptyAgentConversation( agentSoulProfileBootstrapFromState(soulProfileState), )",
+    "new conversations capture current Soul profile bootstrap",
+  );
+
+  const inlineSoulSettings =
+    app.match(
+      /<div className="soul-profile-settings">[\s\S]*?<div className="setup-form compact-settings-form">/,
+    )?.[0] ?? "";
+  if (!inlineSoulSettings) {
+    failures.push("apps/desktop/src/App.tsx must include the Soul settings button block");
+    return;
+  }
+  if (
+    /soulProfileState\.summary_lines|soulProfileNotice|soulProfileError|soulProfileExists|soulProfileTemplate|soulProfileSummary/.test(
+      inlineSoulSettings,
+    )
+  ) {
+    failures.push(
+      "apps/desktop/src/App.tsx Soul settings button block must not show saved status or runtime summary",
+    );
+    return;
+  }
+  checks.push("Soul settings button block hides runtime summary and saved status");
 }
 
 function checkOperationsBriefingArchiveReplayUi() {
