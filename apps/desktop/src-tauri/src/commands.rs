@@ -2536,17 +2536,87 @@ struct AgentMemoryCandidateMatch {
     score_breakdown: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AgentMemoryFeedbackSummary {
+    useful: usize,
+    irrelevant: usize,
+    stale: usize,
+    conflicting: usize,
+    should_update: usize,
+}
+
+impl AgentMemoryFeedbackSummary {
+    fn record(&mut self, feedback: MemorySelectedFeedbackKind) {
+        match feedback {
+            MemorySelectedFeedbackKind::Useful => self.useful += 1,
+            MemorySelectedFeedbackKind::Irrelevant => self.irrelevant += 1,
+            MemorySelectedFeedbackKind::Stale => self.stale += 1,
+            MemorySelectedFeedbackKind::Conflicting => self.conflicting += 1,
+            MemorySelectedFeedbackKind::ShouldUpdate => self.should_update += 1,
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.useful == 0
+            && self.irrelevant == 0
+            && self.stale == 0
+            && self.conflicting == 0
+            && self.should_update == 0
+    }
+
+    fn score_delta(self) -> i32 {
+        self.useful as i32 * 4
+            - self.irrelevant as i32 * 6
+            - self.stale as i32 * 8
+            - self.conflicting as i32 * 4
+            - self.should_update as i32 * 2
+    }
+
+    fn score_breakdown(self) -> String {
+        let mut parts = Vec::new();
+        if self.useful > 0 {
+            parts.push(format!("useful+{}", self.useful * 4));
+        }
+        if self.irrelevant > 0 {
+            parts.push(format!("irrelevant-{}", self.irrelevant * 6));
+        }
+        if self.stale > 0 {
+            parts.push(format!("stale-{}", self.stale * 8));
+        }
+        if self.conflicting > 0 {
+            parts.push(format!("conflicting-{}", self.conflicting * 4));
+        }
+        if self.should_update > 0 {
+            parts.push(format!("should_update-{}", self.should_update * 2));
+        }
+        format!("feedback:{} total:{:+}", parts.join(","), self.score_delta())
+    }
+}
+
 fn load_agent_memory_runtime_context(
     store: &EventStore,
     prompt: &str,
 ) -> Result<AgentMemoryRuntimeContext, String> {
     let memories = store.list_memory_records().map_err(event_store_error)?;
-    Ok(select_agent_memory_runtime_context(prompt, &memories))
+    let feedback = store
+        .list_selected_memory_feedback()
+        .map_err(event_store_error)?;
+    Ok(select_agent_memory_runtime_context_with_feedback(
+        prompt, &memories, &feedback,
+    ))
 }
 
 fn select_agent_memory_runtime_context(
     prompt: &str,
     memories: &[MemoryRecord],
+) -> AgentMemoryRuntimeContext {
+    select_agent_memory_runtime_context_with_feedback(prompt, memories, &[])
+}
+
+fn select_agent_memory_runtime_context_with_feedback(
+    prompt: &str,
+    memories: &[MemoryRecord],
+    feedback: &[MemorySelectedFeedback],
 ) -> AgentMemoryRuntimeContext {
     let query_terms = agent_memory_query_terms(prompt);
     let mut context = AgentMemoryRuntimeContext::default();
@@ -2555,6 +2625,10 @@ fn select_agent_memory_runtime_context(
     let mut sensitive_omitted = 0usize;
     let mut archived_omitted = 0usize;
     let mut candidates = Vec::new();
+    let feedback_by_memory = agent_memory_feedback_by_memory(feedback);
+    let mut feedback_stale = 0usize;
+    let mut feedback_conflicting = 0usize;
+    let mut feedback_should_update = 0usize;
 
     if query_terms.is_empty() {
         return context;
@@ -2569,7 +2643,22 @@ fn select_agent_memory_runtime_context(
             archived_omitted += 1;
             continue;
         }
-        if let Some(candidate) = agent_memory_candidate_match(memory, &query_terms) {
+        if let Some(summary) = feedback_by_memory.get(&memory.id).copied() {
+            if summary.stale > 0 {
+                feedback_stale += 1;
+            }
+            if summary.conflicting > 0 {
+                feedback_conflicting += 1;
+            }
+            if summary.should_update > 0 {
+                feedback_should_update += 1;
+            }
+        }
+        if let Some(candidate) = agent_memory_candidate_match(
+            memory,
+            &query_terms,
+            feedback_by_memory.get(&memory.id).copied(),
+        ) {
             candidates.push(candidate);
         }
     }
@@ -2631,14 +2720,43 @@ fn select_agent_memory_runtime_context(
             "{budget_omitted} lower-ranked memories omitted by context budget"
         ));
     }
+    if feedback_stale > 0 {
+        context.omissions.push(format!(
+            "{feedback_stale} memories marked stale by feedback need update or archive review"
+        ));
+    }
+    if feedback_conflicting > 0 {
+        context.omissions.push(format!(
+            "{feedback_conflicting} memories flagged conflicting by feedback need conflict review"
+        ));
+    }
+    if feedback_should_update > 0 {
+        context.omissions.push(format!(
+            "{feedback_should_update} memories marked should_update by feedback need update candidate review"
+        ));
+    }
     context.omitted_by_budget = budget_omitted;
 
     context
 }
 
+fn agent_memory_feedback_by_memory(
+    feedback: &[MemorySelectedFeedback],
+) -> std::collections::HashMap<Uuid, AgentMemoryFeedbackSummary> {
+    let mut summaries = std::collections::HashMap::new();
+    for item in feedback {
+        summaries
+            .entry(item.memory_id)
+            .or_insert_with(AgentMemoryFeedbackSummary::default)
+            .record(item.feedback);
+    }
+    summaries
+}
+
 fn agent_memory_candidate_match(
     memory: &MemoryRecord,
     query_terms: &[String],
+    feedback_summary: Option<AgentMemoryFeedbackSummary>,
 ) -> Option<AgentMemoryCandidateMatch> {
     let title = memory.title.to_lowercase();
     let body = memory.body.to_lowercase();
@@ -2674,6 +2792,13 @@ fn agent_memory_candidate_match(
     if memory.pinned {
         score += 2;
     }
+    let feedback_summary = feedback_summary.filter(|summary| !summary.is_empty());
+    if let Some(summary) = feedback_summary {
+        score += summary.score_delta();
+        if score <= 0 {
+            return None;
+        }
+    }
 
     Some(AgentMemoryCandidateMatch {
         record: memory.clone(),
@@ -2684,6 +2809,7 @@ fn agent_memory_candidate_match(
             body_terms.len(),
             linked_terms.len(),
             memory.pinned,
+            feedback_summary,
         ),
     })
 }
@@ -2719,11 +2845,17 @@ fn agent_memory_score_breakdown(
     body_terms: usize,
     linked_terms: usize,
     pinned: bool,
+    feedback_summary: Option<AgentMemoryFeedbackSummary>,
 ) -> String {
-    format!(
+    let base = format!(
         "title_terms:{title_terms}*6 body_terms:{body_terms}*3 linked_terms:{linked_terms}*1 pinned:{}",
         if pinned { "+2" } else { "0" }
-    )
+    );
+    if let Some(summary) = feedback_summary {
+        format!("{base} {}", summary.score_breakdown())
+    } else {
+        base
+    }
 }
 
 fn agent_memory_query_terms(prompt: &str) -> Vec<String> {
@@ -8157,8 +8289,9 @@ mod tests {
         AccessMode, ComputerControlBackend, ComputerScreenshotBackend, LargeModelProvider,
         MemoryCandidate, MemoryCandidateRecord, MemoryCandidateResolution, MemoryCandidateSource,
         MemoryCandidateStatus, MemoryLifecycle, MemoryRecord, MemoryRecordSource,
-        MemoryRelationKind, MemoryScope, MemorySearchMatch, MemorySensitivity, MemoryType,
-        ModelRoute, NetworkSearchSourceModel, TaskRecord, ThinkingLevel,
+        MemoryRelationKind, MemoryScope, MemorySearchMatch, MemorySelectedFeedbackKind,
+        MemorySensitivity, MemoryType, ModelRoute, NetworkSearchSourceModel, TaskRecord,
+        ThinkingLevel,
     };
     use crate::kernel::office::{
         build_office_artifact, OfficeApp, OfficeArtifactClient, OfficeCreateResult,
@@ -9823,6 +9956,137 @@ mod tests {
         assert!(receipt.contains("memory_retrieval=memory_runtime/v1"));
         assert!(receipt.contains("max_records=3"));
         assert!(receipt.contains("omitted_by_budget=1"));
+    }
+
+    #[test]
+    fn agent_memory_runtime_context_uses_selected_memory_feedback_for_ranking() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let now = Utc::now();
+        let useful_memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "默认语气偏好 useful".to_string(),
+            body: "默认语气应该简洁、温暖、直接。".to_string(),
+            memory_type: MemoryType::Preference,
+            scope: MemoryScope::User,
+            sensitivity: MemorySensitivity::Normal,
+            lifecycle: MemoryLifecycle::Active,
+            source: MemoryRecordSource::MemoryCandidate,
+            source_id: None,
+            pinned: false,
+            expires_at: None,
+            linked_memory_ids: Vec::new(),
+            linked_memories: Vec::new(),
+            search_match: MemorySearchMatch::direct(),
+            created_at: now,
+            updated_at: now,
+        };
+        let irrelevant_memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "默认语气偏好 irrelevant".to_string(),
+            body: "默认语气应该简洁、温暖、直接。".to_string(),
+            updated_at: now + Duration::seconds(60),
+            ..useful_memory.clone()
+        };
+        store
+            .append_memory_record(&useful_memory)
+            .expect("useful memory appends");
+        store
+            .append_memory_record(&irrelevant_memory)
+            .expect("irrelevant memory appends");
+        store
+            .record_selected_memory_feedback(
+                useful_memory.id,
+                None,
+                MemorySelectedFeedbackKind::Useful,
+                "This memory helped the answer.".to_string(),
+            )
+            .expect("useful feedback appends");
+        store
+            .record_selected_memory_feedback(
+                irrelevant_memory.id,
+                None,
+                MemorySelectedFeedbackKind::Irrelevant,
+                "This memory was not relevant for this query.".to_string(),
+            )
+            .expect("irrelevant feedback appends");
+
+        let context =
+            super::load_agent_memory_runtime_context(&store, "请按默认语气回复").expect("context");
+
+        assert_eq!(context.selected[0].id, useful_memory.id);
+        assert!(context.selected[0]
+            .score_breakdown
+            .contains("feedback:useful+4"));
+        assert!(context
+            .selected
+            .iter()
+            .any(|memory| memory
+                .score_breakdown
+                .contains("feedback:irrelevant-6")));
+    }
+
+    #[test]
+    fn agent_memory_runtime_context_reports_feedback_review_hints() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let now = Utc::now();
+        let memories = [
+            (MemorySelectedFeedbackKind::Stale, "旧默认语气偏好 stale"),
+            (
+                MemorySelectedFeedbackKind::Conflicting,
+                "默认语气偏好 conflicting",
+            ),
+            (
+                MemorySelectedFeedbackKind::ShouldUpdate,
+                "默认语气偏好 should update",
+            ),
+        ]
+        .into_iter()
+        .map(|(feedback, title)| {
+            let memory = MemoryRecord {
+                id: Uuid::new_v4(),
+                title: title.to_string(),
+                body: "默认语气应该简洁、温暖、直接。".to_string(),
+                memory_type: MemoryType::Preference,
+                scope: MemoryScope::User,
+                sensitivity: MemorySensitivity::Normal,
+                lifecycle: MemoryLifecycle::Active,
+                source: MemoryRecordSource::MemoryCandidate,
+                source_id: None,
+                pinned: false,
+                expires_at: None,
+                linked_memory_ids: Vec::new(),
+                linked_memories: Vec::new(),
+                search_match: MemorySearchMatch::direct(),
+                created_at: now,
+                updated_at: now,
+            };
+            store.append_memory_record(&memory).expect("memory appends");
+            store
+                .record_selected_memory_feedback(
+                    memory.id,
+                    None,
+                    feedback,
+                    "Needs follow-up review.".to_string(),
+                )
+                .expect("feedback appends");
+            memory
+        })
+        .collect::<Vec<_>>();
+
+        let context =
+            super::load_agent_memory_runtime_context(&store, "请按默认语气回复").expect("context");
+
+        assert_eq!(context.considered_records, memories.len());
+        assert!(context
+            .omissions
+            .iter()
+            .any(|line| line == "1 memories marked stale by feedback need update or archive review"));
+        assert!(context.omissions.iter().any(|line| {
+            line == "1 memories flagged conflicting by feedback need conflict review"
+        }));
+        assert!(context.omissions.iter().any(|line| {
+            line == "1 memories marked should_update by feedback need update candidate review"
+        }));
     }
 
     #[test]
