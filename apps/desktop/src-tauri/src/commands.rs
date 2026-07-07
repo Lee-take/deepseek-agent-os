@@ -207,6 +207,12 @@ struct AgentMemoryRuntimeContext {
     used_bytes: usize,
     max_records: usize,
     max_bytes: usize,
+    query_terms_count: usize,
+    considered_records: usize,
+    candidate_count: usize,
+    filtered_sensitive: usize,
+    filtered_archived: usize,
+    omitted_by_budget: usize,
 }
 
 impl Default for AgentMemoryRuntimeContext {
@@ -217,6 +223,12 @@ impl Default for AgentMemoryRuntimeContext {
             used_bytes: 0,
             max_records: AGENT_MEMORY_CONTEXT_MAX_RECORDS,
             max_bytes: AGENT_MEMORY_CONTEXT_MAX_BYTES,
+            query_terms_count: 0,
+            considered_records: 0,
+            candidate_count: 0,
+            filtered_sensitive: 0,
+            filtered_archived: 0,
+            omitted_by_budget: 0,
         }
     }
 }
@@ -229,6 +241,9 @@ struct AgentSelectedMemory {
     scope: MemoryScope,
     match_reason: String,
     snippet: String,
+    rank: usize,
+    score: i32,
+    inclusion_mode: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2533,6 +2548,8 @@ fn select_agent_memory_runtime_context(
 ) -> AgentMemoryRuntimeContext {
     let query_terms = agent_memory_query_terms(prompt);
     let mut context = AgentMemoryRuntimeContext::default();
+    context.query_terms_count = query_terms.len();
+    context.considered_records = memories.len();
     let mut sensitive_omitted = 0usize;
     let mut archived_omitted = 0usize;
     let mut candidates = Vec::new();
@@ -2554,6 +2571,10 @@ fn select_agent_memory_runtime_context(
             candidates.push(candidate);
         }
     }
+
+    context.filtered_sensitive = sensitive_omitted;
+    context.filtered_archived = archived_omitted;
+    context.candidate_count = candidates.len();
 
     candidates.sort_by(|left, right| {
         right
@@ -2579,6 +2600,9 @@ fn select_agent_memory_runtime_context(
                 &candidate.record.body,
                 AGENT_MEMORY_CONTEXT_SNIPPET_CHARS,
             ),
+            rank: context.selected.len() + 1,
+            score: candidate.score,
+            inclusion_mode: "compact_snippet".to_string(),
         };
         let block_bytes = agent_selected_memory_prompt_block(&selected).len();
         if context.used_bytes + block_bytes > context.max_bytes {
@@ -2604,6 +2628,7 @@ fn select_agent_memory_runtime_context(
             "{budget_omitted} lower-ranked memories omitted by context budget"
         ));
     }
+    context.omitted_by_budget = budget_omitted;
 
     context
 }
@@ -2748,6 +2773,16 @@ fn build_agent_memory_context_prompt(memory_context: &AgentMemoryRuntimeContext)
             "- selection_policy=max_records:{} max_bytes:{} used_bytes:{}; use only when relevant; current user message wins; do not write memories silently",
             memory_context.max_records, memory_context.max_bytes, memory_context.used_bytes
         ),
+        format!(
+            "- retrieval_receipt=memory_runtime/v1; query_terms_count={}; considered_records={}; candidate_count={}; selected_count={}; filtered_sensitive={}; filtered_archived={}; omitted_by_budget={}",
+            memory_context.query_terms_count,
+            memory_context.considered_records,
+            memory_context.candidate_count,
+            memory_context.selected.len(),
+            memory_context.filtered_sensitive,
+            memory_context.filtered_archived,
+            memory_context.omitted_by_budget
+        ),
     ];
     lines.extend(
         memory_context
@@ -2766,24 +2801,53 @@ fn build_agent_memory_context_prompt(memory_context: &AgentMemoryRuntimeContext)
 
 fn agent_selected_memory_prompt_block(memory: &AgentSelectedMemory) -> String {
     format!(
-        "- memory_id={}; type={}; scope={}; match_reason={}\n  title: {}\n  snippet: {}",
+        "- memory_id={}; rank={}; type={}; scope={}; score={}; match_reason={}; inclusion_mode={}\n  title: {}\n  snippet: {}",
         memory.id,
+        memory.rank,
         serialize_agent_chat_context_value(&memory.memory_type),
         serialize_agent_chat_context_value(&memory.scope),
+        memory.score,
         memory.match_reason,
+        memory.inclusion_mode,
         memory.title,
         memory.snippet
     )
 }
 
+fn agent_memory_retrieval_receipt_line(memory_context: &AgentMemoryRuntimeContext) -> String {
+    format!(
+        "memory_retrieval=memory_runtime/v1; query_terms_count={}; considered_records={}; candidate_count={}; selected_count={}; max_records={}; max_bytes={}; used_bytes={}; filtered_sensitive={}; filtered_archived={}; omitted_by_budget={}",
+        memory_context.query_terms_count,
+        memory_context.considered_records,
+        memory_context.candidate_count,
+        memory_context.selected.len(),
+        memory_context.max_records,
+        memory_context.max_bytes,
+        memory_context.used_bytes,
+        memory_context.filtered_sensitive,
+        memory_context.filtered_archived,
+        memory_context.omitted_by_budget
+    )
+}
+
+fn agent_memory_context_has_retrieval_receipt(memory_context: &AgentMemoryRuntimeContext) -> bool {
+    memory_context.query_terms_count > 0
+        || memory_context.considered_records > 0
+        || !memory_context.selected.is_empty()
+        || !memory_context.omissions.is_empty()
+}
+
 fn agent_selected_memory_receipt_line(memory: &AgentSelectedMemory) -> String {
     format!(
-        "memory_id={}; title={}; type={}; scope={}; match_reason={}; snippet={}",
+        "memory_id={}; rank={}; title={}; type={}; scope={}; score={}; match_reason={}; inclusion_mode={}; snippet={}",
         memory.id,
+        memory.rank,
         memory.title,
         serialize_agent_chat_context_value(&memory.memory_type),
         serialize_agent_chat_context_value(&memory.scope),
+        memory.score,
         memory.match_reason,
+        memory.inclusion_mode,
         agent_context_truncate_chars(&memory.snippet, 160)
     )
 }
@@ -3182,16 +3246,20 @@ fn agent_context_receipt_for_action(
     receipt.confirmation_rule = loop_mode_descriptor.confirmation_rule.to_string();
     receipt.policy_constraints = agent_context_policy_constraints(action, access_mode);
     receipt.selected_evidence = agent_context_selected_evidence(action);
-    receipt.selected_memories = soul_profile
+    let mut selected_memories = soul_profile
         .map(agent_soul_profile_receipt_line)
         .into_iter()
-        .chain(
-            memory_context
-                .selected
-                .iter()
-                .map(agent_selected_memory_receipt_line),
-        )
-        .collect();
+        .collect::<Vec<_>>();
+    if agent_memory_context_has_retrieval_receipt(memory_context) {
+        selected_memories.push(agent_memory_retrieval_receipt_line(memory_context));
+    }
+    selected_memories.extend(
+        memory_context
+            .selected
+            .iter()
+            .map(agent_selected_memory_receipt_line),
+    );
+    receipt.selected_memories = selected_memories;
     receipt.memory_candidate_gate =
         agent_memory_candidate_gate_receipt_lines(memory_candidate_gate);
     receipt.validation_results = agent_context_validation_results(action);
@@ -8852,6 +8920,13 @@ mod tests {
         assert!(payload.contains("permission_request="));
         assert!(payload.contains("reports/source.md"));
         assert!(payload.contains("\"selected_memories\""));
+        assert!(payload.contains("memory_retrieval=memory_runtime/v1"));
+        assert!(payload.contains("candidate_count=1"));
+        assert!(payload.contains("selected_count=1"));
+        assert!(payload.contains("query_terms_count="));
+        assert!(payload.contains("inclusion_mode=compact_snippet"));
+        assert!(payload.contains("rank=1"));
+        assert!(payload.contains("score="));
         assert!(payload.contains("项目记忆运行规则"));
         assert!(payload.contains("soul_profile=memory/soul.md"));
         assert!(payload.contains("match_reason="));
@@ -9595,6 +9670,19 @@ mod tests {
         assert!(user_message
             .content
             .contains("Selected reviewed DS Agent memories"));
+        assert!(user_message
+            .content
+            .contains("retrieval_receipt=memory_runtime/v1"));
+        assert!(user_message.content.contains("candidate_count=1"));
+        assert!(user_message.content.contains("selected_count=1"));
+        assert!(user_message.content.contains("query_terms_count="));
+        assert!(user_message.content.contains("filtered_sensitive=1"));
+        assert!(user_message.content.contains("filtered_archived=1"));
+        assert!(user_message
+            .content
+            .contains("inclusion_mode=compact_snippet"));
+        assert!(user_message.content.contains("rank=1"));
+        assert!(user_message.content.contains("score="));
         assert!(user_message.content.contains("用户默认语气偏好"));
         assert!(user_message.content.contains("match_reason="));
         assert!(user_message
@@ -9606,6 +9694,69 @@ mod tests {
         assert!(!user_message
             .content
             .contains("ARCHIVED_MEMORY_SHOULD_NOT_APPEAR"));
+    }
+
+    #[test]
+    fn agent_memory_runtime_context_caps_records_and_reports_budget_omissions() {
+        let now = Utc::now();
+        let memories = (0..4)
+            .map(|index| MemoryRecord {
+                id: Uuid::new_v4(),
+                title: format!("默认语气偏好 {index}"),
+                body: format!("默认语气稳定偏好 {index}，只允许作为紧凑片段进入上下文。"),
+                memory_type: MemoryType::Preference,
+                scope: MemoryScope::User,
+                sensitivity: MemorySensitivity::Normal,
+                lifecycle: MemoryLifecycle::Active,
+                source: MemoryRecordSource::MemoryCandidate,
+                source_id: None,
+                pinned: false,
+                expires_at: None,
+                linked_memory_ids: Vec::new(),
+                linked_memories: Vec::new(),
+                search_match: MemorySearchMatch::direct(),
+                created_at: now,
+                updated_at: now + Duration::seconds(index),
+            })
+            .collect::<Vec<_>>();
+
+        let context = super::select_agent_memory_runtime_context("请按默认语气回复", &memories);
+
+        assert_eq!(context.considered_records, 4);
+        assert_eq!(context.candidate_count, 4);
+        assert_eq!(
+            context.selected.len(),
+            super::AGENT_MEMORY_CONTEXT_MAX_RECORDS
+        );
+        assert_eq!(context.omitted_by_budget, 1);
+        assert!(context.query_terms_count > 0);
+        assert!(context
+            .omissions
+            .iter()
+            .any(|line| line == "1 lower-ranked memories omitted by context budget"));
+        assert_eq!(
+            context
+                .selected
+                .iter()
+                .map(|memory| memory.rank)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(context
+            .selected
+            .iter()
+            .all(|memory| memory.inclusion_mode == "compact_snippet"));
+
+        let prompt = super::build_agent_memory_context_prompt(&context);
+        assert!(prompt.contains("retrieval_receipt=memory_runtime/v1"));
+        assert!(prompt.contains("candidate_count=4"));
+        assert!(prompt.contains("selected_count=3"));
+        assert!(prompt.contains("omitted_by_budget=1"));
+
+        let receipt = super::agent_memory_retrieval_receipt_line(&context);
+        assert!(receipt.contains("memory_retrieval=memory_runtime/v1"));
+        assert!(receipt.contains("max_records=3"));
+        assert!(receipt.contains("omitted_by_budget=1"));
     }
 
     #[test]
