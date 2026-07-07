@@ -2344,6 +2344,35 @@ dd {
   gap: 10px;
 }
 
+.memory-list.compact {
+  gap: 8px;
+}
+
+.memory-feedback-review {
+  display: grid;
+  gap: 8px;
+}
+
+.memory-subsection-heading,
+.memory-row-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.memory-row-title span {
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: 999px;
+  color: var(--accent);
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+
+.memory-feedback-note {
+  margin-bottom: 0;
+}
+
 .memory-search {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

@@ -2589,7 +2589,11 @@ impl AgentMemoryFeedbackSummary {
         if self.should_update > 0 {
             parts.push(format!("should_update-{}", self.should_update * 2));
         }
-        format!("feedback:{} total:{:+}", parts.join(","), self.score_delta())
+        format!(
+            "feedback:{} total:{:+}",
+            parts.join(","),
+            self.score_delta()
+        )
     }
 }
 
@@ -6821,6 +6825,16 @@ pub fn list_memory_candidate_records(
 }
 
 #[tauri::command]
+pub fn list_selected_memory_feedback(
+    state: State<'_, AppState>,
+) -> Result<Vec<MemorySelectedFeedback>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .list_selected_memory_feedback()
+        .map_err(event_store_error)
+}
+
+#[tauri::command]
 pub fn search_memory_records(
     query: String,
     state: State<'_, AppState>,
@@ -10020,9 +10034,7 @@ mod tests {
         assert!(context
             .selected
             .iter()
-            .any(|memory| memory
-                .score_breakdown
-                .contains("feedback:irrelevant-6")));
+            .any(|memory| memory.score_breakdown.contains("feedback:irrelevant-6")));
     }
 
     #[test]
@@ -10077,10 +10089,9 @@ mod tests {
             super::load_agent_memory_runtime_context(&store, "请按默认语气回复").expect("context");
 
         assert_eq!(context.considered_records, memories.len());
-        assert!(context
-            .omissions
-            .iter()
-            .any(|line| line == "1 memories marked stale by feedback need update or archive review"));
+        assert!(context.omissions.iter().any(
+            |line| line == "1 memories marked stale by feedback need update or archive review"
+        ));
         assert!(context.omissions.iter().any(|line| {
             line == "1 memories flagged conflicting by feedback need conflict review"
         }));

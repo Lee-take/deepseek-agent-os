@@ -559,6 +559,12 @@ type TranslationSet = {
     sensitivityOptions: Record<MemorySensitivity, string>;
     lifecycleOptions: Record<MemoryLifecycle, string>;
     relationOptions: Record<MemoryRelationKind, string>;
+    feedbackReview: string;
+    feedbackReviewEmpty: string;
+    feedbackReviewCount: (count: number) => string;
+    latestFeedback: string;
+    needsFeedbackReview: string;
+    feedbackMemoryMissing: string;
   };
   memoryFeedback: {
     title: string;
@@ -1510,6 +1516,12 @@ export const translations: Record<Language, TranslationSet> = {
         extends: "扩展",
         derives: "推导",
       },
+      feedbackReview: "反馈复核",
+      feedbackReviewEmpty: "暂无已记录的记忆反馈",
+      feedbackReviewCount: (count) => `${count} 条反馈`,
+      latestFeedback: "最新反馈",
+      needsFeedbackReview: "需要复核",
+      feedbackMemoryMissing: "这条记忆当前不可见",
     },
     memoryFeedback: {
       title: "选中记忆反馈",
@@ -2482,6 +2494,12 @@ export const translations: Record<Language, TranslationSet> = {
         extends: "Extends",
         derives: "Derives",
       },
+      feedbackReview: "Feedback review",
+      feedbackReviewEmpty: "No recorded memory feedback yet",
+      feedbackReviewCount: (count) => `${count} feedback ${count === 1 ? "entry" : "entries"}`,
+      latestFeedback: "Latest feedback",
+      needsFeedbackReview: "Needs review",
+      feedbackMemoryMissing: "This memory is not currently visible",
     },
     memoryFeedback: {
       title: "Selected memory feedback",

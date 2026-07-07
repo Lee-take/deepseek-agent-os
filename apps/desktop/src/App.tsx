@@ -32,7 +32,7 @@ import {
   TerminalSquare,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, MouseEvent } from "react";
 import {
   derivePersistedConversationTitle,
@@ -758,6 +758,9 @@ export function App() {
   const [taskRecords, setTaskRecords] = useState<TaskRecord[]>([]);
   const [memoryRecords, setMemoryRecords] = useState<MemoryRecord[]>([]);
   const [memoryCandidateRecords, setMemoryCandidateRecords] = useState<MemoryCandidateRecord[]>([]);
+  const [selectedMemoryFeedbackRecords, setSelectedMemoryFeedbackRecords] = useState<
+    MemorySelectedFeedback[]
+  >([]);
   const [permissionAudits, setPermissionAudits] = useState<PermissionAuditEntry[]>([]);
   const [capabilityCatalog, setCapabilityCatalog] = useState<CapabilityDescriptor[]>([]);
   const [capabilityRecords, setCapabilityRecords] = useState<CapabilityAccessRecord[]>([]);
@@ -965,6 +968,52 @@ export function App() {
   const agentStopRequestedRef = useRef(false);
   const agentChatRunTokenRef = useRef(0);
   const appUpdateDownloadKeyRef = useRef("");
+  const feedbackReviewItems = useMemo(() => {
+    const memoriesById = new Map(memoryRecords.map((memory) => [memory.id, memory]));
+    const feedbackByMemory = selectedMemoryFeedbackRecords.reduce(
+      (groups, feedback) => {
+        const records = groups.get(feedback.memory_id) ?? [];
+        records.push(feedback);
+        groups.set(feedback.memory_id, records);
+        return groups;
+      },
+      new Map<string, MemorySelectedFeedback[]>(),
+    );
+
+    return Array.from(feedbackByMemory.entries())
+      .map(([memoryId, feedbackRecords]) => {
+        const counts = feedbackRecords.reduce(
+          (summary, feedback) => ({
+            ...summary,
+            [feedback.feedback]: (summary[feedback.feedback] ?? 0) + 1,
+          }),
+          {} as Partial<Record<MemorySelectedFeedbackKind, number>>,
+        );
+        const latestFeedback = [...feedbackRecords].sort((left, right) =>
+          String(right.created_at).localeCompare(String(left.created_at)),
+        )[0];
+        const needsFeedbackReview = feedbackRecords.some((feedback) =>
+          ["stale", "conflicting", "should_update"].includes(feedback.feedback),
+        );
+
+        return {
+          memoryId,
+          memory: memoriesById.get(memoryId) ?? null,
+          counts,
+          latestFeedback,
+          records: feedbackRecords,
+          needsFeedbackReview,
+        };
+      })
+      .sort((left, right) => {
+        if (left.needsFeedbackReview !== right.needsFeedbackReview) {
+          return left.needsFeedbackReview ? -1 : 1;
+        }
+        return String(right.latestFeedback?.created_at ?? "").localeCompare(
+          String(left.latestFeedback?.created_at ?? ""),
+        );
+      });
+  }, [memoryRecords, selectedMemoryFeedbackRecords]);
   const copy = translations[language];
   const exposePluginsSidebarEntry = shouldExposePluginsSidebarEntry();
   const settingsPanelItemCount = settingsPanelItems.length;
@@ -1704,6 +1753,7 @@ export function App() {
       setTaskRecords([]);
       setMemoryRecords([]);
       setMemoryCandidateRecords([]);
+      setSelectedMemoryFeedbackRecords([]);
       setPermissionAudits([]);
       setCapabilityCatalog([]);
       setCapabilityRecords([]);
@@ -1717,6 +1767,7 @@ export function App() {
       invoke<TaskRecord[]>("list_task_records"),
       invoke<MemoryRecord[]>("list_memory_records"),
       invoke<MemoryCandidateRecord[]>("list_memory_candidate_records"),
+      invoke<MemorySelectedFeedback[]>("list_selected_memory_feedback"),
       invoke<PermissionAuditEntry[]>("list_permission_audit_entries"),
       invoke<CapabilityDescriptor[]>("list_capability_catalog"),
       invoke<CapabilityAccessRecord[]>("list_capability_access_records"),
@@ -1728,6 +1779,7 @@ export function App() {
         records,
         memories,
         memoryCandidates,
+        selectedMemoryFeedback,
         audits,
         catalog,
         capabilityAccessRecords,
@@ -1738,6 +1790,7 @@ export function App() {
         setTaskRecords(records);
         setMemoryRecords(memories);
         setMemoryCandidateRecords(memoryCandidates);
+        setSelectedMemoryFeedbackRecords(selectedMemoryFeedback);
         setPermissionAudits(audits);
         setCapabilityCatalog(catalog);
         setCapabilityRecords(capabilityAccessRecords);
@@ -2351,12 +2404,16 @@ export function App() {
     setMemoryFeedbackError("");
 
     try {
-      await invoke<MemorySelectedFeedback>("record_selected_memory_feedback", {
+      const recordedFeedback = await invoke<MemorySelectedFeedback>("record_selected_memory_feedback", {
         memoryId,
         contextReceiptId: receiptId,
         feedback,
         note: copy.memoryFeedback.options[feedback],
       });
+      setSelectedMemoryFeedbackRecords((currentRecords) => [
+        recordedFeedback,
+        ...currentRecords,
+      ]);
       setMemoryFeedbackNotice(copy.memoryFeedback.recorded);
     } catch (error) {
       setMemoryFeedbackError(String(error) || copy.memoryFeedback.recordFailed);
@@ -5489,6 +5546,49 @@ export function App() {
                 ) : null}
                 {memoryNotice ? <p className="package-message">{memoryNotice}</p> : null}
                 {memoryError ? <p className="package-error">{memoryError}</p> : null}
+                <section
+                  className="memory-feedback-review"
+                  aria-label={copy.memory.feedbackReview}
+                >
+                  <div className="memory-subsection-heading">
+                    <strong>{copy.memory.feedbackReview}</strong>
+                    <span>{copy.memory.feedbackReviewCount(selectedMemoryFeedbackRecords.length)}</span>
+                  </div>
+                  {feedbackReviewItems.length === 0 ? (
+                    <p className="empty-state">{copy.memory.feedbackReviewEmpty}</p>
+                  ) : (
+                    <div className="memory-list compact">
+                      {feedbackReviewItems.slice(0, 5).map((item) => (
+                        <article className="memory-row" key={item.memoryId}>
+                          <div className="memory-row-title">
+                            <strong>
+                              {item.memory?.title ?? copy.memory.feedbackMemoryMissing}
+                            </strong>
+                            {item.needsFeedbackReview ? (
+                              <span>{copy.memory.needsFeedbackReview}</span>
+                            ) : null}
+                          </div>
+                          <div className="memory-meta">
+                            {(Object.keys(copy.memoryFeedback.options) as MemorySelectedFeedbackKind[])
+                              .filter((feedback) => (item.counts[feedback] ?? 0) > 0)
+                              .map((feedback) => (
+                                <span key={feedback}>
+                                  {copy.memoryFeedback.options[feedback]}: {item.counts[feedback]}
+                                </span>
+                              ))}
+                          </div>
+                          {item.latestFeedback ? (
+                            <p className="memory-feedback-note">
+                              {copy.memory.latestFeedback}:{" "}
+                              {copy.memoryFeedback.options[item.latestFeedback.feedback]}
+                              {item.latestFeedback.note ? ` · ${item.latestFeedback.note}` : ""}
+                            </p>
+                          ) : null}
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </section>
                 {memoryRecords.length === 0 ? (
                   <p className="empty-state">{copy.memory.noMemories}</p>
                 ) : (

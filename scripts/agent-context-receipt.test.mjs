@@ -6,6 +6,8 @@ import { test } from "node:test";
 
 const receiptModuleUrl = new URL("../apps/desktop/src/agentContextReceipt.ts", import.meta.url);
 const appSourceUrl = new URL("../apps/desktop/src/App.tsx", import.meta.url);
+const commandsSourceUrl = new URL("../apps/desktop/src-tauri/src/commands.rs", import.meta.url);
+const mainSourceUrl = new URL("../apps/desktop/src-tauri/src/main.rs", import.meta.url);
 
 const { summarizeAgentContextReceipt } = await import(receiptModuleUrl);
 
@@ -128,4 +130,19 @@ test("App exposes update and archive candidate actions in Memory Studio", () => 
   assert.match(appSource, /"archive_memory_candidate_conflicts"/);
   assert.match(appSource, /copy\.memory\.updateAndAccept/);
   assert.match(appSource, /copy\.memory\.archiveStaleTarget/);
+});
+
+test("Memory Studio exposes selected-memory feedback review", () => {
+  const appSource = readFileSync(appSourceUrl, "utf8");
+  const commandsSource = readFileSync(commandsSourceUrl, "utf8");
+  const mainSource = readFileSync(mainSourceUrl, "utf8");
+
+  assert.match(commandsSource, /pub fn list_selected_memory_feedback/);
+  assert.match(mainSource, /list_selected_memory_feedback/);
+  assert.match(appSource, /invoke<MemorySelectedFeedback\[\]>\("list_selected_memory_feedback"\)/);
+  assert.match(appSource, /selectedMemoryFeedbackRecords/);
+  assert.match(appSource, /feedbackReviewItems/);
+  assert.match(appSource, /copy\.memory\.feedbackReview/);
+  assert.match(appSource, /copy\.memory\.needsFeedbackReview/);
+  assert.match(appSource, /copy\.memory\.feedbackReviewEmpty/);
 });

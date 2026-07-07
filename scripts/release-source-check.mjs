@@ -2742,6 +2742,30 @@ function checkMemoryStudioDocs() {
     "runtime context emits should_update feedback review hints",
   );
   checkTextIncludesCollapsed(
+    "apps/desktop/src-tauri/src/commands.rs",
+    memoryCommands,
+    "pub fn list_selected_memory_feedback",
+    "desktop command exposes selected-memory feedback review list",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    'invoke<MemorySelectedFeedback[]>("list_selected_memory_feedback")',
+    "Memory Studio loads selected-memory feedback records",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "feedbackReviewItems",
+    "Memory Studio groups selected-memory feedback for review",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/i18n.ts",
+    i18n,
+    "feedbackReviewEmpty",
+    "Memory Studio feedback review empty-state copy",
+  );
+  checkTextIncludesCollapsed(
     "README.md",
     readme,
     "new/skipped archived briefing runs",
