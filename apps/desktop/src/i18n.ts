@@ -386,6 +386,9 @@ type TranslationSet = {
     contextWorkflowPolicy: string;
     contextSelectedEvidence: string;
     contextSelectedMemories: string;
+    contextMemoryRetrieval: string;
+    contextMemoryScores: string;
+    contextMemoryConflictHints: string;
     contextMemoryCandidateGate: string;
     contextNoSelectedMemories: string;
     contextModelRoute: string;
@@ -1232,6 +1235,9 @@ export const translations: Record<Language, TranslationSet> = {
       contextWorkflowPolicy: "工作流策略",
       contextSelectedEvidence: "选入证据",
       contextSelectedMemories: "选入记忆",
+      contextMemoryRetrieval: "记忆检索",
+      contextMemoryScores: "记忆评分",
+      contextMemoryConflictHints: "记忆提示",
       contextMemoryCandidateGate: "候选闸门",
       contextNoSelectedMemories: "本次未选入记忆",
       contextModelRoute: "模型类型",
@@ -2128,6 +2134,9 @@ export const translations: Record<Language, TranslationSet> = {
       contextWorkflowPolicy: "Workflow policy",
       contextSelectedEvidence: "Selected evidence",
       contextSelectedMemories: "Selected memories",
+      contextMemoryRetrieval: "Memory retrieval",
+      contextMemoryScores: "Memory scores",
+      contextMemoryConflictHints: "Memory hints",
       contextMemoryCandidateGate: "Memory candidate gate",
       contextNoSelectedMemories: "No memory selected for this run",
       contextModelRoute: "Model route",

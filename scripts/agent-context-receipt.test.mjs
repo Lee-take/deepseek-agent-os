@@ -22,9 +22,10 @@ test("summarizes agent context receipts for compact inspector display", () => {
     workflow_run_id: null,
     selected_evidence: ["capability_invocation:invocation-1", "target:reports/source.md"],
     selected_memories: [
-      "memory_id=memory-1; title=项目记忆运行规则; match_reason=title_terms=记忆,系统",
-      "memory_id=memory-2; title=用户默认语气偏好; match_reason=body_terms=语气",
-      "memory_id=memory-3; title=lower-ranked memory",
+      "memory_retrieval=memory_runtime/v1; query_terms_count=6; considered_records=4; candidate_count=3; selected_count=2; max_records=3; max_bytes=1200; used_bytes=512; filtered_sensitive=1; filtered_archived=1; omitted_by_budget=1",
+      "memory_id=memory-1; rank=1; title=项目记忆运行规则; type=workflow_rule; scope=project; score=18; score_breakdown=title_terms:2*6 body_terms:2*3 linked_terms:0*1 pinned:0; match_reason=title_terms=记忆,系统; inclusion_mode=compact_snippet; snippet=用户要求 DS Agent 记忆系统要对标 Codex 和 Claude Code。",
+      "memory_id=memory-2; rank=2; title=用户默认语气偏好; type=preference; scope=user; score=11; score_breakdown=title_terms:1*6 body_terms:1*3 linked_terms:0*1 pinned:+2; match_reason=body_terms=语气; inclusion_mode=compact_snippet; snippet=默认用简洁、温暖、直接的中文语气。",
+      "soul_profile=memory/soul.md; reason=identity_profile; bytes=35/800; lines=user preferred address: 李总",
     ],
     memory_candidate_gate: [
       "proposed=3; kept=1; dropped=2; reasons=sensitive=1,transient=1,archived=0,invalid=0,over_limit=0",
@@ -63,8 +64,21 @@ test("summarizes agent context receipts for compact inspector display", () => {
     "target:reports/source.md",
   ]);
   assert.deepEqual(summary.memories, [
-    "memory_id=memory-1; title=项目记忆运行规则; match_reason=title_terms=记忆,系统",
-    "memory_id=memory-2; title=用户默认语气偏好; match_reason=body_terms=语气",
+    "项目记忆运行规则",
+    "用户默认语气偏好",
+  ]);
+  assert.deepEqual(summary.memoryRetrieval, [
+    "retrieval v1: selected 2/3 candidates from 4 reviewed memories",
+    "budget: records 2/3, bytes 512/1200, query terms 6",
+  ]);
+  assert.deepEqual(summary.memoryScores, [
+    "rank 1 score 18: 项目记忆运行规则 (workflow_rule/project; title_terms=记忆,系统; compact_snippet; title_terms:2*6 body_terms:2*3 linked_terms:0*1 pinned:0)",
+    "rank 2 score 11: 用户默认语气偏好 (preference/user; body_terms=语气; compact_snippet; title_terms:1*6 body_terms:1*3 linked_terms:0*1 pinned:+2)",
+  ]);
+  assert.deepEqual(summary.memoryConflictHints, [
+    "1 sensitive memory omitted from prompt context",
+    "1 archived or stale memory omitted from prompt context",
+    "1 lower-ranked memory omitted by retrieval budget",
   ]);
   assert.deepEqual(summary.memoryCandidateGate, [
     "proposed=3; kept=1; dropped=2; reasons=sensitive=1,transient=1,archived=0,invalid=0,over_limit=0",
@@ -95,5 +109,8 @@ test("App wires the context receipt list into the capability inspector", () => {
   assert.match(appSource, /agentContextReceipts\.slice\(0,\s*3\)\.map/);
   assert.match(appSource, /summarizeAgentContextReceipt\(receipt\)/);
   assert.match(appSource, /summary\.memories\.length > 0/);
+  assert.match(appSource, /summary\.memoryRetrieval\.length > 0/);
+  assert.match(appSource, /summary\.memoryScores\.length > 0/);
+  assert.match(appSource, /summary\.memoryConflictHints\.length > 0/);
   assert.match(appSource, /summary\.memoryCandidateGate\.length > 0/);
 });

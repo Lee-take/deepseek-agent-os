@@ -243,6 +243,7 @@ struct AgentSelectedMemory {
     snippet: String,
     rank: usize,
     score: i32,
+    score_breakdown: String,
     inclusion_mode: String,
 }
 
@@ -2532,6 +2533,7 @@ struct AgentMemoryCandidateMatch {
     record: MemoryRecord,
     score: i32,
     match_reason: String,
+    score_breakdown: String,
 }
 
 fn load_agent_memory_runtime_context(
@@ -2602,6 +2604,7 @@ fn select_agent_memory_runtime_context(
             ),
             rank: context.selected.len() + 1,
             score: candidate.score,
+            score_breakdown: candidate.score_breakdown,
             inclusion_mode: "compact_snippet".to_string(),
         };
         let block_bytes = agent_selected_memory_prompt_block(&selected).len();
@@ -2676,6 +2679,12 @@ fn agent_memory_candidate_match(
         record: memory.clone(),
         score,
         match_reason: agent_memory_match_reason(&title_terms, &body_terms, &linked_terms),
+        score_breakdown: agent_memory_score_breakdown(
+            title_terms.len(),
+            body_terms.len(),
+            linked_terms.len(),
+            memory.pinned,
+        ),
     })
 }
 
@@ -2703,6 +2712,18 @@ fn agent_memory_join_terms(terms: &[String], max_terms: usize) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn agent_memory_score_breakdown(
+    title_terms: usize,
+    body_terms: usize,
+    linked_terms: usize,
+    pinned: bool,
+) -> String {
+    format!(
+        "title_terms:{title_terms}*6 body_terms:{body_terms}*3 linked_terms:{linked_terms}*1 pinned:{}",
+        if pinned { "+2" } else { "0" }
+    )
 }
 
 fn agent_memory_query_terms(prompt: &str) -> Vec<String> {
@@ -2801,12 +2822,13 @@ fn build_agent_memory_context_prompt(memory_context: &AgentMemoryRuntimeContext)
 
 fn agent_selected_memory_prompt_block(memory: &AgentSelectedMemory) -> String {
     format!(
-        "- memory_id={}; rank={}; type={}; scope={}; score={}; match_reason={}; inclusion_mode={}\n  title: {}\n  snippet: {}",
+        "- memory_id={}; rank={}; type={}; scope={}; score={}; score_breakdown={}; match_reason={}; inclusion_mode={}\n  title: {}\n  snippet: {}",
         memory.id,
         memory.rank,
         serialize_agent_chat_context_value(&memory.memory_type),
         serialize_agent_chat_context_value(&memory.scope),
         memory.score,
+        memory.score_breakdown,
         memory.match_reason,
         memory.inclusion_mode,
         memory.title,
@@ -2839,13 +2861,14 @@ fn agent_memory_context_has_retrieval_receipt(memory_context: &AgentMemoryRuntim
 
 fn agent_selected_memory_receipt_line(memory: &AgentSelectedMemory) -> String {
     format!(
-        "memory_id={}; rank={}; title={}; type={}; scope={}; score={}; match_reason={}; inclusion_mode={}; snippet={}",
+        "memory_id={}; rank={}; title={}; type={}; scope={}; score={}; score_breakdown={}; match_reason={}; inclusion_mode={}; snippet={}",
         memory.id,
         memory.rank,
         memory.title,
         serialize_agent_chat_context_value(&memory.memory_type),
         serialize_agent_chat_context_value(&memory.scope),
         memory.score,
+        memory.score_breakdown,
         memory.match_reason,
         memory.inclusion_mode,
         agent_context_truncate_chars(&memory.snippet, 160)
@@ -8927,6 +8950,7 @@ mod tests {
         assert!(payload.contains("inclusion_mode=compact_snippet"));
         assert!(payload.contains("rank=1"));
         assert!(payload.contains("score="));
+        assert!(payload.contains("score_breakdown="));
         assert!(payload.contains("项目记忆运行规则"));
         assert!(payload.contains("soul_profile=memory/soul.md"));
         assert!(payload.contains("match_reason="));
@@ -9683,6 +9707,7 @@ mod tests {
             .contains("inclusion_mode=compact_snippet"));
         assert!(user_message.content.contains("rank=1"));
         assert!(user_message.content.contains("score="));
+        assert!(user_message.content.contains("score_breakdown="));
         assert!(user_message.content.contains("用户默认语气偏好"));
         assert!(user_message.content.contains("match_reason="));
         assert!(user_message
@@ -9752,6 +9777,7 @@ mod tests {
         assert!(prompt.contains("candidate_count=4"));
         assert!(prompt.contains("selected_count=3"));
         assert!(prompt.contains("omitted_by_budget=1"));
+        assert!(prompt.contains("score_breakdown=title_terms:"));
 
         let receipt = super::agent_memory_retrieval_receipt_line(&context);
         assert!(receipt.contains("memory_retrieval=memory_runtime/v1"));

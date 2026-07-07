@@ -6772,6 +6772,24 @@ export function App() {
                               {summary.memories.join(" · ")}
                             </p>
                           ) : null}
+                          {summary.memoryRetrieval.length > 0 ? (
+                            <p>
+                              {copy.operationsBriefing.contextMemoryRetrieval}:{" "}
+                              {summary.memoryRetrieval.join(" · ")}
+                            </p>
+                          ) : null}
+                          {summary.memoryScores.length > 0 ? (
+                            <p>
+                              {copy.operationsBriefing.contextMemoryScores}:{" "}
+                              {summary.memoryScores.join(" · ")}
+                            </p>
+                          ) : null}
+                          {summary.memoryConflictHints.length > 0 ? (
+                            <p>
+                              {copy.operationsBriefing.contextMemoryConflictHints}:{" "}
+                              {summary.memoryConflictHints.join(" · ")}
+                            </p>
+                          ) : null}
                           {summary.memoryCandidateGate.length > 0 ? (
                             <p>
                               {copy.operationsBriefing.contextMemoryCandidateGate}:{" "}
