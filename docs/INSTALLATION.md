@@ -39,7 +39,7 @@ Install dependencies and verify the desktop package:
 ```powershell
 npx pnpm@9.15.9 install
 npx pnpm@9.15.9 test
-npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop tauri build --debug
+npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop tauri build --config src-tauri/tauri.windows.conf.json
 ```
 
 `pnpm test` runs the repository secret scan, desktop frontend build, and Rust

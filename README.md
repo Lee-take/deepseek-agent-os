@@ -182,7 +182,7 @@ Desktop source commands:
 npx pnpm@9.15.9 install
 npx pnpm@9.15.9 test
 npx pnpm@9.15.9 tauri:dev
-npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop tauri build --debug
+npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop tauri build --config src-tauri/tauri.windows.conf.json
 npx pnpm@9.15.9 dev
 ```
 

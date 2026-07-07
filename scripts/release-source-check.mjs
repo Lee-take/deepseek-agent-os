@@ -566,8 +566,8 @@ function checkWindowsAppIconPackaging() {
   checkTextIncludes(
     "apps/desktop/src-tauri/src/main.rs",
     mainSource,
-    '#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]',
-    "desktop release binary uses Windows GUI subsystem",
+    '#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]',
+    "desktop app binary uses Windows GUI subsystem for packaged debug and release builds",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/main.rs",
@@ -1103,6 +1103,24 @@ function checkRequiredDocs() {
   } else {
     checks.push("release notes local release gate");
   }
+  checkTextDoesNotInclude(
+    "docs/RELEASE_NOTES_v0.1.0.md",
+    releaseNotes,
+    "tauri build --debug",
+    "release notes must not document debug Tauri builds for Windows installer publication",
+  );
+  checkTextDoesNotInclude(
+    "README.md",
+    readme,
+    "tauri build --debug",
+    "README must not document debug Tauri builds for Windows installer publication",
+  );
+  checkTextDoesNotInclude(
+    "docs/INSTALLATION.md",
+    readText("docs/INSTALLATION.md"),
+    "tauri build --debug",
+    "installation docs must not document debug Tauri builds for Windows installer publication",
+  );
 
   checkTextIncludes(
     "docs/RELEASE_NOTES_v0.1.0.md",
@@ -1663,14 +1681,14 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.1.0.md",
     releaseNotes,
-    "v0.1.0-rc.7 Update",
-    "release notes rc.7 update heading",
+    "v0.1.0-rc.8 Update",
+    "release notes rc.8 update heading",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",
     readText("apps/desktop/src-tauri/src/commands.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.7"',
-    "app updater current release tag rc.7",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.1.0-rc.8"',
+    "app updater current release tag rc.8",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",
@@ -3839,6 +3857,14 @@ function checkPackageManagerBaseline() {
 function checkTextIncludes(filePath, content, expected, checkName) {
   if (!content.includes(expected)) {
     failures.push(`${filePath} must include ${expected}`);
+    return;
+  }
+  checks.push(checkName);
+}
+
+function checkTextDoesNotInclude(filePath, content, rejected, checkName) {
+  if (content.includes(rejected)) {
+    failures.push(`${filePath} must not include ${rejected}`);
     return;
   }
   checks.push(checkName);

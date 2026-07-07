@@ -42,7 +42,7 @@ test("settings panel exposes only the ordinary user configuration items", () => 
       "select",
       "select",
       "select",
-      "profile_editor",
+      "modal_button",
       "directory_picker",
       "balance_reader",
     ],
@@ -127,18 +127,33 @@ test("compact settings controls use smaller typography than full setup forms", (
   assert.match(styles, /\.compact-settings-form\s+\.setup-field\s+button[\s\S]*min-height:\s*32px;/);
 });
 
-test("settings panel exposes a Soul Profile editor with explicit save", () => {
+test("settings panel exposes Soul as a modal button with annotated editor", () => {
   const soulItem = settingsPanelItems.find((item) => item.id === "soul_profile");
   const appSource = readFileSync(appSourceUrl, "utf8");
   const i18nSource = readFileSync(i18nSourceUrl, "utf8");
+  const styles = readFileSync(stylesSourceUrl, "utf8");
 
-  assert.equal(soulItem?.control, "profile_editor");
+  assert.equal(soulItem?.control, "modal_button");
   assert.match(appSource, /invoke<AgentSoulProfileState>\("get_agent_soul_profile"\)/);
   assert.match(appSource, /invoke<AgentSoulProfileState>\("save_agent_soul_profile",\s*\{/);
+  assert.match(appSource, /const \[soulProfileModalOpen,\s*setSoulProfileModalOpen\]/);
+  assert.match(appSource, /onClick=\{\(\) => setSoulProfileModalOpen\(true\)\}/);
+  assert.match(appSource, /role="dialog"[\s\S]*aria-labelledby="soul-profile-modal-title"/);
+  assert.match(appSource, /className="soul-profile-guide"/);
+  assert.match(appSource, /copy\.settingsPanel\.soulProfileGuides\.map/);
   assert.match(appSource, /value=\{soulProfileDraft\}/);
   assert.match(appSource, /aria-label=\{copy\.settingsPanel\.soulProfile\}/);
-  assert.match(i18nSource, /soulProfile:\s*"Soul Profile"/);
+  assert.doesNotMatch(appSource, /className="soul-profile-settings"[\s\S]{0,800}<textarea/);
+  assert.match(i18nSource, /soulProfile:\s*"Soul"/);
+  assert.match(i18nSource, /soulProfileModalTitle:\s*"Soul Profile"/);
+  assert.match(i18nSource, /soulProfileGuides:\s*\[/);
   assert.match(i18nSource, /soulProfileSave:\s*"Save Soul Profile"/);
+  assert.match(styles, /\.soul-profile-modal/);
+  assert.match(
+    styles,
+    /\.soul-profile-modal \.setup-modal-actions \{[\s\S]*position:\s*sticky/,
+  );
+  assert.match(styles, /\.soul-profile-guide/);
 });
 
 test("plugins are not exposed as a left sidebar entry", () => {

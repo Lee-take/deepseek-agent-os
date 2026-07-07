@@ -78,6 +78,14 @@ type TranslationSet = {
     apiKeyReady: string;
     fallbackApiKeyPlaceholder: string;
     soulProfile: string;
+    soulProfileOpen: string;
+    soulProfileClose: string;
+    soulProfileModalTitle: string;
+    soulProfileModalDescription: string;
+    soulProfileGuides: Array<{
+      title: string;
+      lines: string[];
+    }>;
     soulProfilePlaceholder: string;
     soulProfileSave: string;
     soulProfileSaving: string;
@@ -803,9 +811,52 @@ export const translations: Record<Language, TranslationSet> = {
       apiKeyConfiguredPlaceholder: "••••••••••••••••（已配置）",
       apiKeyReady: "API key 已通过启动检测",
       fallbackApiKeyPlaceholder: "主 key 不可用时自动尝试",
-      soulProfile: "Soul Profile",
+      soulProfile: "Soul",
+      soulProfileOpen: "打开 Soul 设置",
+      soulProfileClose: "关闭",
+      soulProfileModalTitle: "Soul Profile",
+      soulProfileModalDescription:
+        "只写长期稳定的称呼、语气和协作偏好。不要写密码、密钥、账号、身份证件或临时任务内容。",
+      soulProfileGuides: [
+        {
+          title: "User",
+          lines: [
+            "preferred_name：你希望 DS Agent 记住的名字或简称。",
+            "address_as：默认怎么称呼你，例如“李总”或直接称呼名字。",
+            "language_preferences：默认使用中文、英文或双语。",
+            "default_response_tone：默认回复语气，例如简洁、温暖、正式。",
+            "default_response_length：默认长短，例如短答、适中、详细。",
+            "formatting_preferences：默认格式偏好，例如少用嵌套列表。",
+            "initiative_level：DS Agent 可以主动推进到什么程度。",
+          ],
+        },
+        {
+          title: "DS Agent",
+          lines: [
+            "user_calls_ds_agent：你平时怎么称呼这个工具。",
+            "ds_agent_should_refer_to_itself_as：DS Agent 回复时怎么称呼自己。",
+            "relationship_boundary：协作边界，例如只做本地执行和可审计记忆。",
+          ],
+        },
+        {
+          title: "Stable Preferences",
+          lines: [
+            "workflow_preferences：长期工作流偏好，例如先验收再发布。",
+            "writing_preferences：长期写作偏好，例如中文公文或英文邮件风格。",
+            "confirmation_preferences：哪些动作需要先问你，哪些可直接做。",
+            "privacy_preferences：隐私和本地文件处理偏好。",
+          ],
+        },
+        {
+          title: "Never Store",
+          lines: [
+            "这一段是禁止写入清单，用来提醒 DS Agent 不要保存密钥、密码、账号或敏感身份信息。",
+            "临时任务、一次性文件路径、实时价格和当天状态也不要写进 Soul Profile。",
+          ],
+        },
+      ],
       soulProfilePlaceholder: "编辑 memory/soul.md，记录称呼、DS Agent 称呼和默认回复偏好。",
-      soulProfileSave: "保存 Soul Profile",
+      soulProfileSave: "保存 soul profile",
       soulProfileSaving: "保存中",
       soulProfileSaved: "Soul Profile 已保存。",
       soulProfileExists: "已启用本机 Soul Profile",
@@ -1721,7 +1772,50 @@ export const translations: Record<Language, TranslationSet> = {
       apiKeyConfiguredPlaceholder: "•••••••••••••••• (configured)",
       apiKeyReady: "API key passed startup check",
       fallbackApiKeyPlaceholder: "Tried automatically if the primary key fails",
-      soulProfile: "Soul Profile",
+      soulProfile: "Soul",
+      soulProfileOpen: "Open Soul settings",
+      soulProfileClose: "Close",
+      soulProfileModalTitle: "Soul Profile",
+      soulProfileModalDescription:
+        "Store only stable naming, tone, and collaboration preferences. Do not store passwords, keys, account identifiers, identity documents, or temporary task details.",
+      soulProfileGuides: [
+        {
+          title: "User",
+          lines: [
+            "preferred_name: the name or short name DS Agent should remember.",
+            "address_as: the default way to address you.",
+            "language_preferences: default Chinese, English, or bilingual preference.",
+            "default_response_tone: default tone such as concise, warm, or formal.",
+            "default_response_length: default answer length.",
+            "formatting_preferences: default formatting preferences.",
+            "initiative_level: how proactively DS Agent should move work forward.",
+          ],
+        },
+        {
+          title: "DS Agent",
+          lines: [
+            "user_calls_ds_agent: what you usually call this tool.",
+            "ds_agent_should_refer_to_itself_as: how DS Agent should refer to itself.",
+            "relationship_boundary: the collaboration boundary to preserve.",
+          ],
+        },
+        {
+          title: "Stable Preferences",
+          lines: [
+            "workflow_preferences: long-term workflow habits.",
+            "writing_preferences: stable writing and editing preferences.",
+            "confirmation_preferences: what DS Agent should ask before doing.",
+            "privacy_preferences: privacy and local-file handling preferences.",
+          ],
+        },
+        {
+          title: "Never Store",
+          lines: [
+            "This section is a do-not-store reminder for secrets, passwords, accounts, and sensitive identity data.",
+            "Temporary tasks, one-off paths, live prices, and same-day state should not go into Soul Profile.",
+          ],
+        },
+      ],
       soulProfilePlaceholder:
         "Edit memory/soul.md for names, DS Agent naming, and default response preferences.",
       soulProfileSave: "Save Soul Profile",

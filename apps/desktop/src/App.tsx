@@ -819,6 +819,7 @@ export function App() {
   const [exportedPackageJson, setExportedPackageJson] = useState("");
   const [importPackageJson, setImportPackageJson] = useState("");
   const [importPreview, setImportPreview] = useState<WorkPackageImportPreview | null>(null);
+  const [soulProfileModalOpen, setSoulProfileModalOpen] = useState(false);
   const [packageNotice, setPackageNotice] = useState("");
   const [packageError, setPackageError] = useState("");
   const [memoryNotice, setMemoryNotice] = useState("");
@@ -4138,30 +4139,22 @@ export function App() {
                   </select>
                 </label>
                 <div className="soul-profile-settings">
-                  <label>
+                  <div>
                     <span>{copy.settingsPanel.soulProfile}</span>
-                    <textarea
-                      value={soulProfileDraft}
-                      aria-label={copy.settingsPanel.soulProfile}
-                      placeholder={copy.settingsPanel.soulProfilePlaceholder}
-                      onChange={(event) => setSoulProfileDraft(event.target.value)}
-                    />
-                  </label>
-                  <div className="soul-profile-settings-actions">
-                    <span>
+                    <small>
                       {soulProfileState.exists
                         ? copy.settingsPanel.soulProfileExists
                         : copy.settingsPanel.soulProfileTemplate}
-                    </span>
+                    </small>
+                  </div>
+                  <div className="soul-profile-settings-actions">
                     <button
                       type="button"
-                      onClick={() => void saveSoulProfile()}
-                      disabled={soulProfilePending}
+                      onClick={() => setSoulProfileModalOpen(true)}
+                      aria-label={copy.settingsPanel.soulProfileOpen}
                     >
                       <Brain size={14} aria-hidden="true" />
-                      {soulProfilePending
-                        ? copy.settingsPanel.soulProfileSaving
-                        : copy.settingsPanel.soulProfileSave}
+                      {copy.settingsPanel.soulProfile}
                     </button>
                   </div>
                   {soulProfileState.summary_lines.length > 0 ? (
@@ -7324,6 +7317,89 @@ export function App() {
           )}
         </section>
       </section>
+      {soulProfileModalOpen ? (
+        <div className="setup-modal-backdrop" role="presentation">
+          <section
+            className="setup-modal soul-profile-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="soul-profile-modal-title"
+          >
+            <form
+              className="setup-modal-form soul-profile-modal-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void saveSoulProfile();
+              }}
+            >
+              <header>
+                <Brain size={18} aria-hidden="true" />
+                <div>
+                  <h2 id="soul-profile-modal-title">
+                    {copy.settingsPanel.soulProfileModalTitle}
+                  </h2>
+                  <p>{copy.settingsPanel.soulProfileModalDescription}</p>
+                </div>
+                <button
+                  type="button"
+                  className="modal-icon-button"
+                  onClick={() => setSoulProfileModalOpen(false)}
+                  aria-label={copy.settingsPanel.soulProfileClose}
+                >
+                  <X size={16} aria-hidden="true" />
+                </button>
+              </header>
+              <div className="soul-profile-guide">
+                {copy.settingsPanel.soulProfileGuides.map((guide) => (
+                  <section key={guide.title}>
+                    <h3>{guide.title}</h3>
+                    <ul>
+                      {guide.lines.map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                  </section>
+                ))}
+              </div>
+              <label>
+                <span>{copy.settingsPanel.soulProfile}</span>
+                <textarea
+                  value={soulProfileDraft}
+                  aria-label={copy.settingsPanel.soulProfile}
+                  placeholder={copy.settingsPanel.soulProfilePlaceholder}
+                  onChange={(event) => setSoulProfileDraft(event.target.value)}
+                />
+              </label>
+              {soulProfileState.summary_lines.length > 0 ? (
+                <p className="setup-status">
+                  {copy.settingsPanel.soulProfileSummary}:{" "}
+                  {soulProfileState.summary_lines.join(" · ")}
+                </p>
+              ) : null}
+              {soulProfileNotice ? (
+                <p className="package-message">{soulProfileNotice}</p>
+              ) : null}
+              {soulProfileError ? <p className="package-error">{soulProfileError}</p> : null}
+              <div className="setup-modal-actions">
+                <button type="submit" disabled={soulProfilePending}>
+                  <Brain size={14} aria-hidden="true" />
+                  {soulProfilePending
+                    ? copy.settingsPanel.soulProfileSaving
+                    : copy.settingsPanel.soulProfileSave}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSoulProfileModalOpen(false)}
+                  disabled={soulProfilePending}
+                >
+                  <X size={14} aria-hidden="true" />
+                  {copy.settingsPanel.soulProfileClose}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      ) : null}
       {agentSetupPrompt ? (
         <div className="setup-modal-backdrop" role="presentation">
           <section

@@ -1,6 +1,6 @@
 # DeepSeek Agent OS v0.1.0 Candidate Notes
 
-Status: Windows-first release candidate. The `v0.1.0-rc.7` prerelease is
+Status: Windows-first release candidate. The `v0.1.0-rc.8` prerelease is
 intended for colleague testing through a GitHub release asset after the final
 local gates pass.
 
@@ -10,6 +10,19 @@ so Windows may show an unknown-publisher warning, but it embeds the Microsoft
 WebView2 bootstrapper and runs it silently when the target machine needs the
 WebView2 runtime. Ordinary users do not need Node.js, pnpm, Rust, or a source
 checkout to run the installed app.
+
+## v0.1.0-rc.8 Update
+
+- Fixes Windows prerelease packaging so the DS Agent app binary uses the
+  Windows GUI subsystem in packaged debug and release builds, preventing the
+  extra black console window from opening beside the desktop app.
+- Updates the documented Windows installer build command to use the Windows
+  Tauri packaging config instead of a debug Tauri build, and adds a release
+  guard so debug build commands cannot be reintroduced into the current release
+  docs.
+- Moves Soul Profile editing behind a compact `Soul` button in Settings.
+  Clicking it opens an annotated modal editor with field-by-field guidance and
+  a bottom `保存 soul profile` action that stays visible while the modal scrolls.
 
 ## v0.1.0-rc.7 Update
 
@@ -206,7 +219,7 @@ npx pnpm@9.15.9 test
 npx pnpm@9.15.9 test:release-local
 npx pnpm@9.15.9 test:release-local -- --require-live-deepseek --include-installed-workflow
 npx pnpm@9.15.9 test:release-source
-npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop tauri build --debug
+npx pnpm@9.15.9 --filter @deepseek-agent-os/desktop tauri build --config src-tauri/tauri.windows.conf.json
 git diff --check
 git diff --cached --check
 ```

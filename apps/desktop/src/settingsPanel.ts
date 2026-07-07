@@ -3,7 +3,7 @@ export type SettingsPanelItemControl =
   | "select"
   | "directory_picker"
   | "balance_reader"
-  | "profile_editor";
+  | "modal_button";
 
 export type SettingsPanelItemId =
   | "deepseek_api_key"
@@ -27,7 +27,7 @@ export const settingsPanelItems: SettingsPanelItem[] = [
   { id: "deepseek_model", control: "select" },
   { id: "deepseek_thinking", control: "select" },
   { id: "interface_style", control: "select" },
-  { id: "soul_profile", control: "profile_editor" },
+  { id: "soul_profile", control: "modal_button" },
   { id: "workspace_directory", control: "directory_picker", autoSaveOnChange: true },
   { id: "deepseek_balance", control: "balance_reader" },
 ];
