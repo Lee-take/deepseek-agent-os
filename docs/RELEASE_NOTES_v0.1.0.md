@@ -41,6 +41,9 @@ checkout to run the installed app.
 - When stale/conflicting/should_update feedback surfaces compact review hints,
   the runtime context points local testing toward update, archive, and conflict
   review without dumping full memory bodies into receipts.
+- Adds Memory maintenance strategy v1: repeated irrelevant feedback flags
+  retrieval review, repeated stale feedback flags update/archive review, and
+  neither path silently deletes or rewrites long-term memory.
 - Keeps memory runtime context bounded while surfacing compact feedback targets
   and update/archive candidate hints for local testing.
 

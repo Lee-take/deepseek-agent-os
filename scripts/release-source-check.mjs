@@ -2696,6 +2696,18 @@ function checkMemoryStudioDocs() {
   checkTextIncludesCollapsed(
     "README.md",
     readme,
+    "Memory maintenance strategy v1 treats repeated irrelevant/stale feedback as review pressure only",
+    "README.md memory maintenance strategy v1",
+  );
+  checkTextIncludesCollapsed(
+    "README.md",
+    readme,
+    "重复 irrelevant/stale 反馈只会触发维护复核压力",
+    "README.md memory maintenance strategy v1 zh",
+  );
+  checkTextIncludesCollapsed(
+    "README.md",
+    readme,
     "反馈会参与后续检索评分",
     "README.md feedback-informed memory retrieval scoring zh",
   );
@@ -2710,6 +2722,12 @@ function checkMemoryStudioDocs() {
     releaseNotes,
     "stale/conflicting/should_update feedback surfaces compact review hints",
     "release notes selected-memory feedback review hints",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.1.0.md",
+    releaseNotes,
+    "Memory maintenance strategy v1",
+    "release notes memory maintenance strategy v1",
   );
   checkTextIncludesCollapsed(
     "apps/desktop/src-tauri/src/commands.rs",
@@ -2744,6 +2762,18 @@ function checkMemoryStudioDocs() {
   checkTextIncludesCollapsed(
     "apps/desktop/src-tauri/src/commands.rs",
     memoryCommands,
+    "memories repeatedly marked irrelevant by feedback need retrieval review",
+    "runtime context emits repeated irrelevant maintenance review hints",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src-tauri/src/commands.rs",
+    memoryCommands,
+    "memories repeatedly marked stale by feedback need update or archive review",
+    "runtime context emits repeated stale maintenance review hints",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src-tauri/src/commands.rs",
+    memoryCommands,
     "pub fn list_selected_memory_feedback",
     "desktop command exposes selected-memory feedback review list",
   );
@@ -2758,6 +2788,18 @@ function checkMemoryStudioDocs() {
     app,
     "feedbackReviewItems",
     "Memory Studio groups selected-memory feedback for review",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "repeatedIrrelevantFeedback",
+    "Memory Studio escalates repeated irrelevant feedback for review",
+  );
+  checkTextIncludesCollapsed(
+    "apps/desktop/src/App.tsx",
+    app,
+    "repeatedStaleFeedback",
+    "Memory Studio escalates repeated stale feedback for review",
   );
   checkTextIncludesCollapsed(
     "apps/desktop/src/i18n.ts",

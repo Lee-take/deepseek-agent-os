@@ -141,6 +141,7 @@ const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
 const AGENT_MEMORY_CONTEXT_MAX_RECORDS: usize = 3;
 const AGENT_MEMORY_CONTEXT_MAX_BYTES: usize = 1200;
 const AGENT_MEMORY_CONTEXT_SNIPPET_CHARS: usize = 220;
+const AGENT_MEMORY_FEEDBACK_MAINTENANCE_THRESHOLD: usize = 2;
 const AGENT_MEMORY_CANDIDATE_GATE_MAX_RECORDS: usize = 3;
 const AGENT_MEMORY_CANDIDATE_EVIDENCE_CHARS: usize = 180;
 const AGENT_MEMORY_CANDIDATE_REASON_CHARS: usize = 220;
@@ -2564,6 +2565,14 @@ impl AgentMemoryFeedbackSummary {
             && self.should_update == 0
     }
 
+    fn needs_retrieval_review(self) -> bool {
+        self.irrelevant >= AGENT_MEMORY_FEEDBACK_MAINTENANCE_THRESHOLD
+    }
+
+    fn needs_update_archive_review(self) -> bool {
+        self.stale >= AGENT_MEMORY_FEEDBACK_MAINTENANCE_THRESHOLD
+    }
+
     fn score_delta(self) -> i32 {
         self.useful as i32 * 4
             - self.irrelevant as i32 * 6
@@ -2633,6 +2642,8 @@ fn select_agent_memory_runtime_context_with_feedback(
     let mut feedback_stale = 0usize;
     let mut feedback_conflicting = 0usize;
     let mut feedback_should_update = 0usize;
+    let mut feedback_repeated_irrelevant = 0usize;
+    let mut feedback_repeated_stale = 0usize;
 
     if query_terms.is_empty() {
         return context;
@@ -2656,6 +2667,12 @@ fn select_agent_memory_runtime_context_with_feedback(
             }
             if summary.should_update > 0 {
                 feedback_should_update += 1;
+            }
+            if summary.needs_retrieval_review() {
+                feedback_repeated_irrelevant += 1;
+            }
+            if summary.needs_update_archive_review() {
+                feedback_repeated_stale += 1;
             }
         }
         if let Some(candidate) = agent_memory_candidate_match(
@@ -2737,6 +2754,16 @@ fn select_agent_memory_runtime_context_with_feedback(
     if feedback_should_update > 0 {
         context.omissions.push(format!(
             "{feedback_should_update} memories marked should_update by feedback need update candidate review"
+        ));
+    }
+    if feedback_repeated_irrelevant > 0 {
+        context.omissions.push(format!(
+            "{feedback_repeated_irrelevant} memories repeatedly marked irrelevant by feedback need retrieval review"
+        ));
+    }
+    if feedback_repeated_stale > 0 {
+        context.omissions.push(format!(
+            "{feedback_repeated_stale} memories repeatedly marked stale by feedback need update or archive review"
         ));
     }
     context.omitted_by_budget = budget_omitted;
@@ -10097,6 +10124,72 @@ mod tests {
         }));
         assert!(context.omissions.iter().any(|line| {
             line == "1 memories marked should_update by feedback need update candidate review"
+        }));
+    }
+
+    #[test]
+    fn agent_memory_runtime_context_reports_repeated_feedback_maintenance_hints() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let now = Utc::now();
+        let repeated_irrelevant_memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "默认语气偏好 repeated irrelevant".to_string(),
+            body: "默认语气应该简洁、温暖、直接。".to_string(),
+            memory_type: MemoryType::Preference,
+            scope: MemoryScope::User,
+            sensitivity: MemorySensitivity::Normal,
+            lifecycle: MemoryLifecycle::Active,
+            source: MemoryRecordSource::MemoryCandidate,
+            source_id: None,
+            pinned: false,
+            expires_at: None,
+            linked_memory_ids: Vec::new(),
+            linked_memories: Vec::new(),
+            search_match: MemorySearchMatch::direct(),
+            created_at: now,
+            updated_at: now,
+        };
+        let repeated_stale_memory = MemoryRecord {
+            id: Uuid::new_v4(),
+            title: "默认语气偏好 repeated stale".to_string(),
+            updated_at: now + Duration::seconds(60),
+            ..repeated_irrelevant_memory.clone()
+        };
+        store
+            .append_memory_record(&repeated_irrelevant_memory)
+            .expect("irrelevant memory appends");
+        store
+            .append_memory_record(&repeated_stale_memory)
+            .expect("stale memory appends");
+
+        for _ in 0..2 {
+            store
+                .record_selected_memory_feedback(
+                    repeated_irrelevant_memory.id,
+                    None,
+                    MemorySelectedFeedbackKind::Irrelevant,
+                    "This memory was not useful for this query.".to_string(),
+                )
+                .expect("irrelevant feedback appends");
+            store
+                .record_selected_memory_feedback(
+                    repeated_stale_memory.id,
+                    None,
+                    MemorySelectedFeedbackKind::Stale,
+                    "This memory needs update or archive review.".to_string(),
+                )
+                .expect("stale feedback appends");
+        }
+
+        let context =
+            super::load_agent_memory_runtime_context(&store, "请按默认语气回复").expect("context");
+
+        assert_eq!(store.list_memory_records().expect("records").len(), 2);
+        assert!(context.omissions.iter().any(|line| {
+            line == "1 memories repeatedly marked irrelevant by feedback need retrieval review"
+        }));
+        assert!(context.omissions.iter().any(|line| {
+            line == "1 memories repeatedly marked stale by feedback need update or archive review"
         }));
     }
 

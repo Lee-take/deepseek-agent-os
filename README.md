@@ -151,6 +151,7 @@ plugin execution, and polished signed installers are not complete in `0.1.0`.
 - Memory Studio，用于记忆候选、编辑、删除、过期、关联记忆标题/正文搜索、关联记忆搜索命中来源、
   关联说明、手动关联已有长期记忆、冲突处理和反馈驱动检索。Context Receipt 里的已选记忆反馈会参与后续检索评分，
   同时把 stale/conflicting/should_update 反馈压缩成更新、归档和冲突复核提示。
+  重复 irrelevant/stale 反馈只会触发维护复核压力，不会静默删除或改写长期记忆。
 - Operations Briefing 经营简报工作流：
   - 读取本地证据并生成管理简报。
   - 配置 DeepSeek 后可调用模型合成。
@@ -494,6 +495,10 @@ useful feedback can lift later recall, irrelevant, stale, conflicting, or
 should_update feedback can lower recall, and stale/conflicting/should_update
 feedback surfaces compact review hints without dumping full memory bodies into
 receipts.
+Memory maintenance strategy v1 treats repeated irrelevant/stale feedback as
+review pressure only: repeated irrelevant feedback flags retrieval review,
+repeated stale feedback flags update/archive review, and DS Agent still does
+not silently delete or rewrite long-term memories.
 
 Memory conflict clarity v1 surfaces likely overlaps before acceptance and
 supports link, merge, and replace decisions with inspectable relation notes.

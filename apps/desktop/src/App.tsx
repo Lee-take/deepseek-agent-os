@@ -992,9 +992,14 @@ export function App() {
         const latestFeedback = [...feedbackRecords].sort((left, right) =>
           String(right.created_at).localeCompare(String(left.created_at)),
         )[0];
-        const needsFeedbackReview = feedbackRecords.some((feedback) =>
-          ["stale", "conflicting", "should_update"].includes(feedback.feedback),
-        );
+        const repeatedIrrelevantFeedback = (counts.irrelevant ?? 0) >= 2;
+        const repeatedStaleFeedback = (counts.stale ?? 0) >= 2;
+        const needsFeedbackReview =
+          repeatedIrrelevantFeedback ||
+          repeatedStaleFeedback ||
+          feedbackRecords.some((feedback) =>
+            ["stale", "conflicting", "should_update"].includes(feedback.feedback),
+          );
 
         return {
           memoryId,

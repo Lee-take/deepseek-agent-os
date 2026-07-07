@@ -146,3 +146,15 @@ test("Memory Studio exposes selected-memory feedback review", () => {
   assert.match(appSource, /copy\.memory\.needsFeedbackReview/);
   assert.match(appSource, /copy\.memory\.feedbackReviewEmpty/);
 });
+
+test("Memory Studio escalates repeated selected-memory feedback for maintenance review", () => {
+  const appSource = readFileSync(appSourceUrl, "utf8");
+
+  assert.match(
+    appSource,
+    /const repeatedIrrelevantFeedback = \(counts\.irrelevant \?\? 0\) >= 2/,
+  );
+  assert.match(appSource, /const repeatedStaleFeedback = \(counts\.stale \?\? 0\) >= 2/);
+  assert.match(appSource, /repeatedIrrelevantFeedback \|\|/);
+  assert.match(appSource, /repeatedStaleFeedback \|\|/);
+});
