@@ -3839,6 +3839,16 @@ export function App() {
     },
   }),
   ];
+  const agentStarterPrompts = [
+    copy.chatWorkbench.quickAsk,
+    copy.chatWorkbench.quickDraft,
+    copy.chatWorkbench.quickAnalyze,
+  ];
+  const showAgentStarterPrompts =
+    !agentChatPending &&
+    agentMessages.length === 0 &&
+    agentPrompt.trim().length === 0 &&
+    agentAttachments.length === 0;
   const agentErrorSteps: WorkflowStep[] = showAgentErrorStatus
     ? [
         {
@@ -5075,6 +5085,23 @@ export function App() {
                             <X size={12} aria-hidden="true" />
                           </button>
                         </div>
+                      ))}
+                    </div>
+                  ) : null}
+                  {showAgentStarterPrompts ? (
+                    <div
+                      className="starter-prompts"
+                      aria-label={copy.chatWorkbench.starterPromptsLabel}
+                    >
+                      {agentStarterPrompts.map((prompt) => (
+                        <button
+                          type="button"
+                          className="starter-prompt"
+                          key={prompt}
+                          onClick={() => setAgentPrompt(prompt)}
+                        >
+                          {prompt}
+                        </button>
                       ))}
                     </div>
                   ) : null}

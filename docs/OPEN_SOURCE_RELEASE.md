@@ -1,6 +1,6 @@
 # Open Source Release Plan
 
-This document defines the `0.1.0` upload checkpoint so the project can keep a
+This document defines the `0.1.0` release checkpoint so the project can keep a
 credible GitHub open-source baseline for DeepSeek-first desktop agent support
 that can run on Windows.
 
@@ -20,7 +20,7 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
 - A platform roadmap that keeps the Windows checkpoint first, then validates
   and releases macOS after the Windows checkpoint remains stable.
 
-## Non-Goals For The 0.1.0 Upload Candidate
+## Non-Goals For The 0.1.0 Release
 
 - No new workflow packs.
 - No new model providers beyond the existing abstraction.
@@ -31,19 +31,19 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
 - No broader Computer Use automation.
 - No arbitrary third-party executable plugin system.
 
-## Required Before Publication Resumes
+## Required Before Publication
 
 - Confirm Apache-2.0 license metadata is present in the repository.
 - Confirm repository visibility and project owner name.
 - Keep the already-published `v0.0.1` source snapshot, tag, and release
   unchanged.
-- For the `v0.1.0` RC line, publish a new prerelease with the Windows installer
-  attached after final verification passes.
+- For the formal `v0.1.0` line, publish a GitHub release with the Windows
+  installer attached after final verification passes.
 - The Windows installer should embed the Microsoft WebView2 bootstrapper so
   ordinary users do not need a developer toolchain or a separate WebView2 setup
   step.
-- Run final local release-candidate verification on the release branch before
-  any publication decision.
+- Run final local release verification on the release branch before any
+  publication decision.
 - Prepare release notes that call out preview limits plainly.
 
 ## Post-Release Maintenance
@@ -53,10 +53,10 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
   `v0.1-alpha` tag is historical and should not be treated as the current
   project version.
 - If post-release hardening commits should become a released snapshot, create a
-  new prerelease tag instead of rewriting an old tag.
+  new patch or prerelease tag instead of rewriting an old tag.
 - The older source-only publication decision is superseded by the
-  `v0.1.0` Windows installer prerelease plan.
-- Keep patch prereleases focused on release hygiene, security checks,
+  `v0.1.0` Windows installer release plan.
+- Keep patch releases focused on release hygiene, security checks,
   documentation corrections, Windows run reliability, or DeepSeek compatibility
   verification. Do not use patch releases to add broad new product capabilities
   outside the existing DeepSeek-first workflows, permissions, memory, Windows
@@ -100,7 +100,7 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
   exports or packaged assets do not enter generated source archives.
 - `.env.example` documents local DeepSeek and optional local bridge environment
   variables without storing secret values.
-- `docs/RELEASE_NOTES_v0.1.0.md` is the current upload-candidate note source.
+- `docs/RELEASE_NOTES_v0.1.0.md` is the current release note source.
 
 Maintainer handoff notes, decision logs, and `docs/superpowers/` planning files
 are local-only continuation material. They are useful for project handoff on the

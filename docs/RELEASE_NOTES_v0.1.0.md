@@ -1,15 +1,40 @@
-# DeepSeek Agent OS v0.1.0 Candidate Notes
+# DeepSeek Agent OS v0.1.0 Release Notes
 
-Status: Windows-first release candidate. The `v0.1.0-rc.11` prerelease is
-intended for colleague testing through a GitHub release asset after the final
-local gates pass.
+Status: Windows-first formal release. The `v0.1.0` release is intended for
+colleague testing through a GitHub release asset after the final local gates
+pass.
 
-Packaging: Windows installer prerelease. The GitHub prerelease should attach
-the NSIS setup executable and its SHA-256 checksum. The installer is unsigned,
-so Windows may show an unknown-publisher warning, but it embeds the Microsoft
+Packaging: Windows installer release. The GitHub release should attach the
+NSIS setup executable and its SHA-256 checksum. The installer is unsigned, so
+Windows may show an unknown-publisher warning, but it embeds the Microsoft
 WebView2 bootstrapper and runs it silently when the target machine needs the
 WebView2 runtime. Ordinary users do not need Node.js, pnpm, Rust, or a source
 checkout to run the installed app.
+
+For the formal `v0.1.0` release, maintainers should check
+`docs/V0_1_0_RELEASE_SCORECARD.md`, confirm the recorded gates, and keep memory
+work in stabilization mode unless a release-blocking regression appears.
+
+## Formal v0.1.0 Release Focus
+
+DS Agent v0.1.0 is a Windows-first local desktop agent for DeepSeek users who
+need practical office help: summarize evidence, draft management briefings,
+create local artifacts, continue projects with auditable memory, and keep
+every local action behind visible permission and audit boundaries.
+
+Highlights:
+
+- DeepSeek-first local desktop experience for Windows users.
+- Chat-first office workflows for evidence summaries, management briefings, and
+  local artifacts.
+- Permissioned local execution: the model proposes, DS Agent validates and
+  records.
+- Context Receipts that show selected evidence, memory, route, validation,
+  omissions, and output paths.
+- Auditable memory with feedback, quality scoring, maintenance history, and no
+  silent model-owned writes.
+- Local-first workspace for files, reports, work packages, logs, and replayable
+  artifacts.
 
 ## v0.1.0-rc.11 Update
 

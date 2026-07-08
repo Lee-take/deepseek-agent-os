@@ -12,25 +12,30 @@ The Windows build produces a normal NSIS setup executable:
 DS Agent_0.1.0_x64-setup.exe
 ```
 
-The `v0.1.0` release-candidate prereleases attach this Windows installer for
-colleague testing. It is unsigned, so Windows may show an unknown-publisher
-warning. The installer embeds the Microsoft WebView2 bootstrapper and runs it
-silently when the target machine needs the WebView2 runtime; users do not need
-Node.js, pnpm, Rust, or a source checkout to run the installed app.
+The `v0.1.0` release attaches this Windows installer for colleague testing. It
+is unsigned, so Windows may show an unknown-publisher warning. The installer
+embeds the Microsoft WebView2 bootstrapper and runs it silently when the target
+machine needs the WebView2 runtime; users do not need Node.js, pnpm, Rust, or a
+source checkout to run the installed app.
 
 The installer-selected application directory is only for program files. It is
 not the workspace, evidence folder, export folder, or event database location.
 
-At first run, choose three local folders in the setup panel:
+At first run, choose one local workspace root. DS Agent uses that workspace for
+approved local file actions and maintains subdirectories for evidence, exports,
+reports, workflow runs, work packages, memory, logs, and future artifact types
+as needed. Ordinary users should not need to choose separate internal folders
+before starting their first chat task.
 
-- Default workspace: where approved file writes can create local files.
-- Default evidence folder: where evidence templates and screenshot evidence can
-  be written.
-- Default export folder: where reports and work packages can be exported.
+The app stores this local directory choice in `local-directories.json` under
+the OS app data directory. The setup panel shows the exact app data and
+settings-file paths for the current machine.
 
-The app stores these choices in `local-directories.json` under the OS app data
-directory. The setup panel shows the exact app data and settings-file paths for
-the current machine.
+Good first tasks to try:
+
+- `根据我的证据文件夹，生成一份经营简报，并导出 HTML 和 PDF。`
+- `把这段会议纪要整理成行动项、责任部门、截止时间和风险提示。`
+- `继续上次的项目，先说明你用了哪些记忆，再给我下一步建议。`
 
 ## Build From Source
 
@@ -54,8 +59,7 @@ To run only the repository secret scan before committing or pushing:
 npx pnpm@9.15.9 test:secrets
 ```
 
-Before any publication decision for a new prerelease, run the local
-release-candidate gate:
+Before any publication decision for a new release, run the local release gate:
 
 ```powershell
 npx pnpm@9.15.9 test:release-local

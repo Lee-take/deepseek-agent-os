@@ -1055,6 +1055,32 @@ h1 {
   overflow-y: auto;
 }
 
+.starter-prompts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.starter-prompt {
+  flex: 1 1 180px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-bg) 88%, var(--surface-control));
+  color: var(--body-text);
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.starter-prompt:hover {
+  border-color: color-mix(in srgb, var(--surface-accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--surface-accent) 8%, var(--surface-bg));
+}
+
 .attachment-strip {
   display: flex;
   flex-wrap: wrap;

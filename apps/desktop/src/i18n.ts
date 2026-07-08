@@ -222,6 +222,7 @@ type TranslationSet = {
     assistantMessage: string;
     taskTitlePlaceholder: string;
     composerPlaceholder: string;
+    starterPromptsLabel: string;
     quickAsk: string;
     quickDraft: string;
     quickAnalyze: string;
@@ -1160,9 +1161,10 @@ export const translations: Record<Language, TranslationSet> = {
       assistantMessage: "直接输入问题或指令。我会先判断需要的上下文、权限和插件，再连接 DeepSeek 回复。",
       taskTitlePlaceholder: "给这个任务起个短标题",
       composerPlaceholder: "输入问题、文字或指令",
-      quickAsk: "直接提问",
-      quickDraft: "帮我写一段",
-      quickAnalyze: "分析这段材料",
+      starterPromptsLabel: "试试这些办公任务",
+      quickAsk: "根据我的证据文件夹，生成一份经营简报。",
+      quickDraft: "把这段会议纪要整理成行动项、责任部门、截止时间和风险提示。",
+      quickAnalyze: "继续上次的项目，先说明你用了哪些记忆，再给我下一步建议。",
       saveTask: "发送",
       stopTask: "停止",
       addAttachment: "添加文件",
@@ -2215,9 +2217,10 @@ export const translations: Record<Language, TranslationSet> = {
       assistantMessage: "Type a question or instruction. I will check context, permissions, and plugins first, then connect to DeepSeek.",
       taskTitlePlaceholder: "Give this task a short title",
       composerPlaceholder: "Enter a question, text, or instruction",
-      quickAsk: "Ask directly",
-      quickDraft: "Help me draft",
-      quickAnalyze: "Analyze this text",
+      starterPromptsLabel: "Try an office task",
+      quickAsk: "Create a management briefing from my evidence folder.",
+      quickDraft: "Turn these meeting notes into actions, owners, deadlines, and risks.",
+      quickAnalyze: "Continue the previous project, first explain which memories you used.",
       saveTask: "Send",
       stopTask: "Stop",
       addAttachment: "Add files",

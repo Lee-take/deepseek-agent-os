@@ -338,6 +338,7 @@ const requiredPackageScripts = new Map([
   ["test:deepseek", "node scripts/deepseek-smoke.mjs"],
   ["test:deepseek:briefing", "node scripts/deepseek-operations-briefing-smoke.mjs"],
   ["test:builtin-plugins", "node scripts/validate-builtin-plugins.mjs"],
+  ["test:frontend-starter-prompts", "node scripts/frontend-starter-prompts-smoke.mjs"],
   ["test:windows-local", "node scripts/windows-local-smoke.mjs"],
   ["test:windows-installed-ui", "node scripts/windows-installed-ui-smoke.mjs"],
   ["test:release-source", "node scripts/release-source-check.mjs"],
@@ -463,6 +464,7 @@ checkRuntimeComputerUseCopyPositioning();
 checkRuntimeLocalDesktopRouteFailureCopyPositioning();
 checkChatFirstRunStatusUi();
 checkChatFirstCenterWorkbenchUi();
+checkFrontendStarterPromptsSmoke();
 checkHistoricalReleaseNotes();
 checkWindowsValidationStatusDocs();
 checkReleaseGateDocs();
@@ -690,6 +692,22 @@ function checkRequiredDocs() {
     "Permissioned tool surfaces for file, network, browser, terminal, local-folder read/export, email read/draft/send approval records, and Computer Use operations.",
     "README.md current English tool surface wording",
   );
+  for (const [phrase, label] of [
+    [
+      "turning local evidence into reviewable office outputs",
+      "README.md English introduction names DS Agent office-output strength",
+    ],
+    [
+      "what evidence, memory, route, validation, omissions, and output paths were used",
+      "README.md English introduction names auditable context receipts",
+    ],
+    [
+      "让日常办公任务真的能被完成、复核、延续和纠偏",
+      "README.md Chinese introduction names practical office strength",
+    ],
+  ]) {
+    checkTextIncludesCollapsed("README.md", readme, phrase, label);
+  }
 
   for (const phrase of [
     "BrowserSubmit boundary v1, NetworkSearch source adapter v1, FileRead v1",
@@ -1005,6 +1023,23 @@ function checkRequiredDocs() {
     "Permissioned tool surfaces for file, network, browser, terminal, local-folder read/export, email read/draft/send approval records, and Computer Use operations.",
     "release notes current English tool surface wording",
   );
+  const releaseScorecard = readText("docs/V0_1_0_RELEASE_SCORECARD.md");
+  for (const phrase of [
+    "Status: pending",
+    "Target: v0.1.0 Windows formal release",
+    "Operations Briefing creates local Markdown, HTML, lightweight PDF, and work-package JSON from sample evidence",
+    "Memory remains bounded and auditable",
+    "npx pnpm@9.15.9 test:frontend-starter-prompts",
+    "npx pnpm@9.15.9 test:release-local -- --require-live-deepseek --include-installed-workflow",
+    "Do Not Block v0.1.0",
+  ]) {
+    checkTextIncludesCollapsed(
+      "docs/V0_1_0_RELEASE_SCORECARD.md",
+      releaseScorecard,
+      phrase,
+      `v0.1.0 release scorecard: ${phrase}`,
+    );
+  }
 
   const installation = readText("docs/INSTALLATION.md");
   const collapsedInstallation = installation.replace(/\s+/g, " ").trim();
@@ -1046,7 +1081,9 @@ function checkRequiredDocs() {
     "If web search is blocked",
     "choose a free source-linked web-search option in the UI before running search",
     "choose a free source-linked web-search option when prompted",
-    "Default workspace: where approved file writes can create local files",
+    "At first run, choose one local workspace root",
+    "approved local file actions and maintains subdirectories for evidence",
+    "Ordinary users should not need to choose separate internal folders",
     "checks bridge readiness before using the local bridge for screen inspection, computer control, and source-linked web search",
     "start and stop the bridge service yourself",
     "DS Agent does not launch or manage the bridge service in this preview",
@@ -1090,10 +1127,16 @@ function checkRequiredDocs() {
   );
 
   if (!releaseNotes.includes("npx pnpm@9.15.9 test:release-local")) {
-    failures.push("release notes must document the local release-candidate gate");
+    failures.push("release notes must document the local release gate");
   } else {
     checks.push("release notes local release gate");
   }
+  checkTextDoesNotInclude(
+    "docs/RELEASE_NOTES_v0.1.0.md",
+    releaseNotes,
+    "v0.1.0 Candidate Notes",
+    "release notes title must use formal release wording",
+  );
   checkTextDoesNotInclude(
     "docs/RELEASE_NOTES_v0.1.0.md",
     releaseNotes,
@@ -1128,12 +1171,12 @@ function checkRequiredDocs() {
   );
 
   if (
-    !releaseNotes.includes("Windows installer prerelease") ||
+    !releaseNotes.includes("Windows installer release") ||
     !releaseNotes.includes("WebView2 bootstrapper")
   ) {
-    failures.push("release notes must document Windows installer prerelease packaging");
+    failures.push("release notes must document Windows installer release packaging");
   } else {
-    checks.push("release notes Windows installer prerelease packaging");
+    checks.push("release notes Windows installer release packaging");
   }
 }
 
@@ -2017,6 +2060,9 @@ function checkChatFirstCenterWorkbenchUi() {
     "className=\"chat-thread\"",
     "className=\"chat-message assistant pending\"",
     'className={`chat-composer${agentAttachmentDragActive ? " drag-active" : ""}`}',
+    "className=\"starter-prompts\"",
+    "className=\"starter-prompt\"",
+    "copy.chatWorkbench.starterPromptsLabel",
     "className=\"sidebar-record-list\"",
     "onSubmit={sendAgentMessage}",
     "agentMessages.map",
@@ -2034,10 +2080,12 @@ function checkChatFirstCenterWorkbenchUi() {
   for (const phrase of [
     "DeepSeek 对话工作台",
     "输入问题、文字或指令",
+    "根据我的证据文件夹，生成一份经营简报。",
     "技能与插件",
     "请输入 DeepSeek API key",
     "DeepSeek Chat Workbench",
     "Enter a question, text, or instruction",
+    "Create a management briefing from my evidence folder.",
     "Skills & Plugins",
     "Enter a DeepSeek API key",
   ]) {
@@ -2059,12 +2107,38 @@ function checkChatFirstCenterWorkbenchUi() {
     ".chat-message",
     ".chat-message.pending",
     ".chat-composer",
+    ".starter-prompts",
+    ".starter-prompt",
     ".chat-session-meta",
     ".composer-actions",
     ".setup-modal-backdrop",
     ".setup-modal",
   ]) {
     checkTextIncludes(stylesPath, styles, snippet, `chat-first center workbench style: ${snippet}`);
+  }
+}
+
+function checkFrontendStarterPromptsSmoke() {
+  const scriptPath = "scripts/frontend-starter-prompts-smoke.mjs";
+  const script = readText(scriptPath);
+  for (const [snippet, checkName] of [
+    ["--self-test", "frontend starter prompts smoke has self-test flag"],
+    ["starter_prompt_count", "frontend starter prompts smoke reports prompt count"],
+    [".starter-prompt", "frontend starter prompts smoke checks starter prompt DOM"],
+    ["Runtime.evaluate", "frontend starter prompts smoke uses CDP runtime evaluation"],
+    ["Page.captureScreenshot", "frontend starter prompts smoke captures screenshot evidence"],
+    ["--remote-debugging-port", "frontend starter prompts smoke launches browser with CDP"],
+    ["npx-cli.js", "frontend starter prompts smoke avoids direct Windows npx.cmd spawn"],
+    [
+      "根据我的证据文件夹，生成一份经营简报。",
+      "frontend starter prompts smoke checks Chinese briefing prompt",
+    ],
+    [
+      "Create a management briefing from my evidence folder.",
+      "frontend starter prompts smoke checks English briefing prompt",
+    ],
+  ]) {
+    checkTextIncludes(scriptPath, script, snippet, checkName);
   }
 }
 
@@ -2523,8 +2597,8 @@ function checkReleaseGateDocs() {
     checkTextIncludesCollapsed(
       docPath,
       content,
-      "Before any publication decision for a new prerelease, run the local release-candidate gate",
-      `${docPath} prerelease gate docs`,
+      "Before any publication decision for a new release, run the local release gate",
+      `${docPath} release gate docs`,
     );
     checkTextIncludesCollapsed(
       docPath,
@@ -3730,8 +3804,8 @@ function checkOpenSourceReleaseStatus() {
   checkTextIncludesCollapsed(
     "docs/OPEN_SOURCE_RELEASE.md",
     openSourceRelease,
-    "For the `v0.1.0` RC line, publish a new prerelease with the Windows installer attached after final verification passes",
-    "open-source release Windows installer prerelease strategy",
+    "For the formal `v0.1.0` line, publish a GitHub release with the Windows installer attached after final verification passes",
+    "open-source release Windows installer release strategy",
   );
   checkTextIncludesCollapsed(
     "docs/OPEN_SOURCE_RELEASE.md",
@@ -3742,7 +3816,7 @@ function checkOpenSourceReleaseStatus() {
   checkTextIncludesCollapsed(
     "docs/OPEN_SOURCE_RELEASE.md",
     openSourceRelease,
-    "Run final local release-candidate verification on the release branch before any publication decision",
+    "Run final local release verification on the release branch before any publication decision",
     "open-source release final local verification policy",
   );
 
@@ -4326,6 +4400,12 @@ function checkLocalReleaseHelperSelfTests() {
   checkTextIncludes(
     "scripts/windows-installed-ui-smoke.mjs",
     windowsInstalledUiSmoke,
+    "--office",
+    "Windows installed UI Office artifact smoke flag",
+  );
+  checkTextIncludes(
+    "scripts/windows-installed-ui-smoke.mjs",
+    windowsInstalledUiSmoke,
     "runInstalledMemoryFeedbackSmoke",
     "Windows installed UI memory-feedback smoke helper",
   );
@@ -4358,6 +4438,54 @@ function checkLocalReleaseHelperSelfTests() {
     windowsInstalledUiSmoke,
     "memory_maintenance:",
     "Windows installed UI memory-maintenance JSON output",
+  );
+  checkTextIncludes(
+    "scripts/windows-installed-ui-smoke.mjs",
+    windowsInstalledUiSmoke,
+    "export_work_package",
+    "Windows installed workflow smoke exports work package",
+  );
+  checkTextIncludes(
+    "scripts/windows-installed-ui-smoke.mjs",
+    windowsInstalledUiSmoke,
+    "deepseek-agent-os-work-package-${run.value.id}.json",
+    "Windows installed workflow smoke writes work-package JSON evidence",
+  );
+  checkTextIncludes(
+    "scripts/windows-installed-ui-smoke.mjs",
+    windowsInstalledUiSmoke,
+    "work_package_run_count",
+    "Windows installed workflow smoke reports work-package run count",
+  );
+  checkTextIncludes(
+    "scripts/windows-installed-ui-smoke.mjs",
+    windowsInstalledUiSmoke,
+    "runInstalledOfficeArtifactSmoke",
+    "Windows installed UI Office artifact smoke helper",
+  );
+  checkTextIncludes(
+    "scripts/windows-installed-ui-smoke.mjs",
+    windowsInstalledUiSmoke,
+    "resume_agent_chat_action",
+    "Windows installed UI Office smoke uses agent action dispatch path",
+  );
+  checkTextIncludes(
+    "scripts/windows-installed-ui-smoke.mjs",
+    windowsInstalledUiSmoke,
+    "New-Object -ComObject Word.Application",
+    "Windows installed UI Office smoke verifies Word can open artifact",
+  );
+  checkTextIncludes(
+    "scripts/windows-installed-ui-smoke.mjs",
+    windowsInstalledUiSmoke,
+    "-EncodedCommand",
+    "Windows installed UI Office smoke uses whole-script PowerShell execution",
+  );
+  checkTextIncludes(
+    "scripts/windows-installed-ui-smoke.mjs",
+    windowsInstalledUiSmoke,
+    "office_artifact:",
+    "Windows installed UI Office artifact JSON output",
   );
 
   const releaseLocal = readText("scripts/release-local-check.mjs");

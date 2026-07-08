@@ -14,6 +14,7 @@ const allowedArgs = new Set([
   "--help",
   "--memory-feedback",
   "--memory-maintenance",
+  "--office",
   "--self-test",
   "--workflow",
 ]);
@@ -29,6 +30,7 @@ if (rawArgs.includes("--help")) {
       "  --agent-chat Exercise the installed Tauri agent chat command bridge.",
       "  --memory-feedback Exercise installed memory candidate + selected-memory feedback bridge.",
       "  --memory-maintenance Exercise installed background memory update/archive maintenance.",
+      "  --office Exercise installed Office artifact creation and Word open verification.",
       "  --self-test Run deterministic helper checks without launching DS Agent.",
       "  --workflow  Exercise the installed Tauri workflow and report exports.",
     ].join("\n"),
@@ -51,6 +53,9 @@ const includeMemoryFeedbackSmoke =
 const includeMemoryMaintenanceSmoke =
   args.has("--memory-maintenance") ||
   process.env.DEEPSEEK_AGENT_OS_INSTALLED_MEMORY_MAINTENANCE_SMOKE === "1";
+const includeOfficeArtifactSmoke =
+  args.has("--office") ||
+  process.env.DEEPSEEK_AGENT_OS_INSTALLED_OFFICE_ARTIFACT_SMOKE === "1";
 const expectModelTelemetry = Boolean(process.env.DEEPSEEK_API_KEY?.trim());
 const timeoutMs = readPositiveInteger(
   process.env.DEEPSEEK_AGENT_OS_INSTALLED_UI_TIMEOUT_MS ?? "20000",
@@ -133,6 +138,9 @@ async function main() {
     const workflow = includeWorkflowSmoke
       ? await runInstalledWorkflowSmoke(cdp)
       : null;
+    const officeArtifact = includeOfficeArtifactSmoke
+      ? await runInstalledOfficeArtifactSmoke(cdp)
+      : null;
 
     const checks = {
       title: title === "DS Agent",
@@ -162,6 +170,7 @@ async function main() {
           agent_chat: agentChat ?? "skipped",
           memory_feedback: memoryFeedback ?? "skipped",
           memory_maintenance: memoryMaintenance ?? "skipped",
+          office_artifact: officeArtifact ?? "skipped",
           workflow: workflow ?? "skipped",
         },
         null,
@@ -748,10 +757,26 @@ async function runInstalledWorkflowSmoke(client) {
       run.value.id,
       approvals,
     );
+    const workPackage = await invokeTauri(client, "export_work_package", {});
+    const workPackagePath = path.join(
+      exportDir,
+      `deepseek-agent-os-work-package-${run.value.id}.json`,
+    );
+    await writeFile(workPackagePath, `${JSON.stringify(workPackage, null, 2)}\n`, "utf8");
+    const workPackageBriefingRuns = Array.isArray(workPackage?.operations_briefing_runs)
+      ? workPackage.operations_briefing_runs
+      : [];
+    if (!workPackageBriefingRuns.some((item) => item?.id === run.value.id)) {
+      throw new Error("Exported work package did not include the installed workflow run.");
+    }
+
     const exportedFiles = await readdir(exportDir);
-    const exportedRefs = [markdown.value, html.value, pdf.value]
-      .map((invocation) => invocation.evidence_ref)
-      .filter(Boolean);
+    const exportedRefs = [
+      markdown.value?.evidence_ref,
+      html.value?.evidence_ref,
+      pdf.value?.evidence_ref,
+      workPackagePath,
+    ].filter(Boolean);
 
     for (const filePath of exportedRefs) {
       if (!existsSync(filePath)) {
@@ -767,6 +792,8 @@ async function runInstalledWorkflowSmoke(client) {
       evidence_ref: describeLocalPath(evidenceFolderPath),
       export_dir: describeLocalPath(exportDir),
       exported_files: exportedFiles,
+      work_package_file: path.basename(workPackagePath),
+      work_package_run_count: workPackageBriefingRuns.length,
       approvals_resolved: approvals.length,
       model_telemetry: modelTelemetry,
       settings_file_restored: false,
@@ -790,6 +817,250 @@ async function runInstalledWorkflowSmoke(client) {
     app_data_events: appDataEventsRestored ? "restored" : "restore_failed",
     app_data_events_restored: appDataEventsRestored,
   };
+}
+
+async function runInstalledOfficeArtifactSmoke(client) {
+  const startedAt = new Date();
+  const runRoot = path.join(
+    workflowRootDir,
+    `office-${startedAt.toISOString().replaceAll(":", "-").replaceAll(".", "-")}`,
+  );
+  const workspaceDir = path.join(runRoot, "workspace");
+  const evidenceDir = path.join(workspaceDir, "evidence");
+  const exportDir = path.join(workspaceDir, "exports");
+  await mkdir(workspaceDir, { recursive: true });
+  await mkdir(evidenceDir, { recursive: true });
+  await mkdir(exportDir, { recursive: true });
+
+  const directoryState = await invokeTauri(client, "get_local_directory_state", {});
+  const settingsBackup = await backupSettingsFile(directoryState?.settings_file);
+  const appDataEventsBackup = await backupAppDataEventsFile(directoryState?.settings_file);
+  const approvals = [];
+  let officeResult = null;
+  let restoreVerified = false;
+  let appDataEventsRestored = false;
+
+  try {
+    const savedDirectoryState = await invokeTauri(client, "save_local_directory_settings", {
+      workspaceDir,
+      workspaceName: "Installed Office Artifact Smoke",
+      evidenceDir,
+      exportDir,
+    });
+    if (savedDirectoryState?.needs_setup) {
+      throw new Error("Temporary installed office artifact directories were not accepted.");
+    }
+
+    const target = "office/office-artifact-smoke.docx";
+    const createAction = installedOfficeSmokeAction({
+      actionType: "office_create",
+      target,
+      title: "DS Agent Office Artifact Smoke",
+      reason: "Create a Word document to verify release Office artifact packaging.",
+      content: JSON.stringify({
+        app: "word",
+        title: "DS Agent Office Artifact Smoke",
+        body: [
+          "DS Agent Office Artifact Smoke",
+          "This document verifies that DS Agent can create a Word artifact that opens in Microsoft Word without repair.",
+        ].join("\n"),
+        target_location: "workspace",
+      }),
+    });
+    const create = await resumeAgentActionWithApproval(client, createAction, "file_write", approvals);
+    if (create.action?.execution_state !== "succeeded") {
+      throw new Error(
+        `office_create did not succeed: ${create.action?.execution_state ?? "unknown"} ${
+          create.action?.blocked_reason ?? ""
+        }`.trim(),
+      );
+    }
+
+    const relativeTarget = String(create.action.target ?? target).replaceAll("\\", "/");
+    const createdPath = path.join(workspaceDir, relativeTarget);
+    if (!existsSync(createdPath)) {
+      throw new Error(`Expected Office artifact was not found: ${createdPath}`);
+    }
+
+    const wordOpen = verifyWordCanOpenDocument(createdPath);
+    officeResult = {
+      ok: true,
+      mode: "office_artifact",
+      app: "word",
+      target: relativeTarget,
+      created_file: describeLocalPath(createdPath),
+      create_state: create.action.execution_state,
+      create_dispatch_note: create.action.dispatch_note ?? null,
+      approvals_resolved: approvals.length,
+      word_open_ok: wordOpen.ok === true,
+      word_paragraphs: wordOpen.paragraphs ?? null,
+      word_text_chars: wordOpen.text_chars ?? null,
+      settings_file_restored: false,
+      app_data_events: "pending_restore",
+      app_data_events_restored: false,
+    };
+  } finally {
+    await closeInstalledAppForAppDataRestore();
+    restoreVerified = await restoreSettingsFile(settingsBackup);
+    appDataEventsRestored = await restoreAppDataEventsFile(appDataEventsBackup);
+  }
+
+  assertWorkflowRestoresVerified({
+    settingsRestored: restoreVerified,
+    appDataEventsRestored,
+  });
+
+  return {
+    ...officeResult,
+    settings_file_restored: restoreVerified,
+    app_data_events: appDataEventsRestored ? "restored" : "restore_failed",
+    app_data_events_restored: appDataEventsRestored,
+  };
+}
+
+function installedOfficeSmokeAction({ actionType, target, title, reason, content }) {
+  return {
+    action_type: actionType,
+    title,
+    reason,
+    risk: "medium",
+    requires_confirmation: true,
+    target,
+    target_location: "workspace",
+    destination: null,
+    preferred_browser: null,
+    content,
+    capability: null,
+    policy_decision: null,
+    execution_state: "proposed",
+    dispatch_note: null,
+    permission_request_id: null,
+    capability_invocation_id: null,
+    workflow_run_id: null,
+    blocked_reason: null,
+  };
+}
+
+async function resumeAgentActionWithApproval(client, action, capability, approvals) {
+  const firstAction = await invokeTauri(client, "resume_agent_chat_action", {
+    accessMode: "full_access",
+    largeModelProvider: "deepseek",
+    networkSearchSourceModel: null,
+    action,
+  });
+  if (firstAction?.execution_state !== "needs_confirmation") {
+    return { action: firstAction, retried: false };
+  }
+
+  const requestId = await approveNewestPendingCapability(client, capability);
+  approvals.push(requestId);
+  const retryAction = {
+    ...firstAction,
+    execution_state: "proposed",
+  };
+  return {
+    action: await invokeTauri(client, "resume_agent_chat_action", {
+      accessMode: "full_access",
+      largeModelProvider: "deepseek",
+      networkSearchSourceModel: null,
+      action: retryAction,
+    }),
+    retried: true,
+  };
+}
+
+function verifyWordCanOpenDocument(filePath) {
+  const shell = resolvePowerShellExecutable();
+  const script = `
+$ErrorActionPreference = 'Stop'
+$path = $env:DS_AGENT_OFFICE_SMOKE_DOCX
+if (-not (Test-Path -LiteralPath $path)) {
+  throw "Office smoke file does not exist: $path"
+}
+$before = @(Get-Process WINWORD -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+$word = $null
+$doc = $null
+try {
+  $word = New-Object -ComObject Word.Application
+  $word.Visible = $false
+  $word.DisplayAlerts = 0
+  $readOnly = $true
+  $confirmConversions = $false
+  $addToRecentFiles = $false
+  $doc = $word.Documents.Open([ref] $path, [ref] $confirmConversions, [ref] $readOnly, [ref] $addToRecentFiles)
+  $text = [string]$doc.Content.Text
+  if ($text -notlike '*DS Agent Office Artifact Smoke*') {
+    throw "Word opened the document but expected smoke text was not found."
+  }
+  $result = [ordered]@{
+    ok = $true
+    app = 'Word'
+    paragraphs = [int]$doc.Paragraphs.Count
+    text_chars = [int]$text.Length
+  }
+  $result | ConvertTo-Json -Compress
+} finally {
+  if ($doc -ne $null) {
+    try { $doc.Close([ref] $false) | Out-Null } catch {}
+  }
+  if ($word -ne $null) {
+    try { $word.Quit() | Out-Null } catch {}
+    try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null } catch {}
+  }
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
+  $after = @(Get-Process WINWORD -ErrorAction SilentlyContinue)
+  foreach ($process in $after) {
+    if ($before -notcontains $process.Id) {
+      try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
+    }
+  }
+}
+`;
+  const encodedScript = Buffer.from(script, "utf16le").toString("base64");
+  const result = spawnSync(shell, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodedScript], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      DS_AGENT_OFFICE_SMOKE_DOCX: filePath,
+    },
+    timeout: 45_000,
+    windowsHide: true,
+  });
+
+  if (result.error) {
+    throw new Error(`Word open verification failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `Word open verification failed: ${(result.stderr || result.stdout).trim()}`,
+    );
+  }
+  const stdout = result.stdout.trim();
+  try {
+    return JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(`Word open verification returned invalid JSON: ${stdout || error.message}`);
+  }
+}
+
+function resolvePowerShellExecutable() {
+  const candidates = [
+    process.env.PWSH_EXE,
+    "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+    "pwsh.exe",
+    "powershell.exe",
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    const probe = spawnSync(candidate, ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    if (probe.status === 0) {
+      return candidate;
+    }
+  }
+  throw new Error("PowerShell is required for Word COM Office artifact verification.");
 }
 
 async function invokeWithApproval(client, command, params, capability, approvals) {
@@ -1168,9 +1439,21 @@ async function runSelfTest() {
   if (!allowedArgs.has("--memory-maintenance")) {
     throw new Error("Self-test expected --memory-maintenance to be a supported installed UI smoke flag.");
   }
+  if (!allowedArgs.has("--office")) {
+    throw new Error("Self-test expected --office to be a supported installed UI smoke flag.");
+  }
   validateInstalledUiSmokeFlagCombination(["--memory-feedback", "--agent-chat"]);
+  validateInstalledUiSmokeFlagCombination(["--office"]);
   assertSelfTestThrows(
     () => validateInstalledUiSmokeFlagCombination(["--memory-feedback", "--workflow"]),
+    "cannot be combined",
+  );
+  assertSelfTestThrows(
+    () => validateInstalledUiSmokeFlagCombination(["--office", "--workflow"]),
+    "cannot be combined",
+  );
+  assertSelfTestThrows(
+    () => validateInstalledUiSmokeFlagCombination(["--office", "--memory-feedback"]),
     "cannot be combined",
   );
   assertSelfTestThrows(
@@ -1295,6 +1578,15 @@ function assertSelfTestThrows(action, expectedMessage) {
 
 function validateInstalledUiSmokeFlagCombination(values) {
   const valueSet = new Set(values);
+  if (valueSet.has("--office") && valueSet.has("--workflow")) {
+    throw new Error("--office cannot be combined with --workflow.");
+  }
+  if (valueSet.has("--office") && valueSet.has("--memory-feedback")) {
+    throw new Error("--office cannot be combined with --memory-feedback.");
+  }
+  if (valueSet.has("--office") && valueSet.has("--memory-maintenance")) {
+    throw new Error("--office cannot be combined with --memory-maintenance.");
+  }
   if (valueSet.has("--memory-feedback") && valueSet.has("--workflow")) {
     throw new Error("--memory-feedback cannot be combined with --workflow.");
   }

@@ -15,6 +15,7 @@
     "test:deepseek": "node scripts/deepseek-smoke.mjs",
     "test:deepseek:briefing": "node scripts/deepseek-operations-briefing-smoke.mjs",
     "test:builtin-plugins": "node scripts/validate-builtin-plugins.mjs",
+    "test:frontend-starter-prompts": "node scripts/frontend-starter-prompts-smoke.mjs",
     "test:windows-local": "node scripts/windows-local-smoke.mjs",
     "test:windows-installed-ui": "node scripts/windows-installed-ui-smoke.mjs",
     "test:release-source": "node scripts/release-source-check.mjs",
