@@ -33,7 +33,7 @@ export const settingsPanelItems: SettingsPanelItem[] = [
 ];
 
 export function shouldExposePluginsSidebarEntry(): boolean {
-  return false;
+  return true;
 }
 
 export function deepSeekApiKeyCandidates(primaryApiKey: string, fallbackApiKey: string): string[] {

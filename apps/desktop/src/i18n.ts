@@ -228,6 +228,7 @@ type TranslationSet = {
     quickAnalyze: string;
     saveTask: string;
     stopTask: string;
+    queueGuidance: string;
     addAttachment: string;
     removeAttachment: string;
     attachmentBlocked: string;
@@ -239,6 +240,7 @@ type TranslationSet = {
     guidanceRunning: string;
     guidanceQueuedFeedback: string;
     guidanceRunningFeedback: string;
+    taskQueuedFeedback: string;
     stopRequestedFeedback: string;
     readyStatus: string;
     sendingStatus: string;
@@ -276,8 +278,42 @@ type TranslationSet = {
   skills: {
     title: string;
     enabled: string;
+    disabled: string;
     operationsTitle: string;
     operationsDescription: string;
+    installedTitle: string;
+    manifestPlaceholder: string;
+    remotePackageUrlPlaceholder: string;
+    installManifest: string;
+    installZip: string;
+    previewRemote: string;
+    installing: string;
+    empty: string;
+    enable: string;
+    disable: string;
+    verifySource: string;
+    prepareExecution: string;
+    resetTrust: string;
+    uninstall: string;
+    executionsTitle: string;
+    safeBoundary: string;
+    noPermissions: string;
+    installSucceeded: string;
+    previewSucceeded: (name: string, fileCount: number) => string;
+    statusChanged: string;
+    sourceVerified: (provenance: string) => string;
+    executionPrepared: (name: string) => string;
+    executionBlocked: (name: string, reason: string) => string;
+    trustReset: string;
+    uninstalled: string;
+    loadFailed: string;
+    installFailed: string;
+    previewFailed: string;
+    statusFailed: string;
+    sourceFailed: string;
+    executionFailed: string;
+    trustResetFailed: string;
+    uninstallFailed: string;
   };
   runStatus: {
     title: string;
@@ -297,6 +333,11 @@ type TranslationSet = {
     agentActionBody: string;
     permissionsAndTools: string;
     routeDetails: string;
+    recentRuns: string;
+    queuedRuns: string;
+    runStepsLabel: (count: number) => string;
+    runArtifactsLabel: (count: number) => string;
+    workerLabel: (worker: string) => string;
     steps: {
       understand: string;
       attachments: string;
@@ -1167,6 +1208,7 @@ export const translations: Record<Language, TranslationSet> = {
       quickAnalyze: "继续上次的项目，先说明你用了哪些记忆，再给我下一步建议。",
       saveTask: "发送",
       stopTask: "停止",
+      queueGuidance: "补充到当前任务",
       addAttachment: "添加文件",
       removeAttachment: "移除附件",
       attachmentBlocked: "已阻止",
@@ -1178,6 +1220,7 @@ export const translations: Record<Language, TranslationSet> = {
       guidanceRunning: "正在引导补充指令，并入同一任务继续执行",
       guidanceQueuedFeedback: "已收到补充说明，当前小节点完成后会并入同一任务。",
       guidanceRunningFeedback: "正在引导补充指令，DS Agent 会把它和当前任务统一考虑。",
+      taskQueuedFeedback: "已加入后台队列；当前任务完成后会自动执行。",
       stopRequestedFeedback: "已请求停止当前任务；本轮返回将不再追加到对话。",
       readyStatus: "输入后会先预处理，再连接 DeepSeek",
       sendingStatus: "正在预处理并连接 DeepSeek",
@@ -1224,8 +1267,42 @@ export const translations: Record<Language, TranslationSet> = {
     skills: {
       title: "技能与插件",
       enabled: "已启用",
+      disabled: "已禁用",
       operationsTitle: "运营简报",
       operationsDescription: "读取本地证据，调用 DeepSeek 生成可复核的经营管理简报。",
+      installedTitle: "本地 Skill Registry",
+      manifestPlaceholder: "粘贴 ds-agent.skill.v1 manifest JSON。本版本只登记声明式 skill，不执行脚本或二进制。",
+      remotePackageUrlPlaceholder: "GitHub/Hugging Face skill zip URL（仅预检，不安装）",
+      installManifest: "安装 manifest",
+      installZip: "导入 zip",
+      previewRemote: "预检远程包",
+      installing: "正在校验",
+      empty: "还没有安装本地 skill。",
+      enable: "启用",
+      disable: "禁用",
+      verifySource: "验证来源",
+      prepareExecution: "准备执行",
+      resetTrust: "重置信任",
+      uninstall: "卸载",
+      executionsTitle: "执行审计",
+      safeBoundary: "仅校验并登记 manifest；脚本、二进制和高风险权限默认阻止。",
+      noPermissions: "未声明权限",
+      installSucceeded: "Skill manifest 已通过校验并登记。",
+      previewSucceeded: (name, fileCount) => `远程包预检通过：${name}，${fileCount} 个文件。`,
+      statusChanged: "Skill 状态已记录。",
+      sourceVerified: (provenance: string) => `来源已验证：${provenance}`,
+      executionPrepared: (name: string) => `已准备安全执行计划：${name}`,
+      executionBlocked: (name: string, reason: string) => `已阻止 skill 执行：${name}（${reason}）`,
+      trustReset: "Skill 信任已重置并禁用，需复核后再启用。",
+      uninstalled: "Skill 已卸载，审计记录已保留。",
+      loadFailed: "读取本地 skill registry 失败。",
+      installFailed: "Skill manifest 未通过安全校验。",
+      previewFailed: "远程 skill 包预检失败。",
+      statusFailed: "Skill 状态更新失败。",
+      sourceFailed: "Skill 来源验证失败。",
+      executionFailed: "Skill 执行准备失败。",
+      trustResetFailed: "Skill 信任重置失败。",
+      uninstallFailed: "Skill 卸载失败。",
     },
     runStatus: {
       title: "任务状态",
@@ -1245,6 +1322,11 @@ export const translations: Record<Language, TranslationSet> = {
       agentActionBody: "DeepSeek 返回了结构化计划，DS Agent 已将用户回复和本地动作提案分离。",
       permissionsAndTools: "权限与工具",
       routeDetails: "模型与路线详情",
+      recentRuns: "最近运行",
+      queuedRuns: "排队中",
+      runStepsLabel: (count) => `${count} 个步骤`,
+      runArtifactsLabel: (count) => `${count} 个产物`,
+      workerLabel: (worker) => `Worker：${worker}`,
       steps: {
         understand: "理解任务",
         attachments: "附件证据",
@@ -2223,6 +2305,7 @@ export const translations: Record<Language, TranslationSet> = {
       quickAnalyze: "Continue the previous project, first explain which memories you used.",
       saveTask: "Send",
       stopTask: "Stop",
+      queueGuidance: "Add to current task",
       addAttachment: "Add files",
       removeAttachment: "Remove attachment",
       attachmentBlocked: "Blocked",
@@ -2234,6 +2317,7 @@ export const translations: Record<Language, TranslationSet> = {
       guidanceRunning: "Guiding the supplement into the same running task",
       guidanceQueuedFeedback: "Supplement received. DS Agent will fold it into the same task after the current step.",
       guidanceRunningFeedback: "Guiding the supplement now. DS Agent will consider it together with the running task.",
+      taskQueuedFeedback: "Added to the background queue. It will run after the current task finishes.",
       stopRequestedFeedback: "Stop requested for the current task. This run's reply will not be appended.",
       readyStatus: "Input is preprocessed before DS Agent connects to DeepSeek",
       sendingStatus: "Preprocessing and connecting to DeepSeek",
@@ -2280,8 +2364,46 @@ export const translations: Record<Language, TranslationSet> = {
     skills: {
       title: "Skills & Plugins",
       enabled: "Enabled",
+      disabled: "Disabled",
       operationsTitle: "Operations Briefing",
       operationsDescription: "Reads local evidence and uses DeepSeek to produce a reviewable management brief.",
+      installedTitle: "Local Skill Registry",
+      manifestPlaceholder:
+        "Paste a ds-agent.skill.v1 manifest JSON. This version registers declarative skills only; scripts and binaries are not executed.",
+      remotePackageUrlPlaceholder: "GitHub/Hugging Face skill zip URL (preview only; no install)",
+      installManifest: "Install manifest",
+      installZip: "Import zip",
+      previewRemote: "Preview remote",
+      installing: "Validating",
+      empty: "No local skills installed yet.",
+      enable: "Enable",
+      disable: "Disable",
+      verifySource: "Verify source",
+      prepareExecution: "Prepare run",
+      resetTrust: "Reset trust",
+      uninstall: "Uninstall",
+      executionsTitle: "Execution audit",
+      safeBoundary:
+        "DS Agent only validates and registers the manifest; scripts, binaries, and high-risk permissions are blocked by default.",
+      noPermissions: "No permissions declared",
+      installSucceeded: "Skill manifest passed validation and was registered.",
+      previewSucceeded: (name: string, fileCount: number) =>
+        `Remote package preflight passed: ${name}, ${fileCount} files.`,
+      statusChanged: "Skill status recorded.",
+      sourceVerified: (provenance: string) => `Source verified: ${provenance}`,
+      executionPrepared: (name: string) => `Safe execution plan prepared: ${name}`,
+      executionBlocked: (name: string, reason: string) =>
+        `Skill execution blocked: ${name} (${reason})`,
+      trustReset: "Skill trust was reset and disabled until review.",
+      uninstalled: "Skill uninstalled. Audit history was retained.",
+      loadFailed: "Could not read the local skill registry.",
+      installFailed: "Skill manifest did not pass safety validation.",
+      previewFailed: "Remote skill package preflight failed.",
+      statusFailed: "Could not update skill status.",
+      sourceFailed: "Could not verify skill source.",
+      executionFailed: "Could not prepare skill execution.",
+      trustResetFailed: "Could not reset skill trust.",
+      uninstallFailed: "Could not uninstall skill.",
     },
     runStatus: {
       title: "Run Status",
@@ -2301,6 +2423,11 @@ export const translations: Record<Language, TranslationSet> = {
       agentActionBody: "DeepSeek returned a structured plan. DS Agent separated the reply from local action proposals.",
       permissionsAndTools: "Permissions and tools",
       routeDetails: "Model and route details",
+      recentRuns: "Recent runs",
+      queuedRuns: "Queued",
+      runStepsLabel: (count: number) => `${count} steps`,
+      runArtifactsLabel: (count: number) => `${count} artifacts`,
+      workerLabel: (worker: string) => `Worker: ${worker}`,
       steps: {
         understand: "Understand task",
         attachments: "Attachment evidence",

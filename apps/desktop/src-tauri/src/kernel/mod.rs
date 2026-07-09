@@ -1,4 +1,5 @@
 pub mod agent_context;
+pub mod agent_run;
 pub mod attachments;
 pub mod capability;
 pub mod codex_bridge_contract;
@@ -12,6 +13,7 @@ pub mod models;
 pub mod network_search;
 pub mod office;
 pub mod policy;
+pub mod skill;
 pub mod tool_strategy;
 pub mod work_package;
 pub mod workflow;

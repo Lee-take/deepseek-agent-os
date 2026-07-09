@@ -9,6 +9,9 @@ const {
   agentChatComposerAction,
   agentChatGuidanceStepState,
   agentChatLoopSteps,
+  createAgentChatRun,
+  queueAgentRunGuidance,
+  requestAgentRunCancel,
   buildAgentGuidancePrompt,
 } = await import(runStateModuleUrl);
 
@@ -17,17 +20,47 @@ test("uses a stop action while an agent task is running without draft guidance",
   assert.equal(agentChatComposerAction({ pending: true, draft: "   " }), "stop");
 });
 
-test("uses a send-guidance action when the user types during a running task", () => {
-  assert.equal(agentChatComposerAction({ pending: true, draft: "补充：先打开网页" }), "send_guidance");
+test("keeps the main composer available for a new queued task while a run is active", () => {
+  assert.equal(agentChatComposerAction({ pending: true, draft: "继续检查下一份文件" }), "send");
+});
+
+test("uses a send-guidance action only when the user explicitly targets the active run", () => {
+  assert.equal(
+    agentChatComposerAction({
+      pending: true,
+      draft: "补充：先打开网页",
+      guidanceMode: true,
+    }),
+    "send_guidance",
+  );
 });
 
 test("returns to stop action after submitted guidance clears the draft", () => {
-  assert.equal(agentChatComposerAction({ pending: true, draft: "补充：优先处理当前文件" }), "send_guidance");
+  assert.equal(
+    agentChatComposerAction({
+      pending: true,
+      draft: "补充：优先处理当前文件",
+      guidanceMode: true,
+    }),
+    "send_guidance",
+  );
   assert.equal(agentChatComposerAction({ pending: true, draft: "" }), "stop");
 });
 
-test("uses send-guidance action when attachments are added during a running task", () => {
-  assert.equal(agentChatComposerAction({ pending: true, draft: "", attachmentCount: 1 }), "send_guidance");
+test("keeps attachments in the main composer as a new queued task while a run is active", () => {
+  assert.equal(agentChatComposerAction({ pending: true, draft: "", attachmentCount: 1 }), "send");
+});
+
+test("uses send-guidance action for attachments only in explicit guidance mode", () => {
+  assert.equal(
+    agentChatComposerAction({
+      pending: true,
+      draft: "",
+      attachmentCount: 1,
+      guidanceMode: true,
+    }),
+    "send_guidance",
+  );
 });
 
 test("keeps normal send action when no agent task is running", () => {
@@ -106,4 +139,71 @@ test("moves loop steps toward verification as the run progresses", () => {
     ],
   );
   assert.equal(steps[2].detail, "补充：优先检查本地文件");
+});
+
+test("creates an active background run with a stable id and audit timestamps", () => {
+  const run = createAgentChatRun({
+    id: "run-1",
+    conversationId: "conversation-1",
+    prompt: "整理这份材料",
+    createdAt: "2026-07-09T10:00:00.000Z",
+  });
+
+  assert.equal(run.id, "run-1");
+  assert.equal(run.conversation_id, "conversation-1");
+  assert.equal(run.status, "running");
+  assert.equal(run.prompt, "整理这份材料");
+  assert.equal(run.created_at, "2026-07-09T10:00:00.000Z");
+  assert.equal(run.updated_at, "2026-07-09T10:00:00.000Z");
+  assert.deepEqual(run.queued_guidance, []);
+});
+
+test("queues follow-up guidance on the active run without replacing the composer draft model", () => {
+  const run = createAgentChatRun({
+    id: "run-1",
+    conversationId: "conversation-1",
+    prompt: "整理这份材料",
+    createdAt: "2026-07-09T10:00:00.000Z",
+  });
+
+  const updated = queueAgentRunGuidance(run, {
+    id: "guidance-1",
+    content: "补充：先检查本地证据",
+    attachmentCount: 1,
+    createdAt: "2026-07-09T10:00:05.000Z",
+  });
+
+  assert.equal(updated.status, "running");
+  assert.equal(updated.updated_at, "2026-07-09T10:00:05.000Z");
+  assert.deepEqual(updated.queued_guidance, [
+    {
+      id: "guidance-1",
+      content: "补充：先检查本地证据",
+      attachment_count: 1,
+      created_at: "2026-07-09T10:00:05.000Z",
+    },
+  ]);
+});
+
+test("marks a running background run as cancel-requested while preserving queued guidance", () => {
+  const run = queueAgentRunGuidance(
+    createAgentChatRun({
+      id: "run-1",
+      conversationId: "conversation-1",
+      prompt: "整理这份材料",
+      createdAt: "2026-07-09T10:00:00.000Z",
+    }),
+    {
+      id: "guidance-1",
+      content: "补充：先检查本地证据",
+      createdAt: "2026-07-09T10:00:05.000Z",
+    },
+  );
+
+  const updated = requestAgentRunCancel(run, "2026-07-09T10:00:07.000Z");
+
+  assert.equal(updated.status, "cancel_requested");
+  assert.equal(updated.cancel_requested, true);
+  assert.equal(updated.updated_at, "2026-07-09T10:00:07.000Z");
+  assert.equal(updated.queued_guidance.length, 1);
 });

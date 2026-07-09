@@ -8,6 +8,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::kernel::agent_context::AgentContextReceipt;
+use crate::kernel::agent_run::{
+    AgentRunArtifactRecord, AgentRunCancelRequest, AgentRunClaim, AgentRunFinish,
+    AgentRunQueuedGuidance, AgentRunRecord, AgentRunStart, AgentRunStatus, AgentRunStepRecord,
+};
 use crate::kernel::capability::CapabilityInvocation;
 use crate::kernel::deepseek::DeepSeekChatTelemetry;
 use crate::kernel::models::{
@@ -22,6 +26,10 @@ use crate::kernel::policy::{
     capability_risk, CapabilityAccessRecord, CapabilityAccessRequest, CapabilityAccessStatus,
     CapabilityGrantState, CapabilityKind, PermissionAuditEntry, PermissionResolution, RiskLevel,
 };
+use crate::kernel::skill::{
+    SkillEnablementChange, SkillEnablementStatus, SkillExecutionRecord, SkillInstallationRecord,
+    SkillRecord, SkillTrustLevel, SkillTrustReset, SkillUninstallRecord,
+};
 use crate::kernel::work_package::{
     redact_operations_briefing_run_for_package_export, WorkPackage, WorkPackageImportPreview,
     WorkPackageImportSummary, WorkPackageMemoryCandidateImportPreview,
@@ -34,6 +42,13 @@ use crate::kernel::workflow::{OperationsBriefingRun, WorkflowTemplatePackage};
 pub const CAPABILITY_ACCESS_REQUESTED_EVENT: &str = "capability_access.requested";
 pub const CAPABILITY_INVOCATION_RECORDED_EVENT: &str = "capability_invocation.recorded";
 pub const AGENT_CONTEXT_RECEIPT_RECORDED_EVENT: &str = "agent_context_receipt_recorded";
+pub const AGENT_RUN_CANCEL_REQUESTED_EVENT: &str = "agent_run.cancel_requested";
+pub const AGENT_RUN_CLAIMED_EVENT: &str = "agent_run.claimed";
+pub const AGENT_RUN_FINISHED_EVENT: &str = "agent_run.finished";
+pub const AGENT_RUN_GUIDANCE_QUEUED_EVENT: &str = "agent_run.guidance_queued";
+pub const AGENT_RUN_STARTED_EVENT: &str = "agent_run.started";
+pub const AGENT_RUN_STEP_RECORDED_EVENT: &str = "agent_run.step_recorded";
+pub const AGENT_RUN_ARTIFACT_RECORDED_EVENT: &str = "agent_run.artifact_recorded";
 pub const DEEPSEEK_CHAT_TELEMETRY_RECORDED_EVENT: &str = "deepseek_chat.telemetry_recorded";
 pub const MEMORY_CANDIDATE_PROPOSED_EVENT: &str = "memory_candidate.proposed";
 pub const MEMORY_CANDIDATE_RESOLVED_EVENT: &str = "memory_candidate.resolved";
@@ -47,6 +62,11 @@ pub const MEMORY_MAINTENANCE_REVIEW_ACTION_RECORDED_EVENT: &str =
 pub const OPERATIONS_BRIEFING_RUN_RECORDED_EVENT: &str = "operations_briefing.run_recorded";
 pub const PERMISSION_AUDIT_RECORDED_EVENT: &str = "permission_audit.recorded";
 pub const PERMISSION_RESOLUTION_RECORDED_EVENT: &str = "permission_resolution.recorded";
+pub const SKILL_ENABLEMENT_CHANGED_EVENT: &str = "skill.enablement_changed";
+pub const SKILL_EXECUTION_RECORDED_EVENT: &str = "skill.execution_recorded";
+pub const SKILL_INSTALLED_EVENT: &str = "skill.installed";
+pub const SKILL_TRUST_RESET_EVENT: &str = "skill.trust_reset";
+pub const SKILL_UNINSTALLED_EVENT: &str = "skill.uninstalled";
 pub const TASK_RECORD_CREATED_EVENT: &str = "task_record.created";
 pub const WORKFLOW_TEMPLATE_PACKAGE_IMPORTED_EVENT: &str = "workflow_template_package.imported";
 
@@ -174,6 +194,346 @@ impl EventStore {
                 serde_json::from_str::<TaskRecord>(&event.payload_json).map_err(Into::into)
             })
             .collect()
+    }
+
+    pub fn append_agent_run_start(&self, start: &AgentRunStart) -> EventStoreResult<bool> {
+        let existing = self
+            .list_agent_run_starts()?
+            .into_iter()
+            .any(|record| record.id == start.id);
+        if existing {
+            return Ok(false);
+        }
+
+        let event = KernelEvent::new(AGENT_RUN_STARTED_EVENT, start)?;
+        self.append(&event)?;
+        Ok(true)
+    }
+
+    fn list_agent_run_starts(&self) -> EventStoreResult<Vec<AgentRunStart>> {
+        let events = self.list_by_type(AGENT_RUN_STARTED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<AgentRunStart>(&event.payload_json).map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn claim_next_agent_run(
+        &self,
+        worker_id: String,
+        lease_seconds: i64,
+    ) -> EventStoreResult<Option<AgentRunRecord>> {
+        let Some(next_run) = self
+            .list_agent_run_records()?
+            .into_iter()
+            .filter(|record| record.status == AgentRunStatus::Queued)
+            .min_by_key(|record| record.started_at)
+        else {
+            return Ok(None);
+        };
+        let claim = AgentRunClaim::new(next_run.id, worker_id, lease_seconds)
+            .map_err(EventStoreError::InvalidState)?;
+        self.append_agent_run_claim(&claim)?;
+        self.list_agent_run_records()
+            .map(|records| records.into_iter().find(|record| record.id == next_run.id))
+    }
+
+    pub fn claim_agent_run(
+        &self,
+        run_id: Uuid,
+        worker_id: String,
+        lease_seconds: i64,
+    ) -> EventStoreResult<AgentRunRecord> {
+        let target = self
+            .list_agent_run_records()?
+            .into_iter()
+            .find(|record| record.id == run_id)
+            .ok_or_else(|| EventStoreError::InvalidState("agent run does not exist".to_string()))?;
+        if target.status != AgentRunStatus::Queued || target.cancel_requested {
+            return Err(EventStoreError::InvalidState(format!(
+                "agent run {} cannot be claimed from status {:?}",
+                target.id, target.status
+            )));
+        }
+
+        let claim = AgentRunClaim::new(run_id, worker_id, lease_seconds)
+            .map_err(EventStoreError::InvalidState)?;
+        self.append_agent_run_claim(&claim)?;
+        self.list_agent_run_records()?
+            .into_iter()
+            .find(|record| record.id == run_id)
+            .ok_or_else(|| EventStoreError::InvalidState("claimed agent run missing".to_string()))
+    }
+
+    pub fn append_agent_run_claim(&self, claim: &AgentRunClaim) -> EventStoreResult<()> {
+        self.ensure_agent_run_exists(claim.run_id)?;
+        let event = KernelEvent::new(AGENT_RUN_CLAIMED_EVENT, claim)?;
+        self.append(&event)
+    }
+
+    fn list_agent_run_claims(&self) -> EventStoreResult<Vec<AgentRunClaim>> {
+        let events = self.list_by_type(AGENT_RUN_CLAIMED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<AgentRunClaim>(&event.payload_json).map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_agent_run_queued_guidance(
+        &self,
+        guidance: &AgentRunQueuedGuidance,
+    ) -> EventStoreResult<()> {
+        self.ensure_agent_run_exists(guidance.run_id)?;
+        let event = KernelEvent::new(AGENT_RUN_GUIDANCE_QUEUED_EVENT, guidance)?;
+        self.append(&event)
+    }
+
+    fn list_agent_run_guidance(&self) -> EventStoreResult<Vec<AgentRunQueuedGuidance>> {
+        let events = self.list_by_type(AGENT_RUN_GUIDANCE_QUEUED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<AgentRunQueuedGuidance>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_agent_run_cancel_request(
+        &self,
+        cancel: &AgentRunCancelRequest,
+    ) -> EventStoreResult<()> {
+        self.ensure_agent_run_exists(cancel.run_id)?;
+        let event = KernelEvent::new(AGENT_RUN_CANCEL_REQUESTED_EVENT, cancel)?;
+        self.append(&event)
+    }
+
+    fn list_agent_run_cancel_requests(&self) -> EventStoreResult<Vec<AgentRunCancelRequest>> {
+        let events = self.list_by_type(AGENT_RUN_CANCEL_REQUESTED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<AgentRunCancelRequest>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_agent_run_finish(&self, finish: &AgentRunFinish) -> EventStoreResult<()> {
+        self.ensure_agent_run_exists(finish.run_id)?;
+        let event = KernelEvent::new(AGENT_RUN_FINISHED_EVENT, finish)?;
+        self.append(&event)
+    }
+
+    fn list_agent_run_finishes(&self) -> EventStoreResult<Vec<AgentRunFinish>> {
+        let events = self.list_by_type(AGENT_RUN_FINISHED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<AgentRunFinish>(&event.payload_json).map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_agent_run_step(&self, step: &AgentRunStepRecord) -> EventStoreResult<()> {
+        self.ensure_agent_run_exists(step.run_id)?;
+        let event = KernelEvent::new(AGENT_RUN_STEP_RECORDED_EVENT, step)?;
+        self.append(&event)
+    }
+
+    fn list_agent_run_steps(&self) -> EventStoreResult<Vec<AgentRunStepRecord>> {
+        let events = self.list_by_type(AGENT_RUN_STEP_RECORDED_EVENT, 1000)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<AgentRunStepRecord>(&event.payload_json).map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_agent_run_artifact(
+        &self,
+        artifact: &AgentRunArtifactRecord,
+    ) -> EventStoreResult<()> {
+        self.ensure_agent_run_exists(artifact.run_id)?;
+        let event = KernelEvent::new(AGENT_RUN_ARTIFACT_RECORDED_EVENT, artifact)?;
+        self.append(&event)
+    }
+
+    fn list_agent_run_artifacts(&self) -> EventStoreResult<Vec<AgentRunArtifactRecord>> {
+        let events = self.list_by_type(AGENT_RUN_ARTIFACT_RECORDED_EVENT, 1000)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<AgentRunArtifactRecord>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn list_agent_run_records(&self) -> EventStoreResult<Vec<AgentRunRecord>> {
+        let mut guidance_by_run_id =
+            std::collections::HashMap::<Uuid, Vec<AgentRunQueuedGuidance>>::new();
+        for guidance in self.list_agent_run_guidance()? {
+            guidance_by_run_id
+                .entry(guidance.run_id)
+                .or_default()
+                .push(guidance);
+        }
+        for guidance in guidance_by_run_id.values_mut() {
+            guidance.sort_by_key(|item| item.queued_at);
+        }
+
+        let mut cancel_by_run_id = std::collections::HashMap::<Uuid, AgentRunCancelRequest>::new();
+        for cancel in self.list_agent_run_cancel_requests()? {
+            cancel_by_run_id
+                .entry(cancel.run_id)
+                .and_modify(|current| {
+                    if cancel.requested_at > current.requested_at {
+                        *current = cancel.clone();
+                    }
+                })
+                .or_insert(cancel);
+        }
+
+        let mut claim_by_run_id = std::collections::HashMap::<Uuid, AgentRunClaim>::new();
+        for claim in self.list_agent_run_claims()? {
+            claim_by_run_id
+                .entry(claim.run_id)
+                .and_modify(|current| {
+                    if claim.claimed_at > current.claimed_at {
+                        *current = claim.clone();
+                    }
+                })
+                .or_insert(claim);
+        }
+
+        let mut finish_by_run_id = std::collections::HashMap::<Uuid, AgentRunFinish>::new();
+        for finish in self.list_agent_run_finishes()? {
+            finish_by_run_id
+                .entry(finish.run_id)
+                .and_modify(|current| {
+                    if finish.finished_at > current.finished_at {
+                        *current = finish.clone();
+                    }
+                })
+                .or_insert(finish);
+        }
+
+        let mut steps_by_run_id = std::collections::HashMap::<Uuid, Vec<AgentRunStepRecord>>::new();
+        for step in self.list_agent_run_steps()? {
+            steps_by_run_id.entry(step.run_id).or_default().push(step);
+        }
+        for steps in steps_by_run_id.values_mut() {
+            steps.sort_by_key(|step| (step.sequence, step.recorded_at));
+        }
+
+        let mut artifacts_by_run_id =
+            std::collections::HashMap::<Uuid, Vec<AgentRunArtifactRecord>>::new();
+        for artifact in self.list_agent_run_artifacts()? {
+            artifacts_by_run_id
+                .entry(artifact.run_id)
+                .or_default()
+                .push(artifact);
+        }
+        for artifacts in artifacts_by_run_id.values_mut() {
+            artifacts.sort_by_key(|artifact| artifact.created_at);
+        }
+
+        self.list_agent_run_starts()?
+            .into_iter()
+            .map(|start| {
+                let queued_guidance = guidance_by_run_id.remove(&start.id).unwrap_or_default();
+                let latest_cancel = cancel_by_run_id.remove(&start.id);
+                let latest_claim = claim_by_run_id.remove(&start.id);
+                let latest_finish = finish_by_run_id.remove(&start.id);
+                let steps = steps_by_run_id.remove(&start.id).unwrap_or_default();
+                let artifacts = artifacts_by_run_id.remove(&start.id).unwrap_or_default();
+                let mut updated_at = start.started_at;
+                let mut status = latest_finish
+                    .as_ref()
+                    .map(|finish| finish.status)
+                    .unwrap_or_else(|| {
+                        if latest_claim.is_some() {
+                            AgentRunStatus::Running
+                        } else {
+                            start.initial_status
+                        }
+                    });
+                let finished_at = latest_finish.as_ref().map(|finish| finish.finished_at);
+                let finish_summary = latest_finish
+                    .as_ref()
+                    .and_then(|finish| finish.summary.clone());
+                let finish_error = latest_finish
+                    .as_ref()
+                    .and_then(|finish| finish.error.clone());
+
+                if let Some(finished_at) = finished_at {
+                    updated_at = updated_at.max(finished_at);
+                }
+                for guidance in &queued_guidance {
+                    updated_at = updated_at.max(guidance.queued_at);
+                }
+                for step in &steps {
+                    updated_at = updated_at.max(step.recorded_at);
+                }
+                for artifact in &artifacts {
+                    updated_at = updated_at.max(artifact.created_at);
+                }
+                let worker_id = latest_claim.as_ref().map(|claim| claim.worker_id.clone());
+                let lease_expires_at = latest_claim.as_ref().map(|claim| claim.lease_expires_at);
+                if let Some(claim) = &latest_claim {
+                    updated_at = updated_at.max(claim.claimed_at);
+                }
+                let cancel_requested = latest_cancel.is_some();
+                let cancel_reason = latest_cancel.as_ref().map(|cancel| cancel.reason.clone());
+                if let Some(cancel) = &latest_cancel {
+                    updated_at = updated_at.max(cancel.requested_at);
+                    if !matches!(
+                        latest_finish.as_ref().map(|finish| finish.status),
+                        Some(AgentRunStatus::Cancelled | AgentRunStatus::Failed)
+                    ) {
+                        status = AgentRunStatus::CancelRequested;
+                    }
+                }
+
+                Ok(AgentRunRecord {
+                    id: start.id,
+                    conversation_id: start.conversation_id,
+                    prompt: start.prompt,
+                    attachment_count: start.attachment_count,
+                    status,
+                    worker_id,
+                    lease_expires_at,
+                    queued_guidance,
+                    steps,
+                    artifacts,
+                    cancel_requested,
+                    cancel_reason,
+                    started_at: start.started_at,
+                    updated_at,
+                    finished_at,
+                    finish_summary,
+                    finish_error,
+                })
+            })
+            .collect()
+    }
+
+    fn ensure_agent_run_exists(&self, run_id: Uuid) -> EventStoreResult<()> {
+        let exists = self
+            .list_agent_run_starts()?
+            .into_iter()
+            .any(|record| record.id == run_id);
+        if exists {
+            Ok(())
+        } else {
+            Err(EventStoreError::NotFound(format!("agent run {run_id}")))
+        }
     }
 
     pub fn import_task_records(
@@ -1366,6 +1726,202 @@ impl EventStore {
             .collect()
     }
 
+    pub fn append_skill_installation(
+        &self,
+        installation: &SkillInstallationRecord,
+    ) -> EventStoreResult<bool> {
+        let existing = self.list_skill_installations()?.into_iter().any(|record| {
+            record.manifest.name == installation.manifest.name
+                && record.manifest.version == installation.manifest.version
+                && record.manifest.source.url == installation.manifest.source.url
+        });
+        if existing {
+            return Ok(false);
+        }
+
+        let event = KernelEvent::new(SKILL_INSTALLED_EVENT, installation)?;
+        self.append(&event)?;
+        Ok(true)
+    }
+
+    pub fn list_skill_installations(&self) -> EventStoreResult<Vec<SkillInstallationRecord>> {
+        let events = self.list_by_type(SKILL_INSTALLED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<SkillInstallationRecord>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_skill_enablement_change(
+        &self,
+        change: &SkillEnablementChange,
+    ) -> EventStoreResult<()> {
+        let exists = self
+            .list_skill_installations()?
+            .into_iter()
+            .any(|record| record.id == change.skill_id);
+        if !exists {
+            return Err(EventStoreError::NotFound(format!(
+                "skill installation {}",
+                change.skill_id
+            )));
+        }
+
+        let event = KernelEvent::new(SKILL_ENABLEMENT_CHANGED_EVENT, change)?;
+        self.append(&event)
+    }
+
+    pub fn list_skill_enablement_changes(&self) -> EventStoreResult<Vec<SkillEnablementChange>> {
+        let events = self.list_by_type(SKILL_ENABLEMENT_CHANGED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<SkillEnablementChange>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_skill_trust_reset(&self, reset: &SkillTrustReset) -> EventStoreResult<()> {
+        self.ensure_skill_installation_exists(reset.skill_id)?;
+        let event = KernelEvent::new(SKILL_TRUST_RESET_EVENT, reset)?;
+        self.append(&event)
+    }
+
+    pub fn list_skill_trust_resets(&self) -> EventStoreResult<Vec<SkillTrustReset>> {
+        let events = self.list_by_type(SKILL_TRUST_RESET_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<SkillTrustReset>(&event.payload_json).map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_skill_uninstall(&self, uninstall: &SkillUninstallRecord) -> EventStoreResult<()> {
+        self.ensure_skill_installation_exists(uninstall.skill_id)?;
+        let event = KernelEvent::new(SKILL_UNINSTALLED_EVENT, uninstall)?;
+        self.append(&event)
+    }
+
+    pub fn list_skill_uninstalls(&self) -> EventStoreResult<Vec<SkillUninstallRecord>> {
+        let events = self.list_by_type(SKILL_UNINSTALLED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<SkillUninstallRecord>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn list_skill_records(&self) -> EventStoreResult<Vec<SkillRecord>> {
+        let mut latest_change_by_skill_id = std::collections::HashMap::new();
+        for change in self.list_skill_enablement_changes()? {
+            latest_change_by_skill_id
+                .entry(change.skill_id)
+                .or_insert(change);
+        }
+
+        let mut latest_reset_by_skill_id = std::collections::HashMap::new();
+        for reset in self.list_skill_trust_resets()? {
+            latest_reset_by_skill_id
+                .entry(reset.skill_id)
+                .or_insert(reset);
+        }
+
+        let uninstalled_skill_ids = self
+            .list_skill_uninstalls()?
+            .into_iter()
+            .map(|record| record.skill_id)
+            .collect::<std::collections::HashSet<_>>();
+
+        self.list_skill_installations()?
+            .into_iter()
+            .filter(|installation| !uninstalled_skill_ids.contains(&installation.id))
+            .map(|installation| {
+                let latest_change = latest_change_by_skill_id.remove(&installation.id);
+                let latest_reset = latest_reset_by_skill_id.remove(&installation.id);
+                let mut manifest = installation.manifest;
+                let mut enablement_status = latest_change
+                    .as_ref()
+                    .map(|change| change.status)
+                    .unwrap_or(SkillEnablementStatus::Enabled);
+                let mut last_audit_note = latest_change.as_ref().map(|change| change.note.clone());
+                let mut updated_at = latest_change
+                    .as_ref()
+                    .map(|change| change.changed_at)
+                    .unwrap_or(installation.installed_at);
+                if let Some(reset) = latest_reset {
+                    manifest.trust_level = SkillTrustLevel::Untrusted;
+                    enablement_status = SkillEnablementStatus::Disabled;
+                    last_audit_note = Some(reset.note);
+                    updated_at = updated_at.max(reset.reset_at);
+                }
+
+                Ok(SkillRecord {
+                    id: installation.id,
+                    manifest,
+                    installed_from: installation.installed_from,
+                    installed_at: installation.installed_at,
+                    enablement_status,
+                    last_audit_note,
+                    updated_at,
+                })
+            })
+            .collect()
+    }
+
+    pub fn prepare_skill_execution(
+        &self,
+        skill_id: Uuid,
+        input_summary: String,
+    ) -> EventStoreResult<SkillExecutionRecord> {
+        let record = self
+            .list_skill_records()?
+            .into_iter()
+            .find(|record| record.id == skill_id)
+            .ok_or_else(|| EventStoreError::NotFound(format!("skill installation {skill_id}")))?;
+        let execution = SkillExecutionRecord::for_skill(&record, input_summary)
+            .map_err(EventStoreError::InvalidState)?;
+        self.append_skill_execution(&execution)?;
+        Ok(execution)
+    }
+
+    pub fn append_skill_execution(&self, execution: &SkillExecutionRecord) -> EventStoreResult<()> {
+        self.ensure_skill_installation_exists(execution.skill_id)?;
+        let event = KernelEvent::new(SKILL_EXECUTION_RECORDED_EVENT, execution)?;
+        self.append(&event)
+    }
+
+    pub fn list_skill_executions(&self) -> EventStoreResult<Vec<SkillExecutionRecord>> {
+        let events = self.list_by_type(SKILL_EXECUTION_RECORDED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<SkillExecutionRecord>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    fn ensure_skill_installation_exists(&self, skill_id: Uuid) -> EventStoreResult<()> {
+        let exists = self
+            .list_skill_installations()?
+            .into_iter()
+            .any(|record| record.id == skill_id);
+        if exists {
+            Ok(())
+        } else {
+            Err(EventStoreError::NotFound(format!(
+                "skill installation {skill_id}"
+            )))
+        }
+    }
+
     pub fn append_capability_access_request(
         &self,
         request: &CapabilityAccessRequest,
@@ -1781,6 +2337,10 @@ mod tests {
 
     use super::{EventStore, EventStoreError, MEMORY_RECORD_LINKED_EVENT};
     use crate::kernel::agent_context::AgentContextReceipt;
+    use crate::kernel::agent_run::{
+        AgentRunArtifactRecord, AgentRunCancelRequest, AgentRunFinish, AgentRunQueuedGuidance,
+        AgentRunStart, AgentRunStatus, AgentRunStepRecord, AgentRunStepStatus,
+    };
     use crate::kernel::capability::{CapabilityInvocation, CapabilityInvocationStatus};
     use crate::kernel::deepseek::{DeepSeekChatCacheStatus, DeepSeekChatTelemetry};
     use crate::kernel::models::{AccessMode, FoundationState};
@@ -1860,6 +2420,185 @@ mod tests {
         let records = store.list_task_records().expect("records load");
 
         assert_eq!(records, vec![record]);
+    }
+
+    #[test]
+    fn agent_run_records_queue_guidance_and_preserve_cancel_requested_over_stale_finish() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let start = AgentRunStart::new(
+            "conversation-1".to_string(),
+            "Prepare the operating briefing.".to_string(),
+            2,
+        )
+        .expect("run start is valid");
+        store
+            .append_agent_run_start(&start)
+            .expect("run start appends");
+        let guidance = AgentRunQueuedGuidance::new(
+            start.id,
+            "Use the latest handoff before drafting.".to_string(),
+        )
+        .expect("guidance is valid");
+        store
+            .append_agent_run_queued_guidance(&guidance)
+            .expect("guidance appends");
+        let cancel = AgentRunCancelRequest::new(
+            start.id,
+            "User changed direction while run was active.".to_string(),
+        )
+        .expect("cancel request is valid");
+        store
+            .append_agent_run_cancel_request(&cancel)
+            .expect("cancel appends");
+        let stale_finish = AgentRunFinish::completed(
+            start.id,
+            "Worker returned after the cancellation request.".to_string(),
+        )
+        .expect("finish is valid");
+        store
+            .append_agent_run_finish(&stale_finish)
+            .expect("finish is still audited");
+
+        let records = store.list_agent_run_records().expect("run records load");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, start.id);
+        assert_eq!(records[0].status, AgentRunStatus::CancelRequested);
+        assert_eq!(records[0].queued_guidance, vec![guidance]);
+        assert_eq!(
+            records[0].cancel_reason.as_deref(),
+            Some("User changed direction while run was active.")
+        );
+        assert_eq!(
+            records[0].finish_summary.as_deref(),
+            Some("Worker returned after the cancellation request.")
+        );
+    }
+
+    #[test]
+    fn agent_run_queue_claims_oldest_pending_and_skips_cancel_requested() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let first = AgentRunStart::queued(
+            "conversation-1".to_string(),
+            "First queued run.".to_string(),
+            0,
+        )
+        .expect("first run is valid");
+        let second = AgentRunStart::queued(
+            "conversation-1".to_string(),
+            "Second queued run.".to_string(),
+            0,
+        )
+        .expect("second run is valid");
+        store
+            .append_agent_run_start(&first)
+            .expect("first run appends");
+        store
+            .append_agent_run_start(&second)
+            .expect("second run appends");
+        let cancel =
+            AgentRunCancelRequest::new(first.id, "User cancelled before claim.".to_string())
+                .expect("cancel is valid");
+        store
+            .append_agent_run_cancel_request(&cancel)
+            .expect("cancel appends");
+
+        let claimed = store
+            .claim_next_agent_run("worker-a".to_string(), 30)
+            .expect("claim succeeds")
+            .expect("second run claimed");
+
+        assert_eq!(claimed.id, second.id);
+        assert_eq!(claimed.status, AgentRunStatus::Running);
+        assert_eq!(claimed.worker_id.as_deref(), Some("worker-a"));
+        assert!(claimed.lease_expires_at.is_some());
+
+        let records = store.list_agent_run_records().expect("records load");
+        let first_record = records
+            .iter()
+            .find(|record| record.id == first.id)
+            .expect("first record exists");
+        assert_eq!(first_record.status, AgentRunStatus::CancelRequested);
+    }
+
+    #[test]
+    fn agent_run_can_claim_a_specific_queued_run_for_a_worker() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let first = AgentRunStart::queued(
+            "conversation-1".to_string(),
+            "First queued run.".to_string(),
+            0,
+        )
+        .expect("first run is valid");
+        let second = AgentRunStart::queued(
+            "conversation-1".to_string(),
+            "Second queued run.".to_string(),
+            0,
+        )
+        .expect("second run is valid");
+        store
+            .append_agent_run_start(&first)
+            .expect("first run appends");
+        store
+            .append_agent_run_start(&second)
+            .expect("second run appends");
+
+        let claimed = store
+            .claim_agent_run(second.id, "worker-b".to_string(), 45)
+            .expect("specific run claims");
+
+        assert_eq!(claimed.id, second.id);
+        assert_eq!(claimed.status, AgentRunStatus::Running);
+        assert_eq!(claimed.worker_id.as_deref(), Some("worker-b"));
+        assert!(claimed.lease_expires_at.is_some());
+
+        let stale_claim = store.claim_agent_run(second.id, "worker-c".to_string(), 45);
+        assert!(stale_claim.is_err());
+    }
+
+    #[test]
+    fn agent_run_records_step_stream_and_artifacts() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let start = AgentRunStart::queued(
+            "conversation-1".to_string(),
+            "Create a briefing and attach the report.".to_string(),
+            1,
+        )
+        .expect("run is valid");
+        store.append_agent_run_start(&start).expect("run appends");
+        store
+            .claim_next_agent_run("worker-a".to_string(), 30)
+            .expect("claim succeeds")
+            .expect("run claimed");
+        let step = AgentRunStepRecord::new(
+            start.id,
+            1,
+            AgentRunStepStatus::Completed,
+            "Read evidence".to_string(),
+            "Evidence manifest loaded.".to_string(),
+        )
+        .expect("step is valid");
+        store.append_agent_run_step(&step).expect("step appends");
+        let artifact = AgentRunArtifactRecord::new(
+            start.id,
+            "report".to_string(),
+            "Operations briefing".to_string(),
+            "D:/DS Agent/reports/briefing.md".to_string(),
+        )
+        .expect("artifact is valid");
+        store
+            .append_agent_run_artifact(&artifact)
+            .expect("artifact appends");
+
+        let records = store.list_agent_run_records().expect("records load");
+        let record = records
+            .iter()
+            .find(|record| record.id == start.id)
+            .expect("record exists");
+
+        assert_eq!(record.steps, vec![step]);
+        assert_eq!(record.artifacts, vec![artifact]);
+        assert_eq!(record.status, AgentRunStatus::Running);
     }
 
     #[test]

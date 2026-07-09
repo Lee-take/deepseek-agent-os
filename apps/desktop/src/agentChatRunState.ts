@@ -4,6 +4,32 @@ export type AgentChatGuidanceStatus = "idle" | "queued" | "guiding";
 
 export type AgentChatLoopStepState = "done" | "current" | "waiting";
 
+export type AgentChatRunStatus =
+  | "queued"
+  | "running"
+  | "cancel_requested"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type AgentChatQueuedGuidance = {
+  id: string;
+  content: string;
+  attachment_count: number;
+  created_at: string;
+};
+
+export type AgentChatRun = {
+  id: string;
+  conversation_id: string;
+  prompt: string;
+  status: AgentChatRunStatus;
+  cancel_requested: boolean;
+  queued_guidance: AgentChatQueuedGuidance[];
+  created_at: string;
+  updated_at: string;
+};
+
 export type AgentChatLoopStep = {
   key: string;
   label: string;
@@ -15,12 +41,85 @@ export function agentChatComposerAction(input: {
   pending: boolean;
   draft: string;
   attachmentCount?: number;
+  guidanceMode?: boolean;
 }): AgentChatComposerAction {
   if (!input.pending) {
     return "send";
   }
 
-  return input.draft.trim() || (input.attachmentCount ?? 0) > 0 ? "send_guidance" : "stop";
+  const hasPayload = Boolean(input.draft.trim()) || (input.attachmentCount ?? 0) > 0;
+  if (!hasPayload) {
+    return "stop";
+  }
+
+  return input.guidanceMode ? "send_guidance" : "send";
+}
+
+export function createAgentChatRun(input: {
+  id: string;
+  conversationId: string;
+  prompt: string;
+  createdAt: string;
+}): AgentChatRun {
+  return {
+    id: input.id,
+    conversation_id: input.conversationId,
+    prompt: input.prompt,
+    status: "running",
+    cancel_requested: false,
+    queued_guidance: [],
+    created_at: input.createdAt,
+    updated_at: input.createdAt,
+  };
+}
+
+export function queueAgentRunGuidance(
+  run: AgentChatRun,
+  input: {
+    id: string;
+    content: string;
+    createdAt: string;
+    attachmentCount?: number;
+  },
+): AgentChatRun {
+  const content = input.content.trim();
+  if (!content && (input.attachmentCount ?? 0) === 0) {
+    return run;
+  }
+
+  return {
+    ...run,
+    queued_guidance: [
+      ...run.queued_guidance,
+      {
+        id: input.id,
+        content,
+        attachment_count: input.attachmentCount ?? 0,
+        created_at: input.createdAt,
+      },
+    ],
+    updated_at: input.createdAt,
+  };
+}
+
+export function requestAgentRunCancel(run: AgentChatRun, requestedAt: string): AgentChatRun {
+  return {
+    ...run,
+    status: "cancel_requested",
+    cancel_requested: true,
+    updated_at: requestedAt,
+  };
+}
+
+export function finishAgentRun(
+  run: AgentChatRun,
+  input: { status: Extract<AgentChatRunStatus, "completed" | "failed">; finishedAt: string },
+): AgentChatRun {
+  return {
+    ...run,
+    status: input.status,
+    updated_at: input.finishedAt,
+  };
 }
 
 export function agentChatGuidanceStepState(status: AgentChatGuidanceStatus): "waiting" | "current" {

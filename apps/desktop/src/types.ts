@@ -53,6 +53,146 @@ export type CodexBridgeTransport = "http" | "stdio";
 
 export type RuntimePlatform = "windows" | "macos" | "other";
 
+export type SkillTrustLevel = "untrusted" | "local_declarative" | "remote_declarative";
+
+export type SkillEnablementStatus = "enabled" | "disabled";
+
+export type AgentRunStatus =
+  | "queued"
+  | "running"
+  | "cancel_requested"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type AgentRunStepStatus = "pending" | "running" | "completed" | "failed";
+
+export type AgentRunQueuedGuidance = {
+  id: string;
+  run_id: string;
+  guidance: string;
+  queued_at: string;
+};
+
+export type AgentRunStepRecord = {
+  id: string;
+  run_id: string;
+  sequence: number;
+  status: AgentRunStepStatus;
+  label: string;
+  detail: string;
+  recorded_at: string;
+};
+
+export type AgentRunArtifactRecord = {
+  id: string;
+  run_id: string;
+  kind: string;
+  title: string;
+  path: string;
+  created_at: string;
+};
+
+export type AgentRunRecord = {
+  id: string;
+  conversation_id: string;
+  prompt: string;
+  attachment_count: number;
+  status: AgentRunStatus;
+  worker_id: string | null;
+  lease_expires_at: string | null;
+  queued_guidance: AgentRunQueuedGuidance[];
+  steps: AgentRunStepRecord[];
+  artifacts: AgentRunArtifactRecord[];
+  cancel_requested: boolean;
+  cancel_reason: string | null;
+  started_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  finish_summary: string | null;
+  finish_error: string | null;
+};
+
+export type SkillSourceIntegrity = {
+  algorithm: string;
+  hash: string;
+};
+
+export type SkillSource = {
+  kind: string;
+  url: string;
+  integrity: SkillSourceIntegrity | null;
+};
+
+export type SkillPermissionDeclaration = {
+  kind: string;
+  scope: string;
+  reason: string;
+};
+
+export type SkillEntry = {
+  kind: string;
+  path: string;
+};
+
+export type SkillManifest = {
+  schema_version: string;
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  license: string;
+  source: SkillSource;
+  capabilities: string[];
+  permissions: SkillPermissionDeclaration[];
+  entry: SkillEntry;
+  trust_level: SkillTrustLevel;
+  risk_warnings: string[];
+};
+
+export type SkillRecord = {
+  id: string;
+  manifest: SkillManifest;
+  installed_from: string;
+  installed_at: string;
+  enablement_status: SkillEnablementStatus;
+  last_audit_note: string | null;
+  updated_at: string;
+};
+
+export type SkillPackagePreflight = {
+  manifest: SkillManifest;
+  package_files: string[];
+  blocked_files: string[];
+  warnings: string[];
+  audit_summary: string;
+};
+
+export type SkillSourceVerification = {
+  verified: boolean;
+  source_kind: string;
+  source_url: string;
+  integrity_algorithm: string | null;
+  integrity_hash: string | null;
+  provenance: string;
+  checked_at: string;
+};
+
+export type SkillExecutionStatus = "planned" | "blocked";
+
+export type SkillExecutionRecord = {
+  id: string;
+  skill_id: string;
+  skill_name: string;
+  status: SkillExecutionStatus;
+  entry_kind: string;
+  entry_path: string;
+  input_summary: string;
+  execution_plan: string;
+  blocked_reason: string | null;
+  requested_at: string;
+};
+
 export type LocalDirectorySettings = {
   workspace_dir: string;
   workspace_name: string;
@@ -153,6 +293,11 @@ export type AgentChatResponse = {
   total_tokens: number | null;
   estimated_cost_micro_usd: number | null;
   created_at: string;
+};
+
+export type AgentRunWorkerResult = {
+  record: AgentRunRecord;
+  response: AgentChatResponse;
 };
 
 export type AgentActionExecutionState =

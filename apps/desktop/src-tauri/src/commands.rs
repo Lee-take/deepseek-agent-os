@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -15,6 +15,10 @@ use uuid::Uuid;
 
 use crate::kernel::agent_context::{
     agent_loop_mode_descriptor, classify_agent_action_loop_mode, AgentContextReceipt, AgentLoopMode,
+};
+use crate::kernel::agent_run::{
+    AgentRunArtifactRecord, AgentRunCancelRequest, AgentRunFinish, AgentRunQueuedGuidance,
+    AgentRunRecord, AgentRunStart, AgentRunStatus, AgentRunStepRecord, AgentRunStepStatus,
 };
 use crate::kernel::attachments::{stage_agent_attachment_paths, AgentAttachment};
 use crate::kernel::capability::{
@@ -92,6 +96,12 @@ use crate::kernel::policy::{
     CapabilityDescriptor, CapabilityGrantState, CapabilityKind, PermissionAuditEntry,
     PermissionResolution, PolicyDecision,
 };
+use crate::kernel::skill::{
+    validate_remote_skill_source_url, SkillEnablementChange, SkillEnablementStatus,
+    SkillExecutionRecord, SkillInstallationRecord, SkillManifest, SkillPackagePreflight,
+    SkillRecord, SkillSourceVerification, SkillTrustReset, SkillUninstallRecord,
+    MAX_REMOTE_SKILL_PACKAGE_BYTES,
+};
 use crate::kernel::tool_strategy::{
     model_driven_tool_strategy_for_current_platform, ModelDrivenToolStrategy,
 };
@@ -131,8 +141,7 @@ const COMPUTER_CONTROL_UNLOCK_TTL_MINUTES: i64 = 5;
 const COMPUTER_CONTROL_UNLOCK_CHALLENGE_LENGTH: usize = 6;
 const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user from agent_actions, missing_prerequisites, required_confirmations, artifact_targets, and memory_candidates. Do not claim local tools ran; propose actions for DS Agent to validate and execute.";
 const AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT: usize = 1200;
-const APP_UPDATE_RELEASES_API_URL: &str =
-    "https://api.github.com/repos/Lee-take/dsagent/releases";
+const APP_UPDATE_RELEASES_API_URL: &str = "https://api.github.com/repos/Lee-take/dsagent/releases";
 const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/dsagent/releases/download/";
 const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.1.1";
@@ -145,6 +154,7 @@ const AGENT_MEMORY_CONTEXT_MAX_BYTES: usize = 1200;
 const AGENT_MEMORY_CONTEXT_SNIPPET_CHARS: usize = 220;
 const AGENT_MEMORY_FEEDBACK_MAINTENANCE_THRESHOLD: usize = 2;
 const AGENT_MEMORY_QUALITY_MAINTENANCE_THRESHOLD: i32 = 12;
+const AGENT_RUN_WORKER_LEASE_SECONDS: i64 = 30 * 60;
 const AGENT_MEMORY_QUALITY_OLD_DAYS: i64 = 120;
 const AGENT_MEMORY_QUALITY_LONG_BODY_CHARS: usize = 800;
 const AGENT_MEMORY_MODEL_REWRITE_MAX_BODY_CHARS: usize = 1200;
@@ -314,6 +324,12 @@ pub struct AgentChatResponse {
     pub total_tokens: Option<u32>,
     pub estimated_cost_micro_usd: Option<u64>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentRunWorkerResult {
+    pub record: AgentRunRecord,
+    pub response: AgentChatResponse,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4608,6 +4624,197 @@ fn run_agent_chat_with_clients_and_api_keys(
     Ok(response)
 }
 
+fn run_next_queued_agent_chat_with_clients_and_api_keys(
+    store: &Mutex<EventStore>,
+    transport: &impl DeepSeekChatCompletionTransport,
+    cache: &DeepSeekMemoryChatCompletionCache,
+    api_keys: &[String],
+    worker_id: String,
+    model_route: ModelRoute,
+    thinking_level: ThinkingLevel,
+    access_mode: AccessMode,
+    runtime_context: AgentChatRuntimeContext,
+    pricing_settings: Option<&DeepSeekPricingSettings>,
+    file_client: &impl FileContentClient,
+    file_write_client: &impl AgentWritableArtifactClient,
+    search_client: &impl NetworkSearchClient,
+    browser_client: &impl BrowserPageClient,
+) -> Result<Option<AgentRunWorkerResult>, String> {
+    run_queued_agent_chat_with_clients_and_api_keys(
+        store,
+        transport,
+        cache,
+        api_keys,
+        None,
+        None,
+        worker_id,
+        model_route,
+        thinking_level,
+        access_mode,
+        runtime_context,
+        pricing_settings,
+        file_client,
+        file_write_client,
+        search_client,
+        browser_client,
+    )
+}
+
+fn run_queued_agent_chat_with_clients_and_api_keys(
+    store: &Mutex<EventStore>,
+    transport: &impl DeepSeekChatCompletionTransport,
+    cache: &DeepSeekMemoryChatCompletionCache,
+    api_keys: &[String],
+    run_id: Option<Uuid>,
+    execution_prompt: Option<String>,
+    worker_id: String,
+    model_route: ModelRoute,
+    thinking_level: ThinkingLevel,
+    access_mode: AccessMode,
+    runtime_context: AgentChatRuntimeContext,
+    pricing_settings: Option<&DeepSeekPricingSettings>,
+    file_client: &impl FileContentClient,
+    file_write_client: &impl AgentWritableArtifactClient,
+    search_client: &impl NetworkSearchClient,
+    browser_client: &impl BrowserPageClient,
+) -> Result<Option<AgentRunWorkerResult>, String> {
+    let Some(claimed) = ({
+        let store = store.lock().map_err(|_| lock_error())?;
+        match run_id {
+            Some(run_id) => Some(
+                store
+                    .claim_agent_run(run_id, worker_id, AGENT_RUN_WORKER_LEASE_SECONDS)
+                    .map_err(event_store_error)?,
+            ),
+            None => store
+                .claim_next_agent_run(worker_id, AGENT_RUN_WORKER_LEASE_SECONDS)
+                .map_err(event_store_error)?,
+        }
+    }) else {
+        return Ok(None);
+    };
+    let run_id = claimed.id;
+    let prompt = execution_prompt
+        .map(|prompt| prompt.trim().to_string())
+        .filter(|prompt| !prompt.is_empty())
+        .unwrap_or_else(|| claimed.prompt.clone());
+
+    record_agent_run_worker_step(
+        store,
+        run_id,
+        1,
+        AgentRunStepStatus::Running,
+        "DeepSeek",
+        "Background worker claimed the queued run and started DeepSeek execution.",
+    )?;
+
+    let response_result = run_agent_chat_with_clients_and_api_keys(
+        store,
+        transport,
+        cache,
+        api_keys,
+        AgentChatRequest {
+            prompt,
+            model_route,
+            thinking_level,
+            access_mode,
+        },
+        runtime_context,
+        pricing_settings,
+        file_client,
+        file_write_client,
+        search_client,
+        browser_client,
+    );
+
+    match response_result {
+        Ok(response) => {
+            record_agent_run_worker_step(
+                store,
+                run_id,
+                1,
+                AgentRunStepStatus::Completed,
+                "DeepSeek",
+                "DeepSeek execution completed and the response was recorded.",
+            )?;
+            let cancel_requested = agent_run_cancel_requested(store, run_id)?;
+            let (status, summary) = if cancel_requested {
+                (
+                    AgentRunStatus::Cancelled,
+                    "Agent run cancelled before committing the completed response.".to_string(),
+                )
+            } else {
+                (AgentRunStatus::Completed, response.content.clone())
+            };
+            let record = finish_agent_run_from_worker(store, run_id, status, Some(summary), None)?;
+            Ok(Some(AgentRunWorkerResult { record, response }))
+        }
+        Err(error) => {
+            let record_error = record_agent_run_worker_step(
+                store,
+                run_id,
+                1,
+                AgentRunStepStatus::Failed,
+                "DeepSeek",
+                format!("DeepSeek execution failed: {error}"),
+            )
+            .and_then(|_| {
+                finish_agent_run_from_worker(
+                    store,
+                    run_id,
+                    AgentRunStatus::Failed,
+                    None,
+                    Some(error.clone()),
+                )
+            })
+            .err();
+            if let Some(record_error) = record_error {
+                return Err(format!(
+                    "{error}; additionally failed to record agent run failure: {record_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn agent_run_cancel_requested(store: &Mutex<EventStore>, run_id: Uuid) -> Result<bool, String> {
+    let store = store.lock().map_err(|_| lock_error())?;
+    Ok(read_agent_run_record(&store, run_id)?.cancel_requested)
+}
+
+fn record_agent_run_worker_step(
+    store: &Mutex<EventStore>,
+    run_id: Uuid,
+    sequence: u32,
+    status: AgentRunStepStatus,
+    label: impl Into<String>,
+    detail: impl Into<String>,
+) -> Result<AgentRunRecord, String> {
+    let step = AgentRunStepRecord::new(run_id, sequence, status, label.into(), detail.into())
+        .map_err(event_store_error)?;
+    let store = store.lock().map_err(|_| lock_error())?;
+    store
+        .append_agent_run_step(&step)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, run_id)
+}
+
+fn finish_agent_run_from_worker(
+    store: &Mutex<EventStore>,
+    run_id: Uuid,
+    status: AgentRunStatus,
+    summary: Option<String>,
+    error: Option<String>,
+) -> Result<AgentRunRecord, String> {
+    let finish = AgentRunFinish::new(run_id, status, summary, error).map_err(event_store_error)?;
+    let store = store.lock().map_err(|_| lock_error())?;
+    store
+        .append_agent_run_finish(&finish)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, run_id)
+}
+
 fn build_agent_tool_evidence_followup_prompt(
     original_user_prompt: &str,
     response: &AgentChatResponse,
@@ -7809,6 +8016,72 @@ pub fn run_agent_chat(
 }
 
 #[tauri::command]
+pub fn run_next_queued_agent_chat_worker(
+    app: AppHandle,
+    run_id: Option<Uuid>,
+    execution_prompt: Option<String>,
+    worker_id: String,
+    large_model_provider: LargeModelProvider,
+    model_route: ModelRoute,
+    thinking_level: ThinkingLevel,
+    access_mode: AccessMode,
+    network_search_source_model: Option<NetworkSearchSourceModel>,
+    api_key_override: Option<String>,
+    fallback_api_key_override: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Option<AgentRunWorkerResult>, String> {
+    let api_keys = agent_chat_api_key_candidates_from_sources(
+        api_key_override,
+        fallback_api_key_override,
+        |name| std::env::var(name).ok(),
+    );
+    if api_keys.is_empty() {
+        return Err("DeepSeek Chat is not configured. Provide a DeepSeek API key for this session or set DEEPSEEK_API_KEY in the local desktop process."
+            .to_string());
+    }
+    let pricing_settings = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .and_then(|app_data_dir| load_deepseek_pricing_state(app_data_dir).ok())
+        .map(|pricing_state| pricing_state.settings);
+    let runtime_context = agent_chat_runtime_context(
+        &app,
+        large_model_provider,
+        network_search_source_model,
+        true,
+    );
+    let transport = HttpDeepSeekChatCompletionTransport::new()?;
+    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
+    let desktop_dir = runtime_context.desktop_dir.clone();
+    let file_client = LocalFileContentClient::new(512 * 1024);
+    let file_write_client = agent_file_write_client(&directory_state, desktop_dir)?;
+    let browser_client = HttpBrowserPageClient::new()?;
+    let search_client =
+        agent_network_search_client(large_model_provider, network_search_source_model);
+
+    run_queued_agent_chat_with_clients_and_api_keys(
+        &state.event_store,
+        &transport,
+        &state.deepseek_chat_cache,
+        &api_keys,
+        run_id,
+        execution_prompt,
+        worker_id,
+        model_route,
+        thinking_level,
+        access_mode,
+        runtime_context,
+        pricing_settings.as_ref(),
+        &file_client,
+        &file_write_client,
+        &search_client,
+        &browser_client,
+    )
+}
+
+#[tauri::command]
 pub fn get_deepseek_user_balance(
     api_key_override: Option<String>,
     fallback_api_key_override: Option<String>,
@@ -8120,6 +8393,157 @@ pub fn save_local_directory_settings(
         LocalDirectorySettings::from_workspace_dir_and_name(workspace_dir, workspace_name)
             .map_err(event_store_error)?;
     persist_local_directory_settings(app_data_dir, settings).map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn list_agent_run_records(state: State<'_, AppState>) -> Result<Vec<AgentRunRecord>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store.list_agent_run_records().map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn start_agent_run_record(
+    conversation_id: String,
+    prompt: String,
+    attachment_count: usize,
+    state: State<'_, AppState>,
+) -> Result<AgentRunRecord, String> {
+    let start =
+        AgentRunStart::new(conversation_id, prompt, attachment_count).map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_agent_run_start(&start)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, start.id)
+}
+
+#[tauri::command]
+pub fn enqueue_agent_run_record(
+    conversation_id: String,
+    prompt: String,
+    attachment_count: usize,
+    state: State<'_, AppState>,
+) -> Result<AgentRunRecord, String> {
+    let start = AgentRunStart::queued(conversation_id, prompt, attachment_count)
+        .map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_agent_run_start(&start)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, start.id)
+}
+
+#[tauri::command]
+pub fn claim_next_agent_run_record(
+    worker_id: String,
+    lease_seconds: i64,
+    state: State<'_, AppState>,
+) -> Result<Option<AgentRunRecord>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .claim_next_agent_run(worker_id, lease_seconds)
+        .map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn claim_agent_run_record(
+    run_id: Uuid,
+    worker_id: String,
+    lease_seconds: i64,
+    state: State<'_, AppState>,
+) -> Result<AgentRunRecord, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .claim_agent_run(run_id, worker_id, lease_seconds)
+        .map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn queue_agent_run_guidance_record(
+    run_id: Uuid,
+    guidance: String,
+    state: State<'_, AppState>,
+) -> Result<AgentRunRecord, String> {
+    let guidance = AgentRunQueuedGuidance::new(run_id, guidance).map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_agent_run_queued_guidance(&guidance)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, run_id)
+}
+
+#[tauri::command]
+pub fn request_agent_run_cancel_record(
+    run_id: Uuid,
+    reason: String,
+    state: State<'_, AppState>,
+) -> Result<AgentRunRecord, String> {
+    let cancel = AgentRunCancelRequest::new(run_id, reason).map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_agent_run_cancel_request(&cancel)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, run_id)
+}
+
+#[tauri::command]
+pub fn record_agent_run_step_record(
+    run_id: Uuid,
+    sequence: u32,
+    status: AgentRunStepStatus,
+    label: String,
+    detail: String,
+    state: State<'_, AppState>,
+) -> Result<AgentRunRecord, String> {
+    let step = AgentRunStepRecord::new(run_id, sequence, status, label, detail)
+        .map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_agent_run_step(&step)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, run_id)
+}
+
+#[tauri::command]
+pub fn record_agent_run_artifact_record(
+    run_id: Uuid,
+    kind: String,
+    title: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<AgentRunRecord, String> {
+    let artifact =
+        AgentRunArtifactRecord::new(run_id, kind, title, path).map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_agent_run_artifact(&artifact)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, run_id)
+}
+
+#[tauri::command]
+pub fn finish_agent_run_record(
+    run_id: Uuid,
+    status: AgentRunStatus,
+    summary: Option<String>,
+    error: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<AgentRunRecord, String> {
+    let finish = AgentRunFinish::new(run_id, status, summary, error).map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_agent_run_finish(&finish)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, run_id)
+}
+
+fn read_agent_run_record(store: &EventStore, run_id: Uuid) -> Result<AgentRunRecord, String> {
+    store
+        .list_agent_run_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| record.id == run_id)
+        .ok_or_else(|| "agent run record could not be read".to_string())
 }
 
 #[tauri::command]
@@ -8455,6 +8879,197 @@ pub fn list_permission_audit_entries(
     store
         .list_permission_audit_entries()
         .map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn list_skill_records(state: State<'_, AppState>) -> Result<Vec<SkillRecord>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store.list_skill_records().map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn list_skill_execution_records(
+    state: State<'_, AppState>,
+) -> Result<Vec<SkillExecutionRecord>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store.list_skill_executions().map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn prepare_skill_execution_record(
+    skill_id: Uuid,
+    input_summary: String,
+    state: State<'_, AppState>,
+) -> Result<SkillExecutionRecord, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .prepare_skill_execution(skill_id, input_summary)
+        .map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn preview_local_skill_package_manifest(
+    manifest_json: String,
+    package_files: Vec<String>,
+) -> Result<SkillPackagePreflight, String> {
+    SkillPackagePreflight::from_manifest_and_files(&manifest_json, &package_files)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn preview_local_skill_zip_package(
+    package_path: String,
+) -> Result<SkillPackagePreflight, String> {
+    let package_bytes = fs::read(&package_path)
+        .map_err(|error| format!("skill package could not be read: {error}"))?;
+    SkillPackagePreflight::from_zip_bytes(&package_bytes).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn preview_remote_skill_zip_package(
+    package_url: String,
+) -> Result<SkillPackagePreflight, String> {
+    let package_url = package_url.trim().to_string();
+    validate_remote_skill_source_url(&package_url).map_err(|error| error.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(StdDuration::from_secs(20))
+        .build()
+        .map_err(|error| format!("skill package HTTP client could not start: {error}"))?;
+    let response = client
+        .get(&package_url)
+        .header(reqwest::header::USER_AGENT, "DS-Agent-Skill-Preflight/1.0")
+        .send()
+        .map_err(|error| format!("skill package could not be downloaded: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("skill package source returned an error: {error}"))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REMOTE_SKILL_PACKAGE_BYTES as u64)
+    {
+        return Err(format!(
+            "skill package is too large: max {} bytes",
+            MAX_REMOTE_SKILL_PACKAGE_BYTES
+        ));
+    }
+    let package_bytes = response
+        .bytes()
+        .map_err(|error| format!("skill package could not be read: {error}"))?;
+    SkillPackagePreflight::from_remote_zip_bytes(&package_url, package_bytes.as_ref())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn verify_skill_source(manifest_json: String) -> Result<SkillSourceVerification, String> {
+    let manifest = SkillManifest::from_json(&manifest_json).map_err(|error| error.to_string())?;
+    SkillSourceVerification::for_manifest(&manifest).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn install_local_skill_manifest(
+    manifest_json: String,
+    installed_from: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<SkillRecord, String> {
+    let manifest = SkillManifest::from_json(&manifest_json).map_err(|error| error.to_string())?;
+    let installed_from = installed_from.unwrap_or_else(|| "local manifest import".to_string());
+    let installation =
+        SkillInstallationRecord::new(manifest, installed_from).map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_skill_installation(&installation)
+        .map_err(event_store_error)?;
+    store
+        .list_skill_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| {
+            record.id == installation.id
+                || (record.manifest.name == installation.manifest.name
+                    && record.manifest.version == installation.manifest.version
+                    && record.manifest.source.url == installation.manifest.source.url)
+        })
+        .ok_or_else(|| "installed skill record could not be read".to_string())
+}
+
+#[tauri::command]
+pub fn install_local_skill_zip_package(
+    package_path: String,
+    state: State<'_, AppState>,
+) -> Result<SkillRecord, String> {
+    let preflight = preview_local_skill_zip_package(package_path.clone())?;
+    let installation = SkillInstallationRecord::new(
+        preflight.manifest,
+        format!("local zip package: {package_path}"),
+    )
+    .map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_skill_installation(&installation)
+        .map_err(event_store_error)?;
+    store
+        .list_skill_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| record.id == installation.id)
+        .ok_or_else(|| "installed skill record could not be read".to_string())
+}
+
+#[tauri::command]
+pub fn reset_skill_trust(
+    skill_id: Uuid,
+    note: String,
+    state: State<'_, AppState>,
+) -> Result<SkillRecord, String> {
+    let reset = SkillTrustReset::new(skill_id, note).map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_skill_trust_reset(&reset)
+        .map_err(event_store_error)?;
+    store
+        .list_skill_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| record.id == skill_id)
+        .ok_or_else(|| "updated skill record could not be read".to_string())
+}
+
+#[tauri::command]
+pub fn uninstall_skill(
+    skill_id: Uuid,
+    note: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SkillRecord>, String> {
+    let uninstall = SkillUninstallRecord::new(skill_id, note).map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_skill_uninstall(&uninstall)
+        .map_err(event_store_error)?;
+    store.list_skill_records().map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn set_skill_enabled(
+    skill_id: Uuid,
+    enabled: bool,
+    note: String,
+    state: State<'_, AppState>,
+) -> Result<SkillRecord, String> {
+    let status = if enabled {
+        SkillEnablementStatus::Enabled
+    } else {
+        SkillEnablementStatus::Disabled
+    };
+    let change = SkillEnablementChange::new(skill_id, status, note).map_err(event_store_error)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_skill_enablement_change(&change)
+        .map_err(event_store_error)?;
+    store
+        .list_skill_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| record.id == skill_id)
+        .ok_or_else(|| "updated skill record could not be read".to_string())
 }
 
 #[tauri::command]
@@ -9673,10 +10288,14 @@ mod tests {
         resume_agent_chat_action_with_clients, run_agent_chat_with_clients,
         run_memory_background_maintenance_in_store,
         run_memory_background_maintenance_with_model_in_store,
+        run_next_queued_agent_chat_with_clients_and_api_keys,
         should_require_computer_control_unlock, thinking_level_context_label,
         AgentChatActionProposal, AgentChatReadiness, AgentChatRequest, AgentChatRuntimeContext,
         BrowserUrlOpenOutcome, BrowserUrlOpener, ComputerControlUnlockState,
         COMPUTER_CONTROL_UNLOCK_TTL_MINUTES,
+    };
+    use crate::kernel::agent_run::{
+        AgentRunCancelRequest, AgentRunStart, AgentRunStatus, AgentRunStepStatus,
     };
     use crate::kernel::capability::{
         BrowserPage, BrowserPageClient, CapabilityInvocationStatus, ComputerControlAction,
@@ -9845,8 +10464,7 @@ mod tests {
     fn app_update_status_hides_source_only_newer_release() {
         let release = GithubRelease {
             tag_name: "v9.9.9".to_string(),
-            html_url: "https://github.com/Lee-take/dsagent/releases/tag/v9.9.9"
-                .to_string(),
+            html_url: "https://github.com/Lee-take/dsagent/releases/tag/v9.9.9".to_string(),
             assets: vec![GithubReleaseAsset {
                 name: "source.zip".to_string(),
                 browser_download_url:
@@ -9867,8 +10485,7 @@ mod tests {
     fn app_update_selects_trusted_windows_installer_asset() {
         let release = GithubRelease {
             tag_name: "v9.9.9".to_string(),
-            html_url: "https://github.com/Lee-take/dsagent/releases/tag/v9.9.9"
-                .to_string(),
+            html_url: "https://github.com/Lee-take/dsagent/releases/tag/v9.9.9".to_string(),
             assets: vec![
                 GithubReleaseAsset {
                     name: "source.zip".to_string(),
@@ -9939,6 +10556,12 @@ mod tests {
         store: &'a Mutex<EventStore>,
         response_text: String,
         lock_available_at_call: Mutex<Vec<bool>>,
+    }
+
+    struct CancelingDeepSeekTransport<'a> {
+        store: &'a Mutex<EventStore>,
+        run_id: Uuid,
+        response_text: String,
     }
 
     struct StoreLockCheckingFileContentClient<'a> {
@@ -10286,6 +10909,42 @@ mod tests {
         }
     }
 
+    impl<'a> CancelingDeepSeekTransport<'a> {
+        fn new(
+            store: &'a Mutex<EventStore>,
+            run_id: Uuid,
+            response_text: impl Into<String>,
+        ) -> Self {
+            Self {
+                store,
+                run_id,
+                response_text: response_text.into(),
+            }
+        }
+    }
+
+    impl DeepSeekChatCompletionTransport for CancelingDeepSeekTransport<'_> {
+        fn post_chat_completion(
+            &self,
+            _endpoint: &str,
+            _api_key: &str,
+            request: &DeepSeekChatCompletionRequest,
+        ) -> Result<DeepSeekChatCompletionResponse, String> {
+            let cancel =
+                AgentRunCancelRequest::new(self.run_id, "用户取消了后台任务。".to_string())
+                    .expect("cancel request");
+            self.store
+                .lock()
+                .expect("store lock")
+                .append_agent_run_cancel_request(&cancel)
+                .expect("cancel request appends");
+            Ok(DeepSeekChatCompletionResponse::from_text(
+                request.model.clone(),
+                self.response_text.clone(),
+            ))
+        }
+    }
+
     fn test_memory_record(
         title: &str,
         body: &str,
@@ -10463,6 +11122,134 @@ mod tests {
                 .expect("invocations")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn queued_agent_run_worker_claims_executes_and_finishes_next_run() {
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let start = AgentRunStart::queued(
+            "conversation-1".to_string(),
+            "后台执行这个任务。".to_string(),
+            0,
+        )
+        .expect("queued run start");
+        store
+            .lock()
+            .expect("store lock")
+            .append_agent_run_start(&start)
+            .expect("queued run appends");
+        let transport = RecordingDeepSeekTransport::new(
+            r#"{
+                "protocol_version": "ds-agent-envelope/v1",
+                "reply_to_user": "后台任务完成。",
+                "agent_actions": [],
+                "missing_prerequisites": []
+            }"#,
+        );
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let outcome = run_next_queued_agent_chat_with_clients_and_api_keys(
+            &store,
+            &transport,
+            &cache,
+            &["test-secret".to_string()],
+            "worker-a".to_string(),
+            ModelRoute::Flash,
+            ThinkingLevel::Fast,
+            AccessMode::AskOnRisk,
+            AgentChatRuntimeContext::default(),
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("worker execution succeeds")
+        .expect("queued run exists");
+
+        assert_eq!(outcome.response.content, "后台任务完成。");
+        assert_eq!(outcome.record.id, start.id);
+        assert_eq!(outcome.record.status, AgentRunStatus::Completed);
+        assert_eq!(outcome.record.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(
+            outcome.record.finish_summary.as_deref(),
+            Some("后台任务完成。")
+        );
+        assert_eq!(
+            outcome
+                .record
+                .steps
+                .iter()
+                .map(|step| (step.sequence, step.status, step.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, AgentRunStepStatus::Running, "DeepSeek"),
+                (1, AgentRunStepStatus::Completed, "DeepSeek"),
+            ]
+        );
+        assert_eq!(transport.recorded_requests().len(), 1);
+    }
+
+    #[test]
+    fn queued_agent_run_worker_records_cancelled_when_cancel_requested_during_execution() {
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let start = AgentRunStart::queued(
+            "conversation-1".to_string(),
+            "后台执行这个任务。".to_string(),
+            0,
+        )
+        .expect("queued run start");
+        store
+            .lock()
+            .expect("store lock")
+            .append_agent_run_start(&start)
+            .expect("queued run appends");
+        let transport = CancelingDeepSeekTransport::new(
+            &store,
+            start.id,
+            r#"{
+                "protocol_version": "ds-agent-envelope/v1",
+                "reply_to_user": "这条回复不应在取消后提交给用户。",
+                "agent_actions": [],
+                "missing_prerequisites": []
+            }"#,
+        );
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let outcome = run_next_queued_agent_chat_with_clients_and_api_keys(
+            &store,
+            &transport,
+            &cache,
+            &["test-secret".to_string()],
+            "worker-a".to_string(),
+            ModelRoute::Flash,
+            ThinkingLevel::Fast,
+            AccessMode::AskOnRisk,
+            AgentChatRuntimeContext::default(),
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("worker execution succeeds")
+        .expect("queued run exists");
+
+        assert_eq!(outcome.record.id, start.id);
+        assert_eq!(outcome.record.status, AgentRunStatus::Cancelled);
+        assert!(outcome.record.cancel_requested);
+        assert_eq!(
+            outcome.record.finish_summary.as_deref(),
+            Some("Agent run cancelled before committing the completed response.")
         );
     }
 

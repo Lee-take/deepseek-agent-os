@@ -184,8 +184,8 @@ test("new conversations keep Soul bootstrap outside compressed chat history", ()
   );
 });
 
-test("plugins are not exposed as a left sidebar entry", () => {
-  assert.equal(shouldExposePluginsSidebarEntry(), false);
+test("plugins are exposed as a conservative local skill registry entry", () => {
+  assert.equal(shouldExposePluginsSidebarEntry(), true);
 });
 
 test("workspace directory picker has Tauri dialog open permission", () => {

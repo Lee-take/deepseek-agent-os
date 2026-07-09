@@ -42,8 +42,12 @@ import {
   agentChatComposerAction,
   agentChatLoopSteps,
   buildAgentGuidancePrompt,
+  createAgentChatRun,
+  finishAgentRun,
+  queueAgentRunGuidance,
+  requestAgentRunCancel,
 } from "./agentChatRunState";
-import type { AgentChatGuidanceStatus } from "./agentChatRunState";
+import type { AgentChatGuidanceStatus, AgentChatRun } from "./agentChatRunState";
 import {
   agentChatPendingStageDelaysMs,
   agentChatPendingStageIndex,
@@ -70,6 +74,8 @@ import type {
   AgentChatMissingPrerequisite,
   AgentChatResponse,
   AgentContextReceipt,
+  AgentRunRecord,
+  AgentRunWorkerResult,
   AgentSoulProfileState,
   AppUpdateDownloadResult,
   AppUpdateInstallResult,
@@ -112,6 +118,10 @@ import type {
   NetworkSearchRouteStatus,
   OperationsBriefingRun,
   PermissionAuditEntry,
+  SkillExecutionRecord,
+  SkillPackagePreflight,
+  SkillRecord,
+  SkillSourceVerification,
   TaskRecord,
   TerminalReadCommand,
   ThemeStyle,
@@ -364,6 +374,12 @@ type MemoryEditDraft = {
 type WorkflowStepState = "done" | "current" | "waiting" | "needs_action" | "blocked";
 type WorkflowStatusTone = "ready" | "running" | "needs_action" | "done" | "blocked";
 type AgentChatSetupPrompt = "deepseek_key" | "workspace" | "network_search";
+type QueuedAgentPrompt = {
+  prompt: string;
+  displayPrompt: string;
+  attachments: AgentAttachment[];
+  runId: string | null;
+};
 
 type AgentConversationMessage = {
   id: string;
@@ -753,6 +769,24 @@ function formatMicroUsd(value: number) {
   return `$${formatted || "0"}`;
 }
 
+function agentChatRunFromRecord(record: AgentRunRecord, displayPrompt?: string): AgentChatRun {
+  return {
+    id: record.id,
+    conversation_id: record.conversation_id,
+    prompt: displayPrompt ?? record.prompt,
+    status: record.status,
+    cancel_requested: record.cancel_requested,
+    queued_guidance: record.queued_guidance.map((guidance) => ({
+      id: guidance.id,
+      content: guidance.guidance,
+      attachment_count: 0,
+      created_at: guidance.queued_at,
+    })),
+    created_at: record.started_at,
+    updated_at: record.updated_at,
+  };
+}
+
 function capabilityFamilyIcon(family: CapabilityFamily) {
   switch (family) {
     case "file":
@@ -816,6 +850,9 @@ export function App() {
   const [capabilityRecords, setCapabilityRecords] = useState<CapabilityAccessRecord[]>([]);
   const [capabilityInvocations, setCapabilityInvocations] = useState<CapabilityInvocation[]>([]);
   const [agentContextReceipts, setAgentContextReceipts] = useState<AgentContextReceipt[]>([]);
+  const [skillRecords, setSkillRecords] = useState<SkillRecord[]>([]);
+  const [skillExecutionRecords, setSkillExecutionRecords] = useState<SkillExecutionRecord[]>([]);
+  const [agentRunRecords, setAgentRunRecords] = useState<AgentRunRecord[]>([]);
   const [operationsBriefingRuns, setOperationsBriefingRuns] = useState<OperationsBriefingRun[]>([]);
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryFeedbackFilter, setMemoryFeedbackFilter] =
@@ -904,6 +941,7 @@ export function App() {
   const [renamingConversationId, setRenamingConversationId] = useState<string | null>(null);
   const [renameConversationTitle, setRenameConversationTitle] = useState("");
   const [agentChatPending, setAgentChatPending] = useState(false);
+  const [activeAgentRun, setActiveAgentRun] = useState<AgentChatRun | null>(null);
   const [agentChatPendingStage, setAgentChatPendingStage] = useState(0);
   const [agentGuidanceStatus, setAgentGuidanceStatus] =
     useState<AgentChatGuidanceStatus>("idle");
@@ -919,6 +957,8 @@ export function App() {
   const [deepSeekBalance, setDeepSeekBalance] = useState<DeepSeekUserBalanceResponse | null>(null);
   const [exportedPackageJson, setExportedPackageJson] = useState("");
   const [importPackageJson, setImportPackageJson] = useState("");
+  const [skillManifestJson, setSkillManifestJson] = useState("");
+  const [skillRemotePackageUrl, setSkillRemotePackageUrl] = useState("");
   const [importPreview, setImportPreview] = useState<WorkPackageImportPreview | null>(null);
   const [soulProfileModalOpen, setSoulProfileModalOpen] = useState(false);
   const [packageNotice, setPackageNotice] = useState("");
@@ -929,6 +969,8 @@ export function App() {
   const [memoryCandidateError, setMemoryCandidateError] = useState("");
   const [auditError, setAuditError] = useState("");
   const [capabilityError, setCapabilityError] = useState("");
+  const [skillNotice, setSkillNotice] = useState("");
+  const [skillError, setSkillError] = useState("");
   const [browserNotice, setBrowserNotice] = useState("");
   const [browserError, setBrowserError] = useState("");
   const [browserSubmitNotice, setBrowserSubmitNotice] = useState("");
@@ -979,6 +1021,7 @@ export function App() {
   const [deepSeekPricingError, setDeepSeekPricingError] = useState("");
   const [deepSeekBalanceError, setDeepSeekBalanceError] = useState("");
   const [packagePending, setPackagePending] = useState(false);
+  const [skillPending, setSkillPending] = useState(false);
   const [memoryPending, setMemoryPending] = useState(false);
   const [memoryCandidatePending, setMemoryCandidatePending] = useState(false);
   const [memoryFeedbackPending, setMemoryFeedbackPending] = useState<string | null>(null);
@@ -1012,6 +1055,7 @@ export function App() {
   const [resolutionPending, setResolutionPending] = useState<string | null>(null);
   const agentMessagesRef = useRef(agentMessages);
   const queuedAgentGuidanceRef = useRef("");
+  const queuedAgentPromptRef = useRef<QueuedAgentPrompt[]>([]);
   const agentStopRequestedRef = useRef(false);
   const agentChatRunTokenRef = useRef(0);
   const appUpdateDownloadKeyRef = useRef("");
@@ -1136,7 +1180,9 @@ export function App() {
       Math.min(agentChatPendingStage, copy.chatWorkbench.pendingStages.length - 1)
     ] ?? copy.chatWorkbench.sendingStatus;
   const agentChatPendingStatus =
-    agentGuidanceStatus === "guiding"
+    activeAgentRun?.status === "cancel_requested"
+      ? copy.chatWorkbench.stopRequestedFeedback
+      : agentGuidanceStatus === "guiding"
       ? copy.chatWorkbench.guidanceRunning
       : agentGuidanceStatus === "queued"
         ? copy.chatWorkbench.guidanceQueued
@@ -1551,6 +1597,15 @@ export function App() {
     agentStopRequestedRef.current = value;
   };
 
+  const upsertAgentRunRecord = (record: AgentRunRecord) => {
+    setAgentRunRecords((currentRecords) =>
+      [record, ...currentRecords.filter((currentRecord) => currentRecord.id !== record.id)].sort(
+        (left, right) =>
+          new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
+      ),
+    );
+  };
+
   const queueAgentGuidance = (
     guidanceValue: string,
     attachments: AgentAttachment[] = [],
@@ -1569,6 +1624,25 @@ export function App() {
     setAgentChatError("");
     setAgentChatNotice(copy.chatWorkbench.guidanceQueuedFeedback);
     setAgentGuidanceStatus("queued");
+    const currentRun = activeAgentRun;
+    if (currentRun && hasDesktopRuntime()) {
+      void invoke<AgentRunRecord>("queue_agent_run_guidance_record", {
+        runId: currentRun.id,
+        guidance: guidanceWithAttachments,
+      })
+        .then(upsertAgentRunRecord)
+        .catch(() => null);
+    }
+    setActiveAgentRun((currentRun) =>
+      currentRun
+        ? queueAgentRunGuidance(currentRun, {
+            id: createClientId("guidance"),
+            content: guidanceWithAttachments,
+            attachmentCount: readyAttachments.length,
+            createdAt: new Date().toISOString(),
+          })
+        : currentRun,
+    );
     setQueuedAgentGuidanceValue(
       queuedAgentGuidanceRef.current
         ? `${queuedAgentGuidanceRef.current}\n\n${guidanceWithAttachments}`
@@ -1582,6 +1656,17 @@ export function App() {
     setAgentGuidanceStatus("idle");
     setQueuedAgentGuidanceValue("");
     setAgentStopRequestedValue(true);
+    if (activeAgentRun && hasDesktopRuntime()) {
+      void invoke<AgentRunRecord>("request_agent_run_cancel_record", {
+        runId: activeAgentRun.id,
+        reason: "User requested stop from the chat composer.",
+      })
+        .then(upsertAgentRunRecord)
+        .catch(() => null);
+    }
+    setActiveAgentRun((currentRun) =>
+      currentRun ? requestAgentRunCancel(currentRun, new Date().toISOString()) : currentRun,
+    );
     agentChatRunTokenRef.current += 1;
     setAgentChatPending(false);
   };
@@ -1874,6 +1959,9 @@ export function App() {
       setCapabilityRecords([]);
       setCapabilityInvocations([]);
       setAgentContextReceipts([]);
+      setSkillRecords([]);
+      setSkillExecutionRecords([]);
+      setAgentRunRecords([]);
       setOperationsBriefingRuns([]);
       return;
     }
@@ -1889,6 +1977,9 @@ export function App() {
       invoke<CapabilityAccessRecord[]>("list_capability_access_records"),
       invoke<CapabilityInvocation[]>("list_capability_invocations"),
       invoke<AgentContextReceipt[]>("list_agent_context_receipts"),
+      invoke<SkillRecord[]>("list_skill_records"),
+      invoke<SkillExecutionRecord[]>("list_skill_execution_records"),
+      invoke<AgentRunRecord[]>("list_agent_run_records"),
       invoke<OperationsBriefingRun[]>("list_operations_briefing_runs"),
     ])
       .then(([
@@ -1902,6 +1993,9 @@ export function App() {
         capabilityAccessRecords,
         invocations,
         contextReceipts,
+        skills,
+        skillExecutions,
+        agentRuns,
         briefingRuns,
       ]) => {
         setTaskRecords(records);
@@ -1914,6 +2008,9 @@ export function App() {
         setCapabilityRecords(capabilityAccessRecords);
         setCapabilityInvocations(invocations);
         setAgentContextReceipts(contextReceipts);
+        setSkillRecords(skills);
+        setSkillExecutionRecords(skillExecutions);
+        setAgentRunRecords(agentRuns);
         setOperationsBriefingRuns(briefingRuns);
         void runMemoryBackgroundMaintenance().catch(() => {
           // Background memory maintenance is best-effort; explicit feedback still remains logged.
@@ -1925,6 +2022,7 @@ export function App() {
         setMemoryCandidateError(copy.memory.loadFailed);
         setAuditError(copy.audit.loadFailed);
         setCapabilityError(copy.capabilities.loadFailed);
+        setSkillError(copy.skills.loadFailed);
         setBriefingError(copy.operationsBriefing.loadFailed);
       });
   }, [
@@ -1933,6 +2031,7 @@ export function App() {
     copy.memory.loadFailed,
     copy.operationsBriefing.loadFailed,
     copy.package.loadFailed,
+    copy.skills.loadFailed,
   ]);
 
   useEffect(() => {
@@ -2207,6 +2306,38 @@ export function App() {
     const runs = await invoke<OperationsBriefingRun[]>("list_operations_briefing_runs");
     setOperationsBriefingRuns(runs);
   };
+
+  const refreshSkillRecords = async () => {
+    const skills = await invoke<SkillRecord[]>("list_skill_records");
+    setSkillRecords(skills);
+  };
+
+  const refreshSkillExecutionRecords = async () => {
+    const executions = await invoke<SkillExecutionRecord[]>("list_skill_execution_records");
+    setSkillExecutionRecords(executions);
+    return executions;
+  };
+
+  const refreshAgentRunRecords = async () => {
+    const runs = await invoke<AgentRunRecord[]>("list_agent_run_records");
+    setAgentRunRecords(runs);
+    return runs;
+  };
+
+  useEffect(() => {
+    if (!hasDesktopRuntime() || !agentChatPending) {
+      return;
+    }
+
+    void refreshAgentRunRecords().catch(() => null);
+    const timer = window.setInterval(() => {
+      void refreshAgentRunRecords().catch(() => null);
+    }, 1500);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [agentChatPending]);
 
   const refreshMemoryCandidateRecords = async () => {
     const candidates = await invoke<MemoryCandidateRecord[]>("list_memory_candidate_records");
@@ -3082,6 +3213,11 @@ export function App() {
     setPackageError("");
   };
 
+  const clearSkillStatus = () => {
+    setSkillNotice("");
+    setSkillError("");
+  };
+
   const exportOperationsBriefingPackage = async () => {
     clearPackageStatus();
     setBriefingPending(true);
@@ -3230,6 +3366,7 @@ export function App() {
       isGuidanceContinuation?: boolean;
       displayPrompt?: string;
       attachments?: AgentAttachment[];
+      runId?: string;
     } = {},
   ) => {
     const readyAttachments = readyAgentAttachments(options.attachments ?? []);
@@ -3293,6 +3430,35 @@ export function App() {
       return;
     }
 
+    const displayPrompt = options.displayPrompt?.trim() || prompt;
+    if (agentChatPending && !options.isGuidanceContinuation && !options.runId) {
+      let queuedRunId: string | null = null;
+      try {
+        const queuedRecord = await invoke<AgentRunRecord>("enqueue_agent_run_record", {
+          conversationId: activeAgentConversationId,
+          prompt: displayPrompt,
+          attachmentCount: readyAttachments.length,
+        });
+        queuedRunId = queuedRecord.id;
+        upsertAgentRunRecord(queuedRecord);
+      } catch {
+        // The local worker queue still preserves the user intent if the audit registry is unavailable.
+      }
+
+      queuedAgentPromptRef.current.push({
+        prompt: promptValue,
+        displayPrompt,
+        attachments: options.attachments ?? [],
+        runId: queuedRunId,
+      });
+      setAgentPrompt("");
+      setAgentAttachments([]);
+      setAgentAttachmentError("");
+      setAgentChatError("");
+      setAgentChatNotice(copy.chatWorkbench.taskQueuedFeedback);
+      return;
+    }
+
     const priorMessages = agentMessagesRef.current;
     const activeConversation = agentConversations.find(
       (conversation) => conversation.id === activeAgentConversationId,
@@ -3316,7 +3482,37 @@ export function App() {
         ),
       );
     }
-    const displayPrompt = options.displayPrompt?.trim() || prompt;
+    let agentRunId = options.runId ?? createClientId("run");
+    if (!options.isGuidanceContinuation) {
+      const existingRunRecord = options.runId
+        ? agentRunRecords.find((record) => record.id === options.runId) ?? null
+        : null;
+      let nextAgentRun = createAgentChatRun({
+        id: agentRunId,
+        conversationId: activeAgentConversationId,
+        prompt: displayPrompt,
+        createdAt: new Date().toISOString(),
+      });
+      try {
+        const queuedRecord = options.runId
+          ? null
+          : await invoke<AgentRunRecord>("enqueue_agent_run_record", {
+              conversationId: activeAgentConversationId,
+              prompt: displayPrompt,
+              attachmentCount: readyAttachments.length,
+        });
+        if (queuedRecord) {
+          agentRunId = queuedRecord.id;
+          nextAgentRun = agentChatRunFromRecord(queuedRecord, displayPrompt);
+          upsertAgentRunRecord(queuedRecord);
+        } else if (existingRunRecord) {
+          nextAgentRun = agentChatRunFromRecord(existingRunRecord, displayPrompt);
+        }
+      } catch {
+        // Local run state remains usable when the audit registry is unavailable.
+      }
+      setActiveAgentRun(nextAgentRun);
+    }
     const userMessage: AgentConversationMessage = {
       id: createClientId("user"),
       role: "user",
@@ -3333,22 +3529,69 @@ export function App() {
     updateActiveAgentMessages((currentMessages) => [...currentMessages, userMessage], displayPrompt);
     setAgentChatPending(true);
 
+    let runFinishedStatus: "completed" | "failed" = "completed";
+    let runFinishError: string | null = null;
+    let runFinishedByWorker = false;
     try {
       const contextPacket = buildAgentConversationContextPrompt(
         promptWithAttachments,
         priorMessages,
         capturedSoulProfileBootstrap || null,
       );
-      const response = await invoke<AgentChatResponse>("run_agent_chat", {
-        prompt: contextPacket.prompt,
-        largeModelProvider: state.large_model_provider,
-        modelRoute: state.model_route,
-        thinkingLevel: state.thinking_level,
-        accessMode: state.access_mode,
-        networkSearchSourceModel: state.network_search_source_model || null,
-        apiKeyOverride: apiKeyCandidates[0] ?? null,
-        fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
-      });
+      let response: AgentChatResponse;
+      if (options.isGuidanceContinuation) {
+        void invoke<AgentRunRecord>("record_agent_run_step_record", {
+          runId: agentRunId,
+          sequence: 1,
+          status: "running",
+          label: copy.runStatus.steps.deepseek,
+          detail: agentChatPendingStatus,
+        })
+          .then(upsertAgentRunRecord)
+          .catch(() => null);
+        response = await invoke<AgentChatResponse>("run_agent_chat", {
+          prompt: contextPacket.prompt,
+          largeModelProvider: state.large_model_provider,
+          modelRoute: state.model_route,
+          thinkingLevel: state.thinking_level,
+          accessMode: state.access_mode,
+          networkSearchSourceModel: state.network_search_source_model || null,
+          apiKeyOverride: apiKeyCandidates[0] ?? null,
+          fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
+        });
+        void invoke<AgentRunRecord>("record_agent_run_step_record", {
+          runId: agentRunId,
+          sequence: 1,
+          status: "completed",
+          label: copy.runStatus.steps.deepseek,
+          detail: response.model,
+        })
+          .then(upsertAgentRunRecord)
+          .catch(() => null);
+      } else {
+        const workerResult = await invoke<AgentRunWorkerResult | null>(
+          "run_next_queued_agent_chat_worker",
+          {
+            runId: agentRunId,
+            executionPrompt: contextPacket.prompt,
+            workerId: "desktop-chat-worker",
+            largeModelProvider: state.large_model_provider,
+            modelRoute: state.model_route,
+            thinkingLevel: state.thinking_level,
+            accessMode: state.access_mode,
+            networkSearchSourceModel: state.network_search_source_model || null,
+            apiKeyOverride: apiKeyCandidates[0] ?? null,
+            fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
+          },
+        );
+        if (!workerResult) {
+          throw new Error("Queued agent run was not available for the background worker.");
+        }
+        runFinishedByWorker = true;
+        agentRunId = workerResult.record.id;
+        upsertAgentRunRecord(workerResult.record);
+        response = workerResult.response;
+      }
       if (runToken !== agentChatRunTokenRef.current || agentStopRequestedRef.current) {
         return;
       }
@@ -3410,6 +3653,20 @@ export function App() {
           ? copy.chatWorkbench.deepSeekResponseReadFailed
           : copy.chatWorkbench.deepSeekRequestFailed;
       setAgentChatError("");
+      if (options.isGuidanceContinuation) {
+        void invoke<AgentRunRecord>("record_agent_run_step_record", {
+          runId: agentRunId,
+          sequence: 1,
+          status: "failed",
+          label: copy.runStatus.steps.deepseek,
+          detail: message,
+        })
+          .then(upsertAgentRunRecord)
+          .catch(() => null);
+      } else {
+        runFinishedByWorker = true;
+        void refreshAgentRunRecords().catch(() => null);
+      }
       updateActiveAgentMessages((currentMessages) => [
         ...currentMessages,
         {
@@ -3420,13 +3677,15 @@ export function App() {
           created_at: new Date().toISOString(),
         },
       ], displayPrompt);
+      runFinishedStatus = "failed";
+      runFinishError = message;
     } finally {
       if (runToken !== agentChatRunTokenRef.current) {
         return;
       }
 
       const nextGuidance = queuedAgentGuidanceRef.current;
-      if (nextGuidance) {
+      if (nextGuidance && !agentStopRequestedRef.current) {
         setQueuedAgentGuidanceValue("");
         setAgentGuidanceStatus("guiding");
         setAgentChatNotice(copy.chatWorkbench.guidanceRunningFeedback);
@@ -3434,12 +3693,44 @@ export function App() {
           ...options,
           isGuidanceContinuation: true,
           displayPrompt: nextGuidance,
+          runId: agentRunId,
         });
         return;
       }
 
+      if (!agentStopRequestedRef.current && !runFinishedByWorker) {
+        const finishedRecord = await invoke<AgentRunRecord>("finish_agent_run_record", {
+          runId: agentRunId,
+          status: runFinishedStatus,
+          summary: runFinishedStatus === "completed" ? "Agent chat run completed." : null,
+          error: runFinishError,
+        }).catch(() => null);
+        if (finishedRecord) {
+          upsertAgentRunRecord(finishedRecord);
+        }
+      }
+
+      setActiveAgentRun((currentRun) =>
+        currentRun?.id === agentRunId && !currentRun.cancel_requested
+          ? finishAgentRun(currentRun, {
+              status: runFinishedStatus,
+              finishedAt: new Date().toISOString(),
+            })
+          : currentRun,
+      );
       setAgentChatPending(false);
       setAgentGuidanceStatus("idle");
+      void refreshAgentRunRecords().catch(() => null);
+      const nextQueuedPrompt = queuedAgentPromptRef.current.shift();
+      if (nextQueuedPrompt && !agentStopRequestedRef.current) {
+        window.setTimeout(() => {
+          void sendAgentPrompt(nextQueuedPrompt.prompt, {
+            displayPrompt: nextQueuedPrompt.displayPrompt,
+            attachments: nextQueuedPrompt.attachments,
+            runId: nextQueuedPrompt.runId ?? undefined,
+          });
+        }, 0);
+      }
     }
   };
 
@@ -3709,6 +4000,186 @@ export function App() {
     }
   };
 
+  const installLocalSkillManifest = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    clearSkillStatus();
+
+    if (!skillManifestJson.trim()) {
+      setSkillError(copy.skills.installFailed);
+      return;
+    }
+
+    setSkillPending(true);
+    try {
+      await invoke<SkillRecord>("install_local_skill_manifest", {
+        manifestJson: skillManifestJson,
+        installedFrom: "local manifest paste",
+      });
+      await refreshSkillRecords();
+      setSkillManifestJson("");
+      setSkillNotice(copy.skills.installSucceeded);
+    } catch (error) {
+      setSkillError(`${copy.skills.installFailed} ${String(error)}`);
+    } finally {
+      setSkillPending(false);
+    }
+  };
+
+  const installLocalSkillZipPackage = async () => {
+    clearSkillStatus();
+
+    if (!hasDesktopRuntime()) {
+      setSkillError(copy.chatWorkbench.desktopRuntimeMissing);
+      return;
+    }
+
+    setSkillPending(true);
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "DS Agent skill package", extensions: ["zip"] }],
+      });
+      const packagePath = Array.isArray(selected) ? selected[0] : selected;
+      if (!packagePath) {
+        return;
+      }
+      await invoke<SkillRecord>("install_local_skill_zip_package", {
+        packagePath,
+      });
+      await refreshSkillRecords();
+      setSkillNotice(copy.skills.installSucceeded);
+    } catch (error) {
+      setSkillError(`${copy.skills.installFailed} ${String(error)}`);
+    } finally {
+      setSkillPending(false);
+    }
+  };
+
+  const previewRemoteSkillZipPackage = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    clearSkillStatus();
+    const packageUrl = skillRemotePackageUrl.trim();
+    if (!packageUrl) {
+      setSkillError(copy.skills.previewFailed);
+      return;
+    }
+
+    setSkillPending(true);
+    try {
+      const preflight = await invoke<SkillPackagePreflight>("preview_remote_skill_zip_package", {
+        packageUrl,
+      });
+      setSkillNotice(
+        copy.skills.previewSucceeded(preflight.manifest.name, preflight.package_files.length),
+      );
+    } catch (error) {
+      setSkillError(`${copy.skills.previewFailed} ${String(error)}`);
+    } finally {
+      setSkillPending(false);
+    }
+  };
+
+  const setLocalSkillEnabled = async (record: SkillRecord, enabled: boolean) => {
+    clearSkillStatus();
+    setSkillPending(true);
+    try {
+      const updated = await invoke<SkillRecord>("set_skill_enabled", {
+        skillId: record.id,
+        enabled,
+        note: enabled ? copy.skills.enable : copy.skills.disable,
+      });
+      setSkillRecords((currentRecords) =>
+        currentRecords.map((currentRecord) =>
+          currentRecord.id === updated.id ? updated : currentRecord,
+        ),
+      );
+      setSkillNotice(copy.skills.statusChanged);
+    } catch (error) {
+      setSkillError(`${copy.skills.statusFailed} ${String(error)}`);
+    } finally {
+      setSkillPending(false);
+    }
+  };
+
+  const verifyLocalSkillSource = async (record: SkillRecord) => {
+    clearSkillStatus();
+    setSkillPending(true);
+    try {
+      const verification = await invoke<SkillSourceVerification>("verify_skill_source", {
+        manifestJson: JSON.stringify(record.manifest),
+      });
+      setSkillNotice(copy.skills.sourceVerified(verification.provenance));
+    } catch (error) {
+      setSkillError(`${copy.skills.sourceFailed} ${String(error)}`);
+    } finally {
+      setSkillPending(false);
+    }
+  };
+
+  const prepareLocalSkillExecution = async (record: SkillRecord) => {
+    clearSkillStatus();
+    setSkillPending(true);
+    try {
+      const execution = await invoke<SkillExecutionRecord>("prepare_skill_execution_record", {
+        skillId: record.id,
+        inputSummary: `Manual safe-runtime preparation for ${record.manifest.name}.`,
+      });
+      setSkillExecutionRecords((currentRecords) => [execution, ...currentRecords]);
+      if (execution.status === "blocked") {
+        setSkillError(
+          copy.skills.executionBlocked(
+            execution.skill_name,
+            execution.blocked_reason ?? "blocked by safe runtime",
+          ),
+        );
+      } else {
+        setSkillNotice(copy.skills.executionPrepared(execution.skill_name));
+      }
+    } catch (error) {
+      setSkillError(`${copy.skills.executionFailed} ${String(error)}`);
+    } finally {
+      setSkillPending(false);
+    }
+  };
+
+  const resetLocalSkillTrust = async (record: SkillRecord) => {
+    clearSkillStatus();
+    setSkillPending(true);
+    try {
+      const updated = await invoke<SkillRecord>("reset_skill_trust", {
+        skillId: record.id,
+        note: copy.skills.trustReset,
+      });
+      setSkillRecords((currentRecords) =>
+        currentRecords.map((currentRecord) =>
+          currentRecord.id === updated.id ? updated : currentRecord,
+        ),
+      );
+      setSkillNotice(copy.skills.trustReset);
+    } catch (error) {
+      setSkillError(`${copy.skills.trustResetFailed} ${String(error)}`);
+    } finally {
+      setSkillPending(false);
+    }
+  };
+
+  const uninstallLocalSkill = async (record: SkillRecord) => {
+    clearSkillStatus();
+    setSkillPending(true);
+    try {
+      const records = await invoke<SkillRecord[]>("uninstall_skill", {
+        skillId: record.id,
+        note: copy.skills.uninstalled,
+      });
+      setSkillRecords(records);
+      setSkillNotice(copy.skills.uninstalled);
+    } catch (error) {
+      setSkillError(`${copy.skills.uninstallFailed} ${String(error)}`);
+    } finally {
+      setSkillPending(false);
+    }
+  };
+
   const pendingCapabilityRecords = capabilityRecords.filter(
     (record) => record.effective_status === "pending_approval",
   );
@@ -3759,6 +4230,10 @@ export function App() {
     (action) =>
       action.execution_state === "proposed" || action.execution_state === "waiting_prerequisite",
   );
+  const recentAgentRunRecords = [...agentRunRecords]
+    .sort((left, right) => new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime())
+    .slice(0, 5);
+  const queuedAgentRunCount = agentRunRecords.filter((record) => record.status === "queued").length;
   const latestAgentAllActionsDone =
     latestAgentActions.length > 0 &&
     latestAgentActions.every((action) => action.execution_state === "succeeded");
@@ -3986,6 +4461,7 @@ export function App() {
     showAgentErrorStatus ||
     visibleAgentAttachments.length > 0 ||
     agentChatPending ||
+    agentRunRecords.length > 0 ||
     briefingPending ||
     latestRunNeedsApproval ||
     latestRunFailed ||
@@ -4402,6 +4878,149 @@ export function App() {
                     </div>
                   ) : null}
                 </div>
+              </article>
+              <article className="skill-plugin-card">
+                <header>
+                  <div>
+                    <strong>{copy.skills.installedTitle}</strong>
+                    <p>{copy.skills.safeBoundary}</p>
+                  </div>
+                  <span>{skillRecords.length}</span>
+                </header>
+                <form className="sidebar-form workflow-form" onSubmit={installLocalSkillManifest}>
+                  <textarea
+                    value={skillManifestJson}
+                    aria-label={copy.skills.manifestPlaceholder}
+                    placeholder={copy.skills.manifestPlaceholder}
+                    rows={5}
+                    onChange={(event) => setSkillManifestJson(event.target.value)}
+                  />
+                  <button type="submit" disabled={skillPending}>
+                    <ShieldCheck size={14} aria-hidden="true" />
+                    {skillPending ? copy.skills.installing : copy.skills.installManifest}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    disabled={skillPending}
+                    onClick={() => void installLocalSkillZipPackage()}
+                  >
+                    <PackageOpen size={14} aria-hidden="true" />
+                    {copy.skills.installZip}
+                  </button>
+                </form>
+                <form className="sidebar-form workflow-form" onSubmit={previewRemoteSkillZipPackage}>
+                  <input
+                    value={skillRemotePackageUrl}
+                    aria-label={copy.skills.remotePackageUrlPlaceholder}
+                    placeholder={copy.skills.remotePackageUrlPlaceholder}
+                    onChange={(event) => setSkillRemotePackageUrl(event.target.value)}
+                  />
+                  <button type="submit" disabled={skillPending}>
+                    <ShieldCheck size={14} aria-hidden="true" />
+                    {skillPending ? copy.skills.installing : copy.skills.previewRemote}
+                  </button>
+                </form>
+                {skillNotice ? <p className="package-message">{skillNotice}</p> : null}
+                {skillError ? <p className="package-error">{skillError}</p> : null}
+                <div className="sidebar-compact-panel" aria-live="polite">
+                  {skillRecords.length === 0 ? (
+                    <p className="empty-state">{copy.skills.empty}</p>
+                  ) : (
+                    <div className="sidebar-record-list">
+                      {skillRecords.map((record) => {
+                        const enabled = record.enablement_status === "enabled";
+                        const permissionSummary = record.manifest.permissions.length
+                          ? record.manifest.permissions
+                              .map((permission) => `${permission.kind}:${permission.scope}`)
+                              .join(", ")
+                          : copy.skills.noPermissions;
+                        return (
+                          <article className="sidebar-record-row" key={record.id}>
+                            <div>
+                              <span>{record.manifest.version}</span>
+                              <strong>{record.manifest.name}</strong>
+                              <small>{permissionSummary}</small>
+                            </div>
+                            <button
+                              type="button"
+                              className="secondary-action"
+                              disabled={skillPending}
+                              onClick={() => void verifyLocalSkillSource(record)}
+                            >
+                              <ShieldCheck size={14} aria-hidden="true" />
+                              {copy.skills.verifySource}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-action"
+                              disabled={skillPending}
+                              onClick={() => void prepareLocalSkillExecution(record)}
+                            >
+                              <Play size={14} aria-hidden="true" />
+                              {copy.skills.prepareExecution}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-action"
+                              disabled={skillPending}
+                              onClick={() => void setLocalSkillEnabled(record, !enabled)}
+                            >
+                              {enabled ? copy.skills.disable : copy.skills.enable}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-action"
+                              disabled={skillPending}
+                              onClick={() => void resetLocalSkillTrust(record)}
+                            >
+                              <ArchiveRestore size={14} aria-hidden="true" />
+                              {copy.skills.resetTrust}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-action"
+                              disabled={skillPending}
+                              onClick={() => void uninstallLocalSkill(record)}
+                            >
+                              <X size={14} aria-hidden="true" />
+                              {copy.skills.uninstall}
+                            </button>
+                            <span className={`access-status ${record.enablement_status}`}>
+                              {enabled ? copy.skills.enabled : copy.skills.disabled}
+                            </span>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                {skillExecutionRecords.length > 0 ? (
+                  <div className="sidebar-compact-panel" aria-live="polite">
+                    <div className="queue-heading">
+                      <strong>{copy.skills.executionsTitle}</strong>
+                      <span>{skillExecutionRecords.length}</span>
+                    </div>
+                    <div className="sidebar-record-list">
+                      {skillExecutionRecords.slice(0, 4).map((execution) => (
+                        <article className="sidebar-record-row" key={execution.id}>
+                          <div>
+                            <span>{formatTaskDate(execution.requested_at, language)}</span>
+                            <strong>{execution.skill_name}</strong>
+                            <small>
+                              {execution.status === "blocked"
+                                ? execution.blocked_reason ?? execution.execution_plan
+                                : execution.execution_plan}
+                            </small>
+                          </div>
+                          <span className={`access-status ${execution.status}`}>
+                            {execution.status}
+                          </span>
+                        </article>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
               </article>
             </div>
           </details>
@@ -4959,7 +5578,6 @@ export function App() {
                                   approvalRecord?.effective_status === "pending_approval") ||
                                   action.permission_request_id === null);
                               const actionButtonDisabled =
-                                agentChatPending ||
                                 agentActionPending !== null ||
                                 resolutionPending !== null;
                               const actionDetail = userFacingAgentActionDetail(action);
@@ -5158,6 +5776,16 @@ export function App() {
                       <Paperclip size={15} aria-hidden="true" />
                       {copy.chatWorkbench.addAttachment}
                     </button>
+                    {agentChatPending && (agentPrompt.trim() || readyAgentAttachmentCount > 0) ? (
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        onClick={() => queueAgentGuidance(agentPrompt, agentAttachments)}
+                      >
+                        <Plus size={15} aria-hidden="true" />
+                        {copy.chatWorkbench.queueGuidance}
+                      </button>
+                    ) : null}
                     <button
                       className={`primary-action composer-submit ${agentComposerAction}`}
                       type="submit"
@@ -6269,6 +6897,37 @@ export function App() {
                   );
                 })}
               </ol>
+              {recentAgentRunRecords.length > 0 ? (
+                <>
+                  <div className="queue-heading">
+                    <strong>{copy.runStatus.recentRuns}</strong>
+                    <span>
+                      {queuedAgentRunCount > 0
+                        ? `${copy.runStatus.queuedRuns}: ${queuedAgentRunCount}`
+                        : recentAgentRunRecords.length}
+                    </span>
+                  </div>
+                  <div className="sidebar-record-list">
+                    {recentAgentRunRecords.map((record) => (
+                      <article className="sidebar-record-row" key={record.id}>
+                        <div>
+                          <span>{formatTaskDate(record.updated_at, language)}</span>
+                          <strong>{record.prompt}</strong>
+                          <small>
+                            {copy.runStatus.runStepsLabel(record.steps.length)}
+                            {" / "}
+                            {copy.runStatus.runArtifactsLabel(record.artifacts.length)}
+                            {record.worker_id
+                              ? ` / ${copy.runStatus.workerLabel(record.worker_id)}`
+                              : ""}
+                          </small>
+                        </div>
+                        <span className={`access-status ${record.status}`}>{record.status}</span>
+                      </article>
+                    ))}
+                  </div>
+                </>
+              ) : null}
             </section>
             <details className="inspector-details" open={pendingCapabilityRecords.length > 0}>
               <summary>
