@@ -16,6 +16,7 @@ pub mod office;
 pub mod policy;
 pub mod sandbox;
 pub mod skill;
+pub mod skill_source;
 pub mod tool_runtime;
 pub mod tool_strategy;
 pub mod work_package;

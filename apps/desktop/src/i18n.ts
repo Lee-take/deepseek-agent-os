@@ -286,6 +286,21 @@ type TranslationSet = {
     operationsTitle: string;
     operationsDescription: string;
     autoInvoke: string;
+    systemSkills: string;
+    installedSkills: string;
+    installedPlugins: string;
+    scenarioTemplates: string;
+    protected: string;
+    automaticUpdates: string;
+    checkingUpdates: string;
+    updateSummary: (checked: number, updated: number, failed: number) => string;
+    installFromChat: string;
+    version: string;
+    source: string;
+    localSource: string;
+    skillType: string;
+    pluginType: string;
+    systemSkillType: string;
     installedTitle: string;
     manifestPlaceholder: string;
     remotePackageUrlPlaceholder: string;
@@ -307,6 +322,8 @@ type TranslationSet = {
     installSucceeded: string;
     previewSucceeded: (name: string, fileCount: number) => string;
     statusChanged: string;
+    enabledNotice: string;
+    disabledNotice: string;
     sourceVerified: (provenance: string) => string;
     executionPrepared: (name: string) => string;
     executionBlocked: (name: string, reason: string) => string;
@@ -320,6 +337,7 @@ type TranslationSet = {
     executionFailed: string;
     trustResetFailed: string;
     uninstallFailed: string;
+    updateFailed: string;
   };
   runStatus: {
     title: string;
@@ -1293,6 +1311,22 @@ export const translations: Record<Language, TranslationSet> = {
       operationsTitle: "运营简报",
       operationsDescription: "读取本地证据，调用 DeepSeek 生成可复核的经营管理简报。",
       autoInvoke: "DS Agent 会在任务需要时自动调用已安装的技能与插件。",
+      systemSkills: "系统技能",
+      installedSkills: "已安装 Skill",
+      installedPlugins: "已安装插件",
+      scenarioTemplates: "场景模板",
+      protected: "系统保护",
+      automaticUpdates: "启动时后台自动检查并升级",
+      checkingUpdates: "正在后台检查插件更新…",
+      updateSummary: (checked, updated, failed) =>
+        `已检查 ${checked} 项，升级 ${updated} 项，失败 ${failed} 项。`,
+      installFromChat: "把 GitHub 或 Hugging Face 地址直接发到聊天中，DS Agent 会自动安装。",
+      version: "版本",
+      source: "来源",
+      localSource: "本地生成",
+      skillType: "Skill",
+      pluginType: "插件",
+      systemSkillType: "系统 Skill",
       installedTitle: "本地 Skill Registry",
       manifestPlaceholder: "粘贴 ds-agent.skill.v1 manifest JSON。本版本只登记声明式 skill，不执行脚本或二进制。",
       remotePackageUrlPlaceholder: "GitHub/Hugging Face Skill zip URL",
@@ -1314,6 +1348,8 @@ export const translations: Record<Language, TranslationSet> = {
       installSucceeded: "Skill manifest 已通过校验并登记。",
       previewSucceeded: (name, fileCount) => `远程包预检通过：${name}，${fileCount} 个文件。`,
       statusChanged: "Skill 状态已记录。",
+      enabledNotice: "已启用，后续任务可以自动调用。",
+      disabledNotice: "已禁用，不再参与自动调用。",
       sourceVerified: (provenance: string) => `来源已验证：${provenance}`,
       executionPrepared: (name: string) => `已准备安全执行计划：${name}`,
       executionBlocked: (name: string, reason: string) => `已阻止 skill 执行：${name}（${reason}）`,
@@ -1327,6 +1363,7 @@ export const translations: Record<Language, TranslationSet> = {
       executionFailed: "Skill 执行准备失败。",
       trustResetFailed: "Skill 信任重置失败。",
       uninstallFailed: "Skill 卸载失败。",
+      updateFailed: "后台自动升级检查失败。",
     },
     runStatus: {
       title: "任务状态",
@@ -2424,6 +2461,22 @@ export const translations: Record<Language, TranslationSet> = {
       operationsTitle: "Operations Briefing",
       operationsDescription: "Reads local evidence and uses DeepSeek to produce a reviewable management brief.",
       autoInvoke: "DS Agent automatically uses installed skills and plugins when a task needs them.",
+      systemSkills: "System Skills",
+      installedSkills: "Installed Skills",
+      installedPlugins: "Installed Plugins",
+      scenarioTemplates: "Scenario Templates",
+      protected: "System protected",
+      automaticUpdates: "Checks and upgrades automatically in the background at startup",
+      checkingUpdates: "Checking plugin updates in the background…",
+      updateSummary: (checked, updated, failed) =>
+        `Checked ${checked}, updated ${updated}, failed ${failed}.`,
+      installFromChat: "Send a GitHub or Hugging Face URL in chat and DS Agent installs it automatically.",
+      version: "Version",
+      source: "Source",
+      localSource: "Locally generated",
+      skillType: "Skill",
+      pluginType: "Plugin",
+      systemSkillType: "System Skill",
       installedTitle: "Local Skill Registry",
       manifestPlaceholder:
         "Paste a ds-agent.skill.v1 manifest JSON. This version registers declarative skills only; scripts and binaries are not executed.",
@@ -2448,6 +2501,8 @@ export const translations: Record<Language, TranslationSet> = {
       previewSucceeded: (name: string, fileCount: number) =>
         `Remote package preflight passed: ${name}, ${fileCount} files.`,
       statusChanged: "Skill status recorded.",
+      enabledNotice: "Enabled and available for automatic use.",
+      disabledNotice: "Disabled and removed from automatic use.",
       sourceVerified: (provenance: string) => `Source verified: ${provenance}`,
       executionPrepared: (name: string) => `Safe execution plan prepared: ${name}`,
       executionBlocked: (name: string, reason: string) =>
@@ -2462,6 +2517,7 @@ export const translations: Record<Language, TranslationSet> = {
       executionFailed: "Could not prepare skill execution.",
       trustResetFailed: "Could not reset skill trust.",
       uninstallFailed: "Could not uninstall skill.",
+      updateFailed: "Background automatic update check failed.",
     },
     runStatus: {
       title: "Run Status",

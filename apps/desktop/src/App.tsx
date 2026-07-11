@@ -26,10 +26,13 @@ import {
   Pin,
   Play,
   Plus,
+  Power,
+  RefreshCw,
   Search,
   Send,
   ShieldCheck,
   TerminalSquare,
+  Trash2,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -123,6 +126,7 @@ import type {
   OperationsBriefingRun,
   PermissionAuditEntry,
   SkillRecord,
+  SkillUpdateSweepResult,
   TaskRecord,
   TerminalReadCommand,
   ThemeStyle,
@@ -883,6 +887,11 @@ export function App() {
   const [toolInvocations, setToolInvocations] = useState<ToolInvocationRecord[]>([]);
   const [agentContextReceipts, setAgentContextReceipts] = useState<AgentContextReceipt[]>([]);
   const [skillRecords, setSkillRecords] = useState<SkillRecord[]>([]);
+  const [skillUpdateSweep, setSkillUpdateSweep] = useState<SkillUpdateSweepResult | null>(null);
+  const [skillUpdatePending, setSkillUpdatePending] = useState(false);
+  const [skillActionPending, setSkillActionPending] = useState<string | null>(null);
+  const [skillNotice, setSkillNotice] = useState("");
+  const [skillError, setSkillError] = useState("");
   const [agentRunRecords, setAgentRunRecords] = useState<AgentRunRecord[]>([]);
   const [operationsBriefingRuns, setOperationsBriefingRuns] = useState<OperationsBriefingRun[]>([]);
   const [memoryQuery, setMemoryQuery] = useState("");
@@ -1088,6 +1097,19 @@ export function App() {
   const agentChatPendingRef = useRef(agentChatPending);
   const activeAgentConversationIdRef = useRef(activeAgentConversationId);
   const backgroundAgentWorkerBusyRef = useRef(false);
+  const skillUpdateSweepStartedRef = useRef(false);
+  const systemSkillRecords = useMemo(
+    () => skillRecords.filter((record) => record.package_kind === "system_skill"),
+    [skillRecords],
+  );
+  const installedPluginRecords = useMemo(
+    () => skillRecords.filter((record) => record.package_kind === "plugin"),
+    [skillRecords],
+  );
+  const installedSkillRecords = useMemo(
+    () => skillRecords.filter((record) => record.package_kind === "skill"),
+    [skillRecords],
+  );
   const feedbackReviewItems = useMemo(() => {
     const memoriesById = new Map(memoryRecords.map((memory) => [memory.id, memory]));
     const feedbackByMemory = selectedMemoryFeedbackRecords.reduce(
@@ -1953,6 +1975,7 @@ export function App() {
       setToolInvocations([]);
       setAgentContextReceipts([]);
       setSkillRecords([]);
+      setSkillUpdateSweep(null);
       setAgentRunRecords([]);
       setOperationsBriefingRuns([]);
       return;
@@ -2010,6 +2033,19 @@ export function App() {
         void runMemoryBackgroundMaintenance().catch(() => {
           // Background memory maintenance is best-effort; explicit feedback still remains logged.
         });
+        if (!skillUpdateSweepStartedRef.current) {
+          skillUpdateSweepStartedRef.current = true;
+          setSkillUpdatePending(true);
+          void invoke<SkillUpdateSweepResult>("run_skill_update_sweep")
+            .then((sweep) => {
+              setSkillUpdateSweep(sweep);
+              setSkillRecords(sweep.records);
+            })
+            .catch((error) => {
+              setSkillError(`${copy.skills.updateFailed} ${String(error)}`);
+            })
+            .finally(() => setSkillUpdatePending(false));
+        }
       })
       .catch(() => {
         setPackageError(copy.package.loadFailed);
@@ -2025,7 +2061,49 @@ export function App() {
     copy.memory.loadFailed,
     copy.operationsBriefing.loadFailed,
     copy.package.loadFailed,
+    copy.skills.updateFailed,
   ]);
+
+  const setLocalSkillEnabled = async (record: SkillRecord, enabled: boolean) => {
+    setSkillActionPending(record.id);
+    setSkillNotice("");
+    setSkillError("");
+    try {
+      const updated = await invoke<SkillRecord>("set_skill_enabled", {
+        skillId: record.id,
+        enabled,
+        note: enabled
+          ? "Enabled directly from the installed plugin manager."
+          : "Disabled directly from the installed plugin manager.",
+      });
+      setSkillRecords((records) =>
+        records.map((current) => (current.id === updated.id ? updated : current)),
+      );
+      setSkillNotice(enabled ? copy.skills.enabledNotice : copy.skills.disabledNotice);
+    } catch (error) {
+      setSkillError(`${copy.skills.statusFailed} ${String(error)}`);
+    } finally {
+      setSkillActionPending(null);
+    }
+  };
+
+  const uninstallLocalSkill = async (record: SkillRecord) => {
+    setSkillActionPending(record.id);
+    setSkillNotice("");
+    setSkillError("");
+    try {
+      const records = await invoke<SkillRecord[]>("uninstall_skill", {
+        skillId: record.id,
+        note: "Uninstalled directly from the installed plugin manager.",
+      });
+      setSkillRecords(records);
+      setSkillNotice(copy.skills.uninstalled);
+    } catch (error) {
+      setSkillError(`${copy.skills.uninstallFailed} ${String(error)}`);
+    } finally {
+      setSkillActionPending(null);
+    }
+  };
 
   useEffect(() => {
     document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
@@ -4856,22 +4934,134 @@ export function App() {
             <div className="sidebar-hub-body">
           <details className="sidebar-tool operations-tool" open>
             <summary>
-              <ClipboardList size={16} aria-hidden="true" />
+              <PackageOpen size={16} aria-hidden="true" />
               <span>{copy.skills.title}</span>
             </summary>
             <div className="skill-catalog">
               <p className="skill-catalog-note">{copy.skills.autoInvoke}</p>
+              <p className="skill-update-status">
+                <RefreshCw size={14} aria-hidden="true" />
+                <span>
+                  {skillUpdatePending
+                    ? copy.skills.checkingUpdates
+                    : skillUpdateSweep
+                      ? copy.skills.updateSummary(
+                          skillUpdateSweep.checked,
+                          skillUpdateSweep.updated,
+                          skillUpdateSweep.failed,
+                        )
+                      : copy.skills.automaticUpdates}
+                </span>
+              </p>
+              {[
+                { title: copy.skills.systemSkills, records: systemSkillRecords },
+                { title: copy.skills.installedPlugins, records: installedPluginRecords },
+                { title: copy.skills.installedSkills, records: installedSkillRecords },
+              ].map((group) => (
+                <section className="skill-catalog-group" key={group.title}>
+                  <h4>{group.title}</h4>
+                  <div className="skill-catalog-list">
+                    {group.records.map((record) => (
+                      <details className="skill-catalog-item" key={record.id}>
+                        <summary>
+                          <span>{record.manifest.name}</span>
+                          <small>
+                            {record.package_kind === "system_skill"
+                              ? copy.skills.systemSkillType
+                              : record.package_kind === "plugin"
+                                ? copy.skills.pluginType
+                                : copy.skills.skillType}
+                          </small>
+                        </summary>
+                        <div className="skill-catalog-item-body">
+                          <p>{record.manifest.description}</p>
+                          <dl className="skill-catalog-meta">
+                            <div>
+                              <dt>{copy.skills.version}</dt>
+                              <dd>{record.manifest.version}</dd>
+                            </div>
+                            <div>
+                              <dt>{copy.skills.source}</dt>
+                              <dd>
+                                {record.source_identity?.repository_url ?? copy.skills.localSource}
+                              </dd>
+                            </div>
+                          </dl>
+                          <div className="skill-catalog-badges">
+                            <span
+                              className={
+                                record.enablement_status === "enabled"
+                                  ? "skill-status enabled"
+                                  : "skill-status disabled"
+                              }
+                            >
+                              {record.enablement_status === "enabled"
+                                ? copy.skills.enabled
+                                : copy.skills.disabled}
+                            </span>
+                            {record.system_protected ? (
+                              <span className="skill-status protected">
+                                <ShieldCheck size={12} aria-hidden="true" />
+                                {copy.skills.protected}
+                              </span>
+                            ) : null}
+                          </div>
+                          {!record.system_protected ? (
+                            <div className="skill-catalog-actions">
+                              <button
+                                type="button"
+                                disabled={skillActionPending === record.id}
+                                onClick={() =>
+                                  void setLocalSkillEnabled(
+                                    record,
+                                    record.enablement_status !== "enabled",
+                                  )
+                                }
+                              >
+                                <Power size={13} aria-hidden="true" />
+                                {record.enablement_status === "enabled"
+                                  ? copy.skills.disable
+                                  : copy.skills.enable}
+                              </button>
+                              <button
+                                className="danger-button"
+                                type="button"
+                                disabled={skillActionPending === record.id}
+                                onClick={() => void uninstallLocalSkill(record)}
+                              >
+                                <Trash2 size={13} aria-hidden="true" />
+                                {copy.skills.uninstall}
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      </details>
+                    ))}
+                    {group.records.length === 0 && group.title !== copy.skills.systemSkills ? (
+                      <p className="skill-catalog-empty">{copy.skills.empty}</p>
+                    ) : null}
+                  </div>
+                </section>
+              ))}
+              <p className="skill-catalog-note">{copy.skills.installFromChat}</p>
+              {skillNotice ? <p className="package-message">{skillNotice}</p> : null}
+              {skillError ? <p className="package-error">{skillError}</p> : null}
+            </div>
+          </details>
+
+          <details className="sidebar-tool operations-tool">
+            <summary>
+              <ClipboardList size={16} aria-hidden="true" />
+              <span>{copy.skills.scenarioTemplates}</span>
+            </summary>
+            <div className="skill-catalog">
               <div className="skill-catalog-list">
                 <details className="skill-catalog-item">
                   <summary>{copy.skills.operationsTitle}</summary>
-                  <p>{copy.skills.operationsDescription}</p>
+                  <div className="skill-catalog-item-body">
+                    <p>{copy.skills.operationsDescription}</p>
+                  </div>
                 </details>
-                {skillRecords.map((record) => (
-                  <details className="skill-catalog-item" key={record.id}>
-                    <summary>{record.manifest.name}</summary>
-                    <p>{record.manifest.description}</p>
-                  </details>
-                ))}
               </div>
             </div>
           </details>

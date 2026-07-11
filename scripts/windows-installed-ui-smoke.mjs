@@ -18,6 +18,7 @@ const allowedArgs = new Set([
   "--memory-maintenance",
   "--office",
   "--self-test",
+  "--skill-lifecycle",
   "--workflow",
 ]);
 validateArgs(rawArgs, allowedArgs, "test:windows-installed-ui");
@@ -34,6 +35,7 @@ if (rawArgs.includes("--help")) {
       "  --memory-maintenance Exercise installed background memory update/archive maintenance.",
       "  --office Exercise installed Office artifact creation and Word open verification.",
       "  --self-test Run deterministic helper checks without launching DS Agent.",
+      "  --skill-lifecycle Verify the installed Skills and Plugins catalog UI.",
       "  --workflow  Exercise the installed Tauri workflow and report exports.",
     ].join("\n"),
   );
@@ -58,6 +60,9 @@ const includeMemoryMaintenanceSmoke =
 const includeOfficeArtifactSmoke =
   args.has("--office") ||
   process.env.DEEPSEEK_AGENT_OS_INSTALLED_OFFICE_ARTIFACT_SMOKE === "1";
+const includeSkillLifecycleSmoke =
+  args.has("--skill-lifecycle") ||
+  process.env.DEEPSEEK_AGENT_OS_INSTALLED_SKILL_LIFECYCLE_SMOKE === "1";
 const expectModelTelemetry = Boolean(process.env.DEEPSEEK_API_KEY?.trim());
 const timeoutMs = readPositiveInteger(
   process.env.DEEPSEEK_AGENT_OS_INSTALLED_UI_TIMEOUT_MS ?? "20000",
@@ -144,6 +149,9 @@ async function main() {
     const officeArtifact = includeOfficeArtifactSmoke
       ? await runInstalledOfficeArtifactSmoke(cdp)
       : null;
+    const skillLifecycle = includeSkillLifecycleSmoke
+      ? await runInstalledSkillLifecycleSmoke(cdp)
+      : null;
 
     const checks = {
       title: title === "DS Agent",
@@ -174,6 +182,7 @@ async function main() {
           memory_feedback: memoryFeedback ?? "skipped",
           memory_maintenance: memoryMaintenance ?? "skipped",
           office_artifact: officeArtifact ?? "skipped",
+          skill_lifecycle: skillLifecycle ?? "skipped",
           workflow: workflow ?? "skipped",
         },
         null,
@@ -362,6 +371,105 @@ async function invokeTauri(client, command, params = {}, timeout = workflowTimeo
     timeout,
     `Timed out waiting for Tauri command ${command}.`,
   );
+}
+
+async function runInstalledSkillLifecycleSmoke(client) {
+  const clicked = await evaluate(
+    client,
+    `(() => {
+      const labels = new Set(["插件", "Plugins"]);
+      const target = Array.from(document.querySelectorAll("summary, button")).find((element) =>
+        labels.has((element.textContent ?? "").trim()),
+      );
+      if (!target) return false;
+      target.click();
+      return true;
+    })()`,
+  );
+  if (clicked !== true) {
+    throw new Error("Installed Skills and Plugins smoke could not find the catalog button.");
+  }
+  await evaluate(
+    client,
+    `(() => {
+      const labels = new Set(["场景模板", "Scenario Templates"]);
+      const target = Array.from(document.querySelectorAll("summary")).find((element) =>
+        labels.has((element.textContent ?? "").trim()),
+      );
+      if (!target) return false;
+      target.click();
+      return true;
+    })()`,
+  );
+
+  const deadline = Date.now() + timeoutMs;
+  let catalogText = "";
+  while (Date.now() < deadline) {
+    catalogText = String(
+      (await evaluate(
+        client,
+        "document.body ? document.body.innerText.slice(0, 12000) : ''",
+      ).catch(() => "")) ?? "",
+    );
+    if (
+      ["技能与插件", "Skills and Plugins"].some((token) => catalogText.includes(token)) &&
+      ["系统技能", "System Skills"].some((token) => catalogText.includes(token))
+    ) {
+      break;
+    }
+    await delay(150);
+  }
+
+  const catalogDom = await evaluate(
+    client,
+    `(() => ({
+      hubOpen: document.querySelector("details.plugins-hub")?.open === true,
+      headings: Array.from(document.querySelectorAll(".plugins-hub .skill-catalog-group h4"))
+        .map((element) => (element.textContent ?? "").trim()),
+      scenarioOpen: Array.from(document.querySelectorAll(".plugins-hub details"))
+        .some((element) => element.open && ["场景模板", "Scenario Templates"].includes((element.querySelector(":scope > summary")?.textContent ?? "").trim())),
+      scenarioText: Array.from(document.querySelectorAll(".plugins-hub details"))
+        .filter((element) => ["场景模板", "Scenario Templates"].includes((element.querySelector(":scope > summary")?.textContent ?? "").trim()))
+        .map((element) => element.textContent ?? "")
+        .join("\\n"),
+    }))()`,
+  );
+  const headings = Array.isArray(catalogDom?.headings) ? catalogDom.headings : [];
+
+  const checks = {
+    catalog_heading: ["技能与插件", "Skills and Plugins"].some((token) =>
+      catalogText.includes(token),
+    ),
+    catalog_open: catalogDom?.hubOpen === true,
+    system_skills: ["系统技能", "System Skills"].some((token) => headings.includes(token)),
+    installed_plugins: ["已安装插件", "Installed Plugins"].some((token) =>
+      headings.includes(token),
+    ),
+    installed_skills: ["已安装 Skill", "已安装技能", "Installed Skills"].some((token) =>
+      headings.includes(token),
+    ),
+    scenario_templates: ["场景模板", "Scenario Templates"].some((token) =>
+      catalogText.includes(token),
+    ),
+    protected_builder: catalogText.includes("Skill/Plugin Builder"),
+    scenario_template_open: catalogDom?.scenarioOpen === true,
+    operations_briefing_is_template: ["运营简报", "Operations Briefing"].some((token) =>
+      String(catalogDom?.scenarioText ?? "").includes(token),
+    ),
+  };
+  const failedChecks = Object.entries(checks)
+    .filter(([, passed]) => !passed)
+    .map(([name]) => name);
+  if (failedChecks.length > 0) {
+    throw new Error(
+      `Installed Skills and Plugins smoke failed checks: ${failedChecks.join(", ")}`,
+    );
+  }
+
+  return {
+    checks,
+    screenshot: await captureScreenshot(client, screenshotDir, "skill-lifecycle"),
+  };
 }
 
 async function runInstalledAgentChatSmoke(client) {
@@ -1266,7 +1374,7 @@ function assertWorkflowRestoresVerified({
   }
 }
 
-async function captureScreenshot(client, directory) {
+async function captureScreenshot(client, directory, label = "ui") {
   await mkdir(directory, { recursive: true });
   const response = await client.send("Page.captureScreenshot", {
     format: "png",
@@ -1274,7 +1382,7 @@ async function captureScreenshot(client, directory) {
   });
   const filePath = path.join(
     directory,
-    `ds-agent-installed-ui-${new Date()
+    `ds-agent-installed-${label}-${new Date()
       .toISOString()
       .replaceAll(":", "-")
       .replaceAll(".", "-")}.png`,
@@ -1456,6 +1564,9 @@ async function runSelfTest() {
   }
   if (!allowedArgs.has("--office")) {
     throw new Error("Self-test expected --office to be a supported installed UI smoke flag.");
+  }
+  if (!allowedArgs.has("--skill-lifecycle")) {
+    throw new Error("Self-test expected --skill-lifecycle to be a supported installed UI smoke flag.");
   }
   validateInstalledUiSmokeFlagCombination(["--memory-feedback", "--agent-chat"]);
   validateInstalledUiSmokeFlagCombination(["--office"]);

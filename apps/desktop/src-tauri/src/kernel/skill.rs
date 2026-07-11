@@ -63,6 +63,41 @@ pub enum SkillEnablementStatus {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillPackageKind {
+    #[default]
+    Skill,
+    Plugin,
+    SystemSkill,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUpdatePolicy {
+    #[default]
+    Automatic,
+    Pinned,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUpdateState {
+    #[default]
+    Current,
+    UpdateAvailable,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUpdateCheckStatus {
+    Current,
+    UpdateAvailable,
+    Updated,
+    Failed,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SkillSourceIntegrity {
     pub algorithm: String,
@@ -75,6 +110,18 @@ pub struct SkillSource {
     pub url: String,
     #[serde(default)]
     pub integrity: Option<SkillSourceIntegrity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillSourceIdentity {
+    pub provider: String,
+    pub repository_url: String,
+    #[serde(default)]
+    pub requested_revision: Option<String>,
+    pub resolved_revision: String,
+    #[serde(default)]
+    pub package_path: Option<String>,
+    pub source_format: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -117,6 +164,14 @@ pub struct SkillInstallationRecord {
     pub installed_from: String,
     pub installed_at: DateTime<Utc>,
     #[serde(default)]
+    pub package_kind: SkillPackageKind,
+    #[serde(default)]
+    pub system_protected: bool,
+    #[serde(default)]
+    pub source_identity: Option<SkillSourceIdentity>,
+    #[serde(default)]
+    pub update_policy: SkillUpdatePolicy,
+    #[serde(default)]
     pub entry_content: Option<String>,
     #[serde(default)]
     pub entry_sha256: Option<String>,
@@ -148,6 +203,40 @@ pub struct SkillUninstallRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillUpdateRecord {
+    pub id: Uuid,
+    pub skill_id: Uuid,
+    pub manifest: SkillManifest,
+    pub updated_from: String,
+    pub applied_at: DateTime<Utc>,
+    pub source_identity: Option<SkillSourceIdentity>,
+    pub previous_version: String,
+    pub previous_revision: Option<String>,
+    pub entry_content: String,
+    pub entry_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillUpdateCheckRecord {
+    pub id: Uuid,
+    pub skill_id: Uuid,
+    pub installed_revision: Option<String>,
+    pub latest_revision: Option<String>,
+    pub status: SkillUpdateCheckStatus,
+    pub note: String,
+    pub checked_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillUpdateFailureRecord {
+    pub id: Uuid,
+    pub skill_id: Uuid,
+    pub candidate_revision: Option<String>,
+    pub error: String,
+    pub failed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SkillRecord {
     pub id: Uuid,
     pub manifest: SkillManifest,
@@ -156,6 +245,24 @@ pub struct SkillRecord {
     pub enablement_status: SkillEnablementStatus,
     pub last_audit_note: Option<String>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub package_kind: SkillPackageKind,
+    #[serde(default)]
+    pub system_protected: bool,
+    #[serde(default)]
+    pub source_identity: Option<SkillSourceIdentity>,
+    #[serde(default)]
+    pub update_policy: SkillUpdatePolicy,
+    #[serde(default)]
+    pub update_state: SkillUpdateState,
+    #[serde(default)]
+    pub last_update_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_update_failure: Option<String>,
+    #[serde(default)]
+    pub rollback_version: Option<String>,
+    #[serde(default)]
+    pub rollback_revision: Option<String>,
     #[serde(default)]
     pub entry_available: bool,
     #[serde(default)]
@@ -303,6 +410,10 @@ impl SkillInstallationRecord {
             manifest,
             installed_from,
             installed_at: Utc::now(),
+            package_kind: SkillPackageKind::Skill,
+            system_protected: false,
+            source_identity: None,
+            update_policy: SkillUpdatePolicy::Automatic,
             entry_content: None,
             entry_sha256: None,
         })
@@ -363,6 +474,72 @@ impl SkillUninstallRecord {
             skill_id,
             note: required_string(note, "skill uninstall audit note")?,
             uninstalled_at: Utc::now(),
+        })
+    }
+}
+
+impl SkillUpdateRecord {
+    pub fn from_candidate(
+        skill_id: Uuid,
+        previous_version: String,
+        previous_revision: Option<String>,
+        candidate: SkillInstallationRecord,
+    ) -> Result<Self, String> {
+        let entry_content = candidate
+            .entry_content
+            .filter(|content| !content.trim().is_empty())
+            .ok_or_else(|| "skill update candidate entry content is required".to_string())?;
+        let entry_sha256 = candidate
+            .entry_sha256
+            .filter(|hash| !hash.trim().is_empty())
+            .ok_or_else(|| "skill update candidate entry hash is required".to_string())?;
+        Ok(Self {
+            id: Uuid::new_v4(),
+            skill_id,
+            manifest: candidate.manifest,
+            updated_from: required_string(candidate.installed_from, "skill update source")?,
+            applied_at: Utc::now(),
+            source_identity: candidate.source_identity,
+            previous_version: required_string(previous_version, "previous skill version")?,
+            previous_revision,
+            entry_content,
+            entry_sha256,
+        })
+    }
+}
+
+impl SkillUpdateCheckRecord {
+    pub fn new(
+        skill_id: Uuid,
+        installed_revision: Option<String>,
+        latest_revision: Option<String>,
+        status: SkillUpdateCheckStatus,
+        note: String,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            id: Uuid::new_v4(),
+            skill_id,
+            installed_revision,
+            latest_revision,
+            status,
+            note: required_string(note, "skill update check note")?,
+            checked_at: Utc::now(),
+        })
+    }
+}
+
+impl SkillUpdateFailureRecord {
+    pub fn new(
+        skill_id: Uuid,
+        candidate_revision: Option<String>,
+        error: String,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            id: Uuid::new_v4(),
+            skill_id,
+            candidate_revision,
+            error: required_string(error, "skill update failure")?,
+            failed_at: Utc::now(),
         })
     }
 }
@@ -659,6 +836,9 @@ impl SkillActivationContext {
 }
 
 fn skill_execution_blocked_reason(record: &SkillRecord) -> Option<String> {
+    if record.enablement_status == SkillEnablementStatus::Disabled {
+        return Some("skill is disabled".to_string());
+    }
     if record.manifest.trust_level == SkillTrustLevel::Untrusted {
         return Some("skill trust is unverified".to_string());
     }
@@ -1346,6 +1526,139 @@ mod tests {
     }
 
     #[test]
+    fn event_store_updates_skill_in_place_and_retains_rollback_metadata() {
+        let store = EventStore::open_memory().expect("store opens");
+        let first_entry = r#"{"steps":[{"tool":"network.search"}]}"#;
+        let first_zip = skill_zip_bytes(vec![
+            ("skill.json", safe_manifest_json()),
+            ("workflow.json", first_entry.to_string()),
+        ]);
+        let mut installed = SkillInstallationRecord::from_preflight(
+            SkillPackagePreflight::from_zip_bytes(&first_zip).expect("first package preflights"),
+            "github repository".to_string(),
+        )
+        .expect("first package installs");
+        installed.source_identity = Some(SkillSourceIdentity {
+            provider: "github".to_string(),
+            repository_url: "https://github.com/example/skills".to_string(),
+            requested_revision: None,
+            resolved_revision: "commit-one".to_string(),
+            package_path: None,
+            source_format: "ds_agent_manifest".to_string(),
+        });
+        store
+            .append_skill_installation(&installed)
+            .expect("first install records");
+
+        let next_entry = r#"{"steps":[{"tool":"browser.open"}]}"#;
+        let next_manifest = safe_manifest_json().replace("0.1.0", "0.2.0");
+        let next_zip = skill_zip_bytes(vec![
+            ("skill.json", next_manifest),
+            ("workflow.json", next_entry.to_string()),
+        ]);
+        let mut candidate = SkillInstallationRecord::from_preflight(
+            SkillPackagePreflight::from_zip_bytes(&next_zip).expect("next package preflights"),
+            "github repository update".to_string(),
+        )
+        .expect("candidate package builds");
+        candidate.source_identity = Some(SkillSourceIdentity {
+            resolved_revision: "commit-two".to_string(),
+            ..installed
+                .source_identity
+                .clone()
+                .expect("first source identity exists")
+        });
+        let update = SkillUpdateRecord::from_candidate(
+            installed.id,
+            installed.manifest.version.clone(),
+            installed
+                .source_identity
+                .as_ref()
+                .map(|source| source.resolved_revision.clone()),
+            candidate,
+        )
+        .expect("update record builds");
+
+        store.append_skill_update(&update).expect("update records");
+        let records = store.list_skill_records().expect("records load");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, installed.id);
+        assert_eq!(records[0].manifest.version, "0.2.0");
+        assert_eq!(records[0].rollback_version.as_deref(), Some("0.1.0"));
+        assert_eq!(records[0].rollback_revision.as_deref(), Some("commit-one"));
+        assert_eq!(
+            records[0]
+                .source_identity
+                .as_ref()
+                .map(|source| source.resolved_revision.as_str()),
+            Some("commit-two")
+        );
+        assert_eq!(
+            store
+                .prepare_skill_activation(installed.id, "Use the updated Skill.".to_string())
+                .expect("updated entry activates")
+                .instructions,
+            next_entry
+        );
+    }
+
+    #[test]
+    fn failed_skill_update_keeps_last_working_version() {
+        let store = EventStore::open_memory().expect("store opens");
+        let manifest = SkillManifest::from_json(&safe_manifest_json()).expect("manifest validates");
+        let installed =
+            SkillInstallationRecord::new(manifest, "local import".to_string()).expect("record");
+        store
+            .append_skill_installation(&installed)
+            .expect("install records");
+        let failure = SkillUpdateFailureRecord::new(
+            installed.id,
+            Some("candidate-commit".to_string()),
+            "candidate requests a blocked executable".to_string(),
+        )
+        .expect("failure record builds");
+
+        store
+            .append_skill_update_failure(&failure)
+            .expect("failure records");
+        let records = store.list_skill_records().expect("records load");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].manifest.version, "0.1.0");
+        assert_eq!(records[0].update_state, SkillUpdateState::Failed);
+        assert_eq!(
+            records[0].last_update_failure.as_deref(),
+            Some("candidate requests a blocked executable")
+        );
+    }
+
+    #[test]
+    fn protected_system_skill_cannot_be_uninstalled() {
+        let store = EventStore::open_memory().expect("store opens");
+        let manifest = SkillManifest::from_json(&safe_manifest_json()).expect("manifest validates");
+        let mut installed =
+            SkillInstallationRecord::new(manifest, "DS Agent system".to_string()).expect("record");
+        installed.package_kind = SkillPackageKind::SystemSkill;
+        installed.system_protected = true;
+        store
+            .append_skill_installation(&installed)
+            .expect("system skill records");
+        let uninstall = SkillUninstallRecord::new(
+            installed.id,
+            "Attempt to remove protected system skill.".to_string(),
+        )
+        .expect("uninstall record builds");
+
+        let error = store
+            .append_skill_uninstall(&uninstall)
+            .expect_err("protected system skill is retained");
+
+        assert!(error.to_string().contains("protected system skill"));
+        assert_eq!(store.list_skill_records().expect("records load").len(), 1);
+    }
+
+    #[test]
     fn skill_execution_prepares_enabled_trusted_declarative_skill_and_records_audit() {
         let store = EventStore::open_memory().expect("store opens");
         let manifest = SkillManifest::from_json(&safe_manifest_json()).expect("manifest validates");
@@ -1427,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_execution_ignores_legacy_disabled_status_for_safe_installed_skill() {
+    fn skill_execution_blocks_disabled_installed_skill() {
         let store = EventStore::open_memory().expect("store opens");
         let manifest = SkillManifest::from_json(&safe_manifest_json()).expect("manifest validates");
         let installed =
@@ -1447,10 +1760,13 @@ mod tests {
 
         let execution = store
             .prepare_skill_execution(installed.id, "Use when relevant".to_string())
-            .expect("safe installed skill remains available");
+            .expect("disabled skill records a blocked execution");
 
-        assert_eq!(execution.status, SkillExecutionStatus::Planned);
-        assert!(execution.blocked_reason.is_none());
+        assert_eq!(execution.status, SkillExecutionStatus::Blocked);
+        assert_eq!(
+            execution.blocked_reason.as_deref(),
+            Some("skill is disabled")
+        );
         assert_eq!(
             store.list_skill_executions().expect("executions load"),
             vec![execution]

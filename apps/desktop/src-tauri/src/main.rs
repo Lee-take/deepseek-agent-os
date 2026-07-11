@@ -7,17 +7,18 @@ use commands::{
     archive_memory_candidate_conflicts, archive_memory_from_maintenance_review, browse_url,
     capture_computer_screenshot, check_app_update, claim_agent_run_record,
     claim_next_agent_run_record, clear_deepseek_chat_cache, control_computer_boundary,
-    create_email_draft_boundary, create_task_record, delete_memory_record, download_app_update,
-    enqueue_agent_run_record, execute_agent_tool, export_operations_briefing_html_report,
-    export_operations_briefing_pdf_report, export_operations_briefing_report, export_work_package,
-    finish_agent_run_record, get_agent_soul_profile, get_computer_control_unlock_status,
-    get_computer_use_backend_status, get_computer_use_backend_status_for_model,
-    get_deepseek_chat_cache_state, get_deepseek_credential_status, get_deepseek_pricing_state,
-    get_deepseek_user_balance, get_foundation_state, get_local_directory_state,
-    get_model_driven_tool_strategy, get_network_search_route_status,
-    get_network_search_route_status_for_model, import_work_package, ingest_evidence_folder,
-    install_app_update, install_local_skill_manifest, install_local_skill_zip_package,
-    install_remote_skill_zip_package, link_memory_candidate_to_conflicts, link_memory_records,
+    create_email_draft_boundary, create_generated_skill, create_task_record, delete_memory_record,
+    download_app_update, enqueue_agent_run_record, ensure_system_skill_builder, execute_agent_tool,
+    export_operations_briefing_html_report, export_operations_briefing_pdf_report,
+    export_operations_briefing_report, export_work_package, finish_agent_run_record,
+    get_agent_soul_profile, get_computer_control_unlock_status, get_computer_use_backend_status,
+    get_computer_use_backend_status_for_model, get_deepseek_chat_cache_state,
+    get_deepseek_credential_status, get_deepseek_pricing_state, get_deepseek_user_balance,
+    get_foundation_state, get_local_directory_state, get_model_driven_tool_strategy,
+    get_network_search_route_status, get_network_search_route_status_for_model,
+    import_work_package, ingest_evidence_folder, install_app_update, install_local_skill_manifest,
+    install_local_skill_zip_package, install_remote_skill_zip_package,
+    install_skill_from_repository_url, link_memory_candidate_to_conflicts, link_memory_records,
     list_agent_context_receipts, list_agent_run_records, list_agent_tool_contracts,
     list_agent_tool_invocations, list_capability_access_records, list_capability_catalog,
     list_capability_invocations, list_deepseek_chat_telemetry, list_memory_candidate_records,
@@ -35,12 +36,13 @@ use commands::{
     request_agent_run_cancel_record, request_capability_access, reset_skill_trust,
     resolve_capability_access_request, resolve_memory_candidate, resume_agent_chat_action,
     run_agent_chat, run_memory_background_maintenance, run_next_queued_agent_chat_worker,
-    run_operations_briefing, run_terminal_read, run_terminal_write, save_agent_soul_profile,
-    save_deepseek_pricing_settings, save_local_directory_settings, search_memory_records,
-    search_network_boundary, seed_operations_briefing_evidence_templates, send_email_boundary,
-    set_skill_enabled, stage_agent_attachments, start_agent_run_record, submit_browser_boundary,
-    uninstall_skill, unlock_computer_control, update_memory_candidate_conflict,
-    update_memory_record, verify_skill_source, write_drive_boundary, write_file_boundary, AppState,
+    run_operations_briefing, run_skill_update_sweep, run_terminal_read, run_terminal_write,
+    save_agent_soul_profile, save_deepseek_pricing_settings, save_local_directory_settings,
+    search_memory_records, search_network_boundary, seed_operations_briefing_evidence_templates,
+    send_email_boundary, set_skill_enabled, stage_agent_attachments, start_agent_run_record,
+    submit_browser_boundary, uninstall_skill, unlock_computer_control,
+    update_memory_candidate_conflict, update_memory_record, verify_skill_source,
+    write_drive_boundary, write_file_boundary, AppState,
 };
 use kernel::event_store::EventStore;
 use tauri::{image::Image, Manager};
@@ -197,6 +199,9 @@ fn main() {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
             let event_store = EventStore::open(app_data_dir.join("kernel-events.sqlite3"))?;
+            ensure_system_skill_builder(&event_store).map_err(|error| {
+                std::io::Error::other(format!("system Skill setup failed: {error}"))
+            })?;
             app.manage(AppState::new(event_store));
             if let Some(window) = app.get_webview_window("main") {
                 apply_main_window_icon(&window)?;
@@ -306,6 +311,9 @@ fn main() {
             install_local_skill_manifest,
             install_local_skill_zip_package,
             install_remote_skill_zip_package,
+            install_skill_from_repository_url,
+            run_skill_update_sweep,
+            create_generated_skill,
             reset_skill_trust,
             uninstall_skill,
             set_skill_enabled,

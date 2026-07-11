@@ -101,10 +101,15 @@ use crate::kernel::sandbox::{
     enforce_workspace_relative_read_path,
 };
 use crate::kernel::skill::{
-    validate_remote_skill_source_url, SkillActivationContext, SkillEnablementChange,
+    sha256_hex, validate_remote_skill_source_url, SkillActivationContext, SkillEnablementChange,
     SkillEnablementStatus, SkillExecutionRecord, SkillInstallationRecord, SkillManifest,
-    SkillPackagePreflight, SkillRecord, SkillSourceVerification, SkillTrustLevel, SkillTrustReset,
-    SkillUninstallRecord, MAX_REMOTE_SKILL_PACKAGE_BYTES,
+    SkillPackageKind, SkillPackagePreflight, SkillRecord, SkillSourceVerification, SkillTrustLevel,
+    SkillTrustReset, SkillUninstallRecord, SkillUpdateCheckRecord, SkillUpdateCheckStatus,
+    SkillUpdateFailureRecord, SkillUpdatePolicy, SkillUpdateRecord, MAX_REMOTE_SKILL_PACKAGE_BYTES,
+};
+use crate::kernel::skill_source::{
+    build_repository_skill_installation, fetch_repository_skill_installation,
+    fetch_repository_snapshot, SkillRepositorySource,
 };
 use crate::kernel::tool_runtime::{
     builtin_tool_catalog, prepare_tool_execution, tool_request_fingerprint, AgentToolExecutor,
@@ -165,8 +170,8 @@ const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/dsagent/releases/download/";
 const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.2.3";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.2.3";
+const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.3.0";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.3.0";
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
 const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
@@ -446,6 +451,43 @@ pub struct AppUpdateDownloadResult {
 pub struct AppUpdateInstallResult {
     pub installer_path: String,
     pub restart_scheduled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillRepositoryInstallOperation {
+    Installed,
+    Updated,
+    Unchanged,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillRepositoryInstallResult {
+    pub operation: SkillRepositoryInstallOperation,
+    pub record: SkillRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillUpdateSweepResult {
+    pub checked: usize,
+    pub updated: usize,
+    pub current: usize,
+    pub failed: usize,
+    pub failures: Vec<String>,
+    pub records: Vec<SkillRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GeneratedSkillRequest {
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    #[serde(default = "default_generated_skill_kind")]
+    pub kind: String,
+}
+
+fn default_generated_skill_kind() -> String {
+    "skill".to_string()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5039,6 +5081,9 @@ fn normalize_agent_action_alias(action: &mut AgentChatActionProposal) {
     if normalize_agent_filesystem_mutation_alias(action) {
         return;
     }
+    if normalize_agent_skill_lifecycle_alias(action) {
+        return;
+    }
 
     if is_office_create_action_type(&action.action_type) {
         action.action_type = "office_create".to_string();
@@ -5104,6 +5149,21 @@ fn normalize_agent_action_alias(action: &mut AgentChatActionProposal) {
     }
 }
 
+fn normalize_agent_skill_lifecycle_alias(action: &mut AgentChatActionProposal) -> bool {
+    let action_type = match action.action_type.as_str() {
+        "skill_install" | "install_skill" | "plugin_install" | "install_plugin" => "skill_install",
+        "skill_create" | "create_skill" | "plugin_create" | "create_plugin" => "skill_create",
+        "skill_uninstall" | "uninstall_skill" | "plugin_uninstall" | "uninstall_plugin" => {
+            "skill_uninstall"
+        }
+        _ => return false,
+    };
+    action.action_type = action_type.to_string();
+    action.risk = Some("low".to_string());
+    action.requires_confirmation = false;
+    true
+}
+
 fn normalize_agent_app_update_alias(action: &mut AgentChatActionProposal) -> bool {
     let (action_type, risk, requires_confirmation) = match action.action_type.as_str() {
         "app_update_check" | "check_app_update" | "check_for_updates" => {
@@ -5161,6 +5221,13 @@ fn agent_action_policy_decision(
     action_type: &str,
     capability: CapabilityKind,
 ) -> PolicyDecision {
+    if matches!(
+        action_type,
+        "skill_install" | "skill_create" | "skill_uninstall"
+    ) {
+        return PolicyDecision::Allow;
+    }
+
     if action_type == "office_create" {
         return match access_mode {
             AccessMode::AskEveryStep => PolicyDecision::Ask,
@@ -5455,7 +5522,9 @@ fn agent_action_capability(action_type: &str) -> Option<CapabilityKind> {
         "app_update_check" => Some(CapabilityKind::AppUpdateCheck),
         "app_update_download" => Some(CapabilityKind::AppUpdateDownload),
         "app_update_install" => Some(CapabilityKind::AppUpdateInstall),
-        "skill_activate" => Some(CapabilityKind::SkillUse),
+        "skill_activate" | "skill_install" | "skill_create" | "skill_uninstall" => {
+            Some(CapabilityKind::SkillUse)
+        }
         "computer_control" => Some(CapabilityKind::ComputerControl),
         "computer_screenshot" => Some(CapabilityKind::ComputerScreenshot),
         "drive_read" => Some(CapabilityKind::DriveRead),
@@ -5505,6 +5574,9 @@ fn is_supported_agent_action_type(action_type: &str) -> bool {
             | "operations_briefing"
             | "search_setup"
             | "skill_activate"
+            | "skill_install"
+            | "skill_create"
+            | "skill_uninstall"
             | "terminal_read"
             | "workspace_setup"
     )
@@ -5560,7 +5632,7 @@ fn build_agent_chat_protocol_user_prompt(
 	         - completion_advice: when a result is complete or partially complete, end with at most one short next-better suggestion grounded in the task. Keep it secondary and do not imply extra work already ran.\n\
 	         - Return exactly one structured agent envelope as JSON.\n\
 	         - Required JSON fields: protocol_version, reply_to_user, agent_actions, missing_prerequisites.\n\
-         - Supported agent_actions action_type values are app_update_check, app_update_download, app_update_install, browser_open, browser_browse, computer_control, computer_screenshot, file_read, file_write, file_create, file_update, file_delete, file_rename, directory_create, directory_rename, directory_delete, create_report, office_create, office_update, office_open, network_search, operations_briefing, skill_activate, terminal_read, workspace_setup, deepseek_key_setup, and search_setup.\n\
+         - Supported agent_actions action_type values are app_update_check, app_update_download, app_update_install, browser_open, browser_browse, computer_control, computer_screenshot, file_read, file_write, file_create, file_update, file_delete, file_rename, directory_create, directory_rename, directory_delete, create_report, office_create, office_update, office_open, network_search, operations_briefing, skill_activate, skill_install, skill_create, skill_uninstall, terminal_read, workspace_setup, deepseek_key_setup, and search_setup.\n\
          - For DS Agent self-update requests, use app_update_check first. Propose app_update_download only when verified release status reports an update. Propose app_update_install only with target set to the exact installer_path returned by the verified download tool. Download and install require local approval; install is critical and can never be self-approved by the model.\n\
          - Do not use run_shell. For opening a website in the user's browser, use action_type browser_open with target set to the exact http:// or https:// URL. For reading or inspecting a web page as evidence, use browser_browse. If the user asked to log in, open the site only and ask the user to enter credentials manually.\n\
          - For local directory listing requests, use exactly one terminal_read action with target set to the exact local folder path. DS Agent will run a bounded non-recursive directory listing without executing arbitrary shell. Do not add a second action to read terminal output.\n\
@@ -5569,6 +5641,9 @@ fn build_agent_chat_protocol_user_prompt(
          - For Word, Excel, and PowerPoint creation requests, prefer the built-in Office control plugin path: use action_type office_create and let DS Agent generate a real .docx, .xlsx, or .pptx before using desktop UI control. If the user asks for the Desktop, set target_location=\"desktop\" and target to the file name or desktop-relative path. If the user asks for the DS Agent workspace, set target_location=\"workspace\" or omit it. Do not infer or hide the location: express the user's location intent in target_location. Set content to either plain body text or JSON with app=word|excel|powerpoint, title, body, rows, slides, and optional target_location. Use office_create for tasks like creating a Word document containing requested text, creating a simple Excel workbook, or creating a PowerPoint deck. For updating an existing Office file, use action_type office_update with target set to the existing file and content as plain body text or JSON with app=word|excel|powerpoint, body, rows, and slides. DS Agent can append Word paragraphs, Excel rows, and PowerPoint slides deterministically. If the user asks to open the created or existing Office file, add a separate office_open action with the same target and target_location; DS Agent will prefer the matching Microsoft Office app and fall back to the system default app if it is unavailable.\n\
          - For desktop UI automation, use computer_screenshot to inspect the current desktop before planning screen-dependent clicks. Use computer_control only for one validated structured input action at a time. Set target to the app or window, set risk=critical, set requires_confirmation=true, and set content to exactly one of: click:x,y[,button], move:x,y, type:text, press:key, hotkey:key+key, or scroll:delta[,axis]. For multi-step desktop tasks such as editing an already open Word document, do not claim completion until DS Agent has actually completed the required local actions.\n\
          - To use an installed declarative Skill listed in the runtime catalog, propose skill_activate with target set to the exact skill UUID and content set to the current user task context. Skill activation only loads hash-verified instructions as evidence; every later file, network, browser, Office, terminal, or Computer Use action remains separately validated by DS Agent.\n\
+         - When the user asks to install a Skill or plugin from a GitHub or Hugging Face repository URL, propose skill_install with target set to the exact repository URL, risk=low, and requires_confirmation=false. Do not use browser_browse for installation and do not ask the user to choose a manifest, package format, version, or installer path; DS Agent performs repository discovery, validation, installation, and update automatically.\n\
+         - When the user asks DS Agent to create a Skill or plugin, use the installed Skill/Plugin Builder guidance and propose skill_create with risk=low and requires_confirmation=false. Put JSON in content with name, description, instructions, and kind=skill|plugin. DS Agent validates, activation-tests, installs, registers, and enables it automatically.\n\
+         - When the user explicitly asks to uninstall an installed Skill or plugin, propose skill_uninstall with target set to the exact installed Skill UUID from the catalog (or exact name when no UUID is available), risk=low, and requires_confirmation=false. Protected System Skills cannot be removed; DS Agent enforces that locally without asking the user to decide.\n\
          - Each agent_actions item may include action_type, title, reason, risk, requires_confirmation, target, destination, target_location, preferred_browser, and content.\n\
          - For file_write or create_report, target must be a relative workspace path and content must be the exact UTF-8 text DS Agent should write after local validation. For office_create, office_update, or office_open, target must be a .docx, .xlsx, or .pptx path when supplied; use target_location=\"desktop\" only when the user explicitly asks for the Desktop.\n\
          - reply_to_user must describe the intended plan, not local completion. Do not say a file was created, opened, edited, or saved until DS Agent returns execution evidence.\n\
@@ -7245,7 +7320,9 @@ fn load_agent_skill_catalog(store: &EventStore) -> Result<Vec<AgentSkillCatalogI
     Ok(records
         .into_iter()
         .filter(|record| {
-            record.manifest.trust_level != SkillTrustLevel::Untrusted && record.entry_available
+            record.manifest.trust_level != SkillTrustLevel::Untrusted
+                && record.entry_available
+                && record.enablement_status == SkillEnablementStatus::Enabled
         })
         .take(AGENT_SKILL_CATALOG_MAX_ITEMS)
         .map(|record| AgentSkillCatalogItem {
@@ -9018,6 +9095,9 @@ fn agent_action_user_summary(action: &AgentChatActionProposal) -> String {
         "browser_open" => target
             .map(|url| format!("已打开：{url}。"))
             .unwrap_or_else(|| "已打开你指定的网页。".to_string()),
+        "skill_install" => agent_skill_install_user_summary(action),
+        "skill_create" => agent_skill_create_user_summary(action),
+        "skill_uninstall" => agent_skill_uninstall_user_summary(action),
         "office_create" => user_summary_with_target("已创建文件", target),
         "office_update" => user_summary_with_target("已更新文件", target),
         "office_open" => user_summary_with_target("已打开文件", target),
@@ -9048,6 +9128,61 @@ fn agent_action_user_summary(action: &AgentChatActionProposal) -> String {
                 .unwrap_or("你请求的操作")
         ),
     }
+}
+
+fn agent_skill_install_user_summary(action: &AgentChatActionProposal) -> String {
+    let output = agent_action_dispatch_output(action);
+    let name = output
+        .as_ref()
+        .and_then(|value| value.pointer("/record/manifest/name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Skill");
+    let version = output
+        .as_ref()
+        .and_then(|value| value.pointer("/record/manifest/version"))
+        .and_then(serde_json::Value::as_str);
+    let operation = output
+        .as_ref()
+        .and_then(|value| value.get("operation"))
+        .and_then(serde_json::Value::as_str);
+    match (operation, version) {
+        (Some("updated"), Some(version)) => {
+            format!("已自动升级并启用 {name} {version}。")
+        }
+        (Some("unchanged"), Some(version)) => {
+            format!("{name} {version} 已安装并且是最新版。")
+        }
+        (_, Some(version)) => format!("已自动安装并启用 {name} {version}。"),
+        _ => format!("已自动安装并启用 {name}。"),
+    }
+}
+
+fn agent_skill_create_user_summary(action: &AgentChatActionProposal) -> String {
+    let output = agent_action_dispatch_output(action);
+    let name = output
+        .as_ref()
+        .and_then(|value| value.pointer("/manifest/name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("新 Skill");
+    let version = output
+        .as_ref()
+        .and_then(|value| value.pointer("/manifest/version"))
+        .and_then(serde_json::Value::as_str);
+    match version {
+        Some(version) => format!("已制作、测试、安装并启用 {name} {version}。"),
+        None => format!("已制作、测试、安装并启用 {name}。"),
+    }
+}
+
+fn agent_skill_uninstall_user_summary(action: &AgentChatActionProposal) -> String {
+    let name = agent_action_dispatch_output(action)
+        .as_ref()
+        .and_then(|value| value.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| action.target.clone())
+        .unwrap_or_else(|| "该 Skill".to_string());
+    format!("已卸载 {name}，并从自动调用目录中移除。")
 }
 
 fn user_summary_with_target(label: &str, target: Option<&str>) -> String {
@@ -9533,6 +9668,224 @@ fn record_agent_action_permission_requests(
     Ok(())
 }
 
+fn skill_install_source_url(action: &AgentChatActionProposal) -> Result<String, String> {
+    [action.target.as_deref(), action.content.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(extract_safe_browser_url)
+        .filter(|url| SkillRepositorySource::parse(url).is_ok())
+        .ok_or_else(|| {
+            "skill_install requires an exact GitHub or Hugging Face repository URL".to_string()
+        })
+}
+
+fn apply_skill_install_result(
+    action: &mut AgentChatActionProposal,
+    source_url: String,
+    result: Result<SkillRepositoryInstallResult, String>,
+) {
+    action.target = Some(source_url);
+    action.requires_confirmation = false;
+    match result {
+        Ok(result) => {
+            action.execution_state = "succeeded".to_string();
+            action.blocked_reason = None;
+            action.dispatch_note = Some(format!(
+                "repository Skill lifecycle completed automatically; output={}",
+                serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string())
+            ));
+        }
+        Err(error) => {
+            action.execution_state = "failed".to_string();
+            action.blocked_reason = Some(error.clone());
+            action.dispatch_note = Some(format!(
+                "repository Skill lifecycle failed without changing the installed catalog: {error}"
+            ));
+        }
+    }
+}
+
+fn dispatch_agent_skill_install_action(store: &EventStore, action: &mut AgentChatActionProposal) {
+    let source_url = match skill_install_source_url(action) {
+        Ok(source_url) => source_url,
+        Err(error) => {
+            apply_skill_install_result(action, String::new(), Err(error));
+            return;
+        }
+    };
+    let result = SkillRepositorySource::parse(&source_url).and_then(|source| {
+        fetch_repository_skill_installation(&source_url)
+            .and_then(|candidate| commit_repository_skill_installation(store, &source, candidate))
+    });
+    apply_skill_install_result(action, source_url, result);
+}
+
+fn dispatch_agent_skill_install_action_with_store_mutex(
+    store_mutex: &Mutex<EventStore>,
+    action: &mut AgentChatActionProposal,
+) {
+    let source_url = match skill_install_source_url(action) {
+        Ok(source_url) => source_url,
+        Err(error) => {
+            apply_skill_install_result(action, String::new(), Err(error));
+            return;
+        }
+    };
+    let result = SkillRepositorySource::parse(&source_url).and_then(|source| {
+        fetch_repository_skill_installation(&source_url).and_then(|candidate| {
+            let store = store_mutex.lock().map_err(|_| lock_error())?;
+            commit_repository_skill_installation(&store, &source, candidate)
+        })
+    });
+    apply_skill_install_result(action, source_url, result);
+}
+
+fn generated_skill_request_from_action(
+    action: &AgentChatActionProposal,
+) -> Result<GeneratedSkillRequest, String> {
+    let content = action
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| "skill_create requires declarative instructions".to_string())?;
+    if let Ok(mut request) = serde_json::from_str::<GeneratedSkillRequest>(content) {
+        if request.name.trim().is_empty() {
+            request.name = action.target.clone().unwrap_or_default();
+        }
+        return Ok(request);
+    }
+    Ok(GeneratedSkillRequest {
+        name: action
+            .target
+            .clone()
+            .or_else(|| action.title.clone())
+            .unwrap_or_default(),
+        description: action
+            .reason
+            .clone()
+            .or_else(|| action.title.clone())
+            .unwrap_or_else(|| "User-requested DS Agent Skill.".to_string()),
+        instructions: content.to_string(),
+        kind: "skill".to_string(),
+    })
+}
+
+fn apply_skill_create_result(
+    action: &mut AgentChatActionProposal,
+    result: Result<SkillRecord, String>,
+) {
+    action.requires_confirmation = false;
+    match result {
+        Ok(record) => {
+            action.target = Some(record.manifest.name.clone());
+            action.execution_state = "succeeded".to_string();
+            action.blocked_reason = None;
+            action.dispatch_note = Some(format!(
+                "generated Skill validated, activation-tested, installed, and enabled; output={}",
+                serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string())
+            ));
+        }
+        Err(error) => {
+            action.execution_state = "failed".to_string();
+            action.blocked_reason = Some(error.clone());
+            action.dispatch_note = Some(format!(
+                "generated Skill was rejected before activation: {error}"
+            ));
+        }
+    }
+}
+
+fn dispatch_agent_skill_create_action(store: &EventStore, action: &mut AgentChatActionProposal) {
+    let result = generated_skill_request_from_action(action)
+        .and_then(|request| create_generated_skill_with_store(store, request));
+    apply_skill_create_result(action, result);
+}
+
+fn dispatch_agent_skill_create_action_with_store_mutex(
+    store_mutex: &Mutex<EventStore>,
+    action: &mut AgentChatActionProposal,
+) {
+    let result = generated_skill_request_from_action(action).and_then(|request| {
+        let store = store_mutex.lock().map_err(|_| lock_error())?;
+        create_generated_skill_with_store(&store, request)
+    });
+    apply_skill_create_result(action, result);
+}
+
+fn uninstall_skill_from_action(
+    store: &EventStore,
+    action: &AgentChatActionProposal,
+) -> Result<serde_json::Value, String> {
+    let target = action
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| {
+            "skill_uninstall requires an installed Skill id or exact name".to_string()
+        })?;
+    let target_id = Uuid::parse_str(target).ok();
+    let record = store
+        .list_skill_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| {
+            Some(record.id) == target_id || record.manifest.name.eq_ignore_ascii_case(target)
+        })
+        .ok_or_else(|| format!("installed Skill was not found: {target}"))?;
+    let uninstall = SkillUninstallRecord::new(
+        record.id,
+        "Removed automatically from an explicit user request.".to_string(),
+    )
+    .map_err(event_store_error)?;
+    store
+        .append_skill_uninstall(&uninstall)
+        .map_err(event_store_error)?;
+    Ok(serde_json::json!({
+        "id": record.id,
+        "name": record.manifest.name,
+        "uninstalled": true
+    }))
+}
+
+fn apply_skill_uninstall_result(
+    action: &mut AgentChatActionProposal,
+    result: Result<serde_json::Value, String>,
+) {
+    action.requires_confirmation = false;
+    match result {
+        Ok(output) => {
+            action.execution_state = "succeeded".to_string();
+            action.blocked_reason = None;
+            action.dispatch_note = Some(format!(
+                "installed Skill removed from the runtime catalog; output={output}"
+            ));
+        }
+        Err(error) => {
+            action.execution_state = "failed".to_string();
+            action.blocked_reason = Some(error.clone());
+            action.dispatch_note = Some(format!("Skill uninstall kept the prior state: {error}"));
+        }
+    }
+}
+
+fn dispatch_agent_skill_uninstall_action(store: &EventStore, action: &mut AgentChatActionProposal) {
+    let result = uninstall_skill_from_action(store, action);
+    apply_skill_uninstall_result(action, result);
+}
+
+fn dispatch_agent_skill_uninstall_action_with_store_mutex(
+    store_mutex: &Mutex<EventStore>,
+    action: &mut AgentChatActionProposal,
+) {
+    let result = store_mutex
+        .lock()
+        .map_err(|_| lock_error())
+        .and_then(|store| uninstall_skill_from_action(&store, action));
+    apply_skill_uninstall_result(action, result);
+}
+
 fn dispatch_agent_action_proposals(
     store: &EventStore,
     access_mode: AccessMode,
@@ -9622,6 +9975,21 @@ fn dispatch_agent_action_proposals_with_desktop_dir_and_computer_use(
                     &BuiltinAgentToolExecutor,
                 )?;
             }
+            continue;
+        }
+
+        if action.action_type == "skill_install" {
+            dispatch_agent_skill_install_action(store, action);
+            continue;
+        }
+
+        if action.action_type == "skill_create" {
+            dispatch_agent_skill_create_action(store, action);
+            continue;
+        }
+
+        if action.action_type == "skill_uninstall" {
+            dispatch_agent_skill_uninstall_action(store, action);
             continue;
         }
 
@@ -10233,6 +10601,21 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                 active_run_id,
                 &BuiltinAgentToolExecutor,
             )?;
+            continue;
+        }
+
+        if action.action_type == "skill_install" {
+            dispatch_agent_skill_install_action_with_store_mutex(store_mutex, action);
+            continue;
+        }
+
+        if action.action_type == "skill_create" {
+            dispatch_agent_skill_create_action_with_store_mutex(store_mutex, action);
+            continue;
+        }
+
+        if action.action_type == "skill_uninstall" {
+            dispatch_agent_skill_uninstall_action_with_store_mutex(store_mutex, action);
             continue;
         }
 
@@ -13359,6 +13742,441 @@ pub fn install_remote_skill_zip_package(
         .ok_or_else(|| "installed remote skill record could not be read".to_string())
 }
 
+pub fn ensure_system_skill_builder(store: &EventStore) -> Result<(), String> {
+    const BUILDER_SOURCE_URL: &str = "file:///ds-agent/system/skill-plugin-builder";
+    const BUILDER_INSTRUCTIONS: &str = r#"# DS Agent Skill and Plugin Builder
+
+Use this System Skill when the user asks DS Agent to create a Skill or plugin.
+Return one `skill_create` action with `requires_confirmation=false`. Put a JSON
+object in `content` containing `name`, `description`, `instructions`, and
+`kind` (`skill` or `plugin`). The instructions must be complete declarative
+guidance for future matching tasks. Do not generate installers, scripts,
+binaries, dependency commands, hooks, or hidden network calls. DS Agent will
+validate, hash, test, install, register, and enable the package automatically.
+"#;
+    let entry_sha256 = sha256_hex(BUILDER_INSTRUCTIONS.as_bytes());
+    let manifest_json = serde_json::json!({
+        "schema_version": "ds-agent.skill.v1",
+        "name": "Skill/Plugin Builder",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Creates, validates, installs, and registers declarative DS Agent Skills and plugins from an ordinary user request.",
+        "author": "DS Agent",
+        "license": "Apache-2.0",
+        "source": {
+            "kind": "local",
+            "url": BUILDER_SOURCE_URL,
+            "integrity": { "algorithm": "sha256", "hash": entry_sha256 }
+        },
+        "capabilities": ["skill_authoring"],
+        "permissions": [],
+        "entry": { "kind": "prompt_pack", "path": "SKILL.md" }
+    })
+    .to_string();
+    let manifest = SkillManifest::from_json(&manifest_json).map_err(|error| error.to_string())?;
+    let mut candidate =
+        SkillInstallationRecord::new(manifest, "DS Agent protected System Skill".to_string())
+            .map_err(event_store_error)?;
+    candidate.package_kind = SkillPackageKind::SystemSkill;
+    candidate.system_protected = true;
+    candidate.update_policy = SkillUpdatePolicy::Pinned;
+    candidate.entry_content = Some(BUILDER_INSTRUCTIONS.to_string());
+    candidate.entry_sha256 = Some(entry_sha256.clone());
+
+    let existing = store
+        .list_skill_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| record.manifest.source.url == BUILDER_SOURCE_URL);
+    if let Some(existing) = existing {
+        if existing.manifest.version == candidate.manifest.version
+            && existing.entry_sha256.as_deref() == Some(entry_sha256.as_str())
+        {
+            return Ok(());
+        }
+        let update = SkillUpdateRecord::from_candidate(
+            existing.id,
+            existing.manifest.version,
+            None,
+            candidate,
+        )
+        .map_err(event_store_error)?;
+        store
+            .append_skill_update(&update)
+            .map_err(event_store_error)?;
+        return Ok(());
+    }
+    store
+        .append_skill_installation(&candidate)
+        .map_err(event_store_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn create_generated_skill(
+    request: GeneratedSkillRequest,
+    state: State<'_, AppState>,
+) -> Result<SkillRecord, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    create_generated_skill_with_store(&store, request)
+}
+
+fn create_generated_skill_with_store(
+    store: &EventStore,
+    request: GeneratedSkillRequest,
+) -> Result<SkillRecord, String> {
+    let name = required_generated_skill_field(request.name, "generated Skill name")?;
+    let description =
+        required_generated_skill_field(request.description, "generated Skill description")?;
+    let instructions =
+        required_generated_skill_field(request.instructions, "generated Skill instructions")?;
+    if instructions.len() > crate::kernel::skill::MAX_SKILL_ENTRY_BYTES {
+        return Err(format!(
+            "generated Skill instructions exceed {} bytes",
+            crate::kernel::skill::MAX_SKILL_ENTRY_BYTES
+        ));
+    }
+    let package_kind = match request.kind.trim().to_ascii_lowercase().as_str() {
+        "skill" => SkillPackageKind::Skill,
+        "plugin" => SkillPackageKind::Plugin,
+        other => return Err(format!("generated capability kind is unsupported: {other}")),
+    };
+    let identity_hash = sha256_hex(name.to_ascii_lowercase().as_bytes());
+    let source_url = format!("file:///ds-agent/generated/{}", &identity_hash[..16]);
+    let existing = store
+        .list_skill_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| record.manifest.source.url == source_url);
+    let version = existing
+        .as_ref()
+        .map(|record| next_generated_skill_version(&record.manifest.version))
+        .unwrap_or_else(|| "0.1.0".to_string());
+    let entry_sha256 = sha256_hex(instructions.as_bytes());
+    let manifest_json = serde_json::json!({
+        "schema_version": "ds-agent.skill.v1",
+        "name": name,
+        "version": version,
+        "description": description,
+        "author": "DS Agent",
+        "license": "Local user-created",
+        "source": {
+            "kind": "local",
+            "url": source_url,
+            "integrity": { "algorithm": "sha256", "hash": entry_sha256 }
+        },
+        "capabilities": ["prompt_guidance"],
+        "permissions": [],
+        "entry": { "kind": "prompt_pack", "path": "SKILL.md" }
+    })
+    .to_string();
+    let manifest = SkillManifest::from_json(&manifest_json).map_err(|error| error.to_string())?;
+    let mut candidate = SkillInstallationRecord::new(
+        manifest,
+        "DS Agent generated from an explicit user request".to_string(),
+    )
+    .map_err(event_store_error)?;
+    candidate.package_kind = package_kind;
+    candidate.entry_content = Some(instructions);
+    candidate.entry_sha256 = Some(entry_sha256);
+
+    let skill_id = if let Some(existing) = existing {
+        let update = SkillUpdateRecord::from_candidate(
+            existing.id,
+            existing.manifest.version,
+            None,
+            candidate,
+        )
+        .map_err(event_store_error)?;
+        store
+            .append_skill_update(&update)
+            .map_err(event_store_error)?;
+        existing.id
+    } else {
+        let skill_id = candidate.id;
+        store
+            .append_skill_installation(&candidate)
+            .map_err(event_store_error)?;
+        skill_id
+    };
+    let record = store
+        .list_skill_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| record.id == skill_id)
+        .ok_or_else(|| "generated Skill could not be read after installation".to_string())?;
+    store
+        .prepare_skill_activation(
+            record.id,
+            "Validate generated Skill activation readiness.".to_string(),
+        )
+        .map_err(event_store_error)?;
+    Ok(record)
+}
+
+fn required_generated_skill_field(value: String, label: &str) -> Result<String, String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Err(format!("{label} is required"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn next_generated_skill_version(current: &str) -> String {
+    let mut parts = current.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let patch = parts.next().and_then(|part| part.parse::<u64>().ok());
+    match (major, minor, patch, parts.next()) {
+        (Some(major), Some(minor), Some(patch), None) => {
+            format!("{major}.{minor}.{}", patch.saturating_add(1))
+        }
+        _ => "0.1.0".to_string(),
+    }
+}
+
+#[tauri::command]
+pub fn install_skill_from_repository_url(
+    source_url: String,
+    state: State<'_, AppState>,
+) -> Result<SkillRepositoryInstallResult, String> {
+    let source = SkillRepositorySource::parse(&source_url)?;
+    let candidate = fetch_repository_skill_installation(&source_url)?;
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    commit_repository_skill_installation(&store, &source, candidate)
+}
+
+#[tauri::command]
+pub async fn run_skill_update_sweep(app: AppHandle) -> Result<SkillUpdateSweepResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        run_skill_update_sweep_with_store_mutex(&state.event_store)
+    })
+    .await
+    .map_err(|error| format!("skill update worker could not finish: {error}"))?
+}
+
+fn run_skill_update_sweep_with_store_mutex(
+    store_mutex: &Mutex<EventStore>,
+) -> Result<SkillUpdateSweepResult, String> {
+    let candidates = {
+        let store = store_mutex.lock().map_err(|_| lock_error())?;
+        store
+            .list_skill_records()
+            .map_err(event_store_error)?
+            .into_iter()
+            .filter(|record| {
+                record.update_policy == SkillUpdatePolicy::Automatic
+                    && record.source_identity.is_some()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut result = SkillUpdateSweepResult {
+        checked: 0,
+        updated: 0,
+        current: 0,
+        failed: 0,
+        failures: Vec::new(),
+        records: Vec::new(),
+    };
+
+    for record in candidates {
+        result.checked += 1;
+        let installed_revision = record
+            .source_identity
+            .as_ref()
+            .map(|identity| identity.resolved_revision.clone());
+        let mut candidate_revision = None;
+        let update_result = (|| -> Result<SkillRepositoryInstallOperation, String> {
+            let identity = record
+                .source_identity
+                .as_ref()
+                .ok_or_else(|| "remote Skill source identity is missing".to_string())?;
+            let mut source = SkillRepositorySource::parse(&identity.repository_url)?;
+            source.requested_revision = identity.requested_revision.clone();
+            source.package_path = identity.package_path.clone();
+            let snapshot = fetch_repository_snapshot(&source)?;
+            candidate_revision = Some(snapshot.resolved_revision.clone());
+            if installed_revision.as_deref() == Some(snapshot.resolved_revision.as_str()) {
+                let check = SkillUpdateCheckRecord::new(
+                    record.id,
+                    installed_revision.clone(),
+                    Some(snapshot.resolved_revision),
+                    SkillUpdateCheckStatus::Current,
+                    "startup update check found the installed revision current".to_string(),
+                )
+                .map_err(event_store_error)?;
+                let store = store_mutex.lock().map_err(|_| lock_error())?;
+                store
+                    .append_skill_update_check(&check)
+                    .map_err(event_store_error)?;
+                return Ok(SkillRepositoryInstallOperation::Unchanged);
+            }
+            let installation = build_repository_skill_installation(
+                &source,
+                &snapshot.resolved_revision,
+                &snapshot.files,
+            )?;
+            let store = store_mutex.lock().map_err(|_| lock_error())?;
+            commit_repository_skill_installation(&store, &source, installation)
+                .map(|result| result.operation)
+        })();
+
+        match update_result {
+            Ok(SkillRepositoryInstallOperation::Updated) => result.updated += 1,
+            Ok(SkillRepositoryInstallOperation::Installed) => result.updated += 1,
+            Ok(SkillRepositoryInstallOperation::Unchanged) => result.current += 1,
+            Err(error) => {
+                result.failed += 1;
+                result
+                    .failures
+                    .push(format!("{}: {error}", record.manifest.name));
+                let failure = SkillUpdateFailureRecord::new(
+                    record.id,
+                    candidate_revision.clone(),
+                    error.clone(),
+                )
+                .map_err(event_store_error)?;
+                let check = SkillUpdateCheckRecord::new(
+                    record.id,
+                    installed_revision.clone(),
+                    candidate_revision,
+                    SkillUpdateCheckStatus::Failed,
+                    "startup update check failed; retained the installed revision".to_string(),
+                )
+                .map_err(event_store_error)?;
+                let store = store_mutex.lock().map_err(|_| lock_error())?;
+                store
+                    .append_skill_update_failure(&failure)
+                    .map_err(event_store_error)?;
+                store
+                    .append_skill_update_check(&check)
+                    .map_err(event_store_error)?;
+            }
+        }
+    }
+
+    let store = store_mutex.lock().map_err(|_| lock_error())?;
+    result.records = store.list_skill_records().map_err(event_store_error)?;
+    Ok(result)
+}
+
+fn commit_repository_skill_installation(
+    store: &EventStore,
+    source: &SkillRepositorySource,
+    candidate: SkillInstallationRecord,
+) -> Result<SkillRepositoryInstallResult, String> {
+    let candidate_source = candidate
+        .source_identity
+        .clone()
+        .ok_or_else(|| "repository installation is missing source identity".to_string())?;
+    let existing = store
+        .list_skill_records()
+        .map_err(event_store_error)?
+        .into_iter()
+        .find(|record| skill_record_matches_repository(record, source));
+
+    if let Some(existing) = existing {
+        if existing.source_identity.as_ref().is_some_and(|identity| {
+            identity.resolved_revision == candidate_source.resolved_revision
+        }) {
+            let check = SkillUpdateCheckRecord::new(
+                existing.id,
+                existing
+                    .source_identity
+                    .as_ref()
+                    .map(|identity| identity.resolved_revision.clone()),
+                Some(candidate_source.resolved_revision),
+                SkillUpdateCheckStatus::Current,
+                "repository revision is already installed".to_string(),
+            )
+            .map_err(event_store_error)?;
+            store
+                .append_skill_update_check(&check)
+                .map_err(event_store_error)?;
+            return Ok(SkillRepositoryInstallResult {
+                operation: SkillRepositoryInstallOperation::Unchanged,
+                record: store
+                    .list_skill_records()
+                    .map_err(event_store_error)?
+                    .into_iter()
+                    .find(|record| record.id == existing.id)
+                    .ok_or_else(|| "installed repository Skill could not be read".to_string())?,
+            });
+        }
+
+        let update = SkillUpdateRecord::from_candidate(
+            existing.id,
+            existing.manifest.version.clone(),
+            existing
+                .source_identity
+                .as_ref()
+                .map(|identity| identity.resolved_revision.clone()),
+            candidate,
+        )
+        .map_err(event_store_error)?;
+        let check = SkillUpdateCheckRecord::new(
+            existing.id,
+            existing
+                .source_identity
+                .as_ref()
+                .map(|identity| identity.resolved_revision.clone()),
+            Some(candidate_source.resolved_revision),
+            SkillUpdateCheckStatus::Updated,
+            "repository update validated and installed automatically".to_string(),
+        )
+        .map_err(event_store_error)?;
+        store
+            .append_skill_update(&update)
+            .map_err(event_store_error)?;
+        store
+            .append_skill_update_check(&check)
+            .map_err(event_store_error)?;
+        return Ok(SkillRepositoryInstallResult {
+            operation: SkillRepositoryInstallOperation::Updated,
+            record: store
+                .list_skill_records()
+                .map_err(event_store_error)?
+                .into_iter()
+                .find(|record| record.id == existing.id)
+                .ok_or_else(|| "updated repository Skill could not be read".to_string())?,
+        });
+    }
+
+    let installation_id = candidate.id;
+    let check = SkillUpdateCheckRecord::new(
+        installation_id,
+        Some(candidate_source.resolved_revision.clone()),
+        Some(candidate_source.resolved_revision),
+        SkillUpdateCheckStatus::Current,
+        "repository Skill installed at the latest resolved revision".to_string(),
+    )
+    .map_err(event_store_error)?;
+    store
+        .append_skill_installation(&candidate)
+        .map_err(event_store_error)?;
+    store
+        .append_skill_update_check(&check)
+        .map_err(event_store_error)?;
+    Ok(SkillRepositoryInstallResult {
+        operation: SkillRepositoryInstallOperation::Installed,
+        record: store
+            .list_skill_records()
+            .map_err(event_store_error)?
+            .into_iter()
+            .find(|record| record.id == installation_id)
+            .ok_or_else(|| "installed repository Skill could not be read".to_string())?,
+    })
+}
+
+fn skill_record_matches_repository(record: &SkillRecord, source: &SkillRepositorySource) -> bool {
+    record.source_identity.as_ref().is_some_and(|identity| {
+        identity.provider == source.provider.as_str()
+            && identity.repository_url == source.canonical_url
+            && identity.package_path == source.package_path
+    })
+}
+
 #[tauri::command]
 pub fn reset_skill_trust(
     skill_id: Uuid,
@@ -14558,8 +15376,9 @@ mod tests {
         agent_chat_api_key_candidates_from_sources, agent_chat_api_key_from_sources,
         agent_chat_with_dispatch_and_tool_followup, agent_chat_with_transport,
         apply_memory_candidate_update_if_current, computer_screenshot_evidence_base_dir,
-        computer_tool_strategy_for_command, deepseek_telemetry_with_pricing,
-        dispatch_agent_action_proposals, dispatch_agent_app_update_action_with_executor,
+        computer_tool_strategy_for_command, create_generated_skill_with_store,
+        deepseek_telemetry_with_pricing, dispatch_agent_action_proposals,
+        dispatch_agent_app_update_action_with_executor,
         dispatch_agent_browser_open_action_with_opener,
         dispatch_agent_browser_open_tool_with_executor,
         dispatch_agent_browser_open_tool_with_store_mutex, dispatch_agent_office_create_action,
@@ -14571,11 +15390,12 @@ mod tests {
         dispatch_agent_office_update_tool_with_store_mutex,
         dispatch_agent_operations_briefing_tool_with_executor,
         dispatch_agent_operations_briefing_tool_with_store_mutex,
-        dispatch_agent_skill_activate_tool_with_executor, link_existing_memory_records,
-        list_memory_maintenance_reviews_from_store, normalize_agent_action_proposal,
-        operations_briefing_deepseek_api_key_for_provider, operations_briefing_model_route_context,
-        operations_briefing_report_export_dir, operations_briefing_template_seed_dir,
-        operations_briefing_token_cache_context,
+        dispatch_agent_skill_activate_tool_with_executor, dispatch_agent_skill_create_action,
+        dispatch_agent_skill_uninstall_action, ensure_system_skill_builder,
+        link_existing_memory_records, list_memory_maintenance_reviews_from_store,
+        normalize_agent_action_proposal, operations_briefing_deepseek_api_key_for_provider,
+        operations_briefing_model_route_context, operations_briefing_report_export_dir,
+        operations_briefing_template_seed_dir, operations_briefing_token_cache_context,
         propose_memory_update_candidate_from_feedback_in_store,
         record_agent_action_permission_requests, record_memory_maintenance_review_action_in_store,
         resume_agent_chat_action_with_clients,
@@ -14586,7 +15406,7 @@ mod tests {
         should_require_computer_control_unlock, thinking_level_context_label,
         AgentChatActionProposal, AgentChatReadiness, AgentChatRequest, AgentChatResponse,
         AgentChatRuntimeContext, BrowserUrlOpenOutcome, BrowserUrlOpener,
-        ComputerControlUnlockState, COMPUTER_CONTROL_UNLOCK_TTL_MINUTES,
+        ComputerControlUnlockState, GeneratedSkillRequest, COMPUTER_CONTROL_UNLOCK_TTL_MINUTES,
     };
     use crate::kernel::agent_run::{
         AgentRunCancelRequest, AgentRunExecutionContext, AgentRunQueuedGuidance,
@@ -14630,7 +15450,7 @@ mod tests {
     use crate::kernel::policy::{CapabilityKind, PolicyDecision};
     use crate::kernel::skill::{
         sha256_hex, SkillEnablementChange, SkillEnablementStatus, SkillInstallationRecord,
-        SkillManifest,
+        SkillManifest, SkillPackageKind,
     };
     use crate::kernel::tool_runtime::{
         AgentToolExecutor, ToolEvidence, ToolExecutionOutput, ToolExecutionPlan,
@@ -17667,13 +18487,13 @@ mod tests {
     fn app_update_status_keeps_current_formal_release_quiet_from_release_list() {
         let releases = vec![
             GithubRelease {
-                tag_name: "v0.2.3".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.2.3"
+                tag_name: "v0.3.0".to_string(),
+                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.3.0"
                     .to_string(),
                 assets: vec![GithubReleaseAsset {
-                    name: "DS Agent_0.2.3_x64-setup.exe".to_string(),
+                    name: "DS Agent_0.3.0_x64-setup.exe".to_string(),
                     browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.2.3/DS.Agent_0.2.3_x64-setup.exe"
+                        "https://github.com/Lee-take/dsagent/releases/download/v0.3.0/DS.Agent_0.3.0_x64-setup.exe"
                             .to_string(),
                 }],
             },
@@ -17693,8 +18513,8 @@ mod tests {
         let status = update_status_from_releases(releases, app_update_current_version());
 
         assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.2.3");
-        assert_eq!(status.latest_version.as_deref(), Some("0.2.3"));
+        assert_eq!(status.current_version, "v0.3.0");
+        assert_eq!(status.latest_version.as_deref(), Some("0.3.0"));
         assert!(status.asset_name.is_none());
     }
 
@@ -18565,7 +19385,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_skill_catalog_includes_safe_installed_skill_with_legacy_disabled_status() {
+    fn agent_skill_catalog_excludes_disabled_installed_skill() {
         let store = EventStore::open_memory().expect("store opens");
         let skill_id =
             install_test_declarative_skill(&store, r#"{"steps":[{"tool":"network.search"}]}"#);
@@ -18581,7 +19401,7 @@ mod tests {
 
         let catalog = load_agent_skill_catalog(&store).expect("catalog loads");
 
-        assert!(catalog.iter().any(|skill| skill.id == skill_id));
+        assert!(!catalog.iter().any(|skill| skill.id == skill_id));
     }
 
     impl<'a> StoreLockCheckingFileContentClient<'a> {
@@ -19109,7 +19929,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_agent_run_uses_safe_installed_skill_despite_legacy_disabled_status() {
+    fn queued_agent_run_blocks_disabled_installed_skill() {
         let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
         let skill_id = {
             let store = store.lock().expect("store lock");
@@ -19191,26 +20011,20 @@ mod tests {
             &search_client,
             &browser_client,
         )
-        .expect("safe installed skill execution succeeds")
+        .expect("worker reports blocked run")
         .expect("queued run exists");
 
-        assert_eq!(outcome.record.status, AgentRunStatus::Completed);
-        assert_eq!(outcome.response.proposed_actions.len(), 2);
-        assert!(outcome
-            .response
-            .proposed_actions
-            .iter()
-            .all(|action| action.execution_state == "succeeded"));
-        assert_eq!(search_client.recorded_calls().len(), 1);
-        let invocations = store
-            .lock()
-            .expect("store lock")
-            .list_tool_invocations()
-            .expect("tool invocations load");
-        assert_eq!(invocations.len(), 2);
-        assert!(invocations
-            .iter()
-            .all(|invocation| invocation.status == ToolExecutionStatus::Succeeded));
+        assert_eq!(outcome.record.status, AgentRunStatus::Blocked);
+        assert_eq!(outcome.response.proposed_actions.len(), 1);
+        assert_eq!(
+            outcome.response.proposed_actions[0].execution_state,
+            "failed"
+        );
+        assert!(outcome.response.proposed_actions[0]
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("skill is disabled")));
+        assert!(search_client.recorded_calls().is_empty());
     }
     #[test]
     fn queued_agent_run_applies_new_guidance_at_the_next_tool_boundary() {
@@ -22510,6 +23324,201 @@ schema_version: 1
             .as_str()
             .unwrap_or_default()
             .contains("unsupported action_type"));
+    }
+
+    #[test]
+    fn agent_chat_routes_repository_install_without_a_second_user_decision() {
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope-v1",
+            "reply_to_user": "我会安装并启用这个 Skill。",
+            "agent_actions": [
+                {
+                    "action_type": "plugin_install",
+                    "title": "安装 Karpathy Skill",
+                    "reason": "用户明确要求安装这个 GitHub 仓库。",
+                    "risk": "high",
+                    "requires_confirmation": true,
+                    "target": "https://github.com/multica-ai/andrej-karpathy-skills"
+                }
+            ],
+            "missing_prerequisites": []
+        });
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+
+        let (reply, _) = agent_chat_with_transport(
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "安装 https://github.com/multica-ai/andrej-karpathy-skills".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskEveryStep,
+            },
+            None,
+        )
+        .expect("repository install action normalizes");
+
+        let action = reply.proposed_actions.first().expect("action exists");
+        assert_eq!(action.action_type, "skill_install");
+        assert_eq!(action.capability, Some(CapabilityKind::SkillUse));
+        assert_eq!(action.risk.as_deref(), Some("low"));
+        assert!(!action.requires_confirmation);
+        assert_eq!(action.policy_decision, Some(PolicyDecision::Allow));
+        assert_eq!(action.execution_state, "proposed");
+    }
+
+    #[test]
+    fn system_skill_builder_is_protected_and_seeded_once() {
+        let store = EventStore::open_memory().expect("store opens");
+
+        ensure_system_skill_builder(&store).expect("builder seeds");
+        ensure_system_skill_builder(&store).expect("builder seed is idempotent");
+        let records = store.list_skill_records().expect("records load");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].manifest.name, "Skill/Plugin Builder");
+        assert_eq!(records[0].package_kind, SkillPackageKind::SystemSkill);
+        assert!(records[0].system_protected);
+        assert!(records[0].entry_available);
+    }
+
+    #[test]
+    fn generated_skill_is_tested_and_updated_under_one_stable_id() {
+        let store = EventStore::open_memory().expect("store opens");
+        let first = create_generated_skill_with_store(
+            &store,
+            GeneratedSkillRequest {
+                name: "Hotel Review".to_string(),
+                description: "Review hotel operating results.".to_string(),
+                instructions: "# Hotel Review\n\nCompare actual results with budget.".to_string(),
+                kind: "skill".to_string(),
+            },
+        )
+        .expect("generated Skill installs");
+        let updated = create_generated_skill_with_store(
+            &store,
+            GeneratedSkillRequest {
+                name: "Hotel Review".to_string(),
+                description: "Review hotel operating results and risks.".to_string(),
+                instructions:
+                    "# Hotel Review\n\nCompare actual results with budget and explain risks."
+                        .to_string(),
+                kind: "skill".to_string(),
+            },
+        )
+        .expect("generated Skill updates");
+
+        assert_eq!(first.id, updated.id);
+        assert_eq!(first.manifest.version, "0.1.0");
+        assert_eq!(updated.manifest.version, "0.1.1");
+        assert_eq!(store.list_skill_records().expect("records load").len(), 1);
+        assert!(store
+            .prepare_skill_activation(updated.id, "Review this month.".to_string())
+            .expect("updated generated Skill activates")
+            .instructions
+            .contains("explain risks"));
+    }
+
+    #[test]
+    fn chat_skill_create_and_uninstall_complete_without_intermediate_confirmation() {
+        let create_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope-v1",
+            "reply_to_user": "我会制作并安装这个 Skill。",
+            "agent_actions": [{
+                "action_type": "plugin_create",
+                "title": "制作酒店复盘 Skill",
+                "reason": "用户明确要求制作这个能力。",
+                "risk": "high",
+                "requires_confirmation": true,
+                "target": "酒店复盘",
+                "content": serde_json::json!({
+                    "name": "酒店复盘",
+                    "description": "复盘酒店月度经营表现。",
+                    "instructions": "# 酒店复盘\n\n比较实际、预算和去年同期。",
+                    "kind": "skill"
+                }).to_string()
+            }],
+            "missing_prerequisites": []
+        });
+        let transport = RecordingDeepSeekTransport::new(create_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let (mut reply, _) = agent_chat_with_transport(
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "制作一个酒店复盘 Skill。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskEveryStep,
+            },
+            None,
+        )
+        .expect("create action parses");
+        let create_action = reply
+            .proposed_actions
+            .first_mut()
+            .expect("create action exists");
+        assert_eq!(create_action.action_type, "skill_create");
+        assert_eq!(create_action.policy_decision, Some(PolicyDecision::Allow));
+        assert!(!create_action.requires_confirmation);
+        let store = EventStore::open_memory().expect("store opens");
+        dispatch_agent_skill_create_action(&store, create_action);
+        assert_eq!(create_action.execution_state, "succeeded");
+        let installed = store
+            .list_skill_records()
+            .expect("records load")
+            .into_iter()
+            .next()
+            .expect("generated Skill installed");
+
+        let uninstall_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope-v1",
+            "reply_to_user": "我会卸载这个 Skill。",
+            "agent_actions": [{
+                "action_type": "uninstall_skill",
+                "title": "卸载酒店复盘",
+                "reason": "用户明确要求卸载。",
+                "risk": "high",
+                "requires_confirmation": true,
+                "target": installed.id.to_string()
+            }],
+            "missing_prerequisites": []
+        });
+        let transport = RecordingDeepSeekTransport::new(uninstall_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let (mut reply, _) = agent_chat_with_transport(
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "卸载酒店复盘。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskEveryStep,
+            },
+            None,
+        )
+        .expect("uninstall action parses");
+        let uninstall_action = reply
+            .proposed_actions
+            .first_mut()
+            .expect("uninstall action exists");
+        assert_eq!(uninstall_action.action_type, "skill_uninstall");
+        assert_eq!(
+            uninstall_action.policy_decision,
+            Some(PolicyDecision::Allow)
+        );
+        assert!(!uninstall_action.requires_confirmation);
+        dispatch_agent_skill_uninstall_action(&store, uninstall_action);
+
+        assert_eq!(uninstall_action.execution_state, "succeeded");
+        assert!(store
+            .list_skill_records()
+            .expect("records reload")
+            .is_empty());
     }
 
     #[test]

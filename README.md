@@ -3,7 +3,7 @@
 Local-first DeepSeek AI work platform for background tasks, permissioned tools,
 auditable evidence, and verifiable local execution.
 
-Latest release: [DS Agent v0.2.3](https://github.com/Lee-take/dsagent/releases/tag/v0.2.3)
+Latest release: [DS Agent v0.3.0](https://github.com/Lee-take/dsagent/releases/tag/v0.3.0)
 
 Search aliases: DS Agent, DSAgent, dsagent, DeepSeek Agent OS.
 
@@ -204,9 +204,45 @@ engineering inspiration, with respect for their licenses and maintainers.
 本仓库不应复制任何私有、泄露或未授权代码。公开开源项目仅作为学习材料和工程参考，
 并尊重原项目许可证和维护者权益。
 
-## 0.2.3 Status / 0.2.3 状态
+## 0.3.0 Status / 0.3.0 状态
 
-Version `0.2.3` is the current Windows-first formal release. It turns DS Agent
+Version `0.3.0` is the current Windows-first formal release. It adds an
+automatic lifecycle for declarative Skills and Plugins: send a public GitHub or
+Hugging Face repository URL in chat and DS Agent resolves, validates, installs,
+enables, persists, and later selects the capability automatically without asking
+the user to choose a package format or repeat the instruction.
+
+Remote installations are compared with their upstream immutable revision every
+time DS Agent starts. Compatible updates are validated and committed under the
+same local identity; an incompatible or failed update leaves the last working
+version active and records the failure for audit. Installed third-party items
+can be enabled, disabled, or uninstalled from the Plugins panel.
+
+The Plugins panel separates System Skills, installed Plugins, installed Skills,
+and Scenario Templates. The protected `Skill/Plugin Builder` System Skill lets
+DS Agent create, validate, activation-test, install, and enable safe declarative
+Skills from one user instruction. Operations Briefing is a Scenario Template,
+not a Plugin.
+
+Repository installation is limited to controlled public HTTPS GitHub and
+Hugging Face sources. Strict redirects, size and path checks, manifest and
+permission validation, integrity hashes, declarative-only entry points, and
+append-only lifecycle events keep arbitrary scripts, native binaries, unsafe
+paths, and undeclared permission expansion outside the runtime.
+
+`0.3.0` 是当前 Windows 优先正式发布版本。用户只需在聊天中发送公开的 GitHub 或
+Hugging Face 仓库地址，DS Agent 会自动完成版本解析、内容识别、安全校验、安装、启用
+和持久化，以后再根据任务自动调用，不要求用户选择包格式或重复确认。
+
+每次打开 DS Agent 都会在后台对比远端不可变版本；兼容的新版本自动升级并保持同一本地
+身份，失败时继续使用上一可用版本并记录审计。插件页区分系统技能、已安装插件、已安装
+Skill 和场景模板，第三方项目可直接启用、禁用或卸载。受保护的 `Skill/Plugin Builder`
+系统技能可以根据一次用户指令自动制作、校验、测试和安装声明式 Skill。“运营简报”属于
+场景模板，不属于插件。
+
+## 0.2.3 Historical Status / 0.2.3 历史状态
+
+Version `0.2.3` was the preceding Windows-first formal release. It turned DS Agent
 from a blocking chat tool into the foundation of a local AI work platform:
 DeepSeek handles open-ended understanding and planning, while DS Agent owns
 background execution, tool contracts, permissions, sandbox boundaries, state,
@@ -303,18 +339,18 @@ release tag 和安装包资产，所以补丁发布必须使用新的公开 tag�
 
 License: Apache-2.0.
 
-The public `v0.0.1` through `v0.2.2` releases remain unchanged. The `v0.2.3`
+The public `v0.0.1` through `v0.2.3` releases remain unchanged. The `v0.3.0`
 release is the current Windows installer line for colleague testing.
 The installer is unsigned, so Windows may show an unknown-publisher warning,
 but the NSIS package is built with the Microsoft WebView2 bootstrapper embedded
 and run silently so ordinary Windows users do not need a developer toolchain.
 
-`v0.2.3` focuses on verifiable Windows Agent work: install DS Agent, connect
+`v0.3.0` keeps the verifiable Windows Agent foundation: install DS Agent, connect
 DeepSeek through a local environment variable, choose a workspace, keep tasks
 moving in the background, and let a permissioned runtime execute and verify
 local work with evidence.
 
-`v0.2.3` 的重点是可验证的 Windows Agent 工作：安装 DS Agent，通过本地环境变量连接
+`v0.3.0` 延续可验证的 Windows Agent 工作：安装 DS Agent，通过本地环境变量连接
 DeepSeek，选择一个本地工作目录，让任务在后台推进，并由权限化 runtime 执行、留证和
 验证本地工作。
 
@@ -448,7 +484,7 @@ Read first:
 
 - `docs/INSTALLATION.md`
 - `docs/OPEN_SOURCE_RELEASE.md`
-- `docs/RELEASE_NOTES_v0.2.3.md`
+- `docs/RELEASE_NOTES_v0.3.0.md`
 - `docs/RELEASE_NOTES_v0.2.2.md`
 - `docs/RELEASE_NOTES_v0.2.1.md`
 - `docs/RELEASE_NOTES_v0.2.0.md`
@@ -581,7 +617,7 @@ npx pnpm@9.15.9 test:windows-installed-ui -- --workflow
 
 Windows builds automatically merge `apps/desktop/src-tauri/tauri.windows.conf.json`
 and produce an NSIS installer under the configured Cargo target directory, for
-example `release/bundle/nsis/DS Agent_0.2.3_x64-setup.exe`. The Windows config
+example `release/bundle/nsis/DS Agent_0.3.0_x64-setup.exe`. The Windows config
 embeds the Microsoft WebView2 bootstrapper and runs it silently during install
 when the target machine needs the WebView2 runtime.
 
@@ -643,7 +679,7 @@ the composer available and enqueue the next Agent run instead of blocking the
 whole workspace. Completed or partially completed results can include one
 short, task-grounded next-better suggestion.
 
-The current 0.2.3 preview includes the permission loop for built-in local tools,
+The current 0.3.0 preview includes the permission loop for built-in local tools,
 durable background Agent runs, the generic tool runtime, resource coordination,
 and trusted declarative skill execution.
 Built-in local tools cover file, network, browser, email approval records,

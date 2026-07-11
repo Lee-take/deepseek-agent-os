@@ -16,7 +16,10 @@ assert.match(app, /record\.manifest\.description/);
 assert.match(app, /copy\.skills\.autoInvoke/);
 assert.doesNotMatch(app, /onSubmit=\{installLocalSkillManifest\}/);
 assert.doesNotMatch(app, /copy\.skills\.prepareExecution/);
-assert.doesNotMatch(app, /setLocalSkillEnabled\(record/);
+assert.match(app, /setLocalSkillEnabled\(/);
+assert.match(app, /uninstallLocalSkill\(/);
+assert.match(app, /copy\.skills\.scenarioTemplates/);
+assert.match(app, /run_skill_update_sweep/);
 
 assert.match(i18n, /DS Agent 会在任务需要时自动调用已安装的技能与插件。/);
 assert.match(i18n, /DS Agent automatically uses installed skills and plugins when a task needs them\./);
@@ -24,14 +27,14 @@ assert.match(i18n, /DS Agent automatically uses installed skills and plugins whe
 const catalogStart = commands.indexOf("fn load_agent_skill_catalog");
 const catalogEnd = commands.indexOf("fn build_agent_skill_catalog_prompt", catalogStart);
 const catalog = commands.slice(catalogStart, catalogEnd);
-assert.doesNotMatch(catalog, /enablement_status/);
+assert.match(catalog, /enablement_status == SkillEnablementStatus::Enabled/);
 assert.match(catalog, /trust_level != SkillTrustLevel::Untrusted/);
 assert.match(catalog, /record\.entry_available/);
 
 const executionGateStart = skill.indexOf("fn skill_execution_blocked_reason");
 const executionGateEnd = skill.indexOf("fn declarative_skill_execution_plan", executionGateStart);
 const executionGate = skill.slice(executionGateStart, executionGateEnd);
-assert.doesNotMatch(executionGate, /skill is disabled/);
+assert.match(executionGate, /skill is disabled/);
 assert.match(executionGate, /skill trust is unverified/);
 
 console.log("plugin catalog tests passed");

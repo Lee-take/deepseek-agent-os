@@ -138,6 +138,19 @@ export type SkillSource = {
   integrity: SkillSourceIntegrity | null;
 };
 
+export type SkillPackageKind = "skill" | "plugin" | "system_skill";
+export type SkillUpdatePolicy = "automatic" | "pinned";
+export type SkillUpdateState = "current" | "update_available" | "failed";
+
+export type SkillSourceIdentity = {
+  provider: string;
+  repository_url: string;
+  requested_revision: string | null;
+  resolved_revision: string;
+  package_path: string | null;
+  source_format: string;
+};
+
 export type SkillPermissionDeclaration = {
   kind: string;
   scope: string;
@@ -172,8 +185,26 @@ export type SkillRecord = {
   enablement_status: SkillEnablementStatus;
   last_audit_note: string | null;
   updated_at: string;
+  package_kind: SkillPackageKind;
+  system_protected: boolean;
+  source_identity: SkillSourceIdentity | null;
+  update_policy: SkillUpdatePolicy;
+  update_state: SkillUpdateState;
+  last_update_checked_at: string | null;
+  last_update_failure: string | null;
+  rollback_version: string | null;
+  rollback_revision: string | null;
   entry_available: boolean;
   entry_sha256: string | null;
+};
+
+export type SkillUpdateSweepResult = {
+  checked: number;
+  updated: number;
+  current: number;
+  failed: number;
+  failures: string[];
+  records: SkillRecord[];
 };
 
 export type SkillPackagePreflight = {

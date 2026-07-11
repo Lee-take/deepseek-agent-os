@@ -30,8 +30,10 @@ use crate::kernel::policy::{
     CapabilityGrantState, CapabilityKind, PermissionAuditEntry, PermissionResolution, RiskLevel,
 };
 use crate::kernel::skill::{
-    SkillActivationContext, SkillEnablementChange, SkillEnablementStatus, SkillExecutionRecord,
-    SkillInstallationRecord, SkillRecord, SkillTrustLevel, SkillTrustReset, SkillUninstallRecord,
+    sha256_hex, SkillActivationContext, SkillEnablementChange, SkillEnablementStatus,
+    SkillExecutionRecord, SkillInstallationRecord, SkillRecord, SkillTrustLevel, SkillTrustReset,
+    SkillUninstallRecord, SkillUpdateCheckRecord, SkillUpdateCheckStatus, SkillUpdateFailureRecord,
+    SkillUpdateRecord, SkillUpdateState,
 };
 use crate::kernel::tool_runtime::{ToolExecutionStatus, ToolInvocationRecord};
 use crate::kernel::work_package::{
@@ -78,6 +80,9 @@ pub const SKILL_EXECUTION_RECORDED_EVENT: &str = "skill.execution_recorded";
 pub const SKILL_INSTALLED_EVENT: &str = "skill.installed";
 pub const SKILL_TRUST_RESET_EVENT: &str = "skill.trust_reset";
 pub const SKILL_UNINSTALLED_EVENT: &str = "skill.uninstalled";
+pub const SKILL_UPDATED_EVENT: &str = "skill.updated";
+pub const SKILL_UPDATE_CHECKED_EVENT: &str = "skill.update_checked";
+pub const SKILL_UPDATE_FAILED_EVENT: &str = "skill.update_failed";
 pub const TASK_RECORD_CREATED_EVENT: &str = "task_record.created";
 pub const TOOL_INVOCATION_RECORDED_EVENT: &str = "tool_invocation.recorded";
 pub const WORKFLOW_TEMPLATE_PACKAGE_IMPORTED_EVENT: &str = "workflow_template_package.imported";
@@ -2438,7 +2443,7 @@ impl EventStore {
         &self,
         installation: &SkillInstallationRecord,
     ) -> EventStoreResult<bool> {
-        let existing = self.list_skill_installations()?.into_iter().any(|record| {
+        let existing = self.list_skill_records()?.into_iter().any(|record| {
             record.manifest.name == installation.manifest.name
                 && record.manifest.version == installation.manifest.version
                 && record.manifest.source.url == installation.manifest.source.url
@@ -2511,6 +2516,22 @@ impl EventStore {
 
     pub fn append_skill_uninstall(&self, uninstall: &SkillUninstallRecord) -> EventStoreResult<()> {
         self.ensure_skill_installation_exists(uninstall.skill_id)?;
+        let record = self
+            .list_skill_records()?
+            .into_iter()
+            .find(|record| record.id == uninstall.skill_id)
+            .ok_or_else(|| {
+                EventStoreError::NotFound(format!(
+                    "active skill installation {}",
+                    uninstall.skill_id
+                ))
+            })?;
+        if record.system_protected {
+            return Err(EventStoreError::InvalidState(format!(
+                "protected system skill cannot be uninstalled: {}",
+                record.manifest.name
+            )));
+        }
         let event = KernelEvent::new(SKILL_UNINSTALLED_EVENT, uninstall)?;
         self.append(&event)
     }
@@ -2521,6 +2542,112 @@ impl EventStore {
             .into_iter()
             .map(|event| {
                 serde_json::from_str::<SkillUninstallRecord>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_skill_update(&self, update: &SkillUpdateRecord) -> EventStoreResult<()> {
+        self.ensure_skill_installation_exists(update.skill_id)?;
+        let current = self
+            .list_skill_records()?
+            .into_iter()
+            .find(|record| record.id == update.skill_id)
+            .ok_or_else(|| {
+                EventStoreError::NotFound(format!("active skill installation {}", update.skill_id))
+            })?;
+        if current.manifest.version != update.previous_version {
+            return Err(EventStoreError::InvalidState(format!(
+                "skill update expected version {}, current version is {}",
+                update.previous_version, current.manifest.version
+            )));
+        }
+        if current.manifest.name != update.manifest.name {
+            return Err(EventStoreError::InvalidState(
+                "skill update cannot change package identity".to_string(),
+            ));
+        }
+        if update.manifest.permissions.iter().any(|permission| {
+            !current
+                .manifest
+                .permissions
+                .iter()
+                .any(|current_permission| {
+                    current_permission.kind == permission.kind
+                        && current_permission.scope == permission.scope
+                })
+        }) {
+            return Err(EventStoreError::InvalidState(
+                "skill update cannot expand declared permissions automatically".to_string(),
+            ));
+        }
+        if sha256_hex(update.entry_content.as_bytes()) != update.entry_sha256 {
+            return Err(EventStoreError::InvalidState(
+                "skill update entry integrity mismatch".to_string(),
+            ));
+        }
+        if let (Some(current_source), Some(next_source)) =
+            (&current.source_identity, &update.source_identity)
+        {
+            if current_source.provider != next_source.provider
+                || current_source.repository_url != next_source.repository_url
+                || current_source.package_path != next_source.package_path
+            {
+                return Err(EventStoreError::InvalidState(
+                    "skill update cannot change canonical source identity".to_string(),
+                ));
+            }
+        }
+
+        let event = KernelEvent::new(SKILL_UPDATED_EVENT, update)?;
+        self.append(&event)
+    }
+
+    pub fn list_skill_updates(&self) -> EventStoreResult<Vec<SkillUpdateRecord>> {
+        let events = self.list_by_type(SKILL_UPDATED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<SkillUpdateRecord>(&event.payload_json).map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_skill_update_check(
+        &self,
+        check: &SkillUpdateCheckRecord,
+    ) -> EventStoreResult<()> {
+        self.ensure_skill_installation_exists(check.skill_id)?;
+        let event = KernelEvent::new(SKILL_UPDATE_CHECKED_EVENT, check)?;
+        self.append(&event)
+    }
+
+    pub fn list_skill_update_checks(&self) -> EventStoreResult<Vec<SkillUpdateCheckRecord>> {
+        let events = self.list_by_type(SKILL_UPDATE_CHECKED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<SkillUpdateCheckRecord>(&event.payload_json)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn append_skill_update_failure(
+        &self,
+        failure: &SkillUpdateFailureRecord,
+    ) -> EventStoreResult<()> {
+        self.ensure_skill_installation_exists(failure.skill_id)?;
+        let event = KernelEvent::new(SKILL_UPDATE_FAILED_EVENT, failure)?;
+        self.append(&event)
+    }
+
+    pub fn list_skill_update_failures(&self) -> EventStoreResult<Vec<SkillUpdateFailureRecord>> {
+        let events = self.list_by_type(SKILL_UPDATE_FAILED_EVENT, 500)?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str::<SkillUpdateFailureRecord>(&event.payload_json)
                     .map_err(Into::into)
             })
             .collect()
@@ -2541,6 +2668,27 @@ impl EventStore {
                 .or_insert(reset);
         }
 
+        let mut latest_update_by_skill_id = std::collections::HashMap::new();
+        for update in self.list_skill_updates()? {
+            latest_update_by_skill_id
+                .entry(update.skill_id)
+                .or_insert(update);
+        }
+
+        let mut latest_check_by_skill_id = std::collections::HashMap::new();
+        for check in self.list_skill_update_checks()? {
+            latest_check_by_skill_id
+                .entry(check.skill_id)
+                .or_insert(check);
+        }
+
+        let mut latest_failure_by_skill_id = std::collections::HashMap::new();
+        for failure in self.list_skill_update_failures()? {
+            latest_failure_by_skill_id
+                .entry(failure.skill_id)
+                .or_insert(failure);
+        }
+
         let uninstalled_skill_ids = self
             .list_skill_uninstalls()?
             .into_iter()
@@ -2553,40 +2701,90 @@ impl EventStore {
             .map(|installation| {
                 let latest_change = latest_change_by_skill_id.remove(&installation.id);
                 let latest_reset = latest_reset_by_skill_id.remove(&installation.id);
-                let entry_available = installation
-                    .entry_content
+                let latest_update = latest_update_by_skill_id.remove(&installation.id);
+                let latest_check = latest_check_by_skill_id.remove(&installation.id);
+                let latest_failure = latest_failure_by_skill_id.remove(&installation.id);
+                let mut manifest = installation.manifest;
+                let mut installed_from = installation.installed_from;
+                let mut source_identity = installation.source_identity;
+                let mut entry_content = installation.entry_content;
+                let mut entry_sha256 = installation.entry_sha256;
+                let mut updated_at = installation.installed_at;
+                let mut rollback_version = None;
+                let mut rollback_revision = None;
+                if let Some(update) = latest_update.as_ref() {
+                    manifest = update.manifest.clone();
+                    installed_from = update.updated_from.clone();
+                    source_identity = update.source_identity.clone();
+                    entry_content = Some(update.entry_content.clone());
+                    entry_sha256 = Some(update.entry_sha256.clone());
+                    updated_at = update.applied_at;
+                    rollback_version = Some(update.previous_version.clone());
+                    rollback_revision = update.previous_revision.clone();
+                }
+                let entry_available = entry_content
                     .as_ref()
                     .is_some_and(|content| !content.trim().is_empty())
-                    && installation
-                        .entry_sha256
+                    && entry_sha256
                         .as_ref()
                         .is_some_and(|hash| !hash.trim().is_empty());
-                let entry_sha256 = installation.entry_sha256.clone();
-                let mut manifest = installation.manifest;
                 let mut enablement_status = latest_change
                     .as_ref()
                     .map(|change| change.status)
                     .unwrap_or(SkillEnablementStatus::Enabled);
                 let mut last_audit_note = latest_change.as_ref().map(|change| change.note.clone());
-                let mut updated_at = latest_change
-                    .as_ref()
-                    .map(|change| change.changed_at)
-                    .unwrap_or(installation.installed_at);
-                if let Some(reset) = latest_reset {
+                if let Some(change) = latest_change.as_ref() {
+                    updated_at = updated_at.max(change.changed_at);
+                }
+                if let Some(reset) = latest_reset.filter(|reset| {
+                    latest_update
+                        .as_ref()
+                        .is_none_or(|update| reset.reset_at > update.applied_at)
+                }) {
                     manifest.trust_level = SkillTrustLevel::Untrusted;
                     enablement_status = SkillEnablementStatus::Disabled;
                     last_audit_note = Some(reset.note);
                     updated_at = updated_at.max(reset.reset_at);
                 }
 
+                let mut update_state = latest_check
+                    .as_ref()
+                    .map(|check| match check.status {
+                        SkillUpdateCheckStatus::UpdateAvailable => {
+                            SkillUpdateState::UpdateAvailable
+                        }
+                        SkillUpdateCheckStatus::Failed => SkillUpdateState::Failed,
+                        SkillUpdateCheckStatus::Current | SkillUpdateCheckStatus::Updated => {
+                            SkillUpdateState::Current
+                        }
+                    })
+                    .unwrap_or_default();
+                if latest_failure.as_ref().is_some_and(|failure| {
+                    latest_check
+                        .as_ref()
+                        .is_none_or(|check| failure.failed_at >= check.checked_at)
+                        && failure.failed_at >= updated_at
+                }) {
+                    update_state = SkillUpdateState::Failed;
+                }
+
                 Ok(SkillRecord {
                     id: installation.id,
                     manifest,
-                    installed_from: installation.installed_from,
+                    installed_from,
                     installed_at: installation.installed_at,
                     enablement_status,
                     last_audit_note,
                     updated_at,
+                    package_kind: installation.package_kind,
+                    system_protected: installation.system_protected,
+                    source_identity,
+                    update_policy: installation.update_policy,
+                    update_state,
+                    last_update_checked_at: latest_check.map(|check| check.checked_at),
+                    last_update_failure: latest_failure.map(|failure| failure.error),
+                    rollback_version,
+                    rollback_revision,
                     entry_available,
                     entry_sha256,
                 })
@@ -2604,11 +2802,22 @@ impl EventStore {
             .into_iter()
             .find(|record| record.id == skill_id)
             .ok_or_else(|| EventStoreError::NotFound(format!("skill installation {skill_id}")))?;
-        let installation = self
+        let mut installation = self
             .list_skill_installations()?
             .into_iter()
             .find(|installation| installation.id == skill_id)
             .ok_or_else(|| EventStoreError::NotFound(format!("skill installation {skill_id}")))?;
+        if let Some(update) = self
+            .list_skill_updates()?
+            .into_iter()
+            .find(|update| update.skill_id == skill_id)
+        {
+            installation.manifest = update.manifest;
+            installation.installed_from = update.updated_from;
+            installation.source_identity = update.source_identity;
+            installation.entry_content = Some(update.entry_content);
+            installation.entry_sha256 = Some(update.entry_sha256);
+        }
         SkillActivationContext::for_installation(&record, &installation, input_summary)
             .map_err(EventStoreError::InvalidState)
     }

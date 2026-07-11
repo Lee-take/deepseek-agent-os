@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-const expectedVersion = "0.2.3";
+const expectedVersion = "0.3.0";
 const maxSourceFileBytes = 2 * 1024 * 1024;
 const binaryReleaseExtensions = new Set([
   ".appimage",
@@ -47,6 +47,7 @@ const allowedSourceBinaryFiles = new Set([
 const requiredDocs = [
   "README.md",
   "docs/INSTALLATION.md",
+  "docs/RELEASE_NOTES_v0.3.0.md",
   "docs/RELEASE_NOTES_v0.2.3.md",
   "docs/RELEASE_NOTES_v0.2.2.md",
   "docs/RELEASE_NOTES_v0.2.1.md",
@@ -66,6 +67,7 @@ const publicReleaseCopyFiles = [
   "apps/desktop/package.json",
   "docs/INSTALLATION.md",
   "docs/OPEN_SOURCE_RELEASE.md",
+  "docs/RELEASE_NOTES_v0.3.0.md",
   "docs/RELEASE_NOTES_v0.2.3.md",
   "docs/RELEASE_NOTES_v0.2.2.md",
   "docs/RELEASE_NOTES_v0.2.1.md",
@@ -708,7 +710,7 @@ function checkRequiredDocs() {
       "README.md searchable DSAgent aliases",
     ],
     [
-      "Latest release: [DS Agent v0.2.3]",
+      "Latest release: [DS Agent v0.3.0]",
       "README.md latest release link",
     ],
     [
@@ -888,7 +890,7 @@ function checkRequiredDocs() {
   }
 
   for (const phrase of [
-    "The current 0.2.3 preview includes the permission loop",
+    "The current 0.3.0 preview includes the permission loop",
     "Harness architecture v1",
     "runs through a stable Agent OS Kernel plus Workflow Packs",
     "uses permissioned tool boundaries, source-linked evidence, bounded workflow runs, selective context assembly, and token-efficient DeepSeek routing",
@@ -1747,20 +1749,20 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",
     readText("apps/desktop/src-tauri/src/commands.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.2.3"',
-    "app updater current release tag v0.2.3",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.3.0"',
+    "app updater current release tag v0.3.0",
   );
   checkTextIncludesCollapsed(
-    "docs/RELEASE_NOTES_v0.2.3.md",
-    readText("docs/RELEASE_NOTES_v0.2.3.md"),
-    "Bumps the package, desktop, Tauri, Cargo, and updater metadata to `0.2.3` / `v0.2.3` so installed Windows clients can detect this release as newer than `v0.2.2`.",
-    "v0.2.3 release notes updater version bump",
+    "docs/RELEASE_NOTES_v0.3.0.md",
+    readText("docs/RELEASE_NOTES_v0.3.0.md"),
+    "Bumps the package, desktop, Tauri, Cargo, and updater metadata to `0.3.0` / `v0.3.0` so installed Windows clients can detect this release as newer than `v0.2.3`.",
+    "v0.3.0 release notes updater version bump",
   );
   checkTextIncludesCollapsed(
-    "docs/RELEASE_NOTES_v0.2.3.md",
-    readText("docs/RELEASE_NOTES_v0.2.3.md"),
-    "DS Agent v0.2.3 restores a one-click update experience and makes every real approval actionable where it appears.",
-    "v0.2.3 release notes product positioning",
+    "docs/RELEASE_NOTES_v0.3.0.md",
+    readText("docs/RELEASE_NOTES_v0.3.0.md"),
+    "DS Agent v0.3.0 adds an automatic, persistent lifecycle for declarative Skills and Plugins while keeping installation, updates, activation, and removal inside the local DS Agent safety boundary.",
+    "v0.3.0 release notes product positioning",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",
