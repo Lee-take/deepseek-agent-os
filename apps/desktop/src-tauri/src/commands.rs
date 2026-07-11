@@ -165,8 +165,8 @@ const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/dsagent/releases/download/";
 const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.2.2";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.2.2";
+const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.2.3";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.2.3";
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
 const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
@@ -17667,13 +17667,13 @@ mod tests {
     fn app_update_status_keeps_current_formal_release_quiet_from_release_list() {
         let releases = vec![
             GithubRelease {
-                tag_name: "v0.2.2".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.2.2"
+                tag_name: "v0.2.3".to_string(),
+                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.2.3"
                     .to_string(),
                 assets: vec![GithubReleaseAsset {
-                    name: "DS Agent_0.2.2_x64-setup.exe".to_string(),
+                    name: "DS Agent_0.2.3_x64-setup.exe".to_string(),
                     browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.2.2/DS.Agent_0.2.2_x64-setup.exe"
+                        "https://github.com/Lee-take/dsagent/releases/download/v0.2.3/DS.Agent_0.2.3_x64-setup.exe"
                             .to_string(),
                 }],
             },
@@ -17693,8 +17693,8 @@ mod tests {
         let status = update_status_from_releases(releases, app_update_current_version());
 
         assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.2.2");
-        assert_eq!(status.latest_version.as_deref(), Some("0.2.2"));
+        assert_eq!(status.current_version, "v0.2.3");
+        assert_eq!(status.latest_version.as_deref(), Some("0.2.3"));
         assert!(status.asset_name.is_none());
     }
 

@@ -133,10 +133,6 @@ import type {
   WorkPackageImportSummary,
 } from "./types";
 
-const APP_UPDATE_CHECK_TOOL_ID = "app_update.check";
-const APP_UPDATE_DOWNLOAD_TOOL_ID = "app_update.download";
-const APP_UPDATE_INSTALL_TOOL_ID = "app_update.install";
-
 function invokeAgentTool(
   toolId: string,
   input: Record<string, unknown>,
@@ -1046,6 +1042,7 @@ export function App() {
   const [appUpdateError, setAppUpdateError] = useState("");
   const [downloadedAppUpdate, setDownloadedAppUpdate] =
     useState<AppUpdateDownloadResult | null>(null);
+  const appUpdateDownloadKeyRef = useRef<string | null>(null);
   const [deepSeekCacheNotice, setDeepSeekCacheNotice] = useState("");
   const [deepSeekCacheError, setDeepSeekCacheError] = useState("");
   const [deepSeekPricingNotice, setDeepSeekPricingNotice] = useState("");
@@ -1245,9 +1242,7 @@ export function App() {
   const appUpdateBusy = appUpdateDownloadPending || appUpdateInstallPending;
   const appUpdateButtonLabel = appUpdateInstallPending
     ? copy.appUpdate.installing
-    : appUpdateDownloadPending || !downloadedAppUpdateReady
-      ? copy.appUpdate.downloading
-      : copy.appUpdate.install;
+    : copy.appUpdate.install;
   const latestDeepSeekTelemetry = deepSeekTelemetry[0] ?? null;
   const latestDeepSeekTelemetryCacheLabel = latestDeepSeekTelemetry
     ? latestDeepSeekTelemetry.cache_status === "hit"
@@ -1358,18 +1353,10 @@ export function App() {
     void invoke<FoundationState>("get_foundation_state")
       .then(async (foundationState) => {
         setState(foundationState);
-        const invocation = await invokeAgentTool(
-          APP_UPDATE_CHECK_TOOL_ID,
-          {},
-          foundationState.access_mode,
-        );
-        setToolInvocations((current) => upsertToolInvocation(current, invocation));
-        if (invocation.status === "succeeded" && invocation.output) {
-          setAppUpdateStatus(invocation.output as unknown as AppUpdateStatus);
-        } else if (invocation.status === "waiting_for_confirmation") {
-          setAppUpdateNotice(copy.appUpdate.approvalRequired);
-        } else if (invocation.error) {
-          setAppUpdateError(invocation.error);
+        const status = await invoke<AppUpdateStatus>("check_app_update");
+        setAppUpdateStatus(status);
+        if (status.update_available) {
+          void downloadAvailableAppUpdate(status);
         }
       })
       .catch(() => setState(fallbackState));
@@ -2256,54 +2243,57 @@ export function App() {
     }
   };
 
-  const installAvailableAppUpdate = async () => {
-    const installing = downloadedAppUpdateReady && downloadedAppUpdate !== null;
-    setAppUpdateDownloadPending(!installing);
-    setAppUpdateInstallPending(installing);
+  async function downloadAvailableAppUpdate(status: AppUpdateStatus) {
+    if (!status.update_available) {
+      return;
+    }
+    const downloadKey = `${status.latest_version ?? "unknown"}:${status.asset_name ?? "installer"}`;
+    if (appUpdateDownloadKeyRef.current === downloadKey) {
+      return;
+    }
+
+    appUpdateDownloadKeyRef.current = downloadKey;
+    setAppUpdateDownloadPending(true);
     setAppUpdateError("");
     setAppUpdateNotice("");
 
     try {
-      const invocation = await invokeAgentTool(
-        installing ? APP_UPDATE_INSTALL_TOOL_ID : APP_UPDATE_DOWNLOAD_TOOL_ID,
-        installing && downloadedAppUpdate
-          ? { installer_path: downloadedAppUpdate.installer_path }
-          : {},
-        state.access_mode,
-      );
-      setToolInvocations((current) => upsertToolInvocation(current, invocation));
-      await refreshCapabilityState();
-
-      if (invocation.status === "waiting_for_confirmation") {
-        setAppUpdateNotice(copy.appUpdate.approvalRequired);
-        return;
+      const result = await invoke<AppUpdateDownloadResult>("download_app_update");
+      if (
+        (status.latest_version !== null && result.latest_version !== status.latest_version) ||
+        (status.asset_name !== null && result.asset_name !== status.asset_name)
+      ) {
+        throw new Error(copy.appUpdate.downloadFailed);
       }
-      if (invocation.status !== "succeeded" || !invocation.output) {
-        throw new Error(
-          invocation.error ||
-            (installing ? copy.appUpdate.installFailed : copy.appUpdate.downloadFailed),
-        );
-      }
-
-      if (installing) {
-        const result = invocation.output as unknown as AppUpdateInstallResult;
-        if (!result.restart_scheduled) {
-          throw new Error(copy.appUpdate.installFailed);
-        }
-        setAppUpdateNotice(
-          copy.appUpdate.installStarted(downloadedAppUpdate?.latest_version ?? appUpdateVersionLabel),
-        );
-      } else {
-        const result = invocation.output as unknown as AppUpdateDownloadResult;
-        setDownloadedAppUpdate(result);
-        setAppUpdateNotice(copy.appUpdate.downloadReady(result.latest_version));
-      }
+      setDownloadedAppUpdate(result);
+      setAppUpdateNotice(copy.appUpdate.downloadReady(result.latest_version));
     } catch (error) {
-      setAppUpdateError(
-        String(error) || (installing ? copy.appUpdate.installFailed : copy.appUpdate.downloadFailed),
-      );
+      appUpdateDownloadKeyRef.current = null;
+      setAppUpdateError(String(error) || copy.appUpdate.downloadFailed);
     } finally {
       setAppUpdateDownloadPending(false);
+    }
+  }
+
+  const installAvailableAppUpdate = async () => {
+    if (!downloadedAppUpdateReady || downloadedAppUpdate === null) {
+      return;
+    }
+    setAppUpdateInstallPending(true);
+    setAppUpdateError("");
+    setAppUpdateNotice("");
+
+    try {
+      const result = await invoke<AppUpdateInstallResult>("install_app_update", {
+        installerPath: downloadedAppUpdate.installer_path,
+      });
+      if (!result.restart_scheduled) {
+        throw new Error(copy.appUpdate.installFailed);
+      }
+      setAppUpdateNotice(copy.appUpdate.installStarted(downloadedAppUpdate.latest_version));
+    } catch (error) {
+      setAppUpdateError(String(error) || copy.appUpdate.installFailed);
+    } finally {
       setAppUpdateInstallPending(false);
     }
   };
@@ -3392,8 +3382,10 @@ export function App() {
         note: approved ? copy.capabilities.approve : copy.capabilities.reject,
       });
       await refreshCapabilityState();
+      return true;
     } catch (error) {
       setCapabilityError(String(error) || copy.capabilities.resolveFailed);
+      return false;
     } finally {
       setResolutionPending(null);
     }
@@ -4030,6 +4022,46 @@ export function App() {
     }
   };
 
+  const resolveVisibleToolApproval = async (requestId: string, approved: boolean) => {
+    let matchingAction:
+      | { messageId: string; actionIndex: number; action: AgentChatActionProposal }
+      | undefined;
+
+    for (const message of agentMessages) {
+      const actionIndex =
+        message.proposed_actions?.findIndex(
+          (action) => action.permission_request_id === requestId,
+        ) ?? -1;
+      if (actionIndex >= 0 && message.proposed_actions) {
+        matchingAction = {
+          messageId: message.id,
+          actionIndex,
+          action: message.proposed_actions[actionIndex],
+        };
+        break;
+      }
+    }
+
+    if (approved && matchingAction) {
+      await approveAndResumeAgentAction(
+        matchingAction.messageId,
+        matchingAction.actionIndex,
+        matchingAction.action,
+      );
+      return;
+    }
+
+    const resolved = await resolveCapabilityAccess(requestId, approved);
+    if (!resolved || !matchingAction) {
+      return;
+    }
+    await resumeAgentAction(
+      matchingAction.messageId,
+      matchingAction.actionIndex,
+      matchingAction.action,
+    );
+  };
+
   const sendAgentMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (agentComposerAction === "stop") {
@@ -4203,6 +4235,14 @@ export function App() {
   const pendingCapabilityRecords = capabilityRecords.filter(
     (record) => record.effective_status === "pending_approval",
   );
+  useEffect(() => {
+    if (pendingCapabilityRecords.length === 0 || typeof window === "undefined") {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      approvalsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  }, [pendingCapabilityRecords.length]);
   const latestOperationsBriefingRun = operationsBriefingRuns[0];
   const latestRunFailed = latestOperationsBriefingRun?.status === "failed";
   const latestRunReady = latestOperationsBriefingRun?.status === "draft_ready";
@@ -4521,15 +4561,17 @@ export function App() {
                       : copy.appUpdate.update)
                   }
                 >
-                  <button
-                    className="app-update-button"
-                    type="button"
-                    disabled={appUpdateBusy}
-                    onClick={() => void installAvailableAppUpdate()}
-                  >
-                    <Download size={14} aria-hidden="true" />
-                    {appUpdateButtonLabel}
-                  </button>
+                  {downloadedAppUpdateReady ? (
+                    <button
+                      className="app-update-button"
+                      type="button"
+                      disabled={appUpdateBusy}
+                      onClick={() => void installAvailableAppUpdate()}
+                    >
+                      <Download size={14} aria-hidden="true" />
+                      {appUpdateButtonLabel}
+                    </button>
+                  ) : null}
                   <span className={`app-update-version${appUpdateError ? " error" : ""}`}>
                     {appUpdateError || appUpdateVersionLabel}
                   </span>
@@ -6769,6 +6811,10 @@ export function App() {
                       const contract = agentToolContracts.find(
                         (candidate) => candidate.id === invocation.tool_id,
                       );
+                      const approvalRequestId =
+                        invocation.status === "waiting_for_confirmation"
+                          ? invocation.approval_request_id
+                          : null;
                       return (
                         <article className="sidebar-record-row" key={invocation.id}>
                           <div>
@@ -6784,6 +6830,32 @@ export function App() {
                           <span className={`access-status ${invocation.status}`}>
                             {copy.runStatus.toolStatus[invocation.status]}
                           </span>
+                          {approvalRequestId ? (
+                            <div className="approval-actions sidebar-approval-actions">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void resolveVisibleToolApproval(approvalRequestId, true)
+                                }
+                                disabled={resolutionPending !== null || agentActionPending !== null}
+                              >
+                                <Check size={14} aria-hidden="true" />
+                                {resolutionPending === approvalRequestId
+                                  ? copy.capabilities.resolving
+                                  : copy.chatWorkbench.confirmAndRun}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void resolveVisibleToolApproval(approvalRequestId, false)
+                                }
+                                disabled={resolutionPending !== null || agentActionPending !== null}
+                              >
+                                <X size={14} aria-hidden="true" />
+                                {copy.capabilities.reject}
+                              </button>
+                            </div>
+                          ) : null}
                         </article>
                       );
                     })}
@@ -6802,6 +6874,53 @@ export function App() {
                 <strong id="audit-panel-title">{copy.capabilities.title}</strong>
               </div>
               {capabilityError ? <p className="package-error">{capabilityError}</p> : null}
+              {pendingCapabilityRecords.length > 0 ? (
+                <div className="approval-queue" ref={approvalsSectionRef}>
+                  <div className="queue-heading">
+                    <strong>{copy.capabilities.pendingTitle}</strong>
+                    <span>{pendingCapabilityRecords.length}</span>
+                  </div>
+                  <div className="approval-list">
+                    {pendingCapabilityRecords.map((record) => (
+                      <article className="approval-row" key={record.request.id}>
+                        <div>
+                          <strong>{copy.capabilityOptions[record.request.capability]}</strong>
+                          <p>
+                            {copy.riskOptions[record.request.risk_level]} ·{" "}
+                            {copy.accessOptions[record.request.access_mode]}
+                          </p>
+                        </div>
+                        <div className="approval-actions">
+                          <button
+                            type="button"
+                            aria-label={copy.capabilities.approve}
+                            onClick={() =>
+                              void resolveVisibleToolApproval(record.request.id, true)
+                            }
+                            disabled={resolutionPending !== null || capabilityPending !== null}
+                          >
+                            <Check size={14} aria-hidden="true" />
+                            {resolutionPending === record.request.id
+                              ? copy.capabilities.resolving
+                              : copy.chatWorkbench.confirmAndRun}
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={copy.capabilities.reject}
+                            onClick={() =>
+                              void resolveVisibleToolApproval(record.request.id, false)
+                            }
+                            disabled={resolutionPending !== null || capabilityPending !== null}
+                          >
+                            <X size={14} aria-hidden="true" />
+                            {copy.capabilities.reject}
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
               <form className="browser-tool" onSubmit={browseBrowserUrl}>
                 <div className="tool-heading">
                   <Globe2 size={16} aria-hidden="true" />
@@ -7356,52 +7475,6 @@ export function App() {
                     </article>
                   );
                 })}
-              </div>
-
-              <div className="approval-queue" ref={approvalsSectionRef}>
-                <div className="queue-heading">
-                  <strong>{copy.capabilities.pendingTitle}</strong>
-                  <span>{pendingCapabilityRecords.length}</span>
-                </div>
-                {pendingCapabilityRecords.length === 0 ? (
-                  <p className="empty-state">{copy.capabilities.noPending}</p>
-                ) : (
-                  <div className="approval-list">
-                    {pendingCapabilityRecords.map((record) => (
-                      <article className="approval-row" key={record.request.id}>
-                        <div>
-                          <strong>{copy.capabilityOptions[record.request.capability]}</strong>
-                          <p>
-                            {copy.riskOptions[record.request.risk_level]} ·{" "}
-                            {copy.accessOptions[record.request.access_mode]}
-                          </p>
-                        </div>
-                        <div className="approval-actions">
-                          <button
-                            type="button"
-                            aria-label={copy.capabilities.approve}
-                            onClick={() => void resolveCapabilityAccess(record.request.id, true)}
-                            disabled={resolutionPending !== null || capabilityPending !== null}
-                          >
-                            <Check size={14} aria-hidden="true" />
-                            {resolutionPending === record.request.id
-                              ? copy.capabilities.resolving
-                              : copy.capabilities.approve}
-                          </button>
-                          <button
-                            type="button"
-                            aria-label={copy.capabilities.reject}
-                            onClick={() => void resolveCapabilityAccess(record.request.id, false)}
-                            disabled={resolutionPending !== null || capabilityPending !== null}
-                          >
-                            <X size={14} aria-hidden="true" />
-                            {copy.capabilities.reject}
-                          </button>
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                )}
               </div>
 
               {auditError ? <p className="package-error">{auditError}</p> : null}

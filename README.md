@@ -3,7 +3,7 @@
 Local-first DeepSeek AI work platform for background tasks, permissioned tools,
 auditable evidence, and verifiable local execution.
 
-Latest release: [DS Agent v0.2.2](https://github.com/Lee-take/dsagent/releases/tag/v0.2.2)
+Latest release: [DS Agent v0.2.3](https://github.com/Lee-take/dsagent/releases/tag/v0.2.3)
 
 Search aliases: DS Agent, DSAgent, dsagent, DeepSeek Agent OS.
 
@@ -204,9 +204,9 @@ engineering inspiration, with respect for their licenses and maintainers.
 本仓库不应复制任何私有、泄露或未授权代码。公开开源项目仅作为学习材料和工程参考，
 并尊重原项目许可证和维护者权益。
 
-## 0.2.2 Status / 0.2.2 状态
+## 0.2.3 Status / 0.2.3 状态
 
-Version `0.2.2` is the current Windows-first formal release. It turns DS Agent
+Version `0.2.3` is the current Windows-first formal release. It turns DS Agent
 from a blocking chat tool into the foundation of a local AI work platform:
 DeepSeek handles open-ended understanding and planning, while DS Agent owns
 background execution, tool contracts, permissions, sandbox boundaries, state,
@@ -225,7 +225,7 @@ guidance for the active run, or an explicit cancellation request. Run state,
 steps, artifacts, guidance, cancellation, and terminal outcomes survive the
 chat turn that created them.
 
-`v0.2.2` includes the first restart-safe slice: after an app or process restart,
+`v0.2.3` includes the first restart-safe slice: after an app or process restart,
 an expired run can be reclaimed, durable guidance or cancellation is honored,
 and an already verified write is not executed twice.
 
@@ -252,13 +252,18 @@ skill and plugin names, expands a selected name to its description, and leaves
 capability selection to DeepSeek. DS Agent continues to validate trust,
 verified entry content, permissions, resources, and execution evidence locally.
 
+App updates are downloaded and validated silently. The install button appears
+only when the installer is ready, and clicking it installs without a second
+permission step. Real Agent approvals remain visible and actionable on the
+right-side pending card.
+
 The package version, Tauri version, Cargo version, installer naming, and
-updater current-release tag are bumped together to `0.2.2` / `v0.2.2`. This
+updater current-release tag are bumped together to `0.2.3` / `v0.2.3`. This
 matters for desktop upgrades: installed Windows clients compare against the
 GitHub release tag and installer asset, so a new release must use a new
-public tag instead of reusing `v0.2.1`.
+public tag instead of reusing `v0.2.2`.
 
-`0.2.2` 是当前 Windows 优先正式发布版本。这一版把 DS Agent 从“单次阻塞聊天工具”推
+`0.2.3` 是当前 Windows 优先正式发布版本。这一版把 DS Agent 从“单次阻塞聊天工具”推
 进为本地 AI 工作平台的地基：DeepSeek 负责开放式理解和规划，DS Agent 负责后台执行、
 工具契约、权限、沙箱边界、状态、证据、审计、验证和恢复。
 
@@ -271,7 +276,7 @@ Windows 预览版持续通过本地 release gates 后推进。
 务、追加给当前 run 的持久化 guidance，或取消当前任务。运行状态、步骤、产物、追加指
 令、取消请求和最终结果不再依附于发起任务的那一次聊天回合。
 
-`v0.2.2` 包含第一段重启安全链路：应用或进程重启后，过期任务可以重新领取，持久化
+`v0.2.3` 包含第一段重启安全链路：应用或进程重启后，过期任务可以重新领取，持久化
 guidance 或取消请求会被处理，已经验证成功的写入不会重复执行。
 
 通用工具 runtime 为文件、Office、浏览器、网络、Computer Use、应用更新、工作流和受
@@ -289,24 +294,27 @@ fail-closed 原则阻断。
 名称才显示简介；DeepSeek 根据任务选择能力，DS Agent 继续负责本地信任、入口、权限、
 资源和执行证据校验。
 
+应用更新会在后台自动下载并校验，准备完成后才显示“安装更新”；点击即安装，不再要求
+第二次审批。真正需要审批的 Agent 操作会在右侧“待批准”卡片上直接显示操作按钮。
+
 这次也把 package、Tauri、Cargo、安装包命名和 updater 当前 release tag 一起升级到
-`0.2.2` / `v0.2.2`。这对桌面端自动升级很关键：已安装 Windows 客户端会对比 GitHub
-release tag 和安装包资产，所以补丁发布必须使用新的公开 tag，不能继续沿用 `v0.2.1`。
+`0.2.3` / `v0.2.3`。这对桌面端自动升级很关键：已安装 Windows 客户端会对比 GitHub
+release tag 和安装包资产，所以补丁发布必须使用新的公开 tag，不能继续沿用 `v0.2.2`。
 
 License: Apache-2.0.
 
-The public `v0.0.1` through `v0.2.1` releases remain unchanged. The `v0.2.2`
+The public `v0.0.1` through `v0.2.2` releases remain unchanged. The `v0.2.3`
 release is the current Windows installer line for colleague testing.
 The installer is unsigned, so Windows may show an unknown-publisher warning,
 but the NSIS package is built with the Microsoft WebView2 bootstrapper embedded
 and run silently so ordinary Windows users do not need a developer toolchain.
 
-`v0.2.2` focuses on verifiable Windows Agent work: install DS Agent, connect
+`v0.2.3` focuses on verifiable Windows Agent work: install DS Agent, connect
 DeepSeek through a local environment variable, choose a workspace, keep tasks
 moving in the background, and let a permissioned runtime execute and verify
 local work with evidence.
 
-`v0.2.2` 的重点是可验证的 Windows Agent 工作：安装 DS Agent，通过本地环境变量连接
+`v0.2.3` 的重点是可验证的 Windows Agent 工作：安装 DS Agent，通过本地环境变量连接
 DeepSeek，选择一个本地工作目录，让任务在后台推进，并由权限化 runtime 执行、留证和
 验证本地工作。
 
@@ -395,7 +403,7 @@ The current codebase is intended to provide these basic functions:
 Current limits are intentional: real mailbox connectors, real cloud-drive
 connectors, automatic local bridge-service management, hosted sync, broad
 marketplace-style skill execution, stronger third-party sandboxing, and
-polished signed installers are not complete in `0.2.2`.
+polished signed installers are not complete in `0.2.3`.
 
 ### 中文
 
@@ -431,7 +439,7 @@ polished signed installers are not complete in `0.2.2`.
 - Windows NSIS 安装包构建路径，便于本地验证和 RC 分发，并内置 Microsoft WebView2
   bootstrapper。
 
-当前限制也要说清楚：`0.2.2` 还没有完成真实邮箱连接器、真实云盘连接器、自动安装或管理本地桥接服务、
+当前限制也要说清楚：`0.2.3` 还没有完成真实邮箱连接器、真实云盘连接器、自动安装或管理本地桥接服务、
 云同步、公共 skill marketplace 发现与签名分发、任意第三方 native/script 代码的强进程隔离和正式签名
 安装包。这一版先把后台 run、通用工具 runtime、权限沙箱、Computer Use、可信声明式 skill 和可验证
 执行地基打牢。
@@ -440,6 +448,7 @@ Read first:
 
 - `docs/INSTALLATION.md`
 - `docs/OPEN_SOURCE_RELEASE.md`
+- `docs/RELEASE_NOTES_v0.2.3.md`
 - `docs/RELEASE_NOTES_v0.2.2.md`
 - `docs/RELEASE_NOTES_v0.2.1.md`
 - `docs/RELEASE_NOTES_v0.2.0.md`
@@ -572,7 +581,7 @@ npx pnpm@9.15.9 test:windows-installed-ui -- --workflow
 
 Windows builds automatically merge `apps/desktop/src-tauri/tauri.windows.conf.json`
 and produce an NSIS installer under the configured Cargo target directory, for
-example `release/bundle/nsis/DS Agent_0.2.2_x64-setup.exe`. The Windows config
+example `release/bundle/nsis/DS Agent_0.2.3_x64-setup.exe`. The Windows config
 embeds the Microsoft WebView2 bootstrapper and runs it silently during install
 when the target machine needs the WebView2 runtime.
 
@@ -634,7 +643,7 @@ the composer available and enqueue the next Agent run instead of blocking the
 whole workspace. Completed or partially completed results can include one
 short, task-grounded next-better suggestion.
 
-The current 0.2.2 preview includes the permission loop for built-in local tools,
+The current 0.2.3 preview includes the permission loop for built-in local tools,
 durable background Agent runs, the generic tool runtime, resource coordination,
 and trusted declarative skill execution.
 Built-in local tools cover file, network, browser, email approval records,
