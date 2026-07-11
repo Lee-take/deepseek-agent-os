@@ -47,3 +47,4 @@ apps/desktop/src-tauri/.tauri/
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/generated/
 _reference_repos/
+.codegraph/

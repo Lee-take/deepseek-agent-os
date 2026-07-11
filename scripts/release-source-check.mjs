@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-const expectedVersion = "0.4.0";
+const expectedVersion = "0.4.1";
 const maxSourceFileBytes = 2 * 1024 * 1024;
 const binaryReleaseExtensions = new Set([
   ".appimage",
@@ -47,6 +47,7 @@ const allowedSourceBinaryFiles = new Set([
 const requiredDocs = [
   "README.md",
   "docs/INSTALLATION.md",
+  "docs/RELEASE_NOTES_v0.4.1.md",
   "docs/RELEASE_NOTES_v0.4.0.md",
   "docs/RELEASE_NOTES_v0.3.0.md",
   "docs/RELEASE_NOTES_v0.2.3.md",
@@ -68,6 +69,7 @@ const publicReleaseCopyFiles = [
   "apps/desktop/package.json",
   "docs/INSTALLATION.md",
   "docs/OPEN_SOURCE_RELEASE.md",
+  "docs/RELEASE_NOTES_v0.4.1.md",
   "docs/RELEASE_NOTES_v0.4.0.md",
   "docs/RELEASE_NOTES_v0.3.0.md",
   "docs/RELEASE_NOTES_v0.2.3.md",
@@ -712,7 +714,7 @@ function checkRequiredDocs() {
       "README.md searchable DSAgent aliases",
     ],
     [
-      "Latest release: [DS Agent v0.4.0]",
+      "Latest release: [DS Agent v0.4.1]",
       "README.md latest release link",
     ],
     [
@@ -892,7 +894,7 @@ function checkRequiredDocs() {
   }
 
   for (const phrase of [
-    "The current 0.4.0 preview includes the permission loop",
+    "The current 0.4.1 preview includes the permission loop",
     "Harness architecture v1",
     "runs through a stable Agent OS Kernel plus Workflow Packs",
     "uses permissioned tool boundaries, source-linked evidence, bounded workflow runs, selective context assembly, and token-efficient DeepSeek routing",
@@ -1751,20 +1753,20 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",
     readText("apps/desktop/src-tauri/src/commands.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.4.0"',
-    "app updater current release tag v0.4.0",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.4.1"',
+    "app updater current release tag v0.4.1",
   );
   checkTextIncludesCollapsed(
-    "docs/RELEASE_NOTES_v0.4.0.md",
-    readText("docs/RELEASE_NOTES_v0.4.0.md"),
-    "Bumps the package, desktop, Tauri, Cargo, and updater metadata to `0.4.0` / `v0.4.0` so installed Windows clients can detect this release as newer than `v0.3.0`.",
-    "v0.4.0 release notes updater version bump",
+    "docs/RELEASE_NOTES_v0.4.1.md",
+    readText("docs/RELEASE_NOTES_v0.4.1.md"),
+    "Bumps the package, desktop, Tauri, Cargo, and updater metadata to `0.4.1` / `v0.4.1` so installed Windows clients can detect this release as newer than `v0.4.0`.",
+    "v0.4.1 release notes updater version bump",
   );
   checkTextIncludesCollapsed(
-    "docs/RELEASE_NOTES_v0.4.0.md",
-    readText("docs/RELEASE_NOTES_v0.4.0.md"),
-    "DS Agent v0.4.0 adds native Subagent parallel work with bounded fan-out, isolated child execution, and one parent synthesis while keeping the ordinary chat composer usable.",
-    "v0.4.0 release notes product positioning",
+    "docs/RELEASE_NOTES_v0.4.1.md",
+    readText("docs/RELEASE_NOTES_v0.4.1.md"),
+    "This patch removes the tracked `.codegraph` directory marker from the public source tree.",
+    "v0.4.1 release notes repository cleanliness positioning",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/commands.rs",

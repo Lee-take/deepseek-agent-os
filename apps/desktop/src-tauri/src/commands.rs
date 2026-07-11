@@ -170,8 +170,8 @@ const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/dsagent/releases/download/";
 const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.4.0";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.4.0";
+const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.4.1";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.4.1";
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
 const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
@@ -18739,7 +18739,7 @@ mod tests {
         let status = update_status_from_releases(releases, app_update_current_version());
 
         assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.4.0");
+        assert_eq!(status.current_version, "v0.4.1");
         assert_eq!(status.latest_version.as_deref(), Some("0.3.0"));
         assert!(status.asset_name.is_none());
     }
