@@ -7201,7 +7201,13 @@ export function App() {
                             {record.worker_id
                               ? ` / ${copy.runStatus.workerLabel(record.worker_id)}`
                               : ""}
+                            {record.recovery_count > 0
+                              ? ` / ${copy.runStatus.recoveryLabel(record.recovery_count)}`
+                              : ""}
                           </small>
+                          {record.recovery_reason && record.recovery_reason !== record.status_reason ? (
+                            <small>{record.recovery_reason}</small>
+                          ) : null}
                           {record.status_reason ? <small>{record.status_reason}</small> : null}
                         </div>
                         <span className={`access-status ${record.status}`}>

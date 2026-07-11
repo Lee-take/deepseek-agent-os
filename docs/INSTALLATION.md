@@ -9,7 +9,7 @@ project does not depend on the maintainer's local directories.
 The Windows build produces a normal NSIS setup executable:
 
 ```text
-DS Agent_0.2.0_x64-setup.exe
+DS Agent_0.2.1_x64-setup.exe
 ```
 
 The latest `v0.2.x` release attaches this Windows installer for colleague testing. It

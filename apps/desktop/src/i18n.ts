@@ -344,6 +344,7 @@ type TranslationSet = {
     runStepsLabel: (count: number) => string;
     runArtifactsLabel: (count: number) => string;
     workerLabel: (worker: string) => string;
+    recoveryLabel: (count: number) => string;
     agentRunStatus: Record<AgentRunStatus, string>;
     toolStatus: Record<ToolExecutionStatus, string>;
     steps: {
@@ -1349,6 +1350,7 @@ export const translations: Record<Language, TranslationSet> = {
       runStepsLabel: (count) => `${count} 个步骤`,
       runArtifactsLabel: (count) => `${count} 个产物`,
       workerLabel: (worker) => `Worker：${worker}`,
+      recoveryLabel: (count) => `已恢复 ${count} 次`,
       agentRunStatus: {
         queued: "排队中",
         running: "执行中",
@@ -2482,6 +2484,7 @@ export const translations: Record<Language, TranslationSet> = {
       runStepsLabel: (count: number) => `${count} steps`,
       runArtifactsLabel: (count: number) => `${count} artifacts`,
       workerLabel: (worker: string) => `Worker: ${worker}`,
+      recoveryLabel: (count: number) => `Recovered ${count} time${count === 1 ? "" : "s"}`,
       agentRunStatus: {
         queued: "Queued",
         running: "Running",

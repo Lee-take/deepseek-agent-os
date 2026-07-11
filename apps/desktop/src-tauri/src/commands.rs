@@ -165,8 +165,8 @@ const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/dsagent/releases/download/";
 const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.2.0";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.2.0";
+const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.2.1";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.2.1";
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
 const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
@@ -14515,8 +14515,9 @@ mod tests {
         ComputerControlClient, ComputerControlExecution, ComputerScreenshot,
         ComputerScreenshotClient, EvidenceFolderClient, EvidenceFolderFile, FileContent,
         FileContentClient, FileWriteClient, FileWriteResult, LocalEvidenceFolderClient,
-        LocalFileContentClient, LocalFileSystemMutationClient, NetworkSearchClient,
-        NetworkSearchResult, NetworkSearchResultItem, TerminalCommandOutput, TerminalReadClient,
+        LocalFileContentClient, LocalFileSystemMutationClient, LocalWorkspaceFileWriteClient,
+        NetworkSearchClient, NetworkSearchResult, NetworkSearchResultItem, TerminalCommandOutput,
+        TerminalReadClient,
     };
     use crate::kernel::deepseek::{
         DeepSeekChatCacheStatus, DeepSeekChatCompletionRequest, DeepSeekChatCompletionResponse,
@@ -14569,7 +14570,7 @@ mod tests {
     #[test]
     fn app_update_version_compare_accepts_newer_release_tags() {
         assert!(is_newer_version("v0.1.2", "0.1.1"));
-        assert!(is_newer_version("0.2.0", "0.1.9"));
+        assert!(is_newer_version("0.2.1", "0.1.9"));
         assert!(is_newer_version("v0.1.0-rc.3", "v0.1.0-rc.1"));
         assert!(is_newer_version("v0.1.0", "v0.1.0-rc.3"));
         assert!(!is_newer_version("v0.1.0-rc.3", "v0.1.0"));
@@ -14578,6 +14579,11 @@ mod tests {
     }
 
     struct FakeAgentToolExecutor {
+        calls: Cell<u32>,
+    }
+
+    struct CountingWorkspaceFileWriteClient {
+        inner: LocalWorkspaceFileWriteClient,
         calls: Cell<u32>,
     }
 
@@ -14768,6 +14774,13 @@ mod tests {
                 }),
                 tool_id => Err(format!("fake executor does not support {tool_id}")),
             }
+        }
+    }
+
+    impl FileWriteClient for CountingWorkspaceFileWriteClient {
+        fn write_file(&self, path: &str, content: &str) -> Result<FileWriteResult, String> {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.write_file(path, content)
         }
     }
 
@@ -17050,6 +17063,257 @@ mod tests {
     }
 
     #[test]
+    fn completed_tool_run_reclaims_after_restart_without_duplicate_write() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store_path = temp_dir.path().join("restart-safe-agent-run.jsonl");
+        let workspace_dir = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("workspace creates");
+        let store = Mutex::new(EventStore::open(&store_path).expect("disk store opens"));
+        let run = AgentRunStart::queued(
+            "conversation-restart-safe".to_string(),
+            "Complete one verified file write across a desktop restart.".to_string(),
+            0,
+        )
+        .expect("run is valid");
+        store
+            .lock()
+            .expect("store lock")
+            .append_agent_run_start(&run)
+            .expect("run appends");
+        store
+            .lock()
+            .expect("store lock")
+            .claim_agent_run(run.id, "worker-before-restart".to_string(), 1)
+            .expect("run claim succeeds");
+        let request = ToolExecutionRequest {
+            tool_id: FILE_WRITE_TOOL_ID.to_string(),
+            input: json!({
+                "path": "recovery-proof.txt",
+                "summary": "Persist one restart-safe verified file write.",
+                "content": "one durable write"
+            }),
+            access_mode: AccessMode::FullAccess,
+            run_id: Some(run.id),
+        };
+        let authorized = {
+            let store = store.lock().expect("store lock");
+            match authorize_agent_tool_execution(&store, request.clone()).expect("tool authorizes")
+            {
+                AgentToolAuthorization::Ready(authorized) => authorized,
+                AgentToolAuthorization::Finished(_) => panic!("first tool execution must run"),
+            }
+        };
+        let file_client = CountingWorkspaceFileWriteClient {
+            inner: LocalWorkspaceFileWriteClient::new(workspace_dir.clone(), 1024),
+            calls: Cell::new(0),
+        };
+        let executor = FileWriteAgentToolExecutor {
+            client: &file_client,
+        };
+        let (invocation, heartbeat) = run_with_agent_run_lease_heartbeat(
+            &store,
+            run.id,
+            "worker-before-restart",
+            1,
+            StdDuration::from_millis(5),
+            || {
+                std::thread::sleep(StdDuration::from_millis(20));
+                let invocation = run_authorized_agent_tool_execution(authorized, &executor);
+                record_completed_agent_tool_execution(
+                    &store.lock().expect("store lock"),
+                    &invocation,
+                )
+                .expect("completed tool execution persists");
+                invocation
+            },
+        );
+        heartbeat.expect("long-running tool renews its lease");
+        assert_eq!(file_client.calls.get(), 1);
+        assert_eq!(invocation.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(workspace_dir.join("recovery-proof.txt"))
+                .expect("real tool output is readable"),
+            "one durable write"
+        );
+
+        let guidance = AgentRunQueuedGuidance::new(
+            run.id,
+            "After restart, finish with the verified file evidence.".to_string(),
+        )
+        .expect("guidance is valid");
+        store
+            .lock()
+            .expect("store lock")
+            .append_agent_run_queued_guidance(&guidance)
+            .expect("guidance persists before restart");
+        let lease_expires_at = store
+            .lock()
+            .expect("store lock")
+            .list_agent_run_records()
+            .expect("runs load")
+            .into_iter()
+            .find(|record| record.id == run.id)
+            .and_then(|record| record.lease_expires_at)
+            .expect("renewed lease exists");
+        drop(store);
+
+        let reopened = EventStore::open(&store_path).expect("store reopens after restart");
+        let sweep = reopened
+            .recover_expired_agent_runs(lease_expires_at + Duration::seconds(1))
+            .expect("expired worker recovers");
+        assert_eq!(sweep.recovered, 1);
+        let store = Mutex::new(reopened);
+        let transport = SequencedDeepSeekTransport::new(vec![
+            serde_json::json!({
+                "protocol_version": "ds-agent-envelope-v1",
+                "reply_to_user": "Reusing the verified write before finishing.",
+                "agent_actions": [{
+                    "action_type": "file_write",
+                    "title": "Persist restart-safe proof",
+                    "reason": "Persist one restart-safe verified file write.",
+                    "risk": "medium",
+                    "requires_confirmation": false,
+                    "target": "recovery-proof.txt",
+                    "content": "one durable write"
+                }],
+                "missing_prerequisites": []
+            })
+            .to_string(),
+            "Recovered run finished from verified durable tool evidence.".to_string(),
+        ]);
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let replay_file_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+        let outcome = run_next_queued_agent_chat_with_clients_and_api_keys(
+            &store,
+            &transport,
+            &cache,
+            &["test-secret".to_string()],
+            "worker-after-restart".to_string(),
+            ModelRoute::Flash,
+            ThinkingLevel::Fast,
+            AccessMode::FullAccess,
+            AgentChatRuntimeContext::default(),
+            None,
+            &file_client,
+            &replay_file_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("recovered worker execution succeeds")
+        .expect("recovered run is reclaimed");
+        assert_eq!(replay_file_client.recorded_calls().len(), 0);
+        assert_eq!(
+            outcome.record.worker_id.as_deref(),
+            Some("worker-after-restart")
+        );
+        assert_eq!(
+            outcome.response.proposed_actions[0].execution_state,
+            "succeeded"
+        );
+        assert!(transport.recorded_requests()[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains(&guidance.guidance)));
+
+        let store = store.lock().expect("store lock");
+        let final_record = store
+            .list_agent_run_records()
+            .expect("final run loads")
+            .into_iter()
+            .find(|record| record.id == run.id)
+            .expect("final run exists");
+        assert_eq!(final_record.status, AgentRunStatus::Completed);
+        assert_eq!(final_record.recovery_count, 1);
+        assert!(final_record.queued_guidance[0].applied_at.is_some());
+        assert!(store
+            .list_active_agent_run_resource_claims()
+            .expect("resource claims load")
+            .is_empty());
+        assert_eq!(
+            store
+                .list_tool_invocations()
+                .expect("tool invocations load")
+                .into_iter()
+                .filter(|record| {
+                    record.run_id == Some(run.id)
+                        && record.tool_id == FILE_WRITE_TOOL_ID
+                        && record.status == ToolExecutionStatus::Succeeded
+                })
+                .count(),
+            1
+        );
+        assert!(store
+            .list_capability_invocations()
+            .expect("capability audit loads")
+            .iter()
+            .any(|audit| audit.id == invocation.id));
+    }
+
+    #[test]
+    fn cancel_requested_while_offline_finishes_once_after_restart() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store_path = temp_dir.path().join("cancel-after-restart.jsonl");
+        let store = EventStore::open(&store_path).expect("disk store opens");
+        let run = AgentRunStart::queued(
+            "conversation-cancel-after-restart".to_string(),
+            "Stop this durable run while its worker is offline.".to_string(),
+            0,
+        )
+        .expect("run is valid");
+        store.append_agent_run_start(&run).expect("run appends");
+        let claimed = store
+            .claim_agent_run(run.id, "worker-before-restart".to_string(), 1)
+            .expect("run claim succeeds");
+        let guidance = AgentRunQueuedGuidance::new(
+            run.id,
+            "This guidance must not run after cancellation.".to_string(),
+        )
+        .expect("guidance is valid");
+        store
+            .append_agent_run_queued_guidance(&guidance)
+            .expect("guidance persists");
+        store
+            .append_agent_run_cancel_request(
+                &AgentRunCancelRequest::new(
+                    run.id,
+                    "User cancelled while the app was restarting.".to_string(),
+                )
+                .expect("cancel request is valid"),
+            )
+            .expect("cancel request persists");
+        drop(store);
+
+        let reopened = EventStore::open(&store_path).expect("store reopens after restart");
+        let sweep = reopened
+            .recover_expired_agent_runs(
+                claimed.lease_expires_at.expect("lease exists") + Duration::seconds(1),
+            )
+            .expect("offline cancellation recovers");
+        assert_eq!(sweep.cancelled, 1);
+        let second_sweep = reopened
+            .recover_expired_agent_runs(Utc::now() + Duration::minutes(1))
+            .expect("terminal run is not finished twice");
+        assert_eq!(second_sweep.cancelled, 0);
+        let record = reopened
+            .list_agent_run_records()
+            .expect("runs load")
+            .into_iter()
+            .find(|record| record.id == run.id)
+            .expect("cancelled run exists");
+        assert_eq!(record.status, AgentRunStatus::Cancelled);
+        assert!(record.cancel_requested);
+        assert!(record.queued_guidance[0].applied_at.is_none());
+        assert_eq!(record.recovery_count, 0);
+        assert!(reopened
+            .list_active_agent_run_resource_claims()
+            .expect("resource claims load")
+            .is_empty());
+    }
+
+    #[test]
     fn agent_chat_normalizes_app_update_tools_through_local_policy() {
         let check = normalize_agent_action_proposal(
             AgentChatActionProposal {
@@ -17250,13 +17514,13 @@ mod tests {
     fn app_update_status_keeps_current_formal_release_quiet_from_release_list() {
         let releases = vec![
             GithubRelease {
-                tag_name: "v0.2.0".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.2.0"
+                tag_name: "v0.2.1".to_string(),
+                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.2.1"
                     .to_string(),
                 assets: vec![GithubReleaseAsset {
-                    name: "DS Agent_0.2.0_x64-setup.exe".to_string(),
+                    name: "DS Agent_0.2.1_x64-setup.exe".to_string(),
                     browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.2.0/DS.Agent_0.2.0_x64-setup.exe"
+                        "https://github.com/Lee-take/dsagent/releases/download/v0.2.1/DS.Agent_0.2.1_x64-setup.exe"
                             .to_string(),
                 }],
             },
@@ -17276,8 +17540,8 @@ mod tests {
         let status = update_status_from_releases(releases, app_update_current_version());
 
         assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.2.0");
-        assert_eq!(status.latest_version.as_deref(), Some("0.2.0"));
+        assert_eq!(status.current_version, "v0.2.1");
+        assert_eq!(status.latest_version.as_deref(), Some("0.2.1"));
         assert!(status.asset_name.is_none());
     }
 
