@@ -176,7 +176,7 @@ test("Memory Studio exposes background maintenance audit with filtering and sort
   assert.match(appSource, /invoke<MemoryBackgroundMaintenanceSummary>\(\s*"run_memory_background_maintenance"/);
   assert.match(
     appSource,
-    /await Promise\.all\(\[refreshCapabilityState\(\), runMemoryBackgroundMaintenance\(\)\]\)/,
+    /await Promise\.all\(\[\s*refreshCapabilityState\(\),\s*refreshSkillRecords\(\),\s*runMemoryBackgroundMaintenance\(\),\s*\]\)/,
   );
   assert.match(
     appSource,

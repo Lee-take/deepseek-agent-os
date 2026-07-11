@@ -21,6 +21,22 @@ assert.match(app, /uninstallLocalSkill\(/);
 assert.match(app, /copy\.skills\.scenarioTemplates/);
 assert.match(app, /run_skill_update_sweep/);
 
+const skillRefreshStart = app.indexOf("const refreshSkillRecords");
+const skillRefreshEnd = app.indexOf("const refreshAgentRunRecords", skillRefreshStart);
+const skillRefresh = app.slice(skillRefreshStart, skillRefreshEnd);
+assert.match(skillRefresh, /invoke<SkillRecord\[]>\("list_skill_records"\)/);
+assert.match(skillRefresh, /setSkillRecords\(records\)/);
+
+const durableWorkerStart = app.indexOf("const runNextDurableAgentTask");
+const durableWorkerEnd = app.indexOf("const sendAgentPrompt", durableWorkerStart);
+const durableWorker = app.slice(durableWorkerStart, durableWorkerEnd);
+assert.match(durableWorker, /refreshSkillRecords\(\)/);
+
+const sendAgentPromptStart = app.indexOf("const sendAgentPrompt");
+const sendAgentPromptEnd = app.indexOf("const resumeAgentAction", sendAgentPromptStart);
+const sendAgentPrompt = app.slice(sendAgentPromptStart, sendAgentPromptEnd);
+assert.match(sendAgentPrompt, /refreshSkillRecords\(\)/);
+
 assert.match(i18n, /DS Agent 会在任务需要时自动调用已安装的技能与插件。/);
 assert.match(i18n, /DS Agent automatically uses installed skills and plugins when a task needs them\./);
 

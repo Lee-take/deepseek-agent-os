@@ -3,6 +3,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const AGENT_RUN_GUIDANCE_MAX_CHARS: usize = 4_000;
+pub const AGENT_RUN_MAX_PARALLEL_SUBAGENTS: usize = 3;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRunRole {
+    #[default]
+    Parent,
+    Subagent,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +33,12 @@ pub struct AgentRunStart {
     pub conversation_id: String,
     pub prompt: String,
     pub attachment_count: usize,
+    #[serde(default)]
+    pub role: AgentRunRole,
+    #[serde(default)]
+    pub parent_run_id: Option<Uuid>,
+    #[serde(default)]
+    pub subtask_key: Option<String>,
     #[serde(default = "default_agent_run_initial_status")]
     pub initial_status: AgentRunStatus,
     pub started_at: DateTime<Utc>,
@@ -187,6 +202,9 @@ pub struct AgentRunRecord {
     #[serde(default)]
     pub execution_context_recorded_at: Option<DateTime<Utc>>,
     pub attachment_count: usize,
+    pub role: AgentRunRole,
+    pub parent_run_id: Option<Uuid>,
+    pub subtask_key: Option<String>,
     pub status: AgentRunStatus,
     pub worker_id: Option<String>,
     pub lease_expires_at: Option<DateTime<Utc>>,
@@ -229,6 +247,9 @@ impl AgentRunStart {
             conversation_id,
             prompt,
             attachment_count,
+            role: AgentRunRole::Parent,
+            parent_run_id: None,
+            subtask_key: None,
             initial_status: AgentRunStatus::Running,
             started_at: Utc::now(),
         })
@@ -241,6 +262,22 @@ impl AgentRunStart {
     ) -> Result<Self, String> {
         let mut start = Self::new(conversation_id, prompt, attachment_count)?;
         start.initial_status = AgentRunStatus::Queued;
+        Ok(start)
+    }
+
+    pub fn queued_subagent(
+        parent_run_id: Uuid,
+        conversation_id: String,
+        subtask_key: String,
+        prompt: String,
+    ) -> Result<Self, String> {
+        if parent_run_id.is_nil() {
+            return Err("subagent parent run id is required".to_string());
+        }
+        let mut start = Self::queued(conversation_id, prompt, 0)?;
+        start.role = AgentRunRole::Subagent;
+        start.parent_run_id = Some(parent_run_id);
+        start.subtask_key = Some(required_text(subtask_key, "subagent subtask key")?);
         Ok(start)
     }
 }
@@ -356,12 +393,13 @@ impl AgentRunTransition {
     ) -> Result<Self, String> {
         if !matches!(
             status,
-            AgentRunStatus::Running
+            AgentRunStatus::Queued
+                | AgentRunStatus::Running
                 | AgentRunStatus::WaitingForPrerequisite
                 | AgentRunStatus::WaitingForConfirmation
                 | AgentRunStatus::Blocked
         ) {
-            return Err("agent run transition status must be non-terminal".to_string());
+            return Err("agent run transition status must be queued or non-terminal".to_string());
         }
         Ok(Self {
             id: Uuid::new_v4(),

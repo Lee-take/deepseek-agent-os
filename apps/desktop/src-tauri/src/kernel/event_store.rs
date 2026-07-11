@@ -11,9 +11,9 @@ use crate::kernel::agent_context::AgentContextReceipt;
 use crate::kernel::agent_run::{
     AgentRunArtifactRecord, AgentRunCancelRequest, AgentRunClaim, AgentRunContinuationQueued,
     AgentRunExecutionContext, AgentRunFinish, AgentRunGuidanceApplied, AgentRunQueuedGuidance,
-    AgentRunRecord, AgentRunRecovery, AgentRunRecoverySweep, AgentRunResourceAccess,
+    AgentRunRecord, AgentRunRecovery, AgentRunRecoverySweep, AgentRunResourceAccess, AgentRunRole,
     AgentRunResourceClaim, AgentRunResourceRelease, AgentRunStart, AgentRunStatus,
-    AgentRunStepRecord, AgentRunStepStatus, AgentRunTransition,
+    AgentRunStepRecord, AgentRunStepStatus, AgentRunTransition, AGENT_RUN_MAX_PARALLEL_SUBAGENTS,
 };
 use crate::kernel::capability::CapabilityInvocation;
 use crate::kernel::deepseek::DeepSeekChatTelemetry;
@@ -214,17 +214,147 @@ impl EventStore {
     }
 
     pub fn append_agent_run_start(&self, start: &AgentRunStart) -> EventStoreResult<bool> {
-        let existing = self
-            .list_agent_run_starts()?
-            .into_iter()
-            .any(|record| record.id == start.id);
+        let starts = self.list_agent_run_starts()?;
+        let existing = starts.iter().any(|record| record.id == start.id);
         if existing {
             return Ok(false);
+        }
+
+        if start.role == AgentRunRole::Subagent {
+            let parent_id = start.parent_run_id.ok_or_else(|| {
+                EventStoreError::InvalidState("subagent run requires a parent run".to_string())
+            })?;
+            let parent = starts.iter().find(|record| record.id == parent_id).ok_or_else(|| {
+                EventStoreError::InvalidState("subagent parent run does not exist".to_string())
+            })?;
+            if parent.role != AgentRunRole::Parent || parent.parent_run_id.is_some() {
+                return Err(EventStoreError::InvalidState(
+                    "recursive subagent delegation is not supported".to_string(),
+                ));
+            }
+            if parent.conversation_id != start.conversation_id {
+                return Err(EventStoreError::InvalidState(
+                    "subagent must remain in its parent conversation".to_string(),
+                ));
+            }
+            let sibling_count = starts
+                .iter()
+                .filter(|record| record.parent_run_id == Some(parent_id))
+                .count();
+            if sibling_count >= AGENT_RUN_MAX_PARALLEL_SUBAGENTS {
+                return Err(EventStoreError::InvalidState(format!(
+                    "a parent run may create at most {AGENT_RUN_MAX_PARALLEL_SUBAGENTS} subagents"
+                )));
+            }
+        } else if start.parent_run_id.is_some() || start.subtask_key.is_some() {
+            return Err(EventStoreError::InvalidState(
+                "parent run cannot carry subagent linkage".to_string(),
+            ));
         }
 
         let event = KernelEvent::new(AGENT_RUN_STARTED_EVENT, start)?;
         self.append(&event)?;
         Ok(true)
+    }
+
+    pub fn append_subagent_runs(
+        &self,
+        parent_run_id: Uuid,
+        subtasks: Vec<(String, String)>,
+    ) -> EventStoreResult<Vec<AgentRunRecord>> {
+        if subtasks.is_empty() || subtasks.len() > AGENT_RUN_MAX_PARALLEL_SUBAGENTS {
+            return Err(EventStoreError::InvalidState(format!(
+                "subagent plan must contain between 1 and {AGENT_RUN_MAX_PARALLEL_SUBAGENTS} subtasks"
+            )));
+        }
+        let records = self.list_agent_run_records()?;
+        let parent = records
+            .iter()
+            .find(|record| record.id == parent_run_id)
+            .ok_or_else(|| EventStoreError::NotFound(format!("agent run {parent_run_id}")))?;
+        if parent.role != AgentRunRole::Parent || parent.parent_run_id.is_some() {
+            return Err(EventStoreError::InvalidState(
+                "only a parent run may create subagents".to_string(),
+            ));
+        }
+        if !matches!(parent.status, AgentRunStatus::Queued | AgentRunStatus::Running) {
+            return Err(EventStoreError::InvalidState(format!(
+                "parent run cannot create subagents from status {:?}",
+                parent.status
+            )));
+        }
+        if records.iter().any(|record| record.parent_run_id == Some(parent_run_id)) {
+            return Err(EventStoreError::InvalidState(
+                "parent run already has a subagent plan".to_string(),
+            ));
+        }
+
+        let mut keys = std::collections::HashSet::new();
+        let starts = subtasks
+            .into_iter()
+            .map(|(key, prompt)| {
+                let start = AgentRunStart::queued_subagent(
+                    parent_run_id,
+                    parent.conversation_id.clone(),
+                    key,
+                    prompt,
+                )
+                .map_err(EventStoreError::InvalidState)?;
+                if !keys.insert(start.subtask_key.clone().unwrap_or_default()) {
+                    return Err(EventStoreError::InvalidState(
+                        "subagent subtask keys must be unique within a parent run".to_string(),
+                    ));
+                }
+                Ok(start)
+            })
+            .collect::<EventStoreResult<Vec<_>>>()?;
+        for start in &starts {
+            self.append_agent_run_start(start)?;
+        }
+        let child_ids = starts.iter().map(|start| start.id).collect::<std::collections::HashSet<_>>();
+        Ok(self
+            .list_agent_run_records()?
+            .into_iter()
+            .filter(|record| child_ids.contains(&record.id))
+            .collect())
+    }
+
+    pub fn request_agent_run_tree_cancel(
+        &self,
+        parent_run_id: Uuid,
+        reason: String,
+    ) -> EventStoreResult<Vec<AgentRunRecord>> {
+        let records = self.list_agent_run_records()?;
+        let parent = records
+            .iter()
+            .find(|record| record.id == parent_run_id)
+            .ok_or_else(|| EventStoreError::NotFound(format!("agent run {parent_run_id}")))?;
+        if parent.role != AgentRunRole::Parent {
+            return Err(EventStoreError::InvalidState(
+                "run-tree cancellation must target the parent run".to_string(),
+            ));
+        }
+        let target_ids = records
+            .iter()
+            .filter(|record| record.id == parent_run_id || record.parent_run_id == Some(parent_run_id))
+            .filter(|record| {
+                !matches!(
+                    record.status,
+                    AgentRunStatus::Completed | AgentRunStatus::Failed | AgentRunStatus::Cancelled
+                )
+            })
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        for run_id in &target_ids {
+            let cancel = AgentRunCancelRequest::new(*run_id, reason.clone())
+                .map_err(EventStoreError::InvalidState)?;
+            self.append_agent_run_cancel_request(&cancel)?;
+        }
+        Ok(self
+            .list_agent_run_records()?
+            .into_iter()
+            .filter(|record| target_ids.contains(&record.id))
+            .collect())
     }
 
     fn list_agent_run_starts(&self) -> EventStoreResult<Vec<AgentRunStart>> {
@@ -1158,6 +1288,11 @@ impl EventStore {
                 }
                 let active_claim = if queue_is_latest {
                     None
+                } else if latest_transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.status == AgentRunStatus::Queued)
+                {
+                    None
                 } else {
                     latest_claim.as_ref()
                 };
@@ -1203,6 +1338,9 @@ impl EventStore {
                         .as_ref()
                         .map(|context| context.recorded_at),
                     attachment_count: start.attachment_count,
+                    role: start.role,
+                    parent_run_id: start.parent_run_id,
+                    subtask_key: start.subtask_key,
                     status,
                     worker_id,
                     lease_expires_at,
@@ -3317,8 +3455,8 @@ mod tests {
     use crate::kernel::agent_run::{
         AgentRunArtifactRecord, AgentRunCancelRequest, AgentRunClaim, AgentRunContinuationQueued,
         AgentRunExecutionContext, AgentRunFinish, AgentRunGuidanceApplied, AgentRunQueuedGuidance,
-        AgentRunResourceAccess, AgentRunResourceClaim, AgentRunResourceRelease, AgentRunStart,
-        AgentRunStatus, AgentRunStepRecord, AgentRunStepStatus, AgentRunTransition,
+        AgentRunResourceAccess, AgentRunResourceClaim, AgentRunResourceRelease, AgentRunRole,
+        AgentRunStart, AgentRunStatus, AgentRunStepRecord, AgentRunStepStatus, AgentRunTransition,
     };
     use crate::kernel::capability::{CapabilityInvocation, CapabilityInvocationStatus};
     use crate::kernel::deepseek::{DeepSeekChatCacheStatus, DeepSeekChatTelemetry};
@@ -3456,6 +3594,150 @@ mod tests {
             records[0].finish_summary.as_deref(),
             Some("Worker returned after the cancellation request.")
         );
+    }
+
+    #[test]
+    fn subagent_runs_preserve_parent_linkage_and_enforce_one_level_three_child_limit() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let parent = AgentRunStart::queued(
+            "conversation-parallel".to_string(),
+            "Compare three independent evidence sources.".to_string(),
+            0,
+        )
+        .expect("parent is valid");
+        store.append_agent_run_start(&parent).expect("parent appends");
+
+        let mut children = Vec::new();
+        for index in 1..=3 {
+            let child = AgentRunStart::queued_subagent(
+                parent.id,
+                parent.conversation_id.clone(),
+                format!("source-{index}"),
+                format!("Read source {index} and return evidence."),
+            )
+            .expect("subagent is valid");
+            store.append_agent_run_start(&child).expect("subagent appends");
+            children.push(child);
+        }
+
+        let fourth = AgentRunStart::queued_subagent(
+            parent.id,
+            parent.conversation_id.clone(),
+            "source-4".to_string(),
+            "Read source 4.".to_string(),
+        )
+        .expect("fourth subagent shape is valid");
+        let limit_error = store.append_agent_run_start(&fourth);
+        assert!(matches!(limit_error, Err(EventStoreError::InvalidState(_))));
+
+        let recursive = AgentRunStart::queued_subagent(
+            children[0].id,
+            parent.conversation_id.clone(),
+            "nested".to_string(),
+            "Do nested work.".to_string(),
+        )
+        .expect("nested subagent shape is valid");
+        let recursion_error = store.append_agent_run_start(&recursive);
+        assert!(matches!(recursion_error, Err(EventStoreError::InvalidState(_))));
+
+        let records = store.list_agent_run_records().expect("records load");
+        let parent_record = records.iter().find(|record| record.id == parent.id).unwrap();
+        assert_eq!(parent_record.role, AgentRunRole::Parent);
+        assert!(parent_record.parent_run_id.is_none());
+        for child in children {
+            let record = records.iter().find(|record| record.id == child.id).unwrap();
+            assert_eq!(record.role, AgentRunRole::Subagent);
+            assert_eq!(record.parent_run_id, Some(parent.id));
+            assert_eq!(record.subtask_key, child.subtask_key);
+            assert_eq!(record.status, AgentRunStatus::Queued);
+        }
+    }
+
+    #[test]
+    fn subagent_plan_is_created_once_and_parent_cancel_propagates_to_open_children() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let parent = AgentRunStart::queued(
+            "conversation-tree".to_string(),
+            "Research independent sources and synthesize them.".to_string(),
+            0,
+        )
+        .expect("parent is valid");
+        store.append_agent_run_start(&parent).expect("parent appends");
+
+        let children = store
+            .append_subagent_runs(
+                parent.id,
+                vec![
+                    ("source-a".to_string(), "Read source A.".to_string()),
+                    ("source-b".to_string(), "Read source B.".to_string()),
+                ],
+            )
+            .expect("subagent plan appends");
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|record| record.role == AgentRunRole::Subagent));
+
+        let duplicate_plan = store.append_subagent_runs(
+            parent.id,
+            vec![("source-c".to_string(), "Read source C.".to_string())],
+        );
+        assert!(matches!(duplicate_plan, Err(EventStoreError::InvalidState(_))));
+
+        let cancelled = store
+            .request_agent_run_tree_cancel(parent.id, "User cancelled the parent task.".to_string())
+            .expect("tree cancellation appends");
+        assert_eq!(cancelled.len(), 3);
+        assert!(cancelled
+            .iter()
+            .all(|record| record.status == AgentRunStatus::CancelRequested));
+        assert!(cancelled
+            .iter()
+            .all(|record| record.cancel_reason.as_deref() == Some("User cancelled the parent task.")));
+    }
+
+    #[test]
+    fn parent_synthesis_transition_requeues_without_reusing_the_planning_worker_lease() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let parent = AgentRunStart::queued(
+            "conversation-synthesis".to_string(),
+            "Synthesize parallel evidence.".to_string(),
+            0,
+        )
+        .expect("parent is valid");
+        store.append_agent_run_start(&parent).expect("parent appends");
+        store
+            .claim_agent_run(parent.id, "planning-worker".to_string(), 60)
+            .expect("planning worker claims parent");
+        let waiting = AgentRunTransition::new(
+            parent.id,
+            AgentRunStatus::Blocked,
+            "Waiting for Subagents.".to_string(),
+            None,
+        )
+        .expect("waiting transition is valid");
+        store
+            .append_agent_run_transition(&waiting)
+            .expect("waiting transition appends");
+        let synthesis = AgentRunTransition::new(
+            parent.id,
+            AgentRunStatus::Queued,
+            "Subagents finished; synthesize.".to_string(),
+            None,
+        )
+        .expect("synthesis transition is valid");
+        store
+            .append_agent_run_transition(&synthesis)
+            .expect("synthesis transition appends");
+
+        let queued = store
+            .list_agent_run_records()
+            .expect("records load")
+            .into_iter()
+            .find(|record| record.id == parent.id)
+            .expect("parent exists");
+        assert_eq!(queued.status, AgentRunStatus::Queued);
+        assert!(queued.worker_id.is_none());
+        assert!(queued.lease_expires_at.is_none());
+        assert_eq!(queued.status_reason.as_deref(), Some("Subagents finished; synthesize."));
     }
 
     #[test]

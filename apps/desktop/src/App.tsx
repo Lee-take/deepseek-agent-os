@@ -2415,6 +2415,12 @@ export function App() {
     setOperationsBriefingRuns(runs);
   };
 
+  const refreshSkillRecords = async () => {
+    const records = await invoke<SkillRecord[]>("list_skill_records");
+    setSkillRecords(records);
+    return records;
+  };
+
   const refreshAgentRunRecords = async () => {
     const runs = await invoke<AgentRunRecord[]>("list_agent_run_records");
     setAgentRunRecords(runs);
@@ -2461,6 +2467,81 @@ export function App() {
 
       backgroundAgentWorkerBusyRef.current = true;
       try {
+        const currentRuns = await refreshAgentRunRecords();
+        const recoverableParents = currentRuns.filter(
+          (record) =>
+            record.role === "parent" &&
+            record.status === "blocked" &&
+            currentRuns.some((child) => child.parent_run_id === record.id) &&
+            currentRuns
+              .filter((child) => child.parent_run_id === record.id)
+              .every((child) =>
+                ["completed", "failed", "cancelled"].includes(child.status),
+              ),
+        );
+        if (recoverableParents.length > 0) {
+          const queuedParents = await Promise.all(
+            recoverableParents.map((parent) =>
+              invoke<AgentRunRecord>("queue_parent_agent_synthesis", {
+                parentRunId: parent.id,
+              }),
+            ),
+          );
+          queuedParents.forEach(upsertAgentRunRecord);
+          await refreshAgentRunRecords();
+          return;
+        }
+        const queuedSubagents = currentRuns
+          .filter((record) => record.role === "subagent" && record.status === "queued")
+          .slice(0, 3);
+        if (queuedSubagents.length > 0) {
+          const subagentResults = await Promise.all(
+            queuedSubagents.map((record, index) =>
+              invoke<AgentRunWorkerResult | null>("run_next_queued_agent_chat_worker", {
+                runId: record.id,
+                executionPrompt: record.execution_prompt,
+                workerId: `desktop-subagent-worker-${index + 1}`,
+                largeModelProvider: state.large_model_provider,
+                modelRoute: state.model_route,
+                thinkingLevel: state.thinking_level,
+                accessMode: state.access_mode,
+                networkSearchSourceModel: state.network_search_source_model || null,
+                apiKeyOverride: apiKeyCandidates[0] ?? null,
+                fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
+              }),
+            ),
+          );
+          subagentResults.forEach((result) => {
+            if (result) {
+              upsertAgentRunRecord(result.record);
+            }
+          });
+          const finishedRuns = await refreshAgentRunRecords();
+          const waitingParents = finishedRuns.filter(
+            (record) => record.role === "parent" && record.status === "blocked",
+          );
+          await Promise.all(
+            waitingParents.map(async (parent) => {
+              const children = finishedRuns.filter(
+                (record) => record.parent_run_id === parent.id,
+              );
+              if (
+                children.length > 0 &&
+                children.every((child) =>
+                  ["completed", "failed", "cancelled"].includes(child.status),
+                )
+              ) {
+                const queuedParent = await invoke<AgentRunRecord>(
+                  "queue_parent_agent_synthesis",
+                  { parentRunId: parent.id },
+                );
+                upsertAgentRunRecord(queuedParent);
+              }
+            }),
+          );
+          await Promise.all([refreshAgentRunRecords(), refreshCapabilityState()]);
+          return;
+        }
         const workerResult = await invoke<AgentRunWorkerResult | null>(
           "run_next_queued_agent_chat_worker",
           {
@@ -2481,6 +2562,13 @@ export function App() {
         }
 
         upsertAgentRunRecord(workerResult.record);
+        if (
+          workerResult.record.status === "blocked" &&
+          workerResult.response.subagent_plan.length > 0
+        ) {
+          await refreshAgentRunRecords();
+          return;
+        }
         const assistantMessage: AgentConversationMessage = {
           id: workerResult.response.id,
           role: "assistant",
@@ -2568,7 +2656,11 @@ export function App() {
           recoveredConversation.updated_at = workerResult.record.updated_at;
           return sortAgentConversations([...nextConversations, recoveredConversation]);
         });
-        await Promise.all([refreshAgentRunRecords(), refreshCapabilityState()]);
+        await Promise.all([
+          refreshAgentRunRecords(),
+          refreshCapabilityState(),
+          refreshSkillRecords(),
+        ]);
       } catch {
         if (!cancelled) {
           void refreshAgentRunRecords().catch(() => null);
@@ -3872,27 +3964,33 @@ export function App() {
           ),
         );
       }
-      updateActiveAgentMessages((currentMessages) => [
-        ...currentMessages,
-        {
-          id: response.id,
-          role: "assistant",
-          content: response.content,
-          model: response.model,
-          protocol_version: response.protocol_version,
-          proposed_actions: response.proposed_actions,
-          missing_prerequisites: response.missing_prerequisites,
-          memory_candidates: response.memory_candidates,
-          created_at: response.created_at,
-        },
-      ], displayPrompt);
+      if (response.subagent_plan.length === 0) {
+        updateActiveAgentMessages((currentMessages) => [
+          ...currentMessages,
+          {
+            id: response.id,
+            role: "assistant",
+            content: response.content,
+            model: response.model,
+            protocol_version: response.protocol_version,
+            proposed_actions: response.proposed_actions,
+            missing_prerequisites: response.missing_prerequisites,
+            memory_candidates: response.memory_candidates,
+            created_at: response.created_at,
+          },
+        ], displayPrompt);
+      }
       const [telemetry, cacheState] = await Promise.all([
         invoke<DeepSeekChatTelemetry[]>("list_deepseek_chat_telemetry"),
         invoke<DeepSeekChatCacheState>("get_deepseek_chat_cache_state"),
       ]);
       setDeepSeekTelemetry(telemetry);
       setDeepSeekChatCacheState(cacheState);
-      await Promise.all([refreshCapabilityState(), runMemoryBackgroundMaintenance()]);
+      await Promise.all([
+        refreshCapabilityState(),
+        refreshSkillRecords(),
+        runMemoryBackgroundMaintenance(),
+      ]);
       const memories = await loadMemoryRecords(memoryQuery);
       setMemoryRecords(memories);
       const needsWorkspaceSetup = prerequisitesNeedWorkspaceSetup(response.missing_prerequisites);
@@ -6962,9 +7060,18 @@ export function App() {
                   </div>
                   <div className="sidebar-record-list">
                     {recentAgentRunRecords.map((record) => (
-                      <article className="sidebar-record-row" key={record.id}>
+                      <article
+                        className={`sidebar-record-row${record.role === "subagent" ? " subagent-run-row" : ""}`}
+                        key={record.id}
+                      >
                         <div>
                           <span>{formatTaskDate(record.updated_at, language)}</span>
+                          {record.role === "subagent" ? (
+                            <span>
+                              {language === "zh" ? "并行子任务" : "Parallel subtask"}
+                              {record.subtask_key ? ` · ${record.subtask_key}` : ""}
+                            </span>
+                          ) : null}
                           <strong>{record.prompt}</strong>
                           <small>
                             {copy.runStatus.runStepsLabel(record.steps.length)}

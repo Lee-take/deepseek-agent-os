@@ -68,6 +68,13 @@ export type AgentRunStatus =
   | "failed"
   | "cancelled";
 
+export type AgentRunRole = "parent" | "subagent";
+
+export type AgentSubtaskPlanItem = {
+  key: string;
+  prompt: string;
+};
+
 export type AgentRunStepStatus = "pending" | "running" | "completed" | "failed";
 
 export type AgentRunQueuedGuidance = {
@@ -104,6 +111,9 @@ export type AgentRunRecord = {
   execution_prompt: string | null;
   execution_context_recorded_at: string | null;
   attachment_count: number;
+  role: AgentRunRole;
+  parent_run_id: string | null;
+  subtask_key: string | null;
   status: AgentRunStatus;
   worker_id: string | null;
   lease_expires_at: string | null;
@@ -337,6 +347,7 @@ export type AgentChatResponse = {
   proposed_actions: AgentChatActionProposal[];
   missing_prerequisites: AgentChatMissingPrerequisite[];
   memory_candidates: MemoryCandidate[];
+  subagent_plan: AgentSubtaskPlanItem[];
   model: string;
   cache_status: DeepSeekChatCacheStatus;
   elapsed_ms: number;

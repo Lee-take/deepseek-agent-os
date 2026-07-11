@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
 #[cfg(windows)]
@@ -142,17 +142,17 @@ use crate::kernel::workflow::{
 };
 
 pub struct AppState {
-    event_store: Mutex<EventStore>,
-    computer_control_unlock: Mutex<ComputerControlUnlockState>,
-    deepseek_chat_cache: DeepSeekMemoryChatCompletionCache,
+    event_store: Arc<Mutex<EventStore>>,
+    computer_control_unlock: Arc<Mutex<ComputerControlUnlockState>>,
+    deepseek_chat_cache: Arc<DeepSeekMemoryChatCompletionCache>,
 }
 
 impl AppState {
     pub fn new(event_store: EventStore) -> Self {
         Self {
-            event_store: Mutex::new(event_store),
-            computer_control_unlock: Mutex::new(ComputerControlUnlockState::generated()),
-            deepseek_chat_cache: DeepSeekMemoryChatCompletionCache::default(),
+            event_store: Arc::new(Mutex::new(event_store)),
+            computer_control_unlock: Arc::new(Mutex::new(ComputerControlUnlockState::generated())),
+            deepseek_chat_cache: Arc::new(DeepSeekMemoryChatCompletionCache::default()),
         }
     }
 }
@@ -163,15 +163,15 @@ const AGENT_TOOL_LOOP_MAX_ROUNDS: usize = 4;
 const AGENT_RUN_GUIDANCE_MAX_ITEMS_PER_ROUND: usize = 8;
 const AGENT_RUN_GUIDANCE_PROMPT_CHAR_LIMIT: usize = 12_000;
 const AGENT_SKILL_CATALOG_MAX_ITEMS: usize = 24;
-const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user from agent_actions, missing_prerequisites, required_confirmations, artifact_targets, and memory_candidates. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
+const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user from agent_actions, missing_prerequisites, required_confirmations, artifact_targets, memory_candidates, and subagent_plan. Use subagent_plan only when the request contains two or three concrete, independently useful read-only research or analysis subtasks that benefit from parallel work. Each item requires a short unique key and a self-contained prompt. Never create nested subagents, mutating subtasks, desktop-control subtasks, or more than three items. Leave subagent_plan empty for simple or dependent work. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
 const AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT: usize = 1200;
 const APP_UPDATE_RELEASES_API_URL: &str = "https://api.github.com/repos/Lee-take/dsagent/releases";
 const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/dsagent/releases/download/";
 const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.3.0";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.3.0";
+const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.4.0";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.4.0";
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
 const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
@@ -204,6 +204,7 @@ pub struct AgentChatRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AgentChatRuntimeContext {
     active_run_id: Option<Uuid>,
+    subagent_read_only: bool,
     workspace_ready: AgentChatReadiness,
     workspace_note: String,
     network_search_ready: AgentChatReadiness,
@@ -219,6 +220,7 @@ impl Default for AgentChatRuntimeContext {
     fn default() -> Self {
         Self {
             active_run_id: None,
+            subagent_read_only: false,
             workspace_ready: AgentChatReadiness::Unknown,
             workspace_note: "workspace readiness unavailable in this test context".to_string(),
             network_search_ready: AgentChatReadiness::Unknown,
@@ -357,6 +359,7 @@ pub struct AgentChatResponse {
     pub proposed_actions: Vec<AgentChatActionProposal>,
     pub missing_prerequisites: Vec<AgentChatMissingPrerequisite>,
     pub memory_candidates: Vec<MemoryCandidate>,
+    pub subagent_plan: Vec<AgentSubtaskPlanItem>,
     pub model: String,
     pub cache_status: DeepSeekChatCacheStatus,
     pub elapsed_ms: u128,
@@ -371,6 +374,51 @@ pub struct AgentChatResponse {
 pub struct AgentRunWorkerResult {
     pub record: AgentRunRecord,
     pub response: AgentChatResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentSubtaskPlanItem {
+    pub key: String,
+    pub prompt: String,
+}
+
+fn validated_subagent_plan(items: &[AgentSubtaskPlanItem]) -> Vec<AgentSubtaskPlanItem> {
+    if items.len() < 2 || items.len() > crate::kernel::agent_run::AGENT_RUN_MAX_PARALLEL_SUBAGENTS {
+        return Vec::new();
+    }
+    let mut keys = std::collections::HashSet::new();
+    let mut validated = Vec::with_capacity(items.len());
+    for item in items {
+        let key = item.key.trim();
+        let prompt = item.prompt.trim();
+        if key.is_empty()
+            || key.chars().count() > 64
+            || prompt.is_empty()
+            || prompt.chars().count() > 4_000
+            || !keys.insert(key.to_ascii_lowercase())
+        {
+            return Vec::new();
+        }
+        validated.push(AgentSubtaskPlanItem {
+            key: key.to_string(),
+            prompt: prompt.to_string(),
+        });
+    }
+    validated
+}
+
+fn block_subagent_mutating_actions(response: &mut AgentChatResponse) {
+    for action in &mut response.proposed_actions {
+        if !matches!(
+            action.action_type.as_str(),
+            "file_read" | "network_search" | "browser_browse"
+        ) {
+            let reason = "Background Subagents are read-only; the parent Agent must mediate mutating or foreground actions.".to_string();
+            action.execution_state = "blocked".to_string();
+            action.blocked_reason = Some(reason.clone());
+            action.dispatch_note = Some(reason);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -572,6 +620,8 @@ struct AgentModelEnvelope {
     artifact_targets: Vec<AgentChatArtifactTargetProposal>,
     #[serde(default)]
     memory_candidates: Vec<AgentChatMemoryCandidateProposal>,
+    #[serde(default)]
+    subagent_plan: Vec<AgentSubtaskPlanItem>,
 }
 
 fn deserialize_agent_reply_to_user<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -4746,6 +4796,10 @@ fn agent_chat_response_from_telemetry(
         .as_ref()
         .map(|_| agent_memory_candidates_from_model(&memory_candidate_proposals))
         .unwrap_or_default();
+    let subagent_plan = parsed_envelope
+        .as_ref()
+        .map(|envelope| validated_subagent_plan(&envelope.subagent_plan))
+        .unwrap_or_default();
 
     AgentChatResponse {
         id: Uuid::new_v4(),
@@ -4755,6 +4809,7 @@ fn agent_chat_response_from_telemetry(
         proposed_actions,
         missing_prerequisites,
         memory_candidates,
+        subagent_plan,
         model: telemetry.model.clone(),
         cache_status: telemetry.cache_status,
         elapsed_ms: telemetry.elapsed_ms,
@@ -7867,6 +7922,9 @@ fn agent_chat_with_dispatch_and_tool_followup(
         &original_user_prompt,
         |response| {
             mark_agent_workspace_actions_waiting_if_needed(&runtime_context, response);
+            if runtime_context.subagent_read_only {
+                block_subagent_mutating_actions(response);
+            }
             dispatch_agent_action_proposals_with_desktop_dir(
                 store,
                 request.access_mode,
@@ -8152,6 +8210,9 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
         &original_user_prompt,
         |response| {
             mark_agent_workspace_actions_waiting_if_needed(&runtime_context, response);
+            if runtime_context.subagent_read_only {
+                block_subagent_mutating_actions(response);
+            }
             if let Some(run_id) = runtime_context.active_run_id {
                 if agent_run_cancel_requested(store, run_id)? {
                     mark_agent_actions_cancel_requested(response);
@@ -8493,6 +8554,8 @@ fn run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
         .unwrap_or_else(|| claimed.prompt.clone());
     let mut runtime_context = runtime_context;
     runtime_context.active_run_id = Some(run_id);
+    runtime_context.subagent_read_only =
+        claimed.role == crate::kernel::agent_run::AgentRunRole::Subagent;
 
     record_agent_run_worker_step(
         store,
@@ -8560,6 +8623,48 @@ fn run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
                     ),
                     None,
                 )?
+            } else if claimed.role == crate::kernel::agent_run::AgentRunRole::Parent
+                && !response.subagent_plan.is_empty()
+                && !agent_run_has_subagents(store, run_id)?
+            {
+                {
+                    let store = store.lock().map_err(|_| lock_error())?;
+                    store
+                        .append_subagent_runs(
+                            run_id,
+                            response
+                                .subagent_plan
+                                .iter()
+                                .map(|item| (item.key.clone(), item.prompt.clone()))
+                                .collect(),
+                        )
+                        .map_err(event_store_error)?;
+                }
+                transition_agent_run_from_worker(
+                    store,
+                    run_id,
+                    AgentRunStatus::Blocked,
+                    "Parent run is waiting for its parallel Subagents to finish.".to_string(),
+                    None,
+                )?
+            } else if claimed.role == crate::kernel::agent_run::AgentRunRole::Subagent
+                && response.proposed_actions.iter().any(|action| {
+                    action.execution_state == "blocked"
+                        && action.blocked_reason.as_deref().is_some_and(|reason| {
+                            reason.contains("Background Subagents are read-only")
+                        })
+                })
+            {
+                finish_agent_run_from_worker(
+                    store,
+                    run_id,
+                    AgentRunStatus::Failed,
+                    None,
+                    Some(
+                        "Subagent proposed a mutating or foreground action that must be mediated by the parent Agent."
+                            .to_string(),
+                    ),
+                )?
             } else if let Some((status, reason, tool_invocation_id)) =
                 agent_run_waiting_outcome_from_response(&response)
             {
@@ -8602,6 +8707,15 @@ fn run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
             Err(error)
         }
     }
+}
+
+fn agent_run_has_subagents(store: &Mutex<EventStore>, parent_run_id: Uuid) -> Result<bool, String> {
+    let store = store.lock().map_err(|_| lock_error())?;
+    Ok(store
+        .list_agent_run_records()
+        .map_err(event_store_error)?
+        .iter()
+        .any(|record| record.parent_run_id == Some(parent_run_id)))
 }
 
 fn run_with_agent_run_lease_heartbeat<T>(
@@ -11009,6 +11123,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                     proposed_actions: vec![action.clone()],
                     missing_prerequisites: Vec::new(),
                     memory_candidates: Vec::new(),
+                    subagent_plan: Vec::new(),
                     model: response.model.clone(),
                     cache_status: response.cache_status,
                     elapsed_ms: response.elapsed_ms,
@@ -11083,6 +11198,7 @@ fn resume_agent_chat_action_with_clients_and_computer_use(
         proposed_actions: vec![action],
         missing_prerequisites: Vec::new(),
         memory_candidates: Vec::new(),
+        subagent_plan: Vec::new(),
         model: "local-ds-agent-dispatch".to_string(),
         cache_status: DeepSeekChatCacheStatus::Miss,
         elapsed_ms: 0,
@@ -12287,6 +12403,7 @@ fn agent_chat_runtime_context(
 
     AgentChatRuntimeContext {
         active_run_id: None,
+        subagent_read_only: false,
         workspace_ready,
         workspace_note,
         network_search_ready,
@@ -12665,7 +12782,7 @@ pub fn run_agent_chat(
 }
 
 #[tauri::command]
-pub fn run_next_queued_agent_chat_worker(
+pub async fn run_next_queued_agent_chat_worker(
     app: AppHandle,
     run_id: Option<Uuid>,
     execution_prompt: Option<String>,
@@ -12679,62 +12796,68 @@ pub fn run_next_queued_agent_chat_worker(
     fallback_api_key_override: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Option<AgentRunWorkerResult>, String> {
-    let api_keys = agent_chat_api_key_candidates_from_sources(
-        api_key_override,
-        fallback_api_key_override,
-        |name| std::env::var(name).ok(),
-    );
-    if api_keys.is_empty() {
-        return Err("DeepSeek Chat is not configured. Provide a DeepSeek API key for this session or set DEEPSEEK_API_KEY in the local desktop process."
-            .to_string());
-    }
-    let pricing_settings = app
-        .path()
-        .app_data_dir()
-        .ok()
-        .and_then(|app_data_dir| load_deepseek_pricing_state(app_data_dir).ok())
-        .map(|pricing_state| pricing_state.settings);
-    let runtime_context = agent_chat_runtime_context(
-        &app,
-        large_model_provider,
-        network_search_source_model,
-        true,
-    );
-    let transport = HttpDeepSeekChatCompletionTransport::new()?;
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
-    let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
-    let desktop_dir = runtime_context.desktop_dir.clone();
-    let file_client = LocalFileContentClient::new(512 * 1024);
-    let file_write_client = agent_file_write_client(&directory_state, desktop_dir)?;
-    let browser_client = HttpBrowserPageClient::new()?;
-    let search_client =
-        agent_network_search_client(large_model_provider, network_search_source_model);
-    let computer_strategy =
-        computer_tool_strategy_for_command(large_model_provider, network_search_source_model);
-    let computer_use_client = agent_computer_use_client(
-        &computer_strategy,
-        computer_screenshot_evidence_base_dir(&app_data_dir, &directory_state),
-    );
+    let event_store = Arc::clone(&state.event_store);
+    let cache = Arc::clone(&state.deepseek_chat_cache);
+    tauri::async_runtime::spawn_blocking(move || {
+        let api_keys = agent_chat_api_key_candidates_from_sources(
+            api_key_override,
+            fallback_api_key_override,
+            |name| std::env::var(name).ok(),
+        );
+        if api_keys.is_empty() {
+            return Err("DeepSeek Chat is not configured. Provide a DeepSeek API key for this session or set DEEPSEEK_API_KEY in the local desktop process."
+                .to_string());
+        }
+        let pricing_settings = app
+            .path()
+            .app_data_dir()
+            .ok()
+            .and_then(|app_data_dir| load_deepseek_pricing_state(app_data_dir).ok())
+            .map(|pricing_state| pricing_state.settings);
+        let runtime_context = agent_chat_runtime_context(
+            &app,
+            large_model_provider,
+            network_search_source_model,
+            true,
+        );
+        let transport = HttpDeepSeekChatCompletionTransport::new()?;
+        let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+        let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
+        let desktop_dir = runtime_context.desktop_dir.clone();
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = agent_file_write_client(&directory_state, desktop_dir)?;
+        let browser_client = HttpBrowserPageClient::new()?;
+        let search_client =
+            agent_network_search_client(large_model_provider, network_search_source_model);
+        let computer_strategy =
+            computer_tool_strategy_for_command(large_model_provider, network_search_source_model);
+        let computer_use_client = agent_computer_use_client(
+            &computer_strategy,
+            computer_screenshot_evidence_base_dir(&app_data_dir, &directory_state),
+        );
 
-    run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
-        &state.event_store,
-        &transport,
-        &state.deepseek_chat_cache,
-        &api_keys,
-        run_id,
-        execution_prompt,
-        worker_id,
-        model_route,
-        thinking_level,
-        access_mode,
-        runtime_context,
-        pricing_settings.as_ref(),
-        &file_client,
-        &file_write_client,
-        &search_client,
-        &browser_client,
-        &computer_use_client,
-    )
+        run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
+            &event_store,
+            &transport,
+            &cache,
+            &api_keys,
+            run_id,
+            execution_prompt,
+            worker_id,
+            model_route,
+            thinking_level,
+            access_mode,
+            runtime_context,
+            pricing_settings.as_ref(),
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+            &computer_use_client,
+        )
+    })
+    .await
+    .map_err(|error| format!("agent worker task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -13128,6 +13251,100 @@ pub fn enqueue_agent_run_record(
 }
 
 #[tauri::command]
+pub fn enqueue_subagent_run_records(
+    parent_run_id: Uuid,
+    subtasks: Vec<AgentSubtaskPlanItem>,
+    state: State<'_, AppState>,
+) -> Result<Vec<AgentRunRecord>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .append_subagent_runs(
+            parent_run_id,
+            subtasks
+                .into_iter()
+                .map(|subtask| (subtask.key, subtask.prompt))
+                .collect(),
+        )
+        .map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn queue_parent_agent_synthesis(
+    parent_run_id: Uuid,
+    state: State<'_, AppState>,
+) -> Result<AgentRunRecord, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    let records = store.list_agent_run_records().map_err(event_store_error)?;
+    let parent = records
+        .iter()
+        .find(|record| record.id == parent_run_id)
+        .ok_or_else(|| format!("parent agent run {parent_run_id} does not exist"))?;
+    if parent.role != crate::kernel::agent_run::AgentRunRole::Parent {
+        return Err("Subagent synthesis must target a parent run.".to_string());
+    }
+    let mut children = records
+        .iter()
+        .filter(|record| record.parent_run_id == Some(parent_run_id))
+        .collect::<Vec<_>>();
+    children.sort_by_key(|record| record.started_at);
+    if children.is_empty()
+        || children.iter().any(|record| {
+            !matches!(
+                record.status,
+                AgentRunStatus::Completed | AgentRunStatus::Failed | AgentRunStatus::Cancelled
+            )
+        })
+    {
+        return Err("Parent synthesis requires every Subagent to reach a terminal state.".to_string());
+    }
+    if parent.status == AgentRunStatus::Queued {
+        return Ok(parent.clone());
+    }
+    if parent.status != AgentRunStatus::Blocked {
+        return Err(format!(
+            "parent run cannot queue synthesis from status {:?}",
+            parent.status
+        ));
+    }
+
+    let child_results = children
+        .iter()
+        .map(|child| {
+            format!(
+                "- Subagent `{}` status={:?}\n  result: {}",
+                child.subtask_key.as_deref().unwrap_or("subtask"),
+                child.status,
+                child
+                    .finish_summary
+                    .as_deref()
+                    .or(child.finish_error.as_deref())
+                    .unwrap_or("No result was returned.")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "You are resuming the single parent task after its bounded parallel Subagents finished. Synthesize one final user-facing answer for the original goal. Preserve failures or uncertainty; do not claim failed work succeeded. Do not create another subagent_plan.\n\nOriginal goal:\n{}\n\nSubagent results:\n{}",
+        parent.prompt, child_results
+    );
+    let context = AgentRunExecutionContext::new(parent_run_id, prompt).map_err(event_store_error)?;
+    store
+        .append_agent_run_execution_context(&context)
+        .map_err(event_store_error)?;
+    let transition = AgentRunTransition::new(
+        parent_run_id,
+        AgentRunStatus::Queued,
+        "All Subagents reached terminal state; parent synthesis is queued.".to_string(),
+        None,
+    )
+    .map_err(event_store_error)?;
+    store
+        .append_agent_run_transition(&transition)
+        .map_err(event_store_error)?;
+    read_agent_run_record(&store, parent_run_id)
+}
+
+#[tauri::command]
 pub fn claim_next_agent_run_record(
     worker_id: String,
     lease_seconds: i64,
@@ -13172,11 +13389,18 @@ pub fn request_agent_run_cancel_record(
     reason: String,
     state: State<'_, AppState>,
 ) -> Result<AgentRunRecord, String> {
-    let cancel = AgentRunCancelRequest::new(run_id, reason).map_err(event_store_error)?;
     let store = state.event_store.lock().map_err(|_| lock_error())?;
-    store
-        .append_agent_run_cancel_request(&cancel)
-        .map_err(event_store_error)?;
+    let record = read_agent_run_record(&store, run_id)?;
+    if record.role == crate::kernel::agent_run::AgentRunRole::Parent {
+        store
+            .request_agent_run_tree_cancel(run_id, reason)
+            .map_err(event_store_error)?;
+    } else {
+        let cancel = AgentRunCancelRequest::new(run_id, reason).map_err(event_store_error)?;
+        store
+            .append_agent_run_cancel_request(&cancel)
+            .map_err(event_store_error)?;
+    }
     read_agent_run_record(&store, run_id)
 }
 
@@ -14982,7 +15206,7 @@ pub fn run_operations_briefing(
         let transport = HttpDeepSeekChatCompletionTransport::new()?;
         let synthesizer = DeepSeekOperationsBriefingSynthesizer::new_with_cache(
             &transport,
-            &state.deepseek_chat_cache,
+            state.deepseek_chat_cache.as_ref(),
             api_key,
             model_route,
             thinking_level,
@@ -15404,8 +15628,9 @@ mod tests {
         run_memory_background_maintenance_with_model_in_store,
         run_next_queued_agent_chat_with_clients_and_api_keys,
         should_require_computer_control_unlock, thinking_level_context_label,
-        AgentChatActionProposal, AgentChatReadiness, AgentChatRequest, AgentChatResponse,
-        AgentChatRuntimeContext, BrowserUrlOpenOutcome, BrowserUrlOpener,
+        block_subagent_mutating_actions, validated_subagent_plan, AgentChatActionProposal,
+        AgentChatReadiness, AgentChatRequest, AgentChatResponse, AgentChatRuntimeContext,
+        AgentSubtaskPlanItem, BrowserUrlOpenOutcome, BrowserUrlOpener,
         ComputerControlUnlockState, GeneratedSkillRequest, COMPUTER_CONTROL_UNLOCK_TTL_MINUTES,
     };
     use crate::kernel::agent_run::{
@@ -15760,6 +15985,7 @@ mod tests {
             }],
             missing_prerequisites: Vec::new(),
             memory_candidates: Vec::new(),
+            subagent_plan: Vec::new(),
             model: "deepseek-v4-pro".to_string(),
             cache_status: DeepSeekChatCacheStatus::Miss,
             elapsed_ms: 0,
@@ -18513,7 +18739,7 @@ mod tests {
         let status = update_status_from_releases(releases, app_update_current_version());
 
         assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.3.0");
+        assert_eq!(status.current_version, "v0.4.0");
         assert_eq!(status.latest_version.as_deref(), Some("0.3.0"));
         assert!(status.asset_name.is_none());
     }
@@ -19708,6 +19934,133 @@ mod tests {
         assert!(initial_prompt
             .content
             .contains("Durable compressed conversation context for recovery."));
+    }
+
+    #[test]
+    fn queued_parent_worker_persists_parallel_plan_without_emitting_child_chat_messages() {
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let parent = AgentRunStart::queued(
+            "conversation-parallel-worker".to_string(),
+            "并行核对两组独立证据后统一回答。".to_string(),
+            0,
+        )
+        .expect("parent is valid");
+        store
+            .lock()
+            .expect("store lock")
+            .append_agent_run_start(&parent)
+            .expect("parent appends");
+        let transport = RecordingDeepSeekTransport::new(
+            r#"{
+                "protocol_version": "ds-agent-envelope/v1",
+                "reply_to_user": "正在并行核对。",
+                "subagent_plan": [
+                    {"key":"source-a","prompt":"只读核对来源 A。"},
+                    {"key":"source-b","prompt":"只读核对来源 B。"}
+                ]
+            }"#,
+        );
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let outcome = run_next_queued_agent_chat_with_clients_and_api_keys(
+            &store,
+            &transport,
+            &cache,
+            &["test-secret".to_string()],
+            "parent-planning-worker".to_string(),
+            ModelRoute::Flash,
+            ThinkingLevel::Fast,
+            AccessMode::AskOnRisk,
+            AgentChatRuntimeContext::default(),
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("parent planning succeeds")
+        .expect("parent run exists");
+
+        assert_eq!(outcome.record.status, AgentRunStatus::Blocked);
+        assert_eq!(outcome.response.subagent_plan.len(), 2);
+        let records = store
+            .lock()
+            .expect("store lock")
+            .list_agent_run_records()
+            .expect("records load");
+        let children = records
+            .iter()
+            .filter(|record| record.parent_run_id == Some(parent.id))
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|record| record.status == AgentRunStatus::Queued));
+        assert!(children.iter().all(|record| record.conversation_id == parent.conversation_id));
+    }
+
+    #[test]
+    fn subagent_worker_blocks_mutation_and_finishes_failed_without_writing() {
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let parent = AgentRunStart::queued(
+            "conversation-read-only".to_string(),
+            "Run bounded parallel research.".to_string(),
+            0,
+        )
+        .expect("parent is valid");
+        let child = AgentRunStart::queued_subagent(
+            parent.id,
+            parent.conversation_id.clone(),
+            "unsafe-write".to_string(),
+            "Read evidence only.".to_string(),
+        )
+        .expect("child is valid");
+        {
+            let event_store = store.lock().expect("store lock");
+            event_store.append_agent_run_start(&parent).expect("parent appends");
+            event_store.append_agent_run_start(&child).expect("child appends");
+        }
+        let transport = RecordingDeepSeekTransport::new(
+            r#"{
+                "protocol_version":"ds-agent-envelope/v1",
+                "reply_to_user":"尝试写入。",
+                "agent_actions":[{"action_type":"file_write","target":"reports/blocked.md","content":"blocked"}]
+            }"#,
+        );
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let outcome = run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
+            &store,
+            &transport,
+            &cache,
+            &["test-secret".to_string()],
+            Some(child.id),
+            None,
+            "subagent-worker".to_string(),
+            ModelRoute::Flash,
+            ThinkingLevel::Fast,
+            AccessMode::FullAccess,
+            AgentChatRuntimeContext::default(),
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+            &super::UnavailableAgentComputerUseClient,
+        )
+        .expect("subagent worker returns audited failure")
+        .expect("child run exists");
+
+        assert_eq!(outcome.record.status, AgentRunStatus::Failed);
+        assert!(outcome.record.finish_error.as_deref().unwrap().contains("parent Agent"));
+        assert!(file_write_client.recorded_calls().is_empty());
+        assert_eq!(outcome.response.proposed_actions[0].execution_state, "blocked");
     }
 
     #[test]
@@ -21656,6 +22009,72 @@ mod tests {
             reply.missing_prerequisites[0].message,
             "需要工作区可用才能执行 file_write 到 reports/ 路径"
         );
+    }
+
+    #[test]
+    fn agent_chat_accepts_only_bounded_unique_parallel_subagent_plans() {
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope-v1",
+            "reply_to_user": "我会并行核对三组独立证据，再统一给出结论。",
+            "subagent_plan": [
+                {"key": "policy", "prompt": "只读核对政策原文并返回出处。"},
+                {"key": "market", "prompt": "只读核对市场数据并返回出处。"},
+                {"key": "risk", "prompt": "只读分析风险并返回反证。"}
+            ]
+        });
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let (reply, _) = agent_chat_with_transport(
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "并行研究后给结论。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskOnRisk,
+            },
+            None,
+        )
+        .expect("parallel plan parses");
+
+        assert_eq!(reply.subagent_plan.len(), 3);
+        assert_eq!(reply.subagent_plan[0].key, "policy");
+
+        let invalid = validated_subagent_plan(&[
+            AgentSubtaskPlanItem { key: "same".to_string(), prompt: "A".to_string() },
+            AgentSubtaskPlanItem { key: "SAME".to_string(), prompt: "B".to_string() },
+        ]);
+        assert!(invalid.is_empty());
+
+        let mut blocked_response = reply.clone();
+        blocked_response.proposed_actions = vec![AgentChatActionProposal {
+            action_type: "file_write".to_string(),
+            title: None,
+            reason: None,
+            risk: None,
+            requires_confirmation: false,
+            target: Some("reports/unsafe.md".to_string()),
+            target_location: None,
+            destination: None,
+            preferred_browser: None,
+            content: Some("must not write".to_string()),
+            capability: None,
+            policy_decision: None,
+            execution_state: "proposed".to_string(),
+            dispatch_note: None,
+            permission_request_id: None,
+            capability_invocation_id: None,
+            workflow_run_id: None,
+            blocked_reason: None,
+        }];
+        block_subagent_mutating_actions(&mut blocked_response);
+        assert_eq!(blocked_response.proposed_actions[0].execution_state, "blocked");
+        assert!(blocked_response.proposed_actions[0]
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("read-only"));
     }
 
     #[test]
@@ -26240,6 +26659,7 @@ schema_version: 1
             },
             AgentChatRuntimeContext {
                 active_run_id: None,
+                subagent_read_only: false,
                 workspace_ready: AgentChatReadiness::Missing,
                 workspace_note: "local workspace needs setup".to_string(),
                 network_search_ready: AgentChatReadiness::Ready,
