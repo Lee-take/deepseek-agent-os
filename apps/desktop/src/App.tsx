@@ -122,10 +122,7 @@ import type {
   NetworkSearchRouteStatus,
   OperationsBriefingRun,
   PermissionAuditEntry,
-  SkillExecutionRecord,
-  SkillPackagePreflight,
   SkillRecord,
-  SkillSourceVerification,
   TaskRecord,
   TerminalReadCommand,
   ThemeStyle,
@@ -890,7 +887,6 @@ export function App() {
   const [toolInvocations, setToolInvocations] = useState<ToolInvocationRecord[]>([]);
   const [agentContextReceipts, setAgentContextReceipts] = useState<AgentContextReceipt[]>([]);
   const [skillRecords, setSkillRecords] = useState<SkillRecord[]>([]);
-  const [skillExecutionRecords, setSkillExecutionRecords] = useState<SkillExecutionRecord[]>([]);
   const [agentRunRecords, setAgentRunRecords] = useState<AgentRunRecord[]>([]);
   const [operationsBriefingRuns, setOperationsBriefingRuns] = useState<OperationsBriefingRun[]>([]);
   const [memoryQuery, setMemoryQuery] = useState("");
@@ -996,8 +992,6 @@ export function App() {
   const [deepSeekBalance, setDeepSeekBalance] = useState<DeepSeekUserBalanceResponse | null>(null);
   const [exportedPackageJson, setExportedPackageJson] = useState("");
   const [importPackageJson, setImportPackageJson] = useState("");
-  const [skillManifestJson, setSkillManifestJson] = useState("");
-  const [skillRemotePackageUrl, setSkillRemotePackageUrl] = useState("");
   const [importPreview, setImportPreview] = useState<WorkPackageImportPreview | null>(null);
   const [soulProfileModalOpen, setSoulProfileModalOpen] = useState(false);
   const [packageNotice, setPackageNotice] = useState("");
@@ -1008,8 +1002,6 @@ export function App() {
   const [memoryCandidateError, setMemoryCandidateError] = useState("");
   const [auditError, setAuditError] = useState("");
   const [capabilityError, setCapabilityError] = useState("");
-  const [skillNotice, setSkillNotice] = useState("");
-  const [skillError, setSkillError] = useState("");
   const [browserNotice, setBrowserNotice] = useState("");
   const [browserError, setBrowserError] = useState("");
   const [browserSubmitNotice, setBrowserSubmitNotice] = useState("");
@@ -1060,7 +1052,6 @@ export function App() {
   const [deepSeekPricingError, setDeepSeekPricingError] = useState("");
   const [deepSeekBalanceError, setDeepSeekBalanceError] = useState("");
   const [packagePending, setPackagePending] = useState(false);
-  const [skillPending, setSkillPending] = useState(false);
   const [memoryPending, setMemoryPending] = useState(false);
   const [memoryCandidatePending, setMemoryCandidatePending] = useState(false);
   const [memoryFeedbackPending, setMemoryFeedbackPending] = useState<string | null>(null);
@@ -1975,7 +1966,6 @@ export function App() {
       setToolInvocations([]);
       setAgentContextReceipts([]);
       setSkillRecords([]);
-      setSkillExecutionRecords([]);
       setAgentRunRecords([]);
       setOperationsBriefingRuns([]);
       return;
@@ -1995,7 +1985,6 @@ export function App() {
       invoke<ToolInvocationRecord[]>("list_agent_tool_invocations"),
       invoke<AgentContextReceipt[]>("list_agent_context_receipts"),
       invoke<SkillRecord[]>("list_skill_records"),
-      invoke<SkillExecutionRecord[]>("list_skill_execution_records"),
       invoke<AgentRunRecord[]>("list_agent_run_records"),
       invoke<OperationsBriefingRun[]>("list_operations_briefing_runs"),
     ])
@@ -2013,7 +2002,6 @@ export function App() {
         recordedToolInvocations,
         contextReceipts,
         skills,
-        skillExecutions,
         agentRuns,
         briefingRuns,
       ]) => {
@@ -2030,7 +2018,6 @@ export function App() {
         setToolInvocations(recordedToolInvocations);
         setAgentContextReceipts(contextReceipts);
         setSkillRecords(skills);
-        setSkillExecutionRecords(skillExecutions);
         setAgentRunRecords(agentRuns);
         setOperationsBriefingRuns(briefingRuns);
         void runMemoryBackgroundMaintenance().catch(() => {
@@ -2043,7 +2030,6 @@ export function App() {
         setMemoryCandidateError(copy.memory.loadFailed);
         setAuditError(copy.audit.loadFailed);
         setCapabilityError(copy.capabilities.loadFailed);
-        setSkillError(copy.skills.loadFailed);
         setBriefingError(copy.operationsBriefing.loadFailed);
       });
   }, [
@@ -2052,7 +2038,6 @@ export function App() {
     copy.memory.loadFailed,
     copy.operationsBriefing.loadFailed,
     copy.package.loadFailed,
-    copy.skills.loadFailed,
   ]);
 
   useEffect(() => {
@@ -2360,17 +2345,6 @@ export function App() {
   const refreshOperationsBriefingRuns = async () => {
     const runs = await invoke<OperationsBriefingRun[]>("list_operations_briefing_runs");
     setOperationsBriefingRuns(runs);
-  };
-
-  const refreshSkillRecords = async () => {
-    const skills = await invoke<SkillRecord[]>("list_skill_records");
-    setSkillRecords(skills);
-  };
-
-  const refreshSkillExecutionRecords = async () => {
-    const executions = await invoke<SkillExecutionRecord[]>("list_skill_execution_records");
-    setSkillExecutionRecords(executions);
-    return executions;
   };
 
   const refreshAgentRunRecords = async () => {
@@ -3430,11 +3404,6 @@ export function App() {
     setPackageError("");
   };
 
-  const clearSkillStatus = () => {
-    setSkillNotice("");
-    setSkillError("");
-  };
-
   const exportOperationsBriefingPackage = async () => {
     clearPackageStatus();
     setBriefingPending(true);
@@ -4231,208 +4200,6 @@ export function App() {
     }
   };
 
-  const installLocalSkillManifest = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    clearSkillStatus();
-
-    if (!skillManifestJson.trim()) {
-      setSkillError(copy.skills.installFailed);
-      return;
-    }
-
-    setSkillPending(true);
-    try {
-      await invoke<SkillRecord>("install_local_skill_manifest", {
-        manifestJson: skillManifestJson,
-        installedFrom: "local manifest paste",
-      });
-      await refreshSkillRecords();
-      setSkillManifestJson("");
-      setSkillNotice(copy.skills.installSucceeded);
-    } catch (error) {
-      setSkillError(`${copy.skills.installFailed} ${String(error)}`);
-    } finally {
-      setSkillPending(false);
-    }
-  };
-
-  const installLocalSkillZipPackage = async () => {
-    clearSkillStatus();
-
-    if (!hasDesktopRuntime()) {
-      setSkillError(copy.chatWorkbench.desktopRuntimeMissing);
-      return;
-    }
-
-    setSkillPending(true);
-    try {
-      const selected = await open({
-        multiple: false,
-        filters: [{ name: "DS Agent skill package", extensions: ["zip"] }],
-      });
-      const packagePath = Array.isArray(selected) ? selected[0] : selected;
-      if (!packagePath) {
-        return;
-      }
-      await invoke<SkillRecord>("install_local_skill_zip_package", {
-        packagePath,
-      });
-      await refreshSkillRecords();
-      setSkillNotice(copy.skills.installSucceeded);
-    } catch (error) {
-      setSkillError(`${copy.skills.installFailed} ${String(error)}`);
-    } finally {
-      setSkillPending(false);
-    }
-  };
-
-  const previewRemoteSkillZipPackage = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    clearSkillStatus();
-    const packageUrl = skillRemotePackageUrl.trim();
-    if (!packageUrl) {
-      setSkillError(copy.skills.previewFailed);
-      return;
-    }
-
-    setSkillPending(true);
-    try {
-      const preflight = await invoke<SkillPackagePreflight>("preview_remote_skill_zip_package", {
-        packageUrl,
-      });
-      setSkillNotice(
-        copy.skills.previewSucceeded(preflight.manifest.name, preflight.package_files.length),
-      );
-    } catch (error) {
-      setSkillError(`${copy.skills.previewFailed} ${String(error)}`);
-    } finally {
-      setSkillPending(false);
-    }
-  };
-
-  const installRemoteSkillZipPackage = async () => {
-    clearSkillStatus();
-    const packageUrl = skillRemotePackageUrl.trim();
-    if (!packageUrl) {
-      setSkillError(copy.skills.installFailed);
-      return;
-    }
-
-    setSkillPending(true);
-    try {
-      await invoke<SkillRecord>("install_remote_skill_zip_package", {
-        packageUrl,
-      });
-      await refreshSkillRecords();
-      setSkillNotice(copy.skills.installSucceeded);
-    } catch (error) {
-      setSkillError(`${copy.skills.installFailed} ${String(error)}`);
-    } finally {
-      setSkillPending(false);
-    }
-  };
-
-  const setLocalSkillEnabled = async (record: SkillRecord, enabled: boolean) => {
-    clearSkillStatus();
-    setSkillPending(true);
-    try {
-      const updated = await invoke<SkillRecord>("set_skill_enabled", {
-        skillId: record.id,
-        enabled,
-        note: enabled ? copy.skills.enable : copy.skills.disable,
-      });
-      setSkillRecords((currentRecords) =>
-        currentRecords.map((currentRecord) =>
-          currentRecord.id === updated.id ? updated : currentRecord,
-        ),
-      );
-      setSkillNotice(copy.skills.statusChanged);
-    } catch (error) {
-      setSkillError(`${copy.skills.statusFailed} ${String(error)}`);
-    } finally {
-      setSkillPending(false);
-    }
-  };
-
-  const verifyLocalSkillSource = async (record: SkillRecord) => {
-    clearSkillStatus();
-    setSkillPending(true);
-    try {
-      const verification = await invoke<SkillSourceVerification>("verify_skill_source", {
-        manifestJson: JSON.stringify(record.manifest),
-      });
-      setSkillNotice(copy.skills.sourceVerified(verification.provenance));
-    } catch (error) {
-      setSkillError(`${copy.skills.sourceFailed} ${String(error)}`);
-    } finally {
-      setSkillPending(false);
-    }
-  };
-
-  const prepareLocalSkillExecution = async (record: SkillRecord) => {
-    clearSkillStatus();
-    setSkillPending(true);
-    try {
-      const execution = await invoke<SkillExecutionRecord>("prepare_skill_execution_record", {
-        skillId: record.id,
-        inputSummary: `Manual safe-runtime preparation for ${record.manifest.name}.`,
-      });
-      setSkillExecutionRecords((currentRecords) => [execution, ...currentRecords]);
-      if (execution.status === "blocked") {
-        setSkillError(
-          copy.skills.executionBlocked(
-            execution.skill_name,
-            execution.blocked_reason ?? "blocked by safe runtime",
-          ),
-        );
-      } else {
-        setSkillNotice(copy.skills.executionPrepared(execution.skill_name));
-      }
-    } catch (error) {
-      setSkillError(`${copy.skills.executionFailed} ${String(error)}`);
-    } finally {
-      setSkillPending(false);
-    }
-  };
-
-  const resetLocalSkillTrust = async (record: SkillRecord) => {
-    clearSkillStatus();
-    setSkillPending(true);
-    try {
-      const updated = await invoke<SkillRecord>("reset_skill_trust", {
-        skillId: record.id,
-        note: copy.skills.trustReset,
-      });
-      setSkillRecords((currentRecords) =>
-        currentRecords.map((currentRecord) =>
-          currentRecord.id === updated.id ? updated : currentRecord,
-        ),
-      );
-      setSkillNotice(copy.skills.trustReset);
-    } catch (error) {
-      setSkillError(`${copy.skills.trustResetFailed} ${String(error)}`);
-    } finally {
-      setSkillPending(false);
-    }
-  };
-
-  const uninstallLocalSkill = async (record: SkillRecord) => {
-    clearSkillStatus();
-    setSkillPending(true);
-    try {
-      const records = await invoke<SkillRecord[]>("uninstall_skill", {
-        skillId: record.id,
-        note: copy.skills.uninstalled,
-      });
-      setSkillRecords(records);
-      setSkillNotice(copy.skills.uninstalled);
-    } catch (error) {
-      setSkillError(`${copy.skills.uninstallFailed} ${String(error)}`);
-    } finally {
-      setSkillPending(false);
-    }
-  };
-
   const pendingCapabilityRecords = capabilityRecords.filter(
     (record) => record.effective_status === "pending_approval",
   );
@@ -5050,247 +4817,20 @@ export function App() {
               <ClipboardList size={16} aria-hidden="true" />
               <span>{copy.skills.title}</span>
             </summary>
-            <div className="skill-plugin-list">
-              <article className="skill-plugin-card">
-                <header>
-                  <div>
-                    <strong>{copy.skills.operationsTitle}</strong>
-                    <p>{copy.skills.operationsDescription}</p>
-                  </div>
-                  <span>{copy.skills.enabled}</span>
-                </header>
-                <form className="sidebar-form workflow-form" onSubmit={runOperationsBriefingWorkflow}>
-                  <button
-                    type="button"
-                    disabled={briefingPending || capabilityPending !== null}
-                    onClick={() => void seedOperationsBriefingEvidenceTemplates()}
-                  >
-                    <FileText size={14} aria-hidden="true" />
-                    {copy.operationsBriefing.seedTemplates}
-                  </button>
-                  <button type="submit" disabled={briefingPending || capabilityPending !== null}>
-                    <MousePointerClick size={14} aria-hidden="true" />
-                    {briefingPending ? copy.operationsBriefing.running : copy.operationsBriefing.run}
-                  </button>
-                </form>
-                {briefingNotice ? <p className="package-message">{briefingNotice}</p> : null}
-                {briefingError ? <p className="package-error">{briefingError}</p> : null}
-                <div className="sidebar-compact-panel" aria-live="polite">
-                  <div className="queue-heading">
-                    <strong>{copy.operationsBriefing.runs}</strong>
-                    <span>{operationsBriefingRuns.length}</span>
-                  </div>
-                  {operationsBriefingRuns.length === 0 ? (
-                    <p className="empty-state">{copy.operationsBriefing.noRuns}</p>
-                  ) : (
-                    <div className="sidebar-record-list">
-                      {operationsBriefingRuns.slice(0, 3).map((operationsBriefingRun, runIndex) => (
-                        <article className="sidebar-record-row" key={operationsBriefingRun.id}>
-                          <div>
-                            <span>
-                              {runIndex === 0
-                                ? copy.operationsBriefing.latestRun
-                                : copy.operationsBriefing.runs}
-                            </span>
-                            <strong>{operationsBriefingRun.title}</strong>
-                          </div>
-                          <span className={`access-status ${operationsBriefingRun.status}`}>
-                            {copy.operationsBriefing.status[operationsBriefingRun.status]}
-                          </span>
-                        </article>
-                      ))}
-                    </div>
-                  )}
-                  {latestOperationsBriefingRun ? (
-                    <div className="sidebar-split-actions">
-                      <button
-                        type="button"
-                        onClick={exportOperationsBriefingPackage}
-                        disabled={briefingPending || packagePending}
-                      >
-                        <PackageOpen size={14} aria-hidden="true" />
-                        {copy.operationsBriefing.exportPackage}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void exportOperationsBriefingReport()}
-                        disabled={briefingPending}
-                      >
-                        <FileText size={14} aria-hidden="true" />
-                        {copy.operationsBriefing.exportReport}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void exportOperationsBriefingHtmlReport()}
-                        disabled={briefingPending}
-                      >
-                        <FileText size={14} aria-hidden="true" />
-                        {copy.operationsBriefing.exportHtmlReport}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void exportOperationsBriefingPdfReport()}
-                        disabled={briefingPending}
-                      >
-                        <FileText size={14} aria-hidden="true" />
-                        {copy.operationsBriefing.exportPdfReport}
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
-              </article>
-              <article className="skill-plugin-card">
-                <header>
-                  <div>
-                    <strong>{copy.skills.installedTitle}</strong>
-                    <p>{copy.skills.safeBoundary}</p>
-                  </div>
-                  <span>{skillRecords.length}</span>
-                </header>
-                <form className="sidebar-form workflow-form" onSubmit={installLocalSkillManifest}>
-                  <textarea
-                    value={skillManifestJson}
-                    aria-label={copy.skills.manifestPlaceholder}
-                    placeholder={copy.skills.manifestPlaceholder}
-                    rows={5}
-                    onChange={(event) => setSkillManifestJson(event.target.value)}
-                  />
-                  <button type="submit" disabled={skillPending}>
-                    <ShieldCheck size={14} aria-hidden="true" />
-                    {skillPending ? copy.skills.installing : copy.skills.installManifest}
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-action"
-                    disabled={skillPending}
-                    onClick={() => void installLocalSkillZipPackage()}
-                  >
-                    <PackageOpen size={14} aria-hidden="true" />
-                    {copy.skills.installZip}
-                  </button>
-                </form>
-                <form className="sidebar-form workflow-form" onSubmit={previewRemoteSkillZipPackage}>
-                  <input
-                    value={skillRemotePackageUrl}
-                    aria-label={copy.skills.remotePackageUrlPlaceholder}
-                    placeholder={copy.skills.remotePackageUrlPlaceholder}
-                    onChange={(event) => setSkillRemotePackageUrl(event.target.value)}
-                  />
-                  <button type="submit" disabled={skillPending}>
-                    <ShieldCheck size={14} aria-hidden="true" />
-                    {skillPending ? copy.skills.installing : copy.skills.previewRemote}
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-action"
-                    disabled={skillPending}
-                    onClick={() => void installRemoteSkillZipPackage()}
-                  >
-                    <PackageOpen size={14} aria-hidden="true" />
-                    {copy.skills.installRemote}
-                  </button>
-                </form>
-                {skillNotice ? <p className="package-message">{skillNotice}</p> : null}
-                {skillError ? <p className="package-error">{skillError}</p> : null}
-                <div className="sidebar-compact-panel" aria-live="polite">
-                  {skillRecords.length === 0 ? (
-                    <p className="empty-state">{copy.skills.empty}</p>
-                  ) : (
-                    <div className="sidebar-record-list">
-                      {skillRecords.map((record) => {
-                        const enabled = record.enablement_status === "enabled";
-                        const permissionSummary = record.manifest.permissions.length
-                          ? record.manifest.permissions
-                              .map((permission) => `${permission.kind}:${permission.scope}`)
-                              .join(", ")
-                          : copy.skills.noPermissions;
-                        return (
-                          <article className="sidebar-record-row" key={record.id}>
-                            <div>
-                              <span>{record.manifest.version}</span>
-                              <strong>{record.manifest.name}</strong>
-                              <small>{permissionSummary}</small>
-                            </div>
-                            <button
-                              type="button"
-                              className="secondary-action"
-                              disabled={skillPending}
-                              onClick={() => void verifyLocalSkillSource(record)}
-                            >
-                              <ShieldCheck size={14} aria-hidden="true" />
-                              {copy.skills.verifySource}
-                            </button>
-                            <button
-                              type="button"
-                              className="secondary-action"
-                              disabled={skillPending}
-                              onClick={() => void prepareLocalSkillExecution(record)}
-                            >
-                              <Play size={14} aria-hidden="true" />
-                              {copy.skills.prepareExecution}
-                            </button>
-                            <button
-                              type="button"
-                              className="secondary-action"
-                              disabled={skillPending}
-                              onClick={() => void setLocalSkillEnabled(record, !enabled)}
-                            >
-                              {enabled ? copy.skills.disable : copy.skills.enable}
-                            </button>
-                            <button
-                              type="button"
-                              className="secondary-action"
-                              disabled={skillPending}
-                              onClick={() => void resetLocalSkillTrust(record)}
-                            >
-                              <ArchiveRestore size={14} aria-hidden="true" />
-                              {copy.skills.resetTrust}
-                            </button>
-                            <button
-                              type="button"
-                              className="secondary-action"
-                              disabled={skillPending}
-                              onClick={() => void uninstallLocalSkill(record)}
-                            >
-                              <X size={14} aria-hidden="true" />
-                              {copy.skills.uninstall}
-                            </button>
-                            <span className={`access-status ${record.enablement_status}`}>
-                              {enabled ? copy.skills.enabled : copy.skills.disabled}
-                            </span>
-                          </article>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-                {skillExecutionRecords.length > 0 ? (
-                  <div className="sidebar-compact-panel" aria-live="polite">
-                    <div className="queue-heading">
-                      <strong>{copy.skills.executionsTitle}</strong>
-                      <span>{skillExecutionRecords.length}</span>
-                    </div>
-                    <div className="sidebar-record-list">
-                      {skillExecutionRecords.slice(0, 4).map((execution) => (
-                        <article className="sidebar-record-row" key={execution.id}>
-                          <div>
-                            <span>{formatTaskDate(execution.requested_at, language)}</span>
-                            <strong>{execution.skill_name}</strong>
-                            <small>
-                              {execution.status === "blocked"
-                                ? execution.blocked_reason ?? execution.execution_plan
-                                : execution.execution_plan}
-                            </small>
-                          </div>
-                          <span className={`access-status ${execution.status}`}>
-                            {execution.status}
-                          </span>
-                        </article>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-              </article>
+            <div className="skill-catalog">
+              <p className="skill-catalog-note">{copy.skills.autoInvoke}</p>
+              <div className="skill-catalog-list">
+                <details className="skill-catalog-item">
+                  <summary>{copy.skills.operationsTitle}</summary>
+                  <p>{copy.skills.operationsDescription}</p>
+                </details>
+                {skillRecords.map((record) => (
+                  <details className="skill-catalog-item" key={record.id}>
+                    <summary>{record.manifest.name}</summary>
+                    <p>{record.manifest.description}</p>
+                  </details>
+                ))}
+              </div>
             </div>
           </details>
 

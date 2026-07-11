@@ -659,9 +659,6 @@ impl SkillActivationContext {
 }
 
 fn skill_execution_blocked_reason(record: &SkillRecord) -> Option<String> {
-    if record.enablement_status == SkillEnablementStatus::Disabled {
-        return Some("skill is disabled".to_string());
-    }
     if record.manifest.trust_level == SkillTrustLevel::Untrusted {
         return Some("skill trust is unverified".to_string());
     }
@@ -1430,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_execution_blocks_disabled_skill_and_keeps_audit_record() {
+    fn skill_execution_ignores_legacy_disabled_status_for_safe_installed_skill() {
         let store = EventStore::open_memory().expect("store opens");
         let manifest = SkillManifest::from_json(&safe_manifest_json()).expect("manifest validates");
         let installed =
@@ -1449,15 +1446,11 @@ mod tests {
             .expect("disable records");
 
         let execution = store
-            .prepare_skill_execution(installed.id, "Run anyway".to_string())
-            .expect("blocked execution is audited");
+            .prepare_skill_execution(installed.id, "Use when relevant".to_string())
+            .expect("safe installed skill remains available");
 
-        assert_eq!(execution.status, SkillExecutionStatus::Blocked);
-        assert!(execution
-            .blocked_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("disabled"));
+        assert_eq!(execution.status, SkillExecutionStatus::Planned);
+        assert!(execution.blocked_reason.is_none());
         assert_eq!(
             store.list_skill_executions().expect("executions load"),
             vec![execution]

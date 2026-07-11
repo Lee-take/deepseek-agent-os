@@ -285,6 +285,7 @@ type TranslationSet = {
     disabled: string;
     operationsTitle: string;
     operationsDescription: string;
+    autoInvoke: string;
     installedTitle: string;
     manifestPlaceholder: string;
     remotePackageUrlPlaceholder: string;
@@ -1291,6 +1292,7 @@ export const translations: Record<Language, TranslationSet> = {
       disabled: "已禁用",
       operationsTitle: "运营简报",
       operationsDescription: "读取本地证据，调用 DeepSeek 生成可复核的经营管理简报。",
+      autoInvoke: "DS Agent 会在任务需要时自动调用已安装的技能与插件。",
       installedTitle: "本地 Skill Registry",
       manifestPlaceholder: "粘贴 ds-agent.skill.v1 manifest JSON。本版本只登记声明式 skill，不执行脚本或二进制。",
       remotePackageUrlPlaceholder: "GitHub/Hugging Face Skill zip URL",
@@ -2421,6 +2423,7 @@ export const translations: Record<Language, TranslationSet> = {
       disabled: "Disabled",
       operationsTitle: "Operations Briefing",
       operationsDescription: "Reads local evidence and uses DeepSeek to produce a reviewable management brief.",
+      autoInvoke: "DS Agent automatically uses installed skills and plugins when a task needs them.",
       installedTitle: "Local Skill Registry",
       manifestPlaceholder:
         "Paste a ds-agent.skill.v1 manifest JSON. This version registers declarative skills only; scripts and binaries are not executed.",

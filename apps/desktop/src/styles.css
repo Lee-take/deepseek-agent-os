@@ -554,57 +554,54 @@ textarea {
   gap: 8px;
 }
 
-.skill-plugin-list {
+.skill-catalog {
   display: grid;
   gap: 10px;
   border-top: 1px solid var(--border);
   padding: 10px;
 }
 
-.skill-plugin-card {
+.skill-catalog-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.skill-catalog-list {
   display: grid;
-  gap: 10px;
+  gap: 6px;
   min-width: 0;
+}
+
+.skill-catalog-item {
   border: 1px solid var(--border);
   border-radius: 7px;
   background: color-mix(in srgb, var(--surface-bg) 72%, transparent);
+  overflow: hidden;
+}
+
+.skill-catalog-item > summary {
+  cursor: pointer;
   padding: 10px;
-}
-
-.skill-plugin-card header {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: start;
-}
-
-.skill-plugin-card strong {
-  display: block;
-  min-width: 0;
+  font-size: 12px;
+  font-weight: 700;
   overflow-wrap: anywhere;
-  font-size: 13px;
 }
 
-.skill-plugin-card p {
-  margin: 4px 0 0;
+.skill-catalog-item > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.skill-catalog-item p {
+  margin: 0;
+  border-top: 1px solid var(--border);
+  padding: 9px 10px 10px;
   color: var(--muted);
   font-size: 11px;
-  line-height: 1.45;
+  line-height: 1.5;
   overflow-wrap: anywhere;
-}
-
-.skill-plugin-card header > span {
-  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
-  border-radius: 999px;
-  color: var(--accent);
-  padding: 2px 7px;
-  font-size: 11px;
-  line-height: 1.3;
-}
-
-.skill-plugin-card .sidebar-form {
-  border-top: 1px solid var(--border);
-  padding: 10px 0 0;
 }
 
 .sidebar-controls label {
@@ -3146,7 +3143,6 @@ dd {
   .setup-form,
   .setup-meta,
   .workflow-form,
-  .skill-plugin-card header,
   .context-receipt-meta,
   .context-receipt-lists,
   .workflow-run-sections {

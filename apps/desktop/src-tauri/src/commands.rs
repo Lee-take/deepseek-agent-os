@@ -158,15 +158,15 @@ const AGENT_TOOL_LOOP_MAX_ROUNDS: usize = 4;
 const AGENT_RUN_GUIDANCE_MAX_ITEMS_PER_ROUND: usize = 8;
 const AGENT_RUN_GUIDANCE_PROMPT_CHAR_LIMIT: usize = 12_000;
 const AGENT_SKILL_CATALOG_MAX_ITEMS: usize = 24;
-const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user from agent_actions, missing_prerequisites, required_confirmations, artifact_targets, and memory_candidates. Do not claim local tools ran; propose actions for DS Agent to validate and execute.";
+const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user from agent_actions, missing_prerequisites, required_confirmations, artifact_targets, and memory_candidates. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
 const AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT: usize = 1200;
 const APP_UPDATE_RELEASES_API_URL: &str = "https://api.github.com/repos/Lee-take/dsagent/releases";
 const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/dsagent/releases/download/";
 const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.2.1";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.2.1";
+const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.2.2";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.2.2";
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
 const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
@@ -5572,6 +5572,7 @@ fn build_agent_chat_protocol_user_prompt(
          - Each agent_actions item may include action_type, title, reason, risk, requires_confirmation, target, destination, target_location, preferred_browser, and content.\n\
          - For file_write or create_report, target must be a relative workspace path and content must be the exact UTF-8 text DS Agent should write after local validation. For office_create, office_update, or office_open, target must be a .docx, .xlsx, or .pptx path when supplied; use target_location=\"desktop\" only when the user explicitly asks for the Desktop.\n\
          - reply_to_user must describe the intended plan, not local completion. Do not say a file was created, opened, edited, or saved until DS Agent returns execution evidence.\n\
+         - Write reply_to_user for an ordinary user in the same language as the user. Lead with the useful conclusion or next step, use short natural sentences, and omit internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, and English verification receipts unless the user explicitly asks for technical details.\n\
          - DS Agent will validate schema, permissions, risk, workspace paths, and confirmations before executing any action.\n\n\
          {runtime_memory_section}\
          Full user message:\n{user_prompt}",
@@ -7244,9 +7245,7 @@ fn load_agent_skill_catalog(store: &EventStore) -> Result<Vec<AgentSkillCatalogI
     Ok(records
         .into_iter()
         .filter(|record| {
-            record.enablement_status == SkillEnablementStatus::Enabled
-                && record.manifest.trust_level != SkillTrustLevel::Untrusted
-                && record.entry_available
+            record.manifest.trust_level != SkillTrustLevel::Untrusted && record.entry_available
         })
         .take(AGENT_SKILL_CATALOG_MAX_ITEMS)
         .map(|record| AgentSkillCatalogItem {
@@ -8692,7 +8691,7 @@ fn build_agent_tool_evidence_followup_prompt(
         "DS Agent completed local actions and collected tool evidence.\n\
          Original user message:\n{original_user_prompt}\n\n\
          Tool evidence from completed DS Agent actions:\n{}\n\n\
-         Use only this completed evidence and the original user message to produce the final user-facing answer. Do not claim any unexecuted action succeeded. Do not quote internal loop labels such as loop_mode, validators, stop_conditions, or matched_stop_conditions in the user-facing answer.",
+         Use only this completed evidence and the original user message to produce the final user-facing answer. Lead with the useful conclusion, answer in the user's language, and summarize evidence in ordinary language. Do not claim any unexecuted action succeeded. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, English verification receipts, or loop labels such as loop_mode, validators, stop_conditions, and matched_stop_conditions unless the user explicitly asked for technical details.",
         completed_actions.join("\n")
     ))
 }
@@ -8975,49 +8974,132 @@ fn agent_context_truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 fn apply_agent_local_completion_summary(response: &mut AgentChatResponse) {
-    let completed_actions = completed_agent_action_dispatch_summaries(response);
+    let completed_actions = completed_agent_action_user_summaries(response);
     if completed_actions.is_empty() {
         return;
     }
 
-    response.content = format!(
-        "DS Agent 已完成并验证本地动作：\n{}\n\n验证：本地执行器返回成功状态和结果记录。\n建议：{}",
-        completed_actions.join("\n"),
-        agent_local_completion_advice(response)
-    );
+    response.content = if completed_actions.len() == 1 {
+        completed_actions[0].clone()
+    } else {
+        format!(
+            "已完成以下操作：\n{}",
+            completed_actions
+                .iter()
+                .map(|summary| format!("- {summary}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
 }
 
-fn agent_local_completion_advice(response: &AgentChatResponse) -> &'static str {
-    if response.proposed_actions.iter().any(|action| {
-        action.execution_state == "succeeded"
-            && matches!(
-                action.action_type.as_str(),
-                "office_create" | "office_update" | "office_open"
-            )
-    }) {
-        return "如果这份 Office 结果要发给他人，下一步可以让我帮你检查标题、格式和敏感信息。";
-    }
-
-    if response.proposed_actions.iter().any(|action| {
-        action.execution_state == "succeeded"
-            && matches!(
-                action.action_type.as_str(),
-                "file_create" | "file_update" | "file_write" | "create_report"
-            )
-    }) {
-        return "如果这个文件要用于正式场景，下一步可以让我帮你补一次格式和敏感信息检查。";
-    }
-
-    "如果要把这个结果用于正式场景，下一步可以让我帮你补一次复核。"
-}
-
-fn completed_agent_action_dispatch_summaries(response: &AgentChatResponse) -> Vec<String> {
+fn completed_agent_action_user_summaries(response: &AgentChatResponse) -> Vec<String> {
     response
         .proposed_actions
         .iter()
         .filter(|action| action.execution_state == "succeeded")
-        .filter_map(agent_action_dispatch_summary)
+        .map(agent_action_user_summary)
         .collect()
+}
+
+fn agent_action_user_summary(action: &AgentChatActionProposal) -> String {
+    let target = action
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match action.action_type.as_str() {
+        "app_update_check" => agent_app_update_check_user_summary(action),
+        "app_update_download" => target
+            .map(|path| format!("更新安装包已下载到：{path}。"))
+            .unwrap_or_else(|| "更新安装包已下载并验证。".to_string()),
+        "app_update_install" => "更新安装程序已启动。完成后 DS Agent 会重新打开。".to_string(),
+        "browser_open" => target
+            .map(|url| format!("已打开：{url}。"))
+            .unwrap_or_else(|| "已打开你指定的网页。".to_string()),
+        "office_create" => user_summary_with_target("已创建文件", target),
+        "office_update" => user_summary_with_target("已更新文件", target),
+        "office_open" => user_summary_with_target("已打开文件", target),
+        "file_create" | "file_write" | "create_report" => {
+            user_summary_with_target("已保存文件", target)
+        }
+        "file_update" => user_summary_with_target("已更新文件", target),
+        "file_delete" => user_summary_with_target("已删除文件", target),
+        "file_rename" => {
+            user_summary_with_move("已重命名文件", target, action.destination.as_deref())
+        }
+        "directory_create" => user_summary_with_target("已创建文件夹", target),
+        "directory_delete" => user_summary_with_target("已删除文件夹", target),
+        "directory_rename" => {
+            user_summary_with_move("已重命名文件夹", target, action.destination.as_deref())
+        }
+        "file_read" => user_summary_with_target("已读取文件", target),
+        "terminal_read" => user_summary_with_target("已读取", target),
+        "computer_screenshot" => "已查看当前屏幕。".to_string(),
+        "computer_control" => "已完成电脑操作。".to_string(),
+        _ => format!(
+            "已完成：{}。",
+            action
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("你请求的操作")
+        ),
+    }
+}
+
+fn user_summary_with_target(label: &str, target: Option<&str>) -> String {
+    target
+        .map(|target| format!("{label}：{target}。"))
+        .unwrap_or_else(|| format!("{label}。"))
+}
+
+fn user_summary_with_move(label: &str, target: Option<&str>, destination: Option<&str>) -> String {
+    let destination = destination.map(str::trim).filter(|value| !value.is_empty());
+    match (target, destination) {
+        (Some(target), Some(destination)) => format!("{label}：{target} → {destination}。"),
+        (Some(target), None) => format!("{label}：{target}。"),
+        _ => format!("{label}。"),
+    }
+}
+
+fn agent_app_update_check_user_summary(action: &AgentChatActionProposal) -> String {
+    let output = agent_action_dispatch_output(action);
+    let current_version = output
+        .as_ref()
+        .and_then(|value| value.get("current_version"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let latest_version = output
+        .as_ref()
+        .and_then(|value| value.get("latest_version"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let update_available = output
+        .as_ref()
+        .and_then(|value| value.get("update_available"))
+        .and_then(serde_json::Value::as_bool);
+
+    match (current_version, latest_version, update_available) {
+        (Some(current), _, Some(false)) => {
+            format!("已检查 DS Agent 版本。你当前使用的是 {current}，已经是最新版，无需升级。")
+        }
+        (Some(current), Some(latest), Some(true)) => {
+            format!("已检查 DS Agent 版本。当前版本是 {current}，最新版本是 {latest}，可以升级。")
+        }
+        (Some(current), _, _) => format!("已检查 DS Agent 版本。当前版本是 {current}。"),
+        _ => "已完成 DS Agent 版本检查。".to_string(),
+    }
+}
+
+fn agent_action_dispatch_output(action: &AgentChatActionProposal) -> Option<serde_json::Value> {
+    let note = action.dispatch_note.as_deref()?;
+    let (_, output) = note.rsplit_once("output=")?;
+    serde_json::from_str(output.trim()).ok()
 }
 
 fn agent_action_dispatch_summary(action: &AgentChatActionProposal) -> Option<String> {
@@ -14457,9 +14539,10 @@ mod tests {
     use super::{
         agent_app_update_tool_request, agent_terminal_read_command_from_target,
         agent_tool_run_id_for_action, app_update_current_version,
-        apply_tool_invocation_to_agent_action, authorize_agent_tool_execution,
-        block_agent_run_after_action_resolution, execute_agent_tool_with_executor,
-        finish_agent_run_after_resumed_tool, is_newer_version, is_windows_installer_asset,
+        apply_agent_local_completion_summary, apply_tool_invocation_to_agent_action,
+        authorize_agent_tool_execution, block_agent_run_after_action_resolution,
+        execute_agent_tool_with_executor, finish_agent_run_after_resumed_tool, is_newer_version,
+        is_windows_installer_asset, load_agent_skill_catalog,
         record_completed_agent_tool_execution, release_asset_is_trusted, release_installable_asset,
         run_agent_chat_with_clients_and_api_keys_and_computer_use,
         run_authorized_agent_tool_execution,
@@ -14501,9 +14584,9 @@ mod tests {
         run_memory_background_maintenance_with_model_in_store,
         run_next_queued_agent_chat_with_clients_and_api_keys,
         should_require_computer_control_unlock, thinking_level_context_label,
-        AgentChatActionProposal, AgentChatReadiness, AgentChatRequest, AgentChatRuntimeContext,
-        BrowserUrlOpenOutcome, BrowserUrlOpener, ComputerControlUnlockState,
-        COMPUTER_CONTROL_UNLOCK_TTL_MINUTES,
+        AgentChatActionProposal, AgentChatReadiness, AgentChatRequest, AgentChatResponse,
+        AgentChatRuntimeContext, BrowserUrlOpenOutcome, BrowserUrlOpener,
+        ComputerControlUnlockState, COMPUTER_CONTROL_UNLOCK_TTL_MINUTES,
     };
     use crate::kernel::agent_run::{
         AgentRunCancelRequest, AgentRunExecutionContext, AgentRunQueuedGuidance,
@@ -14576,6 +14659,16 @@ mod tests {
         assert!(!is_newer_version("v0.1.0-rc.3", "v0.1.0"));
         assert!(!is_newer_version("v0.1.0", "0.1.0"));
         assert!(!is_newer_version("v0.0.9", "0.1.0"));
+    }
+
+    #[test]
+    fn agent_chat_prompt_keeps_internal_receipts_out_of_ordinary_replies() {
+        let prompt = super::AGENT_CHAT_SYSTEM_PROMPT;
+        assert!(prompt.contains("ordinary user"));
+        assert!(prompt.contains("user's language"));
+        assert!(prompt.contains("target=/evidence=/output="));
+        assert!(prompt.contains("raw JSON"));
+        assert!(prompt.contains("unless the user explicitly asks for technical details"));
     }
 
     struct FakeAgentToolExecutor {
@@ -14813,6 +14906,66 @@ mod tests {
             capability_invocations[0].capability,
             CapabilityKind::AppUpdateCheck
         );
+    }
+
+    #[test]
+    fn local_completion_summary_turns_update_receipt_into_plain_language() {
+        let mut response = AgentChatResponse {
+            id: Uuid::new_v4(),
+            role: "assistant".to_string(),
+            content: "我会检查版本。".to_string(),
+            protocol_version: "ds-agent-envelope-v1".to_string(),
+            proposed_actions: vec![AgentChatActionProposal {
+                action_type: "app_update_check".to_string(),
+                title: Some("检查 DS Agent 版本更新".to_string()),
+                reason: None,
+                risk: Some("low".to_string()),
+                requires_confirmation: false,
+                target: Some("https://github.com/Lee-take/dsagent".to_string()),
+                target_location: None,
+                destination: None,
+                preferred_browser: None,
+                content: None,
+                capability: Some(CapabilityKind::AppUpdateCheck),
+                policy_decision: Some(PolicyDecision::Allow),
+                execution_state: "succeeded".to_string(),
+                dispatch_note: Some(
+                    "release status verified; evidence=https://github.com/Lee-take/dsagent/releases/tag/v0.2.1; output={\"current_version\":\"v0.2.1\",\"latest_version\":\"0.2.1\",\"update_available\":false}"
+                        .to_string(),
+                ),
+                permission_request_id: None,
+                capability_invocation_id: Some(Uuid::new_v4()),
+                workflow_run_id: None,
+                blocked_reason: None,
+            }],
+            missing_prerequisites: Vec::new(),
+            memory_candidates: Vec::new(),
+            model: "deepseek-v4-pro".to_string(),
+            cache_status: DeepSeekChatCacheStatus::Miss,
+            elapsed_ms: 0,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            estimated_cost_micro_usd: None,
+            created_at: Utc::now(),
+        };
+
+        apply_agent_local_completion_summary(&mut response);
+
+        assert_eq!(
+            response.content,
+            "已检查 DS Agent 版本。你当前使用的是 v0.2.1，已经是最新版，无需升级。"
+        );
+        for internal_detail in [
+            "app_update_check",
+            "target=",
+            "evidence=",
+            "output=",
+            "update_available",
+            "本地执行器",
+        ] {
+            assert!(!response.content.contains(internal_detail));
+        }
     }
 
     #[test]
@@ -17514,13 +17667,13 @@ mod tests {
     fn app_update_status_keeps_current_formal_release_quiet_from_release_list() {
         let releases = vec![
             GithubRelease {
-                tag_name: "v0.2.1".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.2.1"
+                tag_name: "v0.2.2".to_string(),
+                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.2.2"
                     .to_string(),
                 assets: vec![GithubReleaseAsset {
-                    name: "DS Agent_0.2.1_x64-setup.exe".to_string(),
+                    name: "DS Agent_0.2.2_x64-setup.exe".to_string(),
                     browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.2.1/DS.Agent_0.2.1_x64-setup.exe"
+                        "https://github.com/Lee-take/dsagent/releases/download/v0.2.2/DS.Agent_0.2.2_x64-setup.exe"
                             .to_string(),
                 }],
             },
@@ -17540,8 +17693,8 @@ mod tests {
         let status = update_status_from_releases(releases, app_update_current_version());
 
         assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.2.1");
-        assert_eq!(status.latest_version.as_deref(), Some("0.2.1"));
+        assert_eq!(status.current_version, "v0.2.2");
+        assert_eq!(status.latest_version.as_deref(), Some("0.2.2"));
         assert!(status.asset_name.is_none());
     }
 
@@ -18411,6 +18564,26 @@ mod tests {
         skill_id
     }
 
+    #[test]
+    fn agent_skill_catalog_includes_safe_installed_skill_with_legacy_disabled_status() {
+        let store = EventStore::open_memory().expect("store opens");
+        let skill_id =
+            install_test_declarative_skill(&store, r#"{"steps":[{"tool":"network.search"}]}"#);
+        let disabled = SkillEnablementChange::new(
+            skill_id,
+            SkillEnablementStatus::Disabled,
+            "Legacy user-managed status".to_string(),
+        )
+        .expect("disable change is valid");
+        store
+            .append_skill_enablement_change(&disabled)
+            .expect("disable change appends");
+
+        let catalog = load_agent_skill_catalog(&store).expect("catalog loads");
+
+        assert!(catalog.iter().any(|skill| skill.id == skill_id));
+    }
+
     impl<'a> StoreLockCheckingFileContentClient<'a> {
         fn new(store: &'a Mutex<EventStore>) -> Self {
             Self {
@@ -18936,7 +19109,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_agent_run_blocks_when_selected_skill_is_disabled() {
+    fn queued_agent_run_uses_safe_installed_skill_despite_legacy_disabled_status() {
         let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
         let skill_id = {
             let store = store.lock().expect("store lock");
@@ -18945,7 +19118,7 @@ mod tests {
             let disabled = SkillEnablementChange::new(
                 skill_id,
                 SkillEnablementStatus::Disabled,
-                "Disabled before agent execution.".to_string(),
+                "Legacy disabled status before automatic execution.".to_string(),
             )
             .expect("disable change is valid");
             store
@@ -18954,8 +19127,8 @@ mod tests {
             skill_id
         };
         let start = AgentRunStart::queued(
-            "conversation-disabled-skill".to_string(),
-            "Use the disabled workflow.".to_string(),
+            "conversation-legacy-disabled-skill".to_string(),
+            "Use the installed workflow when it matches this task.".to_string(),
             0,
         )
         .expect("queued run start");
@@ -18964,23 +19137,38 @@ mod tests {
             .expect("store lock")
             .append_agent_run_start(&start)
             .expect("queued run appends");
-        let transport = RecordingDeepSeekTransport::new(
+        let transport = SequencedDeepSeekTransport::new(vec![
             serde_json::json!({
                 "protocol_version": "ds-agent-envelope-v1",
-                "reply_to_user": "Trying the requested installed workflow.",
+                "reply_to_user": "Activating the matching installed workflow.",
                 "agent_actions": [{
                     "action_type": "skill_activate",
-                    "title": "Activate disabled workflow",
-                    "reason": "The user selected this workflow.",
+                    "title": "Activate installed workflow",
+                    "reason": "The installed workflow matches the task.",
                     "risk": "low",
                     "requires_confirmation": false,
                     "target": skill_id.to_string(),
-                    "content": "Run the selected workflow."
+                    "content": "Run the matching workflow."
                 }],
                 "missing_prerequisites": []
             })
             .to_string(),
-        );
+            serde_json::json!({
+                "protocol_version": "ds-agent-envelope-v1",
+                "reply_to_user": "The workflow requires public source evidence.",
+                "agent_actions": [{
+                    "action_type": "network_search",
+                    "title": "Search from installed workflow",
+                    "reason": "Follow the verified declarative workflow.",
+                    "risk": "low",
+                    "requires_confirmation": false,
+                    "target": "DS Agent automatic skill selection"
+                }],
+                "missing_prerequisites": []
+            })
+            .to_string(),
+            "The installed workflow completed with verified source evidence.".to_string(),
+        ]);
         let cache = DeepSeekMemoryChatCompletionCache::default();
         let file_client = LocalFileContentClient::new(512 * 1024);
         let file_write_client = RecordingFileWriteClient::new();
@@ -18992,7 +19180,7 @@ mod tests {
             &transport,
             &cache,
             &["test-secret".to_string()],
-            "worker-disabled-skill".to_string(),
+            "worker-legacy-disabled-skill".to_string(),
             ModelRoute::Flash,
             ThinkingLevel::Fast,
             AccessMode::LimitedAuto,
@@ -19003,35 +19191,27 @@ mod tests {
             &search_client,
             &browser_client,
         )
-        .expect("disabled skill result is audited")
+        .expect("safe installed skill execution succeeds")
         .expect("queued run exists");
 
-        assert_eq!(outcome.record.status, AgentRunStatus::Blocked);
-        assert_eq!(
-            outcome.response.proposed_actions[0].execution_state,
-            "failed"
-        );
-        assert!(outcome.response.proposed_actions[0]
-            .blocked_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("disabled"));
-        let invocation = store
+        assert_eq!(outcome.record.status, AgentRunStatus::Completed);
+        assert_eq!(outcome.response.proposed_actions.len(), 2);
+        assert!(outcome
+            .response
+            .proposed_actions
+            .iter()
+            .all(|action| action.execution_state == "succeeded"));
+        assert_eq!(search_client.recorded_calls().len(), 1);
+        let invocations = store
             .lock()
             .expect("store lock")
             .list_tool_invocations()
-            .expect("tool invocations load")
-            .into_iter()
-            .find(|invocation| invocation.tool_id == SKILL_ACTIVATE_TOOL_ID)
-            .expect("failed skill invocation exists");
-        assert_eq!(invocation.status, ToolExecutionStatus::Failed);
-        assert!(invocation
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("disabled"));
+            .expect("tool invocations load");
+        assert_eq!(invocations.len(), 2);
+        assert!(invocations
+            .iter()
+            .all(|invocation| invocation.status == ToolExecutionStatus::Succeeded));
     }
-
     #[test]
     fn queued_agent_run_applies_new_guidance_at_the_next_tool_boundary() {
         let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
@@ -20276,9 +20456,10 @@ mod tests {
         assert!(followup_prompt.contains(
             "stop_conditions=evidence_observed,blocked_or_failed,user_confirmation_required"
         ));
-        assert!(followup_prompt.contains(
-            "Do not quote internal loop labels such as loop_mode, validators, stop_conditions, or matched_stop_conditions in the user-facing answer."
-        ));
+        assert!(followup_prompt
+            .contains("Do not expose internal action types, tool IDs, protocol or schema names"));
+        assert!(followup_prompt.contains("target=/evidence=/output= fields"));
+        assert!(followup_prompt.contains("summarize evidence in ordinary language"));
     }
 
     #[test]
@@ -24909,15 +25090,19 @@ schema_version: 1
 
         assert_eq!(response.proposed_actions.len(), 1);
         assert_eq!(response.proposed_actions[0].execution_state, "succeeded");
-        assert!(response.content.contains("DS Agent 已完成并验证本地动作"));
-        assert!(response.content.contains("desktop/deterministic.docx"));
-        assert!(response
-            .content
-            .contains("验证：本地执行器返回成功状态和结果记录。"));
-        assert!(response.content.contains("建议："));
-        assert!(!response.content.contains("Loop context"));
-        assert!(!response.content.contains("loop_mode="));
-        assert!(!response.content.contains("matched_stop_conditions="));
+        assert_eq!(response.content, "已创建文件：desktop/deterministic.docx。");
+        for internal_detail in [
+            "office_create",
+            "target=",
+            "dispatch_note",
+            "Loop context",
+            "loop_mode=",
+            "matched_stop_conditions=",
+            "本地执行器",
+            "建议：",
+        ] {
+            assert!(!response.content.contains(internal_detail));
+        }
         assert_eq!(transport.recorded_requests().len(), 1);
         assert_eq!(
             store
