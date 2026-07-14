@@ -163,6 +163,11 @@ pub struct OfficeUpdateOutcome {
 
 pub trait OfficeArtifactClient {
     fn write_office_artifact(&self, spec: &OfficeCreateSpec) -> Result<OfficeCreateResult, String>;
+    fn verify_written_artifact_path(
+        &self,
+        spec: &OfficeCreateSpec,
+        result: &OfficeCreateResult,
+    ) -> Result<(), String>;
 }
 
 pub trait OfficeOpenClient {
@@ -176,6 +181,11 @@ pub trait OfficeOpenClient {
 pub trait OfficeUpdateClient {
     fn update_office_artifact(&self, spec: &OfficeUpdateSpec)
         -> Result<OfficeUpdateResult, String>;
+    fn verify_updated_artifact_path(
+        &self,
+        spec: &OfficeUpdateSpec,
+        result: &OfficeUpdateResult,
+    ) -> Result<(), String>;
 }
 
 pub fn office_create_spec_from_action(
@@ -375,6 +385,30 @@ impl OfficeArtifactClient for LocalOfficeArtifactClient {
             artifact_kind: spec.app.artifact_kind().to_string(),
         })
     }
+
+    fn verify_written_artifact_path(
+        &self,
+        spec: &OfficeCreateSpec,
+        result: &OfficeCreateResult,
+    ) -> Result<(), String> {
+        let expected = resolve_office_artifact_path(
+            &self.workspace_dir,
+            self.desktop_dir.as_deref(),
+            &spec.path,
+        )?
+        .path
+        .canonicalize()
+        .map_err(|_| "approved office artifact path could not be resolved".to_string())?;
+        let actual = Path::new(&result.path)
+            .canonicalize()
+            .map_err(|_| "written office artifact path could not be resolved".to_string())?;
+        if actual != expected {
+            return Err(
+                "written office artifact path changed from the approved target".to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl OfficeOpenClient for LocalOfficeArtifactClient {
@@ -466,6 +500,30 @@ impl OfficeUpdateClient for LocalOfficeArtifactClient {
             summary: office_update_summary(spec),
         })
     }
+
+    fn verify_updated_artifact_path(
+        &self,
+        spec: &OfficeUpdateSpec,
+        result: &OfficeUpdateResult,
+    ) -> Result<(), String> {
+        let expected = resolve_office_artifact_path(
+            &self.workspace_dir,
+            self.desktop_dir.as_deref(),
+            &spec.path,
+        )?
+        .path
+        .canonicalize()
+        .map_err(|_| "approved office update path could not be resolved".to_string())?;
+        let actual = Path::new(&result.path)
+            .canonicalize()
+            .map_err(|_| "updated office artifact path could not be resolved".to_string())?;
+        if actual != expected {
+            return Err(
+                "updated office artifact path changed from the approved target".to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 pub fn run_office_create_boundary(
@@ -507,6 +565,7 @@ pub fn run_office_create_boundary(
     let started_at = std::time::Instant::now();
     match client.write_office_artifact(&request.spec) {
         Ok(result) => {
+            client.verify_written_artifact_path(&request.spec, &result)?;
             let invocation = CapabilityInvocation {
                 id: Uuid::new_v4(),
                 capability: CapabilityKind::FileWrite,

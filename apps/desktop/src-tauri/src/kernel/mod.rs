@@ -1,10 +1,15 @@
 pub mod agent_context;
 pub mod agent_run;
+pub mod app_update;
+pub mod artifact_render;
+pub mod artifacts;
 pub mod attachments;
+pub mod automation;
 pub mod capability;
 pub mod codex_bridge_contract;
 pub mod codex_bridge_http;
 pub mod computer_use;
+pub mod connectors;
 pub mod deepseek;
 pub mod deepseek_pricing;
 pub mod event_store;

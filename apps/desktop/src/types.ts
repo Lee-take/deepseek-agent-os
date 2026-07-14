@@ -137,6 +137,211 @@ export type AgentRunRecord = {
   finish_error: string | null;
 };
 
+export type AutomationDefinition = {
+  id: string;
+  revision: number;
+  goal: string;
+  timezone: string;
+  schedule:
+    | { kind: "once"; run_at: string }
+    | { kind: "daily"; hour: number; minute: number }
+    | { kind: "weekly"; weekday: number; hour: number; minute: number }
+    | { kind: "monthly"; day: number; hour: number; minute: number }
+    | { kind: "restricted_cron"; weekdays: number[]; hour: number; minute: number };
+  status: "enabled" | "paused" | "deleted";
+  missed_run_policy: "skip" | "run_once";
+  retry_limit: number;
+  missed_after_seconds: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AutomationRun = {
+  id: string;
+  definition_id: string;
+  definition_revision: number;
+  trigger_window_key: string;
+  scheduled_for: string;
+  status:
+    | "queued"
+    | "running"
+    | "waiting_review"
+    | "waiting_approval"
+    | "completed"
+    | "failed"
+    | "cancelled";
+  attempt: number;
+  agent_run_id: string | null;
+  review_queue_item_id: string | null;
+  last_error: string | null;
+  claimed_by: string | null;
+  claimed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ReviewQueueItem = {
+  id: string;
+  automation_run_id: string;
+  agent_run_id: string | null;
+  tool_invocation_id: string | null;
+  status: "pending_review" | "pending_approval" | "accepted" | "rejected";
+  preview_fingerprint: string | null;
+  revision: number;
+  title: string;
+  evidence_ref: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ConnectorAccountSummary = {
+  id: string;
+  display_name: string;
+  provider_label: "microsoft365" | "google_workspace" | "workspace_connector";
+  abilities: Array<
+    | "mail_read"
+    | "mail_attachments"
+    | "mail_draft"
+    | "mail_send"
+    | "mail_sync"
+    | "calendar_read"
+    | "calendar_change"
+    | "calendar_sync"
+  >;
+  health:
+    | "connected"
+    | "needs_repair"
+    | "disconnect_pending"
+    | "disconnected"
+    | "revocation_pending";
+  health_reason?:
+    | "authorization_expired"
+    | "disconnect_finishing"
+    | "revocation_unconfirmed"
+    | null;
+  sync_state: "not_enabled" | "never_synced" | "healthy" | "delayed" | "stopped";
+  last_successful_sync_at?: string | null;
+  repair_action_available: boolean;
+  connected_at: string;
+  updated_at: string;
+};
+
+export type ConnectorAuthorizationReview = {
+  review_id: string;
+  provider_label: ConnectorAccountSummary["provider_label"];
+  abilities: ConnectorAccountSummary["abilities"];
+  status:
+    | "awaiting_confirmation"
+    | "connecting"
+    | "connected"
+    | "cancelling"
+    | "cancelled"
+    | "repair_required";
+  expires_at: string;
+  account?: ConnectorAccountSummary | null;
+};
+
+export type ConnectorReadActivity = {
+  id: string;
+  kind: "mail" | "calendar";
+  phase: "queued" | "running" | "completed" | "needs_attention" | "cancelled";
+  item_count?: number;
+  evidence_ref?: string;
+  error_code?:
+    | "connection_needs_attention"
+    | "provider_temporarily_unavailable"
+    | "external_result_uncertain"
+    | "evidence_unavailable"
+    | "execution_record_unavailable"
+    | "read_could_not_complete";
+  updated_at: string;
+};
+
+export type ArtifactDelivery = {
+  id: string;
+  format: "word" | "excel" | "power_point" | "pdf";
+  phase:
+    | "generated"
+    | "structure_checked"
+    | "visual_checked"
+    | "revision_required"
+    | "revision_prepared"
+    | "ready_for_delivery"
+    | "completed"
+    | "failed";
+  status_code:
+    | "generated_check_pending"
+    | "structure_passed_visual_pending"
+    | "checks_passed_delivery_pending"
+    | "revision_in_progress"
+    | "completed"
+    | "needs_attention";
+  structure_checked: boolean;
+  visual_checked: boolean;
+  revision_attempts: number;
+  preview_available: boolean;
+  rendered_page_count: number;
+  updated_at: string;
+};
+
+export type ConnectorRecoveryStatus =
+  | "repair_required"
+  | "needs_repair"
+  | "disconnect_pending"
+  | "revocation_pending"
+  | "sync_exhausted"
+  | "reconciliation_required";
+
+export type ConnectorRecoveryReasonCode =
+  | "attachment_legacy_workspace_unbound"
+  | "attachment_legacy_receipt_incomplete"
+  | "attachment_retention_identity_changed"
+  | "attachment_stored_identity_changed"
+  | "attachment_execution_record_incomplete"
+  | "attachment_recovery_required"
+  | "account_needs_repair"
+  | "account_disconnect_pending"
+  | "account_revocation_pending"
+  | "sync_retry_exhausted"
+  | "reconciliation_required";
+
+export type ConnectorRecoveryExternalEffectState =
+  | "local_file_preserved"
+  | "no_external_write"
+  | "local_credential_removal_pending"
+  | "external_result_uncertain";
+
+export type ConnectorRecoveryNextStepCode =
+  | "retry_local_cleanup"
+  | "inspect_file_manually"
+  | "review_account_connection"
+  | "wait_for_local_disconnect_recovery"
+  | "repair_account_connection"
+  | "verify_provider_state";
+
+export type ConnectorRecoveryAction =
+  | { kind: "retry_attachment_cleanup"; action_revision: string }
+  | { kind: "resume_sync"; action_revision: string }
+  | { kind: "inspect_external_result"; action_revision: string };
+
+export type ConnectorRecoveryItem = {
+  id: string;
+  kind: "attachment" | "account" | "sync" | "reconciliation";
+  status: ConnectorRecoveryStatus;
+  title: string;
+  reason_code: ConnectorRecoveryReasonCode;
+  external_effect_state: ConnectorRecoveryExternalEffectState;
+  next_step_code: ConnectorRecoveryNextStepCode;
+  sync_capability?: "mail" | "calendar";
+  action?: ConnectorRecoveryAction;
+  updated_at: string;
+};
+
+export type ConnectorRecoveryCommandResult = {
+  acceptance: "accepted" | "already_accepted";
+  items: ConnectorRecoveryItem[];
+};
+
 export type SkillSourceIntegrity = {
   algorithm: string;
   hash: string;
@@ -563,6 +768,8 @@ export type CapabilityKind =
   | "email_read"
   | "email_draft"
   | "email_send"
+  | "connector_attachment_read"
+  | "connector_write"
   | "drive_read"
   | "drive_write"
   | "terminal_read"
@@ -851,6 +1058,13 @@ export type CapabilityAccessRequest = {
   decision: PolicyDecision;
   status: CapabilityAccessStatus;
   reason: string;
+  exact_tool: {
+    tool_id: string;
+    request_fingerprint: string;
+    preview: string;
+    preview_revision: number;
+    preview_hash: string;
+  } | null;
   created_at: string;
 };
 
@@ -859,6 +1073,9 @@ export type PermissionResolution = {
   request_id: string;
   approved: boolean;
   note: string;
+  expected_request_revision: number | null;
+  exact_preview_revision: number | null;
+  exact_preview_hash: string | null;
   created_at: string;
 };
 
@@ -866,6 +1083,7 @@ export type CapabilityAccessRecord = {
   request: CapabilityAccessRequest;
   resolution: PermissionResolution | null;
   effective_status: CapabilityAccessStatus;
+  projection_revision: number;
   grant_state: CapabilityGrantState;
 };
 

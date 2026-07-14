@@ -1,9 +1,14 @@
 #![allow(dead_code)]
 
-use std::path::Path;
+mod artifact;
+mod read_execution;
+mod revocation;
 
-use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection};
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -11,14 +16,54 @@ use crate::kernel::agent_context::AgentContextReceipt;
 use crate::kernel::agent_run::{
     AgentRunArtifactRecord, AgentRunCancelRequest, AgentRunClaim, AgentRunContinuationQueued,
     AgentRunExecutionContext, AgentRunFinish, AgentRunGuidanceApplied, AgentRunQueuedGuidance,
-    AgentRunRecord, AgentRunRecovery, AgentRunRecoverySweep, AgentRunResourceAccess, AgentRunRole,
-    AgentRunResourceClaim, AgentRunResourceRelease, AgentRunStart, AgentRunStatus,
+    AgentRunRecord, AgentRunRecovery, AgentRunRecoverySweep, AgentRunResourceAccess,
+    AgentRunResourceClaim, AgentRunResourceRelease, AgentRunRole, AgentRunStart, AgentRunStatus,
     AgentRunStepRecord, AgentRunStepStatus, AgentRunTransition, AGENT_RUN_MAX_PARALLEL_SUBAGENTS,
 };
-use crate::kernel::capability::CapabilityInvocation;
+use crate::kernel::automation::{
+    automation_run_transition_allowed, next_scheduled_at, trigger_window_key, AutomationCheckpoint,
+    AutomationDefinition, AutomationDefinitionStatus, AutomationRun, AutomationRunStatus,
+    MissedRunPolicy, ReviewQueueItem,
+};
+use crate::kernel::capability::{CapabilityInvocation, CapabilityInvocationStatus};
+use crate::kernel::connectors::catalog::ConnectorSyncHealthSnapshot;
+use crate::kernel::connectors::domain::{CalendarEvent, MailMessage};
+use crate::kernel::connectors::landing::{
+    connector_attachment_landing_fingerprint, connector_attachment_workspace_binding,
+    ConnectorAttachmentCleanupCandidate, ConnectorAttachmentDownloadPermit,
+    ConnectorAttachmentLandingReceipt, ConnectorAttachmentMetadata, LandedConnectorAttachment,
+    StagedConnectorAttachment,
+};
+use crate::kernel::connectors::oauth::{
+    ConnectorAuthorizationIntent, ConnectorAuthorizationSession, ConnectorAuthorizationStatus,
+};
+use crate::kernel::connectors::provider::ConnectorProviderFailure;
+use crate::kernel::connectors::reconciliation::{
+    ConnectorReconcilerRegistry, EmptyConnectorReconcilerRegistry,
+};
+use crate::kernel::connectors::revocation::ConnectorRevocationPhase;
+use crate::kernel::connectors::runtime_registry::ConnectorSyncRegistry;
+use crate::kernel::connectors::sync::{
+    ConnectorSyncChange, ConnectorSyncContinuation, ConnectorSyncFailure, ConnectorSyncPage,
+    ConnectorSyncPlan, ConnectorSyncProjectionSummary, ConnectorSyncReceipt, ConnectorSyncState,
+    ConnectorSyncStateReceipt, ConnectorSyncStateRecovery, MAX_SYNC_PROJECTION_BYTES_PER_ACCOUNT,
+    MAX_SYNC_PROJECTION_ITEMS_PER_ACCOUNT, MAX_SYNC_PROJECTION_ITEMS_PER_STREAM,
+    MAX_SYNC_PROJECTION_ITEM_BYTES, MAX_SYNC_STREAMS_PER_ACCOUNT, MAX_SYNC_STREAM_IDLE_DAYS,
+};
+use crate::kernel::connectors::{
+    bind_connector_invocation_to_tool_record, bind_running_connector_invocation_to_tool_record,
+    connector_invocation_transition_allowed, ConnectorAccount, ConnectorCapability,
+    ConnectorCredentialDeleteOutcome, ConnectorCredentialHandle, ConnectorDisconnectPhase,
+    ConnectorDisconnectReceipt, ConnectorDisconnectSource, ConnectorDisconnectTicket,
+    ConnectorEvidenceRef, ConnectorHealth, ConnectorInvocation, ConnectorInvocationStatus,
+    ConnectorMutationReceipt, ConnectorRecoveryAcceptance, ConnectorRecoveryAction,
+    ConnectorRecoveryExternalEffectState, ConnectorRecoveryItem, ConnectorRecoveryKind,
+    ConnectorRecoveryNextStepCode, ConnectorRecoveryReasonCode, ConnectorRecoveryStatus,
+    ConnectorRecoverySyncCapability, ConnectorSecret,
+};
 use crate::kernel::deepseek::DeepSeekChatTelemetry;
 use crate::kernel::models::{
-    KernelEvent, MemoryCandidate, MemoryCandidateMergePreview, MemoryCandidateRecord,
+    AccessMode, KernelEvent, MemoryCandidate, MemoryCandidateMergePreview, MemoryCandidateRecord,
     MemoryCandidateReplacePreview, MemoryCandidateResolution, MemoryCandidateSource,
     MemoryCandidateStatus, MemoryConflictSummary, MemoryMaintenanceActionKind,
     MemoryMaintenanceReviewAction, MemoryRecord, MemoryRecordDeletion, MemoryRecordLink,
@@ -26,8 +71,9 @@ use crate::kernel::models::{
     MemorySearchMatchSource, MemorySelectedFeedback, MemorySelectedFeedbackKind, TaskRecord,
 };
 use crate::kernel::policy::{
-    capability_risk, CapabilityAccessRecord, CapabilityAccessRequest, CapabilityAccessStatus,
-    CapabilityGrantState, CapabilityKind, PermissionAuditEntry, PermissionResolution, RiskLevel,
+    capability_risk, request_capability_access, CapabilityAccessRecord, CapabilityAccessRequest,
+    CapabilityAccessStatus, CapabilityGrantState, CapabilityKind, PermissionAuditEntry,
+    PermissionResolution, PolicyDecision, RiskLevel,
 };
 use crate::kernel::skill::{
     sha256_hex, SkillActivationContext, SkillEnablementChange, SkillEnablementStatus,
@@ -35,7 +81,11 @@ use crate::kernel::skill::{
     SkillUninstallRecord, SkillUpdateCheckRecord, SkillUpdateCheckStatus, SkillUpdateFailureRecord,
     SkillUpdateRecord, SkillUpdateState,
 };
-use crate::kernel::tool_runtime::{ToolExecutionStatus, ToolInvocationRecord};
+use crate::kernel::tool_runtime::{
+    prepare_tool_execution, tool_approval_preview, tool_request_fingerprint, ToolEvidence,
+    ToolExecutionStatus, ToolInvocationRecord, ToolVerificationResult,
+    CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID,
+};
 use crate::kernel::work_package::{
     redact_operations_briefing_run_for_package_export, WorkPackage, WorkPackageImportPreview,
     WorkPackageImportSummary, WorkPackageMemoryCandidateImportPreview,
@@ -85,6 +135,15 @@ pub const SKILL_UPDATE_CHECKED_EVENT: &str = "skill.update_checked";
 pub const SKILL_UPDATE_FAILED_EVENT: &str = "skill.update_failed";
 pub const TASK_RECORD_CREATED_EVENT: &str = "task_record.created";
 pub const TOOL_INVOCATION_RECORDED_EVENT: &str = "tool_invocation.recorded";
+pub const CONNECTOR_ATTACHMENT_LANDED_EVENT: &str = "connector.attachment.landed";
+pub const CONNECTOR_RECOVERY_RETRY_QUEUED_EVENT: &str = "connector.recovery.retry_queued";
+const CONNECTOR_ATTACHMENT_RETENTION_DAYS: i64 = 30;
+const CONNECTOR_ATTACHMENT_RECOVERY_LEASE_SECONDS: i64 = 300;
+const CONNECTOR_RECONCILIATION_LEASE_SECONDS: i64 = 300;
+const CONNECTOR_RECONCILIATION_MAX_BACKOFF_SECONDS: i64 = 3600;
+const CONNECTOR_SYNC_RECOVERY_LEASE_SECONDS: i64 = 300;
+const MAX_RETAINED_ATTACHMENTS_PER_WORKSPACE: i64 = 32;
+const MAX_RETAINED_ATTACHMENT_BYTES_PER_WORKSPACE: i64 = 256 * 1024 * 1024;
 pub const WORKFLOW_TEMPLATE_PACKAGE_IMPORTED_EVENT: &str = "workflow_template_package.imported";
 
 #[derive(Debug, Error)]
@@ -110,8 +169,1013 @@ pub enum EventStoreError {
 
 pub type EventStoreResult<T> = Result<T, EventStoreError>;
 
+fn ensure_sqlite_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    migration: &str,
+) -> EventStoreResult<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|candidate| candidate == column) {
+        connection.execute(migration, [])?;
+    }
+    Ok(())
+}
+
+fn migrate_connector_authorization_session_rows(connection: &Connection) -> EventStoreResult<()> {
+    let mut statement = connection.prepare(
+        r#"SELECT id, session_json, expires_at, consumed_at
+           FROM connector_authorization_sessions"#,
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (id, json, expires_at, consumed_at) in rows {
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        let object = value.as_object().ok_or_else(|| {
+            EventStoreError::InvalidState("legacy OAuth authorization row is invalid".to_string())
+        })?;
+        let legacy = [
+            "status",
+            "revision",
+            "cleanup_required",
+            "cleanup_completed_at",
+        ]
+        .iter()
+        .any(|field| !object.contains_key(*field));
+        if !legacy {
+            continue;
+        }
+        let mut session: ConnectorAuthorizationSession = serde_json::from_value(value)?;
+        let projected_id = Uuid::parse_str(&id)?;
+        let projected_expires_at = DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc);
+        let projected_consumed_at = consumed_at
+            .as_deref()
+            .map(|value| DateTime::parse_from_rfc3339(value).map(|value| value.with_timezone(&Utc)))
+            .transpose()?;
+        if session.id != projected_id
+            || session.expires_at != projected_expires_at
+            || session.consumed_at != projected_consumed_at
+        {
+            return Err(EventStoreError::InvalidState(
+                "legacy OAuth authorization projection is invalid".to_string(),
+            ));
+        }
+        if session.status == ConnectorAuthorizationStatus::Pending && session.consumed_at.is_some()
+        {
+            session.status = ConnectorAuthorizationStatus::Completed;
+        }
+        connection.execute(
+            r#"UPDATE connector_authorization_sessions
+               SET session_json = ?2, status = ?3, revision = ?4,
+                   cleanup_required = ?5, cleanup_completed_at = ?6
+               WHERE id = ?1"#,
+            params![
+                id,
+                serde_json::to_string(&session)?,
+                serde_json::to_string(&session.status)?,
+                i64::try_from(session.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                if session.cleanup_required { 1i64 } else { 0i64 },
+                session
+                    .cleanup_completed_at
+                    .map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true)),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn durable_connector_attachment_metadata(
+    metadata: &ConnectorAttachmentMetadata,
+) -> ConnectorAttachmentMetadata {
+    let mut durable = metadata.clone();
+    durable.parent_remote_ref = "redacted:parent".to_string();
+    durable.attachment_remote_ref = "redacted:attachment".to_string();
+    durable
+}
+
+fn connector_attachment_recovery_fingerprint(
+    landing_id: &str,
+    failure_kind: Option<&str>,
+    workspace_identity: &str,
+    storage_identity: &str,
+    updated_at: &str,
+    recovery_revision: i64,
+) -> String {
+    sha256_hex(
+        format!(
+            "ds-agent.connector-recovery.v2\0{landing_id}\0{}\0{workspace_identity}\0{storage_identity}\0{updated_at}\0{recovery_revision}",
+            failure_kind.unwrap_or("")
+        )
+        .as_bytes(),
+    )
+}
+
+fn connector_sync_recovery_item_id(
+    account_id: &str,
+    capability: &str,
+    stream_fingerprint: &str,
+) -> Uuid {
+    let digest = Sha256::digest(
+        format!(
+            "ds-agent.connector-sync-recovery-item.v1\0{account_id}\0{capability}\0{stream_fingerprint}"
+        )
+        .as_bytes(),
+    );
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn connector_sync_recovery_authority_hash(
+    account: &ConnectorAccount,
+    generation: u64,
+    capability: ConnectorCapability,
+) -> String {
+    sha256_hex(
+        format!(
+            "ds-agent.connector-sync-recovery-authority.v1\0{}\0{}\0{}\0{}\0{}",
+            account.provider_id,
+            account.tenant_ref.as_deref().unwrap_or(""),
+            serde_json::to_string(&account.credential_handle).unwrap_or_default(),
+            generation,
+            capability.contract_name(),
+        )
+        .as_bytes(),
+    )
+}
+
+fn connector_sync_recovery_state_hash(state_json: &str) -> String {
+    sha256_hex(format!("ds-agent.connector-sync-recovery-state.v1\0{state_json}").as_bytes())
+}
+
+fn connector_sync_recovery_action_revision(
+    state_json: &str,
+    account: &ConnectorAccount,
+    generation: u64,
+    capability: ConnectorCapability,
+) -> String {
+    sha256_hex(
+        format!(
+            "ds-agent.connector-sync-recovery-action.v1\0{}\0{}",
+            connector_sync_recovery_state_hash(state_json),
+            connector_sync_recovery_authority_hash(account, generation, capability),
+        )
+        .as_bytes(),
+    )
+}
+
+fn connector_reconciliation_invocation_hash(invocation_json: &str) -> String {
+    sha256_hex(
+        format!("ds-agent.connector-reconciliation-invocation.v1\0{invocation_json}").as_bytes(),
+    )
+}
+
+fn connector_authorization_action_token_hash(token: &str) -> String {
+    sha256_hex(format!("ds-agent.connector-authorization-action-token.v1\0{token}").as_bytes())
+}
+
+fn connector_authorization_session_hash(session_json: &str) -> String {
+    sha256_hex(format!("ds-agent.connector-authorization-session.v1\0{session_json}").as_bytes())
+}
+
+fn constant_time_text_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn connector_recovery_action_was_accepted(
+    transaction: &Transaction<'_>,
+    action_kind: &str,
+    item_id: Uuid,
+    action_revision: &str,
+) -> EventStoreResult<bool> {
+    Ok(transaction
+        .query_row(
+            r#"SELECT 1 FROM connector_recovery_action_receipts
+               WHERE action_kind = ?1 AND item_id = ?2 AND action_revision = ?3"#,
+            params![action_kind, item_id.to_string(), action_revision],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn record_connector_recovery_action_acceptance(
+    transaction: &Transaction<'_>,
+    action_kind: &str,
+    item_id: Uuid,
+    action_revision: &str,
+    accepted_at: DateTime<Utc>,
+) -> EventStoreResult<()> {
+    let inserted = transaction.execute(
+        r#"INSERT INTO connector_recovery_action_receipts
+           (action_kind, item_id, action_revision, accepted_at, retain_until)
+           VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        params![
+            action_kind,
+            item_id.to_string(),
+            action_revision,
+            accepted_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            (accepted_at + Duration::days(90)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(EventStoreError::InvalidState(
+            "connector recovery action receipt could not be recorded".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_connector_sync_account_active(
+    transaction: &Transaction<'_>,
+    state: &ConnectorSyncState,
+) -> EventStoreResult<()> {
+    let active = transaction
+        .query_row(
+            r#"SELECT 1
+               FROM connector_accounts AS account
+               JOIN connector_account_generations AS generation
+                 ON generation.account_id = account.id
+               WHERE account.id = ?1 AND account.health = ?2 AND generation.generation = ?3"#,
+            params![
+                state.account_id().to_string(),
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+                i64::try_from(state.account_generation()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector account generation is too large".to_string(),
+                    )
+                })?,
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !active {
+        return Err(EventStoreError::InvalidState(
+            "connector account changed while sync was in flight".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_connector_sync_recovery_claim(
+    transaction: &Transaction<'_>,
+    claim: &ConnectorSyncRecoveryClaim,
+    now: DateTime<Utc>,
+) -> EventStoreResult<()> {
+    if claim.claim_expires_at <= now {
+        return Err(EventStoreError::InvalidState(
+            "connector sync recovery claim expired".to_string(),
+        ));
+    }
+    let (account_json, generation) = transaction.query_row(
+        r#"SELECT account.account_json, generation.generation
+           FROM connector_accounts AS account
+           JOIN connector_account_generations AS generation ON generation.account_id = account.id
+           WHERE account.id = ?1"#,
+        params![claim.account.id.to_string()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    let account: ConnectorAccount = serde_json::from_str(&account_json)?;
+    if account != claim.account
+        || account.health != ConnectorHealth::Connected
+        || u64::try_from(generation).ok() != Some(claim.state.account_generation())
+        || !account
+            .granted_capabilities
+            .contains(&claim.state.capability())
+    {
+        return Err(EventStoreError::InvalidState(
+            "connector sync recovery authority changed".to_string(),
+        ));
+    }
+    let (state_json, revision, request_json) = transaction.query_row(
+        r#"SELECT state_json, revision, request_json FROM connector_sync_streams
+           WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3"#,
+        params![
+            claim.state.account_id().to_string(),
+            claim.state.capability().contract_name(),
+            claim.state.stream_fingerprint(),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    let state = ConnectorSyncState::from_persistence_json(state_json)
+        .map_err(EventStoreError::InvalidState)?;
+    let plan =
+        ConnectorSyncPlan::from_persistence_json(request_json.as_deref().ok_or_else(|| {
+            EventStoreError::InvalidState("connector sync recovery plan is missing".to_string())
+        })?)
+        .map_err(EventStoreError::InvalidState)?;
+    if state != claim.state
+        || u64::try_from(revision).ok() != Some(claim.state.revision())
+        || plan != claim.plan
+    {
+        return Err(EventStoreError::InvalidState(
+            "connector sync recovery binding changed".to_string(),
+        ));
+    }
+    let live: i64 = transaction.query_row(
+        r#"SELECT count(*) FROM connector_sync_recovery_jobs
+           WHERE id = ?1 AND status = 'running' AND claim_id = ?2
+             AND claim_expires_at = ?3 AND claim_expires_at > ?4
+             AND account_id = ?5 AND account_generation = ?6
+             AND capability = ?7 AND stream_fingerprint = ?8
+             AND expected_state_revision = ?9"#,
+        params![
+            claim.job_id.to_string(),
+            claim.claim_id.to_string(),
+            claim
+                .claim_expires_at
+                .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            claim.state.account_id().to_string(),
+            i64::try_from(claim.state.account_generation()).map_err(|_| {
+                EventStoreError::InvalidState("connector sync generation is too large".to_string())
+            })?,
+            claim.state.capability().contract_name(),
+            claim.state.stream_fingerprint(),
+            i64::try_from(claim.state.revision()).map_err(|_| {
+                EventStoreError::InvalidState("connector sync revision is too large".to_string())
+            })?,
+        ],
+        |row| row.get(0),
+    )?;
+    if live != 1 {
+        return Err(EventStoreError::InvalidState(
+            "connector sync recovery claim was lost".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_connector_reconciliation_binding(
+    transaction: &Transaction<'_>,
+    invocation: &ConnectorInvocation,
+    projected_generation: i64,
+) -> EventStoreResult<(ConnectorAccount, ToolInvocationRecord)> {
+    let generation = invocation.account_generation.ok_or_else(|| {
+        EventStoreError::InvalidState(
+            "legacy connector reconciliation has no frozen account generation".to_string(),
+        )
+    })?;
+    if i64::try_from(generation).ok() != Some(projected_generation)
+        || invocation.status != ConnectorInvocationStatus::ReconciliationRequired
+        || !invocation.capability.external_mutation()
+        || invocation.mutation.as_ref().map_or(true, |mutation| {
+            mutation.account_generation != Some(generation)
+                || mutation.provider_id != invocation.provider_id
+                || mutation.account_id != invocation.account_id
+                || mutation.capability != invocation.capability
+                || mutation.idempotency_key != invocation.idempotency_key
+        })
+    {
+        return Err(EventStoreError::InvalidState(
+            "connector reconciliation projection is inconsistent".to_string(),
+        ));
+    }
+    let (account_json, current_generation) = transaction
+        .query_row(
+            r#"SELECT account.account_json, generation.generation
+               FROM connector_accounts AS account
+               JOIN connector_account_generations AS generation
+                 ON generation.account_id = account.id
+               WHERE account.id = ?1 AND account.health = ?2"#,
+            params![
+                invocation.account_id.to_string(),
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "connector account is not ready for reconciliation".to_string(),
+            )
+        })?;
+    let account: ConnectorAccount = serde_json::from_str(&account_json)?;
+    if current_generation != projected_generation
+        || account.provider_id != invocation.provider_id
+        || account.health != ConnectorHealth::Connected
+        || !account
+            .granted_capabilities
+            .contains(&invocation.capability)
+    {
+        return Err(EventStoreError::InvalidState(
+            "connector account changed before reconciliation".to_string(),
+        ));
+    }
+    let tool_invocation_id = invocation.tool_invocation_id.ok_or_else(|| {
+        EventStoreError::InvalidState(
+            "connector reconciliation is missing its exact Tool".to_string(),
+        )
+    })?;
+    let (tool_json, status_json, fingerprint, approval_request_id) = transaction
+        .query_row(
+            r#"SELECT invocation_json, status, request_fingerprint, approval_request_id
+               FROM tool_invocation_state WHERE id = ?1"#,
+            params![tool_invocation_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| EventStoreError::NotFound("connector reconciliation Tool".to_string()))?;
+    let tool: ToolInvocationRecord = serde_json::from_str(&tool_json)?;
+    let approval_request_id = approval_request_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()?
+        .ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "connector reconciliation approval binding is missing".to_string(),
+            )
+        })?;
+    if serde_json::from_str::<ToolExecutionStatus>(&status_json)? != tool.status
+        || fingerprint != tool.request_fingerprint
+        || tool.approval_request_id != Some(approval_request_id)
+    {
+        return Err(EventStoreError::InvalidState(
+            "connector reconciliation Tool projection is inconsistent".to_string(),
+        ));
+    }
+    bind_running_connector_invocation_to_tool_record(invocation, &tool)
+        .map_err(EventStoreError::InvalidState)?;
+    let (request_json, effective_status_json) = transaction
+        .query_row(
+            r#"SELECT request_json, effective_status
+               FROM capability_access_state WHERE request_id = ?1"#,
+            params![approval_request_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            EventStoreError::NotFound("connector reconciliation approval".to_string())
+        })?;
+    let approval_request: CapabilityAccessRequest = serde_json::from_str(&request_json)?;
+    let effective_status: CapabilityAccessStatus = serde_json::from_str(&effective_status_json)?;
+    if approval_request.id != approval_request_id
+        || approval_request.capability != CapabilityKind::ConnectorWrite
+        || effective_status != CapabilityAccessStatus::Approved
+    {
+        return Err(EventStoreError::InvalidState(
+            "connector reconciliation approval is not valid".to_string(),
+        ));
+    }
+    let consumed = transaction
+        .query_row(
+            r#"SELECT 1 FROM connector_approval_consumptions
+               WHERE request_id = ?1 AND connector_invocation_id = ?2"#,
+            params![approval_request_id.to_string(), invocation.id.to_string(),],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !consumed {
+        return Err(EventStoreError::InvalidState(
+            "connector reconciliation approval was not consumed by this invocation".to_string(),
+        ));
+    }
+    if let Some(automation_run_id) = invocation.automation_run_id {
+        let (review_json, status_json) = transaction
+            .query_row(
+                r#"SELECT item_json, status FROM review_queue_items
+                   WHERE automation_run_id = ?1"#,
+                params![automation_run_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                EventStoreError::NotFound("connector reconciliation review".to_string())
+            })?;
+        let review: ReviewQueueItem = serde_json::from_str(&review_json)?;
+        if serde_json::to_string(&review.status)? != status_json
+            || review.status != crate::kernel::automation::ReviewQueueItemStatus::PendingApproval
+            || review.tool_invocation_id != Some(tool_invocation_id)
+            || review.preview_fingerprint.as_deref()
+                != Some(invocation.request_fingerprint.as_str())
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation review binding changed".to_string(),
+            ));
+        }
+    }
+    Ok((account, tool))
+}
+
+struct ConnectorReconciliationRecoverySnapshot {
+    invocation: ConnectorInvocation,
+    invocation_json: String,
+    account: ConnectorAccount,
+    projected_generation: i64,
+    next_reconciliation_at: String,
+    attempt_count: i64,
+    updated_at: String,
+    recovery_revision: i64,
+}
+
+fn connector_reconciliation_recovery_action_revision(
+    snapshot: &ConnectorReconciliationRecoverySnapshot,
+) -> EventStoreResult<String> {
+    let generation = u64::try_from(snapshot.projected_generation).map_err(|_| {
+        EventStoreError::InvalidState(
+            "connector reconciliation account generation is invalid".to_string(),
+        )
+    })?;
+    Ok(sha256_hex(
+        format!(
+            "ds-agent.connector-reconciliation-recovery-action.v2\0{}\0{}\0{}\0{}\0{}\0{}",
+            connector_reconciliation_invocation_hash(&snapshot.invocation_json),
+            connector_sync_recovery_authority_hash(
+                &snapshot.account,
+                generation,
+                snapshot.invocation.capability,
+            ),
+            snapshot.next_reconciliation_at,
+            snapshot.attempt_count,
+            snapshot.updated_at,
+            snapshot.recovery_revision,
+        )
+        .as_bytes(),
+    ))
+}
+
+fn load_connector_reconciliation_recovery_snapshot(
+    transaction: &Transaction<'_>,
+    invocation_id: Uuid,
+) -> EventStoreResult<ConnectorReconciliationRecoverySnapshot> {
+    let row = transaction
+        .query_row(
+            r#"SELECT account_id, account_generation, idempotency_key,
+                      invocation_json, status, next_reconciliation_at,
+                      reconciliation_attempt_count, updated_at,
+                      reconciliation_claim_id, reconciliation_claim_expires_at,
+                      recovery_revision
+               FROM connector_invocations
+               WHERE id = ?1 AND reconciliation_quarantine_code IS NULL"#,
+            params![invocation_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            EventStoreError::NotFound("connector reconciliation recovery".to_string())
+        })?;
+    let (
+        projected_account_id,
+        projected_generation,
+        projected_idempotency_key,
+        invocation_json,
+        projected_status,
+        next_reconciliation_at,
+        attempt_count,
+        updated_at,
+        claim_id,
+        claim_expires_at,
+        recovery_revision,
+    ) = row;
+    if claim_id.is_some()
+        || claim_expires_at.is_some()
+        || attempt_count < 0
+        || recovery_revision < 0
+    {
+        return Err(EventStoreError::InvalidState(
+            "connector reconciliation recovery is already claimed or invalid".to_string(),
+        ));
+    }
+    let invocation: ConnectorInvocation = serde_json::from_str(&invocation_json)?;
+    if invocation.id != invocation_id
+        || invocation.account_id.to_string() != projected_account_id
+        || invocation.idempotency_key != projected_idempotency_key
+        || invocation
+            .updated_at
+            .to_rfc3339_opts(SecondsFormat::Nanos, true)
+            != updated_at
+        || serde_json::to_string(&invocation.status)? != projected_status
+        || invocation.status != ConnectorInvocationStatus::ReconciliationRequired
+    {
+        return Err(EventStoreError::InvalidState(
+            "connector reconciliation recovery projection is inconsistent".to_string(),
+        ));
+    }
+    let next_reconciliation_at = next_reconciliation_at.ok_or_else(|| {
+        EventStoreError::InvalidState(
+            "connector reconciliation recovery has no scheduled verification".to_string(),
+        )
+    })?;
+    DateTime::parse_from_rfc3339(&next_reconciliation_at)?;
+    let (account, _) =
+        load_connector_reconciliation_binding(transaction, &invocation, projected_generation)?;
+    Ok(ConnectorReconciliationRecoverySnapshot {
+        invocation,
+        invocation_json,
+        account,
+        projected_generation,
+        next_reconciliation_at,
+        attempt_count,
+        updated_at,
+        recovery_revision,
+    })
+}
+
+fn prune_connector_sync_retention(
+    transaction: &Transaction<'_>,
+    account_id: Uuid,
+    now: DateTime<Utc>,
+) -> EventStoreResult<()> {
+    let account_id = account_id.to_string();
+    let stale_before = (now - Duration::days(MAX_SYNC_STREAM_IDLE_DAYS))
+        .to_rfc3339_opts(SecondsFormat::Nanos, true);
+    transaction.execute(
+        r#"DELETE FROM connector_sync_projection AS projection
+           WHERE projection.account_id = ?1 AND EXISTS (
+             SELECT 1 FROM connector_sync_streams AS stream
+             WHERE stream.account_id = projection.account_id
+               AND stream.capability = projection.capability
+               AND stream.stream_fingerprint = projection.stream_fingerprint
+               AND stream.updated_at < ?2
+           )"#,
+        params![account_id, stale_before],
+    )?;
+    transaction.execute(
+        "DELETE FROM connector_sync_streams WHERE account_id = ?1 AND updated_at < ?2",
+        params![account_id, stale_before],
+    )?;
+    transaction.execute(
+        r#"DELETE FROM connector_sync_projection AS projection
+           WHERE projection.account_id = ?1
+             AND NOT EXISTS (
+               SELECT 1 FROM (
+                 SELECT capability, stream_fingerprint
+                 FROM connector_sync_streams
+                 WHERE account_id = ?1
+                 ORDER BY updated_at DESC, rowid DESC
+                 LIMIT ?2
+               ) AS retained
+               WHERE retained.capability = projection.capability
+                 AND retained.stream_fingerprint = projection.stream_fingerprint
+             )"#,
+        params![
+            account_id,
+            i64::try_from(MAX_SYNC_STREAMS_PER_ACCOUNT).map_err(|_| {
+                EventStoreError::InvalidState("connector sync stream budget is invalid".to_string())
+            })?,
+        ],
+    )?;
+    transaction.execute(
+        r#"DELETE FROM connector_sync_streams
+           WHERE account_id = ?1 AND rowid NOT IN (
+             SELECT rowid FROM connector_sync_streams
+             WHERE account_id = ?1
+             ORDER BY updated_at DESC, rowid DESC
+             LIMIT ?2
+           )"#,
+        params![
+            account_id,
+            i64::try_from(MAX_SYNC_STREAMS_PER_ACCOUNT).map_err(|_| {
+                EventStoreError::InvalidState("connector sync stream budget is invalid".to_string())
+            })?,
+        ],
+    )?;
+    transaction.execute(
+        r#"WITH ranked AS (
+             SELECT rowid,
+                    ROW_NUMBER() OVER (ORDER BY updated_at DESC, rowid DESC) AS item_number,
+                    SUM(
+                      LENGTH(CAST(COALESCE(item_json, '') AS BLOB))
+                      + LENGTH(CAST(remote_ref AS BLOB))
+                    ) OVER (ORDER BY updated_at DESC, rowid DESC) AS running_bytes
+             FROM connector_sync_projection
+             WHERE account_id = ?1
+           )
+           DELETE FROM connector_sync_projection
+           WHERE rowid IN (
+             SELECT rowid FROM ranked
+             WHERE item_number > ?2 OR running_bytes > ?3
+           )"#,
+        params![
+            account_id,
+            i64::try_from(MAX_SYNC_PROJECTION_ITEMS_PER_ACCOUNT).map_err(|_| {
+                EventStoreError::InvalidState(
+                    "connector sync account item budget is invalid".to_string(),
+                )
+            })?,
+            i64::try_from(MAX_SYNC_PROJECTION_BYTES_PER_ACCOUNT).map_err(|_| {
+                EventStoreError::InvalidState(
+                    "connector sync account byte budget is invalid".to_string(),
+                )
+            })?,
+        ],
+    )?;
+    Ok(())
+}
+
 pub struct EventStore {
     conn: Connection,
+}
+
+pub(crate) struct ConnectorSyncRecoveryClaim {
+    job_id: Uuid,
+    claim_id: Uuid,
+    claim_expires_at: DateTime<Utc>,
+    account: ConnectorAccount,
+    state: ConnectorSyncState,
+    plan: ConnectorSyncPlan,
+    attempt_count: u32,
+}
+
+impl ConnectorSyncRecoveryClaim {
+    pub(crate) fn job_id(&self) -> Uuid {
+        self.job_id
+    }
+
+    pub(crate) fn claim_id(&self) -> Uuid {
+        self.claim_id
+    }
+
+    pub(crate) fn claim_expires_at(&self) -> DateTime<Utc> {
+        self.claim_expires_at
+    }
+
+    pub(crate) fn account(&self) -> &ConnectorAccount {
+        &self.account
+    }
+
+    pub(crate) fn state(&self) -> &ConnectorSyncState {
+        &self.state
+    }
+
+    pub(crate) fn plan(&self) -> &ConnectorSyncPlan {
+        &self.plan
+    }
+
+    pub(crate) fn attempt_count(&self) -> u32 {
+        self.attempt_count
+    }
+}
+
+pub(crate) struct ConnectorAuthorizationExchangeClaim {
+    session: ConnectorAuthorizationSession,
+    claim_id: Uuid,
+    claim_expires_at: DateTime<Utc>,
+    action_authority_handle: Option<ConnectorCredentialHandle>,
+}
+
+impl ConnectorAuthorizationExchangeClaim {
+    pub(crate) fn session(&self) -> &ConnectorAuthorizationSession {
+        &self.session
+    }
+
+    pub(crate) fn into_parts(self) -> (ConnectorAuthorizationSession, Uuid, DateTime<Utc>) {
+        (self.session, self.claim_id, self.claim_expires_at)
+    }
+
+    pub(crate) fn claim_id(&self) -> Uuid {
+        self.claim_id
+    }
+
+    pub(crate) fn action_authority_handle(&self) -> Option<&ConnectorCredentialHandle> {
+        self.action_authority_handle.as_ref()
+    }
+}
+
+impl std::ops::Deref for ConnectorAuthorizationExchangeClaim {
+    type Target = ConnectorAuthorizationSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+pub(crate) struct ConnectorAuthorizationCleanupClaim {
+    session: ConnectorAuthorizationSession,
+    claim_id: Uuid,
+    claim_expires_at: DateTime<Utc>,
+    action_authority_handle: Option<ConnectorCredentialHandle>,
+}
+
+pub(crate) enum ConnectorAuthorizationResolution {
+    Approved(ConnectorAuthorizationExchangeClaim),
+    Cancelled(ConnectorAuthorizationCleanupClaim),
+}
+
+pub(crate) struct ConnectorAuthorizationActionProvision {
+    review_id: Uuid,
+    authorization_id: Uuid,
+    authority_handle: ConnectorCredentialHandle,
+    authority: ConnectorSecret,
+}
+
+impl ConnectorAuthorizationActionProvision {
+    pub(crate) fn review_id(&self) -> Uuid {
+        self.review_id
+    }
+
+    pub(crate) fn authorization_id(&self) -> Uuid {
+        self.authorization_id
+    }
+
+    pub(crate) fn into_vault_parts(self) -> (ConnectorCredentialHandle, ConnectorSecret) {
+        (self.authority_handle, self.authority)
+    }
+}
+
+pub(crate) struct ConnectorAuthorizationActiveReview {
+    review_id: Uuid,
+    authorization_id: Uuid,
+    authority_handle: ConnectorCredentialHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectorAuthorizationReviewIntentState {
+    Active,
+    Approve,
+    Cancel,
+}
+
+pub(crate) struct ConnectorAuthorizationReviewSnapshot {
+    review_id: Uuid,
+    session: ConnectorAuthorizationSession,
+    intent_state: ConnectorAuthorizationReviewIntentState,
+    authority_handle: Option<ConnectorCredentialHandle>,
+    exchange_claim_live: bool,
+    account: Option<ConnectorAccount>,
+    account_binding_valid: bool,
+}
+
+impl ConnectorAuthorizationReviewSnapshot {
+    pub(crate) fn review_id(&self) -> Uuid {
+        self.review_id
+    }
+
+    pub(crate) fn session(&self) -> &ConnectorAuthorizationSession {
+        &self.session
+    }
+
+    pub(crate) fn intent_state(&self) -> ConnectorAuthorizationReviewIntentState {
+        self.intent_state
+    }
+
+    pub(crate) fn authority_handle(&self) -> Option<&ConnectorCredentialHandle> {
+        self.authority_handle.as_ref()
+    }
+
+    pub(crate) fn exchange_claim_live(&self) -> bool {
+        self.exchange_claim_live
+    }
+
+    pub(crate) fn connected_account(&self) -> Option<&ConnectorAccount> {
+        self.account_binding_valid
+            .then_some(self.account.as_ref())
+            .flatten()
+    }
+
+    pub(crate) fn account_binding_valid(&self) -> bool {
+        self.account_binding_valid
+    }
+}
+
+pub(crate) struct ConnectorAuthorizationAuthorityCleanupClaim {
+    review_id: Uuid,
+    authorization_id: Uuid,
+    authority_handle: ConnectorCredentialHandle,
+    claim_id: Uuid,
+    claim_expires_at: DateTime<Utc>,
+}
+
+impl ConnectorAuthorizationAuthorityCleanupClaim {
+    pub(crate) fn review_id(&self) -> Uuid {
+        self.review_id
+    }
+
+    pub(crate) fn authorization_id(&self) -> Uuid {
+        self.authorization_id
+    }
+
+    pub(crate) fn authority_handle(&self) -> &ConnectorCredentialHandle {
+        &self.authority_handle
+    }
+}
+
+impl ConnectorAuthorizationActiveReview {
+    pub(crate) fn review_id(&self) -> Uuid {
+        self.review_id
+    }
+
+    pub(crate) fn authorization_id(&self) -> Uuid {
+        self.authorization_id
+    }
+
+    pub(crate) fn authority_handle(&self) -> &ConnectorCredentialHandle {
+        &self.authority_handle
+    }
+}
+
+impl ConnectorAuthorizationCleanupClaim {
+    pub(crate) fn session(&self) -> &ConnectorAuthorizationSession {
+        &self.session
+    }
+
+    pub(crate) fn action_authority_handle(&self) -> Option<&ConnectorCredentialHandle> {
+        self.action_authority_handle.as_ref()
+    }
+}
+
+impl std::ops::Deref for ConnectorAuthorizationCleanupClaim {
+    type Target = ConnectorAuthorizationSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectorAttachmentCleanupClaim {
+    Owned(Uuid),
+    Busy,
+    KeepFile,
+}
+
+pub(crate) struct ConnectorAttachmentExecution {
+    pub account: ConnectorAccount,
+    pub metadata: ConnectorAttachmentMetadata,
+    pub workspace_root: std::path::PathBuf,
+    pub workspace_identity: String,
+}
+
+pub(crate) struct ConnectorReconciliationClaim {
+    claim_id: Uuid,
+    invocation: ConnectorInvocation,
+    account: ConnectorAccount,
+    attempt_count: u32,
+    claim_expires_at: DateTime<Utc>,
+}
+
+impl ConnectorReconciliationClaim {
+    pub(crate) fn claim_id(&self) -> Uuid {
+        self.claim_id
+    }
+
+    pub(crate) fn invocation(&self) -> &ConnectorInvocation {
+        &self.invocation
+    }
+
+    pub(crate) fn account(&self) -> &ConnectorAccount {
+        &self.account
+    }
+
+    pub(crate) fn claim_expires_at(&self) -> DateTime<Utc> {
+        self.claim_expires_at
+    }
+
+    pub(crate) fn attempt_count(&self) -> u32 {
+        self.attempt_count
+    }
 }
 
 impl EventStore {
@@ -143,17 +1207,1277 @@ impl EventStore {
 
             CREATE INDEX IF NOT EXISTS idx_kernel_events_created_at
                 ON kernel_events (created_at);
+
+            CREATE TABLE IF NOT EXISTS capability_access_state (
+                request_id TEXT PRIMARY KEY NOT NULL,
+                request_json TEXT NOT NULL,
+                resolution_json TEXT,
+                effective_status TEXT NOT NULL,
+                row_revision INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_capability_access_state_status
+                ON capability_access_state (effective_status, updated_at);
+
+            CREATE TABLE IF NOT EXISTS tool_invocation_state (
+                id TEXT PRIMARY KEY NOT NULL,
+                invocation_json TEXT NOT NULL,
+                tool_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                status TEXT NOT NULL,
+                approval_request_id TEXT,
+                request_fingerprint TEXT NOT NULL,
+                row_revision INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_invocation_state_status
+                ON tool_invocation_state (status, updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_tool_invocation_state_approval
+                ON tool_invocation_state (approval_request_id, status);
+
+            CREATE TABLE IF NOT EXISTS execution_projection_cursor (
+                projection_name TEXT PRIMARY KEY NOT NULL,
+                last_event_rowid INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_projection_applied_events (
+                event_id TEXT PRIMARY KEY NOT NULL,
+                event_type TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS capability_approval_consumptions (
+                request_id TEXT PRIMARY KEY NOT NULL,
+                capability_invocation_id TEXT NOT NULL UNIQUE,
+                consumed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS automation_definitions (
+                id TEXT PRIMARY KEY NOT NULL,
+                definition_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS automation_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                definition_id TEXT NOT NULL,
+                trigger_window_key TEXT NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                run_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                definition_revision INTEGER NOT NULL DEFAULT 0,
+                claimed_by TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE (definition_id, trigger_window_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_due
+                ON automation_runs (status, scheduled_for);
+
+            CREATE TABLE IF NOT EXISTS automation_checkpoints (
+                automation_run_id TEXT PRIMARY KEY NOT NULL,
+                checkpoint_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS review_queue_items (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_run_id TEXT NOT NULL UNIQUE,
+                item_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_accounts (
+                id TEXT PRIMARY KEY NOT NULL,
+                provider_id TEXT NOT NULL,
+                account_json TEXT NOT NULL,
+                health TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_connector_accounts_provider
+                ON connector_accounts (provider_id, health);
+
+            CREATE TABLE IF NOT EXISTS connector_account_generations (
+                account_id TEXT PRIMARY KEY NOT NULL,
+                generation INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_invocations (
+                id TEXT PRIMARY KEY NOT NULL,
+                account_id TEXT NOT NULL,
+                account_generation INTEGER,
+                idempotency_key TEXT NOT NULL,
+                invocation_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reconciliation_claim_id TEXT,
+                reconciliation_claim_expires_at TEXT,
+                next_reconciliation_at TEXT,
+                reconciliation_attempt_count INTEGER NOT NULL DEFAULT 0,
+                reconciliation_quarantine_code TEXT,
+                reconciliation_quarantined_at TEXT,
+                recovery_revision INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_invocation_idempotency
+                ON connector_invocations (account_id, idempotency_key);
+
+            CREATE TABLE IF NOT EXISTS connector_approval_consumptions (
+                request_id TEXT PRIMARY KEY NOT NULL,
+                connector_invocation_id TEXT NOT NULL UNIQUE,
+                consumed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_attachment_approval_consumptions (
+                request_id TEXT PRIMARY KEY NOT NULL,
+                landing_id TEXT NOT NULL UNIQUE,
+                consumed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_attachment_sources (
+                request_id TEXT PRIMARY KEY NOT NULL,
+                tool_invocation_id TEXT NOT NULL UNIQUE,
+                request_fingerprint TEXT NOT NULL UNIQUE,
+                metadata_json TEXT NOT NULL,
+                account_generation INTEGER NOT NULL,
+                workspace_root TEXT NOT NULL,
+                workspace_identity TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_attachment_active_sources (
+                landing_id TEXT PRIMARY KEY NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_attachment_landings (
+                id TEXT PRIMARY KEY NOT NULL,
+                account_id TEXT NOT NULL,
+                account_generation INTEGER NOT NULL,
+                metadata_json TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                tool_invocation_id TEXT NOT NULL UNIQUE,
+                approval_request_id TEXT NOT NULL UNIQUE,
+                request_fingerprint TEXT NOT NULL,
+                landing_fingerprint TEXT NOT NULL,
+                workspace_root TEXT,
+                workspace_identity TEXT,
+                storage_identity TEXT,
+                status TEXT NOT NULL,
+                receipt_json TEXT,
+                failure_kind TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT,
+                expires_at TEXT,
+                next_cleanup_at TEXT,
+                cleanup_claim_id TEXT,
+                cleanup_claim_expires_at TEXT,
+                recovery_revision INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_connector_attachment_landings_status
+                ON connector_attachment_landings (status, updated_at);
+
+            CREATE TABLE IF NOT EXISTS connector_authorization_sessions (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_json TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                cleanup_required INTEGER NOT NULL DEFAULT 0,
+                cleanup_completed_at TEXT,
+                exchange_claim_id TEXT,
+                exchange_claim_expires_at TEXT,
+                cleanup_claim_id TEXT,
+                cleanup_claim_expires_at TEXT,
+                account_id TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_authorization_actions (
+                authorization_id TEXT PRIMARY KEY NOT NULL,
+                token_hash TEXT NOT NULL,
+                session_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                review_id TEXT UNIQUE,
+                authority_handle_json TEXT,
+                action_status TEXT,
+                activated_at TEXT,
+                resolved_at TEXT,
+                resolved_intent TEXT,
+                authority_cleanup_required INTEGER NOT NULL DEFAULT 0,
+                authority_cleanup_claim_id TEXT,
+                authority_cleanup_claim_expires_at TEXT,
+                authority_cleanup_completed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_sync_streams (
+                account_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                stream_fingerprint TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                request_json TEXT,
+                last_successful_at TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (account_id, capability, stream_fingerprint)
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_sync_projection (
+                account_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                stream_fingerprint TEXT NOT NULL,
+                remote_ref TEXT NOT NULL,
+                item_json TEXT,
+                deleted INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (account_id, capability, stream_fingerprint, remote_ref)
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_sync_recovery_actions (
+                item_id TEXT PRIMARY KEY NOT NULL,
+                token_hash TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                account_generation INTEGER NOT NULL,
+                capability TEXT NOT NULL,
+                stream_fingerprint TEXT NOT NULL,
+                stream_revision INTEGER NOT NULL,
+                state_hash TEXT NOT NULL,
+                authority_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_sync_recovery_jobs (
+                id TEXT PRIMARY KEY NOT NULL,
+                recovery_item_id TEXT NOT NULL,
+                action_revision TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                account_generation INTEGER NOT NULL,
+                capability TEXT NOT NULL,
+                stream_fingerprint TEXT NOT NULL,
+                expected_state_revision INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                next_attempt_at TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                claim_id TEXT,
+                claim_expires_at TEXT,
+                quarantine_code TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(recovery_item_id, action_revision)
+            );
+
+            CREATE INDEX IF NOT EXISTS connector_sync_recovery_jobs_due
+            ON connector_sync_recovery_jobs
+               (status, next_attempt_at, claim_expires_at, attempt_count);
+
+            CREATE TABLE IF NOT EXISTS connector_reconciliation_recovery_actions (
+                item_id TEXT PRIMARY KEY NOT NULL,
+                action_handle TEXT NOT NULL UNIQUE,
+                token_hash TEXT NOT NULL,
+                invocation_hash TEXT NOT NULL,
+                account_generation INTEGER NOT NULL,
+                authority_hash TEXT NOT NULL,
+                request_fingerprint_hash TEXT NOT NULL,
+                next_reconciliation_at TEXT NOT NULL,
+                reconciliation_attempt_count INTEGER NOT NULL,
+                invocation_updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_recovery_action_receipts (
+                action_kind TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                action_revision TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                retain_until TEXT NOT NULL,
+                PRIMARY KEY (action_kind, item_id, action_revision)
+            );
+
             "#,
         )?;
+        ensure_sqlite_column(
+            &self.conn,
+            "automation_definitions",
+            "revision",
+            "ALTER TABLE automation_definitions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_sqlite_column(
+            &self.conn,
+            "automation_runs",
+            "definition_revision",
+            "ALTER TABLE automation_runs ADD COLUMN definition_revision INTEGER NOT NULL DEFAULT 0",
+        )?;
+        artifact::migrate(self)?;
+        revocation::migrate(self)?;
+        read_execution::migrate(self)?;
+        ensure_sqlite_column(
+            &self.conn,
+            "connector_sync_streams",
+            "request_json",
+            "ALTER TABLE connector_sync_streams ADD COLUMN request_json TEXT",
+        )?;
+        ensure_sqlite_column(
+            &self.conn,
+            "connector_sync_streams",
+            "last_successful_at",
+            "ALTER TABLE connector_sync_streams ADD COLUMN last_successful_at TEXT",
+        )?;
+        ensure_sqlite_column(
+            &self.conn,
+            "connector_authorization_sessions",
+            "revision",
+            "ALTER TABLE connector_authorization_sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_sqlite_column(
+            &self.conn,
+            "connector_authorization_sessions",
+            "cleanup_required",
+            "ALTER TABLE connector_authorization_sessions ADD COLUMN cleanup_required INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_sqlite_column(
+            &self.conn,
+            "connector_authorization_sessions",
+            "cleanup_completed_at",
+            "ALTER TABLE connector_authorization_sessions ADD COLUMN cleanup_completed_at TEXT",
+        )?;
+        ensure_sqlite_column(
+            &self.conn,
+            "connector_authorization_sessions",
+            "account_id",
+            "ALTER TABLE connector_authorization_sessions ADD COLUMN account_id TEXT",
+        )?;
+        for (column, migration) in [
+            ("exchange_claim_id", "ALTER TABLE connector_authorization_sessions ADD COLUMN exchange_claim_id TEXT"),
+            ("exchange_claim_expires_at", "ALTER TABLE connector_authorization_sessions ADD COLUMN exchange_claim_expires_at TEXT"),
+            ("cleanup_claim_id", "ALTER TABLE connector_authorization_sessions ADD COLUMN cleanup_claim_id TEXT"),
+            ("cleanup_claim_expires_at", "ALTER TABLE connector_authorization_sessions ADD COLUMN cleanup_claim_expires_at TEXT"),
+        ] {
+            ensure_sqlite_column(&self.conn, "connector_authorization_sessions", column, migration)?;
+        }
+        for (column, migration) in [
+            (
+                "review_id",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN review_id TEXT",
+            ),
+            (
+                "authority_handle_json",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN authority_handle_json TEXT",
+            ),
+            (
+                "action_status",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN action_status TEXT",
+            ),
+            (
+                "activated_at",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN activated_at TEXT",
+            ),
+            (
+                "resolved_at",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN resolved_at TEXT",
+            ),
+            (
+                "resolved_intent",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN resolved_intent TEXT",
+            ),
+            (
+                "authority_cleanup_required",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN authority_cleanup_required INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "authority_cleanup_claim_id",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN authority_cleanup_claim_id TEXT",
+            ),
+            (
+                "authority_cleanup_claim_expires_at",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN authority_cleanup_claim_expires_at TEXT",
+            ),
+            (
+                "authority_cleanup_completed_at",
+                "ALTER TABLE connector_authorization_actions ADD COLUMN authority_cleanup_completed_at TEXT",
+            ),
+        ] {
+            ensure_sqlite_column(
+                &self.conn,
+                "connector_authorization_actions",
+                column,
+                migration,
+            )?;
+        }
+        self.conn.execute(
+            r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_authorization_review
+               ON connector_authorization_actions (review_id)
+               WHERE review_id IS NOT NULL"#,
+            [],
+        )?;
+        self.conn.execute(
+            r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_authorization_account
+               ON connector_authorization_sessions (account_id)
+               WHERE account_id IS NOT NULL"#,
+            [],
+        )?;
+        self.conn.execute(
+            r#"INSERT OR IGNORE INTO connector_account_generations (account_id, generation)
+               SELECT id, 0 FROM connector_accounts"#,
+            [],
+        )?;
+        for (table, column, migration) in [
+            (
+                "connector_authorization_sessions",
+                "status",
+                "ALTER TABLE connector_authorization_sessions ADD COLUMN status TEXT NOT NULL DEFAULT '\"pending\"'",
+            ),
+            (
+                "review_queue_items",
+                "revision",
+                "ALTER TABLE review_queue_items ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "capability_access_state",
+                "row_revision",
+                "ALTER TABLE capability_access_state ADD COLUMN row_revision INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "capability_access_state",
+                "created_at",
+                "ALTER TABLE capability_access_state ADD COLUMN created_at TEXT",
+            ),
+            (
+                "tool_invocation_state",
+                "row_revision",
+                "ALTER TABLE tool_invocation_state ADD COLUMN row_revision INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "tool_invocation_state",
+                "created_at",
+                "ALTER TABLE tool_invocation_state ADD COLUMN created_at TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "workspace_root",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN workspace_root TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "size_bytes",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "connector_attachment_landings",
+                "workspace_identity",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN workspace_identity TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "storage_identity",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN storage_identity TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "failure_kind",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN failure_kind TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "attempt_count",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "connector_attachment_landings",
+                "created_at",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN created_at TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "expires_at",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN expires_at TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "next_cleanup_at",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN next_cleanup_at TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "cleanup_claim_id",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN cleanup_claim_id TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "cleanup_claim_expires_at",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN cleanup_claim_expires_at TEXT",
+            ),
+            (
+                "connector_attachment_landings",
+                "recovery_revision",
+                "ALTER TABLE connector_attachment_landings ADD COLUMN recovery_revision INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "connector_invocations",
+                "account_generation",
+                "ALTER TABLE connector_invocations ADD COLUMN account_generation INTEGER",
+            ),
+            (
+                "connector_invocations",
+                "reconciliation_claim_id",
+                "ALTER TABLE connector_invocations ADD COLUMN reconciliation_claim_id TEXT",
+            ),
+            (
+                "connector_invocations",
+                "reconciliation_claim_expires_at",
+                "ALTER TABLE connector_invocations ADD COLUMN reconciliation_claim_expires_at TEXT",
+            ),
+            (
+                "connector_invocations",
+                "next_reconciliation_at",
+                "ALTER TABLE connector_invocations ADD COLUMN next_reconciliation_at TEXT",
+            ),
+            (
+                "connector_invocations",
+                "reconciliation_attempt_count",
+                "ALTER TABLE connector_invocations ADD COLUMN reconciliation_attempt_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "connector_invocations",
+                "reconciliation_quarantine_code",
+                "ALTER TABLE connector_invocations ADD COLUMN reconciliation_quarantine_code TEXT",
+            ),
+            (
+                "connector_invocations",
+                "reconciliation_quarantined_at",
+                "ALTER TABLE connector_invocations ADD COLUMN reconciliation_quarantined_at TEXT",
+            ),
+            (
+                "connector_invocations",
+                "recovery_revision",
+                "ALTER TABLE connector_invocations ADD COLUMN recovery_revision INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            ensure_sqlite_column(&self.conn, table, column, migration)?;
+        }
+        ensure_sqlite_column(
+            &self.conn,
+            "connector_recovery_action_receipts",
+            "retain_until",
+            "ALTER TABLE connector_recovery_action_receipts ADD COLUMN retain_until TEXT",
+        )?;
+        self.conn.execute(
+            r#"UPDATE connector_recovery_action_receipts
+               SET retain_until = strftime('%Y-%m-%dT%H:%M:%fZ', accepted_at, '+90 days')
+               WHERE retain_until IS NULL"#,
+            [],
+        )?;
+        self.conn.execute(
+            r#"CREATE INDEX IF NOT EXISTS idx_connector_recovery_action_receipts_retention
+               ON connector_recovery_action_receipts (retain_until)"#,
+            [],
+        )?;
+        self.conn.execute(
+            r#"DELETE FROM connector_recovery_action_receipts
+               WHERE rowid IN (
+                 SELECT rowid FROM connector_recovery_action_receipts
+                 WHERE retain_until <= ?1 ORDER BY retain_until ASC LIMIT 64
+               )"#,
+            params![Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)],
+        )?;
+        migrate_connector_authorization_session_rows(&self.conn)?;
+        self.conn.execute(
+            r#"CREATE INDEX IF NOT EXISTS idx_connector_attachment_landings_recovery_due
+               ON connector_attachment_landings
+                  (status, next_cleanup_at, cleanup_claim_expires_at, attempt_count)"#,
+            [],
+        )?;
+        self.conn.execute(
+            r#"CREATE INDEX IF NOT EXISTS idx_connector_invocations_reconciliation_due
+               ON connector_invocations
+                  (status, next_reconciliation_at, reconciliation_claim_expires_at,
+                   reconciliation_attempt_count)"#,
+            [],
+        )?;
+        self.conn.execute(
+            "UPDATE capability_access_state SET created_at = COALESCE(created_at, updated_at)",
+            [],
+        )?;
+        self.conn.execute(
+            "UPDATE tool_invocation_state SET created_at = COALESCE(created_at, updated_at)",
+            [],
+        )?;
+        self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET size_bytes = COALESCE(NULLIF(size_bytes, 0),
+                 CAST(json_extract(metadata_json, '$.size_bytes') AS INTEGER), 0)"#,
+            [],
+        )?;
+        self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET created_at = COALESCE(created_at, updated_at),
+                   status = CASE
+                     WHEN status = 'completed' AND (
+                       workspace_root IS NULL OR workspace_identity IS NULL
+                       OR storage_identity IS NULL OR receipt_json IS NULL
+                     ) THEN 'repair_required'
+                     WHEN status IN ('completed', 'failed') THEN status
+                     WHEN workspace_root IS NULL OR workspace_identity IS NULL
+                       THEN 'repair_required'
+                     ELSE status
+                   END,
+                   failure_kind = CASE
+                     WHEN status = 'completed' AND (
+                       workspace_root IS NULL OR workspace_identity IS NULL
+                       OR storage_identity IS NULL OR receipt_json IS NULL
+                     ) THEN 'legacy_completed_unverified'
+                     WHEN status NOT IN ('completed', 'failed')
+                       AND (workspace_root IS NULL OR workspace_identity IS NULL)
+                       THEN 'legacy_workspace_unbound'
+                     ELSE failure_kind
+                   END"#,
+            [],
+        )?;
+        self.replay_execution_projection_events()?;
+        self.fail_legacy_connector_attachment_tools()?;
         Ok(())
     }
 
-    pub fn append(&self, event: &KernelEvent) -> EventStoreResult<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO kernel_events (id, event_type, payload_json, created_at)
-            VALUES (?1, ?2, ?3, ?4)
-            "#,
+    fn replay_execution_projection_events(&self) -> EventStoreResult<()> {
+        let last_rowid = self
+            .conn
+            .query_row(
+                r#"SELECT last_event_rowid FROM execution_projection_cursor
+                   WHERE projection_name = 'tool_capability_v1'"#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut statement = transaction.prepare(
+            r#"SELECT rowid, id, event_type, payload_json, created_at
+               FROM kernel_events
+               WHERE rowid > ?1 AND event_type IN (?2, ?3, ?4, ?5)
+               ORDER BY rowid ASC"#,
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    last_rowid,
+                    CAPABILITY_ACCESS_REQUESTED_EVENT,
+                    PERMISSION_RESOLUTION_RECORDED_EVENT,
+                    TOOL_INVOCATION_RECORDED_EVENT,
+                    CAPABILITY_INVOCATION_RECORDED_EVENT,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut newest_rowid = last_rowid;
+        for (rowid, event_id, event_type, payload_json, created_at) in rows {
+            Self::apply_execution_projection(
+                &transaction,
+                &event_id,
+                &event_type,
+                &payload_json,
+                &created_at,
+            )?;
+            newest_rowid = rowid;
+        }
+        transaction.execute(
+            r#"INSERT INTO execution_projection_cursor (projection_name, last_event_rowid)
+               VALUES ('tool_capability_v1', ?1)
+               ON CONFLICT(projection_name) DO UPDATE SET
+                 last_event_rowid = excluded.last_event_rowid"#,
+            params![newest_rowid],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn apply_execution_projection(
+        transaction: &Transaction<'_>,
+        event_id: &str,
+        event_type: &str,
+        payload_json: &str,
+        created_at: &str,
+    ) -> EventStoreResult<()> {
+        if !matches!(
+            event_type,
+            CAPABILITY_ACCESS_REQUESTED_EVENT
+                | PERMISSION_RESOLUTION_RECORDED_EVENT
+                | TOOL_INVOCATION_RECORDED_EVENT
+                | CAPABILITY_INVOCATION_RECORDED_EVENT
+        ) {
+            return Ok(());
+        }
+        let newly_applied = transaction.execute(
+            r#"INSERT OR IGNORE INTO execution_projection_applied_events
+               (event_id, event_type, applied_at) VALUES (?1, ?2, ?3)"#,
+            params![event_id, event_type, created_at],
+        )?;
+        if newly_applied == 0 {
+            return Ok(());
+        }
+        match event_type {
+            CAPABILITY_ACCESS_REQUESTED_EVENT => {
+                let request: CapabilityAccessRequest = serde_json::from_str(payload_json)?;
+                transaction.execute(
+                    r#"INSERT INTO capability_access_state
+                       (request_id, request_json, resolution_json, effective_status,
+                        row_revision, created_at, updated_at)
+                       VALUES (?1, ?2, NULL, ?3, 0, ?4, ?4)
+                       ON CONFLICT(request_id) DO UPDATE SET
+                         request_json = excluded.request_json,
+                         effective_status = CASE
+                           WHEN capability_access_state.resolution_json IS NULL
+                             THEN excluded.effective_status
+                           ELSE capability_access_state.effective_status
+                         END,
+                         row_revision = capability_access_state.row_revision + 1,
+                         updated_at = excluded.updated_at"#,
+                    params![
+                        request.id.to_string(),
+                        payload_json,
+                        serde_json::to_string(&request.status)?,
+                        created_at,
+                    ],
+                )?;
+            }
+            PERMISSION_RESOLUTION_RECORDED_EVENT => {
+                let resolution: PermissionResolution = serde_json::from_str(payload_json)?;
+                let effective_status = if resolution.approved {
+                    CapabilityAccessStatus::Approved
+                } else {
+                    CapabilityAccessStatus::Rejected
+                };
+                if let Some(expected) = resolution.expected_request_revision {
+                    let current = transaction
+                        .query_row(
+                            "SELECT row_revision FROM capability_access_state WHERE request_id = ?1",
+                            params![resolution.request_id.to_string()],
+                            |row| row.get::<_, u64>(0),
+                        )
+                        .optional()?
+                        .ok_or_else(|| {
+                            EventStoreError::InvalidState(
+                                "permission resolution projection has no request".to_string(),
+                            )
+                        })?;
+                    if current != expected {
+                        return Err(EventStoreError::InvalidState(
+                            "permission resolution projection revision changed".to_string(),
+                        ));
+                    }
+                }
+                let changed = transaction.execute(
+                    r#"UPDATE capability_access_state
+                       SET resolution_json = ?2, effective_status = ?3,
+                           row_revision = row_revision + 1, updated_at = ?4
+                       WHERE request_id = ?1"#,
+                    params![
+                        resolution.request_id.to_string(),
+                        payload_json,
+                        serde_json::to_string(&effective_status)?,
+                        created_at,
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(EventStoreError::InvalidState(
+                        "permission resolution projection has no request".to_string(),
+                    ));
+                }
+            }
+            TOOL_INVOCATION_RECORDED_EVENT => {
+                let invocation: ToolInvocationRecord = serde_json::from_str(payload_json)?;
+                transaction.execute(
+                    r#"INSERT INTO tool_invocation_state
+                       (id, invocation_json, tool_id, capability, status,
+                        approval_request_id, request_fingerprint, row_revision,
+                        created_at, updated_at)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?8)
+                       ON CONFLICT(id) DO UPDATE SET
+                         invocation_json = excluded.invocation_json,
+                         tool_id = excluded.tool_id,
+                         capability = excluded.capability,
+                         status = excluded.status,
+                         approval_request_id = excluded.approval_request_id,
+                         request_fingerprint = excluded.request_fingerprint,
+                         row_revision = tool_invocation_state.row_revision + 1,
+                         updated_at = excluded.updated_at"#,
+                    params![
+                        invocation.id.to_string(),
+                        payload_json,
+                        invocation.tool_id,
+                        serde_json::to_string(&invocation.capability)?,
+                        serde_json::to_string(&invocation.status)?,
+                        invocation
+                            .approval_request_id
+                            .map(|value| value.to_string()),
+                        invocation.request_fingerprint,
+                        created_at,
+                    ],
+                )?;
+            }
+            CAPABILITY_INVOCATION_RECORDED_EVENT => {
+                let invocation: CapabilityInvocation = serde_json::from_str(payload_json)?;
+                if invocation.status != CapabilityInvocationStatus::PendingApproval {
+                    if let Some(request_id) = invocation.approval_request_id {
+                        transaction.execute(
+                            r#"INSERT OR IGNORE INTO capability_approval_consumptions
+                           (request_id, capability_invocation_id, consumed_at)
+                           VALUES (?1, ?2, ?3)"#,
+                            params![
+                                request_id.to_string(),
+                                invocation.id.to_string(),
+                                created_at
+                            ],
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn insert_kernel_event(
+        transaction: &Transaction<'_>,
+        event: &KernelEvent,
+    ) -> EventStoreResult<()> {
+        let created_at = event.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        transaction.execute(
+            r#"INSERT INTO kernel_events (id, event_type, payload_json, created_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                event.id.to_string(),
+                event.event_type,
+                event.payload_json,
+                created_at,
+            ],
+        )?;
+        Self::apply_execution_projection(
+            transaction,
+            &event.id.to_string(),
+            &event.event_type,
+            &event.payload_json,
+            &created_at,
+        )
+    }
+
+    fn fail_legacy_connector_attachment_tools(&self) -> EventStoreResult<()> {
+        let mut statement = self.conn.prepare(
+            r#"SELECT tool_invocation_id FROM connector_attachment_landings
+               WHERE status = 'repair_required'
+                 AND failure_kind = 'legacy_workspace_unbound'"#,
+        )?;
+        let tool_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for tool_id in tool_ids {
+            let Ok(tool_id) = Uuid::parse_str(&tool_id) else {
+                continue;
+            };
+            let mut tool = match self.tool_invocation_by_id(tool_id) {
+                Ok(tool) => tool,
+                Err(EventStoreError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            if !matches!(
+                tool.status,
+                ToolExecutionStatus::WaitingForConfirmation | ToolExecutionStatus::Running
+            ) {
+                continue;
+            }
+            tool.status = ToolExecutionStatus::Failed;
+            tool.output = None;
+            tool.evidence.clear();
+            tool.verification = ToolVerificationResult::failed(
+                "legacy attachment landing has no safe workspace binding",
+            );
+            tool.error =
+                Some("connector attachment requires manual workspace inspection".to_string());
+            tool.finished_at = Some(Utc::now());
+            self.append_tool_invocation(&tool)?;
+        }
+        Ok(())
+    }
+
+    pub fn upsert_automation_definition(
+        &self,
+        definition: &AutomationDefinition,
+    ) -> EventStoreResult<AutomationDefinition> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT definition_json FROM automation_definitions WHERE id = ?1",
+                params![definition.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let mut persisted = definition.clone();
+        if let Some(existing) = existing {
+            let existing: AutomationDefinition = serde_json::from_str(&existing)?;
+            if definition.revision != existing.revision {
+                return Err(EventStoreError::InvalidState(
+                    "automation definition revision changed".to_string(),
+                ));
+            }
+            persisted.revision = existing.revision.checked_add(1).ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "automation definition revision is exhausted".to_string(),
+                )
+            })?;
+        } else if definition.revision != 0 {
+            return Err(EventStoreError::InvalidState(
+                "new automation definition revision is invalid".to_string(),
+            ));
+        }
+        let definition_json = serde_json::to_string(&persisted)?;
+        let changed = transaction.execute(
+            r#"INSERT INTO automation_definitions (id, definition_json, status, revision, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(id) DO UPDATE SET
+                 definition_json = excluded.definition_json,
+                 status = excluded.status,
+                 revision = excluded.revision,
+                 updated_at = excluded.updated_at
+               WHERE automation_definitions.revision = excluded.revision - 1"#,
+            params![
+                definition.id.to_string(),
+                definition_json,
+                serde_json::to_string(&persisted.status)?,
+                i64::try_from(persisted.revision).map_err(|_| EventStoreError::InvalidState(
+                    "automation definition revision is too large".to_string()
+                ))?,
+                persisted
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "automation definition revision changed".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(persisted)
+    }
+
+    pub fn set_automation_definition_status(
+        &self,
+        definition_id: Uuid,
+        status: AutomationDefinitionStatus,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<AutomationDefinition> {
+        let mut definition = self.automation_definition(definition_id)?;
+        definition.status = status;
+        definition.updated_at = changed_at;
+        self.upsert_automation_definition(&definition)
+    }
+
+    pub fn update_automation_goal(
+        &self,
+        definition_id: Uuid,
+        goal: String,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<AutomationDefinition> {
+        let mut definition = self.automation_definition(definition_id)?;
+        let goal = goal.trim().to_string();
+        if goal.is_empty() {
+            return Err(EventStoreError::InvalidState(
+                "automation goal is required".to_string(),
+            ));
+        }
+        if definition.status == AutomationDefinitionStatus::Deleted {
+            return Err(EventStoreError::InvalidState(
+                "deleted automation cannot be edited".to_string(),
+            ));
+        }
+        definition.goal = goal;
+        definition.updated_at = changed_at;
+        self.upsert_automation_definition(&definition)
+    }
+
+    pub fn automation_definition(
+        &self,
+        definition_id: Uuid,
+    ) -> EventStoreResult<AutomationDefinition> {
+        let json = self.conn.query_row(
+            "SELECT definition_json FROM automation_definitions WHERE id = ?1",
+            params![definition_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn list_automation_definitions(&self) -> EventStoreResult<Vec<AutomationDefinition>> {
+        let mut statement = self.conn.prepare(
+            "SELECT definition_json FROM automation_definitions ORDER BY updated_at ASC, rowid ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn claim_due_automation_run(
+        &self,
+        definition_id: Uuid,
+        now: DateTime<Utc>,
+        worker_id: String,
+    ) -> EventStoreResult<Option<AutomationRun>> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let definition_json = transaction.query_row(
+            "SELECT definition_json FROM automation_definitions WHERE id = ?1",
+            params![definition_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        let definition: AutomationDefinition = serde_json::from_str(&definition_json)?;
+        if definition.status != AutomationDefinitionStatus::Enabled {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let scheduled_for = due_automation_window(&transaction, &definition, now)?;
+        let Some(scheduled_for) = scheduled_for else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let key = trigger_window_key(definition.id, scheduled_for);
+        let timestamp = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let missed = now.signed_duration_since(scheduled_for).num_seconds()
+            > i64::try_from(definition.missed_after_seconds).unwrap_or(i64::MAX);
+        let skip_missed = missed && definition.missed_run_policy == MissedRunPolicy::Skip;
+        let run = AutomationRun {
+            id: Uuid::new_v4(),
+            definition_id: definition.id,
+            definition_revision: definition.revision,
+            trigger_window_key: key.clone(),
+            scheduled_for,
+            status: if skip_missed {
+                AutomationRunStatus::Cancelled
+            } else {
+                AutomationRunStatus::Queued
+            },
+            attempt: 0,
+            agent_run_id: None,
+            review_queue_item_id: None,
+            last_error: skip_missed.then(|| "missed trigger window skipped by policy".to_string()),
+            claimed_by: Some(worker_id.clone()),
+            claimed_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let inserted = transaction.execute(
+            r#"INSERT OR IGNORE INTO automation_runs
+               (id, definition_id, trigger_window_key, scheduled_for, run_json, status,
+                definition_revision, claimed_by, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                run.id.to_string(),
+                definition.id.to_string(),
+                key,
+                scheduled_for.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&run)?,
+                serde_json::to_string(&run.status)?,
+                i64::try_from(run.definition_revision).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "automation run definition revision is too large".to_string(),
+                    )
+                })?,
+                worker_id,
+                timestamp,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((inserted == 1 && !skip_missed).then_some(run))
+    }
+
+    pub fn enqueue_due_automation_agent_run(
+        &self,
+        definition_id: Uuid,
+        now: DateTime<Utc>,
+        scheduler_id: String,
+        conversation_id: String,
+    ) -> EventStoreResult<Option<(AutomationRun, AgentRunStart)>> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let definition_json = transaction.query_row(
+            "SELECT definition_json FROM automation_definitions WHERE id = ?1",
+            params![definition_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        let definition: AutomationDefinition = serde_json::from_str(&definition_json)?;
+        if definition.status != AutomationDefinitionStatus::Enabled {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let scheduled_for = due_automation_window(&transaction, &definition, now)?;
+        let Some(scheduled_for) = scheduled_for else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let key = trigger_window_key(definition.id, scheduled_for);
+        let missed = now.signed_duration_since(scheduled_for).num_seconds()
+            > i64::try_from(definition.missed_after_seconds).unwrap_or(i64::MAX);
+        let skip_missed = missed && definition.missed_run_policy == MissedRunPolicy::Skip;
+        let agent_run = AgentRunStart::queued(conversation_id, definition.goal, 0)
+            .map_err(EventStoreError::InvalidState)?;
+        let run = AutomationRun {
+            id: Uuid::new_v4(),
+            definition_id: definition.id,
+            definition_revision: definition.revision,
+            trigger_window_key: key.clone(),
+            scheduled_for,
+            status: if skip_missed {
+                AutomationRunStatus::Cancelled
+            } else {
+                AutomationRunStatus::Queued
+            },
+            attempt: 0,
+            agent_run_id: (!skip_missed).then_some(agent_run.id),
+            review_queue_item_id: None,
+            last_error: skip_missed.then(|| "missed trigger window skipped by policy".to_string()),
+            claimed_by: Some(scheduler_id.clone()),
+            claimed_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let timestamp = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let inserted = transaction.execute(
+            r#"INSERT OR IGNORE INTO automation_runs
+               (id, definition_id, trigger_window_key, scheduled_for, run_json, status,
+                definition_revision, claimed_by, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                run.id.to_string(),
+                definition.id.to_string(),
+                key,
+                scheduled_for.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&run)?,
+                serde_json::to_string(&run.status)?,
+                i64::try_from(run.definition_revision).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "automation run definition revision is too large".to_string(),
+                    )
+                })?,
+                scheduler_id,
+                timestamp,
+            ],
+        )?;
+        if inserted == 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        if !skip_missed {
+            let event = KernelEvent::new(AGENT_RUN_STARTED_EVENT, &agent_run)?;
+            transaction.execute(
+                r#"INSERT INTO kernel_events (id, event_type, payload_json, created_at)
+                   VALUES (?1, ?2, ?3, ?4)"#,
+                params![
+                    event.id.to_string(),
+                    event.event_type,
+                    event.payload_json,
+                    event.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok((!skip_missed).then_some((run, agent_run)))
+    }
+
+    pub fn enqueue_manual_automation_agent_run(
+        &self,
+        definition_id: Uuid,
+        manual_invocation_id: Uuid,
+        now: DateTime<Utc>,
+        conversation_id: String,
+    ) -> EventStoreResult<(AutomationRun, AgentRunStart)> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let definition_json = transaction.query_row(
+            "SELECT definition_json FROM automation_definitions WHERE id = ?1",
+            params![definition_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        let definition: AutomationDefinition = serde_json::from_str(&definition_json)?;
+        if definition.status == AutomationDefinitionStatus::Deleted {
+            return Err(EventStoreError::InvalidState(
+                "deleted automation cannot run".to_string(),
+            ));
+        }
+        let key = format!("manual:{manual_invocation_id}");
+        let agent_run = AgentRunStart::queued(conversation_id, definition.goal, 0)
+            .map_err(EventStoreError::InvalidState)?;
+        let run = AutomationRun {
+            id: Uuid::new_v4(),
+            definition_id: definition.id,
+            definition_revision: definition.revision,
+            trigger_window_key: key.clone(),
+            scheduled_for: now,
+            status: AutomationRunStatus::Queued,
+            attempt: 0,
+            agent_run_id: Some(agent_run.id),
+            review_queue_item_id: None,
+            last_error: None,
+            claimed_by: Some("manual".to_string()),
+            claimed_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let inserted = transaction.execute(
+            r#"INSERT OR IGNORE INTO automation_runs
+               (id, definition_id, trigger_window_key, scheduled_for, run_json, status,
+                definition_revision, claimed_by, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                run.id.to_string(),
+                definition.id.to_string(),
+                key,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&run)?,
+                serde_json::to_string(&run.status)?,
+                i64::try_from(run.definition_revision).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "automation run definition revision is too large".to_string(),
+                    )
+                })?,
+                "manual",
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if inserted == 0 {
+            return Err(EventStoreError::InvalidState(
+                "manual automation invocation already exists".to_string(),
+            ));
+        }
+        let event = KernelEvent::new(AGENT_RUN_STARTED_EVENT, &agent_run)?;
+        transaction.execute(
+            r#"INSERT INTO kernel_events (id, event_type, payload_json, created_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
             params![
                 event.id.to_string(),
                 event.event_type,
@@ -161,6 +2485,7428 @@ impl EventStore {
                 event.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
             ],
         )?;
+        transaction.commit()?;
+        Ok((run, agent_run))
+    }
+
+    pub fn list_automation_runs(&self) -> EventStoreResult<Vec<AutomationRun>> {
+        let mut statement = self.conn.prepare(
+            "SELECT run_json FROM automation_runs ORDER BY scheduled_for ASC, rowid ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn reconcile_automation_agent_runs(
+        &self,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<usize> {
+        let agent_runs = self.list_agent_run_records()?;
+        let agent_runs = agent_runs
+            .into_iter()
+            .map(|run| (run.id, run))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut reconciled = 0;
+        for run in self.list_automation_runs()? {
+            let Some(agent_run_id) = run.agent_run_id else {
+                continue;
+            };
+            let Some(agent_run) = agent_runs.get(&agent_run_id) else {
+                continue;
+            };
+            let target = match agent_run.status {
+                AgentRunStatus::Queued => AutomationRunStatus::Queued,
+                AgentRunStatus::Running => AutomationRunStatus::Running,
+                AgentRunStatus::WaitingForPrerequisite => AutomationRunStatus::WaitingReview,
+                AgentRunStatus::WaitingForConfirmation => AutomationRunStatus::WaitingApproval,
+                AgentRunStatus::Completed => AutomationRunStatus::Completed,
+                AgentRunStatus::Failed | AgentRunStatus::Blocked => AutomationRunStatus::Failed,
+                AgentRunStatus::Cancelled | AgentRunStatus::CancelRequested => {
+                    AutomationRunStatus::Cancelled
+                }
+            };
+            if run.status == target {
+                continue;
+            }
+            self.transition_automation_run(
+                run.id,
+                target,
+                None,
+                agent_run.finish_error.clone(),
+                changed_at,
+            )?;
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
+    pub fn automation_run(&self, run_id: Uuid) -> EventStoreResult<AutomationRun> {
+        let json = self.conn.query_row(
+            "SELECT run_json FROM automation_runs WHERE id = ?1",
+            params![run_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn transition_automation_run(
+        &self,
+        run_id: Uuid,
+        status: AutomationRunStatus,
+        agent_run_id: Option<Uuid>,
+        last_error: Option<String>,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<AutomationRun> {
+        let mut run = self.automation_run(run_id)?;
+        if !automation_run_transition_allowed(run.status, status) {
+            return Err(EventStoreError::InvalidState(format!(
+                "automation run cannot transition from {:?} to {:?}",
+                run.status, status
+            )));
+        }
+        if run.status == AutomationRunStatus::Failed && status == AutomationRunStatus::Queued {
+            let definition = self.automation_definition(run.definition_id)?;
+            if run.attempt >= definition.retry_limit {
+                return Err(EventStoreError::InvalidState(
+                    "automation retry limit reached".to_string(),
+                ));
+            }
+            run.attempt += 1;
+        }
+        if let Some(agent_run_id) = agent_run_id {
+            run.agent_run_id = Some(agent_run_id);
+        }
+        run.status = status;
+        run.last_error = last_error;
+        run.updated_at = changed_at;
+        self.persist_automation_run(&run)?;
+        Ok(run)
+    }
+
+    pub fn link_automation_run_to_agent_run(
+        &self,
+        automation_run_id: Uuid,
+        agent_run_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<AutomationRun> {
+        self.ensure_agent_run_exists(agent_run_id)?;
+        let mut run = self.automation_run(automation_run_id)?;
+        if let Some(existing_id) = run.agent_run_id {
+            if existing_id != agent_run_id {
+                return Err(EventStoreError::InvalidState(
+                    "automation run is already linked to another agent run".to_string(),
+                ));
+            }
+            return Ok(run);
+        }
+        run.agent_run_id = Some(agent_run_id);
+        run.updated_at = changed_at;
+        self.persist_automation_run(&run)?;
+        Ok(run)
+    }
+
+    pub fn upsert_automation_checkpoint(
+        &self,
+        checkpoint: &AutomationCheckpoint,
+    ) -> EventStoreResult<()> {
+        self.conn.execute(
+            r#"INSERT INTO automation_checkpoints (automation_run_id, checkpoint_json, updated_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(automation_run_id) DO UPDATE SET
+                 checkpoint_json = excluded.checkpoint_json,
+                 updated_at = excluded.updated_at"#,
+            params![
+                checkpoint.automation_run_id.to_string(),
+                serde_json::to_string(checkpoint)?,
+                checkpoint
+                    .recorded_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_review_queue_item(&self, item: &ReviewQueueItem) -> EventStoreResult<()> {
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT item_json FROM review_queue_items WHERE id = ?1",
+                params![item.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|json| serde_json::from_str::<ReviewQueueItem>(&json))
+            .transpose()?;
+        if existing.as_ref() == Some(item) {
+            return Ok(());
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|current| item.revision != current.revision.saturating_add(1))
+        {
+            return Err(EventStoreError::InvalidState(
+                "review item revision is stale".to_string(),
+            ));
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut run = self.automation_run(item.automation_run_id)?;
+        if let Some(existing_id) = run.review_queue_item_id {
+            if existing_id != item.id {
+                return Err(EventStoreError::InvalidState(
+                    "automation run already has a review queue item".to_string(),
+                ));
+            }
+        }
+        run.review_queue_item_id = Some(item.id);
+        run.updated_at = item.updated_at;
+        let changed = transaction.execute(
+            r#"INSERT INTO review_queue_items (id, automation_run_id, item_json, status, revision, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(id) DO UPDATE SET
+                 item_json = excluded.item_json,
+                 status = excluded.status,
+                 revision = excluded.revision,
+                 updated_at = excluded.updated_at
+               WHERE review_queue_items.revision + 1 = excluded.revision"#,
+            params![
+                item.id.to_string(),
+                item.automation_run_id.to_string(),
+                serde_json::to_string(item)?,
+                serde_json::to_string(&item.status)?,
+                item.revision,
+                item.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "review item update raced with another writer".to_string(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE automation_runs SET run_json = ?2, updated_at = ?3 WHERE id = ?1",
+            params![
+                run.id.to_string(),
+                serde_json::to_string(&run)?,
+                run.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_review_queue_items(&self) -> EventStoreResult<Vec<ReviewQueueItem>> {
+        let mut statement = self.conn.prepare(
+            "SELECT item_json FROM review_queue_items ORDER BY updated_at ASC, rowid ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn review_queue_item(&self, id: Uuid) -> EventStoreResult<ReviewQueueItem> {
+        let json = self.conn.query_row(
+            "SELECT item_json FROM review_queue_items WHERE id = ?1",
+            params![id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn edit_review_queue_item(
+        &self,
+        id: Uuid,
+        title: String,
+        preview_fingerprint: Option<String>,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ReviewQueueItem> {
+        let mut item = self.review_queue_item(id)?;
+        let previous_revision = item.revision;
+        let resolution = self.review_tool_approval_invalidation(&item, "Review preview changed")?;
+        item.edit(title, preview_fingerprint, changed_at)
+            .map_err(EventStoreError::InvalidState)?;
+        self.persist_review_item_transition(&item, previous_revision, resolution)?;
+        Ok(item)
+    }
+
+    pub fn resolve_review_queue_item(
+        &self,
+        id: Uuid,
+        accepted: bool,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ReviewQueueItem> {
+        let mut item = self.review_queue_item(id)?;
+        let previous_revision = item.revision;
+        let resolution = (!accepted)
+            .then(|| self.review_tool_approval_invalidation(&item, "Review item rejected"))
+            .transpose()?
+            .flatten();
+        item.resolve(accepted, changed_at)
+            .map_err(EventStoreError::InvalidState)?;
+        self.persist_review_item_transition(&item, previous_revision, resolution)?;
+        Ok(item)
+    }
+
+    fn review_tool_approval_invalidation(
+        &self,
+        item: &ReviewQueueItem,
+        note: &str,
+    ) -> EventStoreResult<Option<PermissionResolution>> {
+        let Some(tool_invocation_id) = item.tool_invocation_id else {
+            return Ok(None);
+        };
+        let approval_request_id = self
+            .list_tool_invocations()?
+            .into_iter()
+            .find(|record| record.id == tool_invocation_id)
+            .and_then(|record| record.approval_request_id);
+        Ok(approval_request_id
+            .map(|request_id| PermissionResolution::new(request_id, false, note.to_string())))
+    }
+
+    fn persist_review_item_transition(
+        &self,
+        item: &ReviewQueueItem,
+        previous_revision: u32,
+        resolution: Option<PermissionResolution>,
+    ) -> EventStoreResult<()> {
+        let mut run = self.automation_run(item.automation_run_id)?;
+        if run.review_queue_item_id != Some(item.id) {
+            return Err(EventStoreError::InvalidState(
+                "automation run is not linked to this review item".to_string(),
+            ));
+        }
+        run.updated_at = item.updated_at;
+        let resolution_event = resolution
+            .as_ref()
+            .map(|value| KernelEvent::new(PERMISSION_RESOLUTION_RECORDED_EVENT, value))
+            .transpose()?;
+        let transaction = self.conn.unchecked_transaction()?;
+        if let Some(event) = resolution_event {
+            Self::insert_kernel_event(&transaction, &event)?;
+        }
+        let changed = transaction.execute(
+            r#"UPDATE review_queue_items
+               SET item_json = ?2, status = ?3, revision = ?4, updated_at = ?5
+               WHERE id = ?1 AND revision = ?6"#,
+            params![
+                item.id.to_string(),
+                serde_json::to_string(item)?,
+                serde_json::to_string(&item.status)?,
+                item.revision,
+                item.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                previous_revision,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "review item transition raced with another writer".to_string(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE automation_runs SET run_json = ?2, updated_at = ?3 WHERE id = ?1",
+            params![
+                run.id.to_string(),
+                serde_json::to_string(&run)?,
+                run.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn automation_checkpoint(
+        &self,
+        automation_run_id: Uuid,
+    ) -> EventStoreResult<AutomationCheckpoint> {
+        let json = self.conn.query_row(
+            "SELECT checkpoint_json FROM automation_checkpoints WHERE automation_run_id = ?1",
+            params![automation_run_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    fn persist_automation_run(&self, run: &AutomationRun) -> EventStoreResult<()> {
+        self.conn.execute(
+            r#"UPDATE automation_runs
+               SET run_json = ?2, status = ?3, definition_revision = ?4,
+                   claimed_by = ?5, updated_at = ?6
+               WHERE id = ?1"#,
+            params![
+                run.id.to_string(),
+                serde_json::to_string(run)?,
+                serde_json::to_string(&run.status)?,
+                i64::try_from(run.definition_revision).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "automation run definition revision is too large".to_string(),
+                    )
+                })?,
+                run.claimed_by,
+                run.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_connector_account(&self, account: &ConnectorAccount) -> EventStoreResult<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT account_json FROM connector_accounts WHERE id = ?1",
+                params![account.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|json| serde_json::from_str::<ConnectorAccount>(&json))
+            .transpose()?;
+        if existing.as_ref().is_some_and(|stored| {
+            matches!(
+                stored.health,
+                ConnectorHealth::DisconnectPending | ConnectorHealth::RevocationPending
+            )
+        }) {
+            return Err(EventStoreError::InvalidState(
+                "connector pending transition requires its dedicated recovery path".to_string(),
+            ));
+        }
+        transaction.execute(
+            r#"INSERT OR IGNORE INTO connector_account_generations (account_id, generation)
+               VALUES (?1, 0)"#,
+            params![account.id.to_string()],
+        )?;
+        if existing.as_ref().is_some_and(|stored| {
+            stored.provider_id != account.provider_id
+                || stored.tenant_ref != account.tenant_ref
+                || stored.credential_handle != account.credential_handle
+                || stored.granted_capabilities != account.granted_capabilities
+        }) {
+            transaction.execute(
+                "UPDATE connector_account_generations SET generation = generation + 1 WHERE account_id = ?1",
+                params![account.id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM connector_sync_projection WHERE account_id = ?1",
+                params![account.id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM connector_sync_streams WHERE account_id = ?1",
+                params![account.id.to_string()],
+            )?;
+        }
+        transaction.execute(
+            r#"INSERT INTO connector_accounts (id, provider_id, account_json, health, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(id) DO UPDATE SET
+                 provider_id = excluded.provider_id,
+                 account_json = excluded.account_json,
+                 health = excluded.health,
+                 updated_at = excluded.updated_at"#,
+            params![
+                account.id.to_string(),
+                account.provider_id,
+                serde_json::to_string(account)?,
+                serde_json::to_string(&account.health)?,
+                account
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn connector_account_sync_generation(
+        &self,
+        account: &ConnectorAccount,
+    ) -> EventStoreResult<u64> {
+        let (account_json, generation) = self.conn.query_row(
+            r#"SELECT account.account_json, generation.generation
+               FROM connector_accounts AS account
+               JOIN connector_account_generations AS generation
+                 ON generation.account_id = account.id
+               WHERE account.id = ?1 AND account.health = ?2"#,
+            params![
+                account.id.to_string(),
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let stored: ConnectorAccount = serde_json::from_str(&account_json)?;
+        if stored.provider_id != account.provider_id
+            || stored.tenant_ref != account.tenant_ref
+            || stored.credential_handle != account.credential_handle
+            || stored.granted_capabilities != account.granted_capabilities
+            || stored.health != ConnectorHealth::Connected
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector account binding changed".to_string(),
+            ));
+        }
+        u64::try_from(generation).map_err(|_| {
+            EventStoreError::InvalidState("connector account generation is invalid".to_string())
+        })
+    }
+
+    pub fn mark_connector_account_needs_repair(
+        &self,
+        account: &ConnectorAccount,
+        expected_generation: u64,
+    ) -> EventStoreResult<()> {
+        if account.health != ConnectorHealth::NeedsRepair {
+            return Err(EventStoreError::InvalidState(
+                "connector repair transition requires needs-repair state".to_string(),
+            ));
+        }
+        let changed = self.conn.execute(
+            r#"UPDATE connector_accounts
+               SET provider_id = ?2, account_json = ?3, health = ?4, updated_at = ?5
+               WHERE id = ?1 AND health = ?6 AND EXISTS (
+                 SELECT 1 FROM connector_account_generations
+                 WHERE account_id = ?1 AND generation = ?7
+               )"#,
+            params![
+                account.id.to_string(),
+                account.provider_id,
+                serde_json::to_string(account)?,
+                serde_json::to_string(&account.health)?,
+                account
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+                i64::try_from(expected_generation).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector account generation is too large".to_string(),
+                    )
+                })?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector account changed during repair transition".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn begin_connector_disconnect(
+        &self,
+        account_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorDisconnectTicket> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let (json, generation) = transaction
+            .query_row(
+                r#"SELECT account.account_json, generation.generation
+                   FROM connector_accounts AS account
+                   JOIN connector_account_generations AS generation
+                     ON generation.account_id = account.id
+                   WHERE account.id = ?1"#,
+                params![account_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| EventStoreError::NotFound("connector account".to_string()))?;
+        let mut account: ConnectorAccount = serde_json::from_str(&json)?;
+        let generation = u64::try_from(generation).map_err(|_| {
+            EventStoreError::InvalidState("connector account generation is invalid".to_string())
+        })?;
+        if account.health == ConnectorHealth::DisconnectPending {
+            return Ok(ConnectorDisconnectTicket::new(account, generation));
+        }
+        if account.health == ConnectorHealth::RevocationPending {
+            return Err(EventStoreError::InvalidState(
+                "connector revocation must be reconciled before local disconnect".to_string(),
+            ));
+        }
+        if account.health == ConnectorHealth::Disconnected {
+            return Err(EventStoreError::InvalidState(
+                "connector account is already disconnected".to_string(),
+            ));
+        }
+        let previous_health = account.health;
+        let next_generation = generation.checked_add(1).ok_or_else(|| {
+            EventStoreError::InvalidState("connector account generation overflowed".to_string())
+        })?;
+        account.health = ConnectorHealth::DisconnectPending;
+        account.updated_at = now;
+        let generation_changed = transaction.execute(
+            r#"UPDATE connector_account_generations SET generation = ?2
+               WHERE account_id = ?1 AND generation = ?3"#,
+            params![
+                account_id.to_string(),
+                i64::try_from(next_generation).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector account generation is too large".to_string(),
+                    )
+                })?,
+                i64::try_from(generation).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector account generation is too large".to_string(),
+                    )
+                })?,
+            ],
+        )?;
+        if generation_changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector disconnect raced with another account transition".to_string(),
+            ));
+        }
+        transaction.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'cleanup_required', failure_kind = 'account_disconnected', updated_at = ?3
+               WHERE account_id = ?1 AND account_generation = ?2
+                 AND status IN ('reserved', 'staging', 'ready')"#,
+            params![
+                account_id.to_string(),
+                i64::try_from(generation).map_err(|_| EventStoreError::InvalidState(
+                    "connector account generation is too large".to_string()
+                ))?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM connector_sync_projection WHERE account_id = ?1",
+            params![account_id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM connector_sync_streams WHERE account_id = ?1",
+            params![account_id.to_string()],
+        )?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_accounts
+               SET account_json = ?2, health = ?3, updated_at = ?4
+               WHERE id = ?1 AND health = ?5"#,
+            params![
+                account_id.to_string(),
+                serde_json::to_string(&account)?,
+                serde_json::to_string(&account.health)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&previous_health)?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector disconnect could not be started".to_string(),
+            ));
+        }
+        let receipt = ConnectorDisconnectReceipt {
+            account_id,
+            provider_id: account.provider_id.clone(),
+            generation: next_generation,
+            phase: ConnectorDisconnectPhase::Started,
+            source: ConnectorDisconnectSource::User,
+            credential_delete_outcome: None,
+            changed_at: now,
+        };
+        let event = KernelEvent::new("connector.disconnect.started", &receipt)?;
+        transaction.execute(
+            r#"INSERT INTO kernel_events (id, event_type, payload_json, created_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                event.id.to_string(),
+                event.event_type,
+                event.payload_json,
+                event.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        transaction.commit()?;
+        let _ = self.terminalize_connector_attachment_cleanup_tools_for_account_generation(
+            account_id, generation, now,
+        );
+        Ok(ConnectorDisconnectTicket::new(account, next_generation))
+    }
+
+    fn terminalize_connector_attachment_cleanup_tools_for_account_generation(
+        &self,
+        account_id: Uuid,
+        generation: u64,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let mut statement = self.conn.prepare(
+            r#"SELECT id FROM connector_attachment_landings
+               WHERE account_id = ?1 AND account_generation = ?2
+                 AND status = 'cleanup_required'"#,
+        )?;
+        let landing_ids = statement
+            .query_map(
+                params![
+                    account_id.to_string(),
+                    i64::try_from(generation).map_err(|_| EventStoreError::InvalidState(
+                        "connector account generation is too large".to_string()
+                    ))?,
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for landing_id in landing_ids {
+            self.terminalize_connector_attachment_cleanup_tool(
+                Uuid::parse_str(&landing_id)?,
+                changed_at,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn complete_connector_disconnect(
+        &self,
+        ticket: &ConnectorDisconnectTicket,
+        source: ConnectorDisconnectSource,
+        credential_delete_outcome: ConnectorCredentialDeleteOutcome,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAccount> {
+        if ticket.account().health != ConnectorHealth::DisconnectPending {
+            return Err(EventStoreError::InvalidState(
+                "connector disconnect completion requires pending state".to_string(),
+            ));
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let current_json = transaction
+            .query_row(
+                r#"SELECT account.account_json
+                   FROM connector_accounts AS account
+                   JOIN connector_account_generations AS generation
+                     ON generation.account_id = account.id
+                   WHERE account.id = ?1 AND account.health = ?2 AND generation.generation = ?3"#,
+                params![
+                    ticket.account().id.to_string(),
+                    serde_json::to_string(&ConnectorHealth::DisconnectPending)?,
+                    i64::try_from(ticket.generation()).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector account generation is too large".to_string(),
+                        )
+                    })?,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector disconnect state changed before completion".to_string(),
+                )
+            })?;
+        let mut current: ConnectorAccount = serde_json::from_str(&current_json)?;
+        if current.provider_id != ticket.account().provider_id
+            || current.tenant_ref != ticket.account().tenant_ref
+            || current.credential_handle != ticket.account().credential_handle
+            || current.granted_capabilities != ticket.account().granted_capabilities
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector disconnect account binding changed".to_string(),
+            ));
+        }
+        current.health = ConnectorHealth::Disconnected;
+        current.updated_at = now;
+        let changed = transaction.execute(
+            r#"UPDATE connector_accounts
+               SET account_json = ?2, health = ?3, updated_at = ?4
+               WHERE id = ?1 AND health = ?5 AND EXISTS (
+                 SELECT 1 FROM connector_account_generations
+                 WHERE account_id = ?1 AND generation = ?6
+               )"#,
+            params![
+                current.id.to_string(),
+                serde_json::to_string(&current)?,
+                serde_json::to_string(&current.health)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorHealth::DisconnectPending)?,
+                i64::try_from(ticket.generation()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector account generation is too large".to_string(),
+                    )
+                })?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector disconnect completion raced with another transition".to_string(),
+            ));
+        }
+        let receipt = ConnectorDisconnectReceipt {
+            account_id: current.id,
+            provider_id: current.provider_id.clone(),
+            generation: ticket.generation(),
+            phase: ConnectorDisconnectPhase::Completed,
+            source,
+            credential_delete_outcome: Some(credential_delete_outcome),
+            changed_at: now,
+        };
+        let event = KernelEvent::new("connector.disconnect.completed", &receipt)?;
+        transaction.execute(
+            r#"INSERT INTO kernel_events (id, event_type, payload_json, created_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                event.id.to_string(),
+                event.event_type,
+                event.payload_json,
+                event.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(current)
+    }
+
+    pub fn record_connector_disconnect_failure(
+        &self,
+        ticket: &ConnectorDisconnectTicket,
+        source: ConnectorDisconnectSource,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut pending = ticket.account().clone();
+        pending.updated_at = now;
+        let changed = transaction.execute(
+            r#"UPDATE connector_accounts SET account_json = ?3, updated_at = ?4
+               WHERE id = ?1 AND health = ?2 AND EXISTS (
+                 SELECT 1 FROM connector_account_generations
+                 WHERE account_id = ?1 AND generation = ?5
+               )"#,
+            params![
+                ticket.account().id.to_string(),
+                serde_json::to_string(&ConnectorHealth::DisconnectPending)?,
+                serde_json::to_string(&pending)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                i64::try_from(ticket.generation()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector account generation is too large".to_string(),
+                    )
+                })?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector disconnect failure belongs to a stale transition".to_string(),
+            ));
+        }
+        let receipt = ConnectorDisconnectReceipt {
+            account_id: ticket.account().id,
+            provider_id: ticket.account().provider_id.clone(),
+            generation: ticket.generation(),
+            phase: ConnectorDisconnectPhase::CredentialDeleteFailed,
+            source,
+            credential_delete_outcome: None,
+            changed_at: now,
+        };
+        let event = KernelEvent::new("connector.disconnect.retry_required", &receipt)?;
+        transaction.execute(
+            r#"INSERT INTO kernel_events (id, event_type, payload_json, created_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                event.id.to_string(),
+                event.event_type,
+                event.payload_json,
+                event.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_pending_connector_disconnects(
+        &self,
+        limit: usize,
+    ) -> EventStoreResult<Vec<ConnectorDisconnectTicket>> {
+        if limit == 0 || limit > 100 {
+            return Err(EventStoreError::InvalidState(
+                "connector disconnect recovery limit is invalid".to_string(),
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            r#"SELECT account.account_json, generation.generation
+               FROM connector_accounts AS account
+               JOIN connector_account_generations AS generation
+                 ON generation.account_id = account.id
+               WHERE account.health = ?1
+               ORDER BY account.updated_at ASC, account.rowid ASC
+               LIMIT ?2"#,
+        )?;
+        let tickets = statement
+            .query_map(
+                params![
+                    serde_json::to_string(&ConnectorHealth::DisconnectPending)?,
+                    i64::try_from(limit).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector disconnect recovery limit is invalid".to_string(),
+                        )
+                    })?,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .map(|row| {
+                let (json, generation) = row?;
+                let account = serde_json::from_str(&json)?;
+                let generation = u64::try_from(generation).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector account generation is invalid".to_string(),
+                    )
+                })?;
+                Ok(ConnectorDisconnectTicket::new(account, generation))
+            })
+            .collect();
+        tickets
+    }
+
+    pub fn list_connector_accounts(&self) -> EventStoreResult<Vec<ConnectorAccount>> {
+        let mut statement = self.conn.prepare(
+            "SELECT account_json FROM connector_accounts ORDER BY updated_at ASC, rowid ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn list_connector_recovery_items(&self) -> EventStoreResult<Vec<ConnectorRecoveryItem>> {
+        self.list_connector_recovery_items_with_registries(&EmptyConnectorReconcilerRegistry, None)
+    }
+
+    pub(crate) fn list_connector_recovery_items_with_registry(
+        &self,
+        registry: &dyn ConnectorReconcilerRegistry,
+    ) -> EventStoreResult<Vec<ConnectorRecoveryItem>> {
+        self.list_connector_recovery_items_with_registries(registry, None)
+    }
+
+    pub(crate) fn list_connector_recovery_items_with_runtime_registries(
+        &self,
+        registry: &dyn ConnectorReconcilerRegistry,
+        sync_registry: &dyn ConnectorSyncRegistry,
+    ) -> EventStoreResult<Vec<ConnectorRecoveryItem>> {
+        self.list_connector_recovery_items_with_registries(registry, Some(sync_registry))
+    }
+
+    fn list_connector_recovery_items_with_registries(
+        &self,
+        registry: &dyn ConnectorReconcilerRegistry,
+        sync_registry: Option<&dyn ConnectorSyncRegistry>,
+    ) -> EventStoreResult<Vec<ConnectorRecoveryItem>> {
+        let mut items = Vec::new();
+
+        let mut attachment_statement = self.conn.prepare(
+            r#"SELECT id, metadata_json, failure_kind, workspace_root,
+                      workspace_identity, storage_identity, updated_at, recovery_revision
+               FROM connector_attachment_landings
+               WHERE status = 'repair_required'
+               ORDER BY updated_at DESC, id ASC LIMIT 100"#,
+        )?;
+        let attachment_rows = attachment_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(attachment_statement);
+        for (
+            id,
+            metadata_json,
+            failure_kind,
+            workspace_root,
+            workspace_identity,
+            storage_identity,
+            updated_at,
+            recovery_revision,
+        ) in attachment_rows
+        {
+            let metadata: ConnectorAttachmentMetadata = serde_json::from_str(&metadata_json)?;
+            let reason_code = match failure_kind.as_deref() {
+                Some("legacy_workspace_unbound") => {
+                    ConnectorRecoveryReasonCode::AttachmentLegacyWorkspaceUnbound
+                }
+                Some("legacy_completed_unverified") => {
+                    ConnectorRecoveryReasonCode::AttachmentLegacyReceiptIncomplete
+                }
+                Some("retention_identity_conflict") => {
+                    ConnectorRecoveryReasonCode::AttachmentRetentionIdentityChanged
+                }
+                Some("ready_identity_conflict")
+                | Some("ready_cleanup_identity_conflict")
+                | Some("unsafe_cleanup_boundary") => {
+                    ConnectorRecoveryReasonCode::AttachmentStoredIdentityChanged
+                }
+                Some("recovery_projection_unavailable") => {
+                    ConnectorRecoveryReasonCode::AttachmentExecutionRecordIncomplete
+                }
+                _ => ConnectorRecoveryReasonCode::AttachmentRecoveryRequired,
+            };
+            let retry_binding = (failure_kind.as_deref()
+                != Some("recovery_projection_unavailable"))
+            .then(|| {
+                workspace_root
+                    .as_deref()
+                    .zip(workspace_identity.as_deref())
+                    .zip(
+                        storage_identity
+                            .as_deref()
+                            .filter(|identity| !identity.trim().is_empty()),
+                    )
+            })
+            .flatten();
+            let action = retry_binding.map(
+                |((_workspace_root, workspace_identity), storage_identity)| {
+                    ConnectorRecoveryAction::RetryAttachmentCleanup {
+                        action_revision: connector_attachment_recovery_fingerprint(
+                            &id,
+                            failure_kind.as_deref(),
+                            workspace_identity,
+                            storage_identity,
+                            &updated_at,
+                            recovery_revision,
+                        ),
+                    }
+                },
+            );
+            items.push(ConnectorRecoveryItem {
+                id: Uuid::parse_str(&id)?,
+                kind: ConnectorRecoveryKind::Attachment,
+                status: ConnectorRecoveryStatus::RepairRequired,
+                title: metadata.file_name,
+                reason_code,
+                external_effect_state: ConnectorRecoveryExternalEffectState::LocalFilePreserved,
+                next_step_code: if action.is_some() {
+                    ConnectorRecoveryNextStepCode::RetryLocalCleanup
+                } else {
+                    ConnectorRecoveryNextStepCode::InspectFileManually
+                },
+                sync_capability: None,
+                action,
+                updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
+            });
+        }
+
+        let accounts = self.list_connector_accounts()?;
+        let accounts_by_id = accounts
+            .iter()
+            .map(|account| (account.id, account.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        for account in accounts {
+            if !matches!(
+                account.health,
+                ConnectorHealth::NeedsRepair
+                    | ConnectorHealth::DisconnectPending
+                    | ConnectorHealth::RevocationPending
+            ) {
+                continue;
+            }
+            let (status, reason_code, external_effect_state, next_step_code) = match account.health
+            {
+                ConnectorHealth::NeedsRepair => (
+                    ConnectorRecoveryStatus::NeedsRepair,
+                    ConnectorRecoveryReasonCode::AccountNeedsRepair,
+                    ConnectorRecoveryExternalEffectState::NoExternalWrite,
+                    ConnectorRecoveryNextStepCode::ReviewAccountConnection,
+                ),
+                ConnectorHealth::DisconnectPending => (
+                    ConnectorRecoveryStatus::DisconnectPending,
+                    ConnectorRecoveryReasonCode::AccountDisconnectPending,
+                    ConnectorRecoveryExternalEffectState::LocalCredentialRemovalPending,
+                    ConnectorRecoveryNextStepCode::WaitForLocalDisconnectRecovery,
+                ),
+                ConnectorHealth::RevocationPending => {
+                    let phase = self.active_connector_revocation_phase(account.id)?;
+                    let (external_effect_state, next_step_code) = match phase {
+                        ConnectorRevocationPhase::PendingRemote
+                        | ConnectorRevocationPhase::RetryScheduled => (
+                            ConnectorRecoveryExternalEffectState::NoExternalWrite,
+                            ConnectorRecoveryNextStepCode::ReviewAccountConnection,
+                        ),
+                        ConnectorRevocationPhase::RemoteCallStarted
+                        | ConnectorRevocationPhase::ReconciliationRequired => (
+                            ConnectorRecoveryExternalEffectState::ExternalResultUncertain,
+                            ConnectorRecoveryNextStepCode::VerifyProviderState,
+                        ),
+                        ConnectorRevocationPhase::RemoteConfirmed => (
+                            ConnectorRecoveryExternalEffectState::LocalCredentialRemovalPending,
+                            ConnectorRecoveryNextStepCode::WaitForLocalDisconnectRecovery,
+                        ),
+                        ConnectorRevocationPhase::Completed => {
+                            continue;
+                        }
+                    };
+                    (
+                        ConnectorRecoveryStatus::RevocationPending,
+                        ConnectorRecoveryReasonCode::AccountRevocationPending,
+                        external_effect_state,
+                        next_step_code,
+                    )
+                }
+                _ => unreachable!(),
+            };
+            items.push(ConnectorRecoveryItem {
+                id: account.id,
+                kind: ConnectorRecoveryKind::Account,
+                status,
+                title: account.display_name,
+                reason_code,
+                external_effect_state,
+                next_step_code,
+                sync_capability: None,
+                action: None,
+                updated_at: account.updated_at,
+            });
+        }
+
+        let mut sync_statement = self.conn.prepare(
+            r#"SELECT account_id, capability, stream_fingerprint, state_json, updated_at
+               FROM connector_sync_streams
+               ORDER BY updated_at DESC, account_id ASC, capability ASC
+               LIMIT 100"#,
+        )?;
+        let sync_rows = sync_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(sync_statement);
+        for (account_id, capability, stream_fingerprint, state_json, updated_at) in sync_rows {
+            let item = (|| -> EventStoreResult<Option<ConnectorRecoveryItem>> {
+                let state = ConnectorSyncState::from_persistence_json(state_json.clone())
+                    .map_err(EventStoreError::InvalidState)?;
+                let parsed_account_id = Uuid::parse_str(&account_id)?;
+                if state.account_id() != parsed_account_id
+                    || state.capability().contract_name() != capability
+                    || state.stream_fingerprint() != stream_fingerprint
+                    || state.updated_at()
+                        != DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc)
+                {
+                    return Err(EventStoreError::InvalidState(
+                        "connector sync recovery identity is invalid".to_string(),
+                    ));
+                }
+                if !state.stopped() {
+                    return Ok(None);
+                }
+                let sync_capability = match state.capability() {
+                    ConnectorCapability::MailSyncInbox => ConnectorRecoverySyncCapability::Mail,
+                    ConnectorCapability::CalendarSyncEvents => {
+                        ConnectorRecoverySyncCapability::Calendar
+                    }
+                    _ => {
+                        return Err(EventStoreError::InvalidState(
+                            "connector sync recovery capability is invalid".to_string(),
+                        ));
+                    }
+                };
+                let item_id =
+                    connector_sync_recovery_item_id(&account_id, &capability, &stream_fingerprint);
+                let account = accounts_by_id.get(&parsed_account_id);
+                let action = match account {
+                    Some(account)
+                        if account.health == ConnectorHealth::Connected
+                            && account.granted_capabilities.contains(&state.capability())
+                            && sync_registry.is_none_or(|registry| {
+                                registry.execution_enabled()
+                                    && match state.capability() {
+                                        ConnectorCapability::MailSyncInbox => {
+                                            registry.mail_provider(&account.provider_id).is_some()
+                                        }
+                                        ConnectorCapability::CalendarSyncEvents => registry
+                                            .calendar_provider(&account.provider_id)
+                                            .is_some(),
+                                        _ => false,
+                                    }
+                            }) =>
+                    {
+                        Some(ConnectorRecoveryAction::ResumeSync {
+                            action_revision: connector_sync_recovery_action_revision(
+                                &state_json,
+                                account,
+                                state.account_generation(),
+                                state.capability(),
+                            ),
+                        })
+                    }
+                    _ => None,
+                };
+                Ok(Some(ConnectorRecoveryItem {
+                    id: item_id,
+                    kind: ConnectorRecoveryKind::Sync,
+                    status: ConnectorRecoveryStatus::SyncExhausted,
+                    title: accounts_by_id
+                        .get(&parsed_account_id)
+                        .map(|account| account.display_name.clone())
+                        .unwrap_or_else(|| "Unavailable account".to_string()),
+                    reason_code: ConnectorRecoveryReasonCode::SyncRetryExhausted,
+                    external_effect_state: ConnectorRecoveryExternalEffectState::NoExternalWrite,
+                    next_step_code: ConnectorRecoveryNextStepCode::ReviewAccountConnection,
+                    sync_capability: Some(sync_capability),
+                    action,
+                    updated_at: state.updated_at(),
+                }))
+            })();
+            if let Ok(Some(item)) = item {
+                items.push(item);
+            }
+        }
+
+        let mut reconciliation_statement = self.conn.prepare(
+            r#"SELECT id, updated_at
+               FROM connector_invocations
+               WHERE status = ?1
+               ORDER BY updated_at DESC, id ASC
+               LIMIT 100"#,
+        )?;
+        let reconciliation_rows = reconciliation_statement
+            .query_map(
+                params![serde_json::to_string(
+                    &ConnectorInvocationStatus::ReconciliationRequired
+                )?],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(reconciliation_statement);
+        let reconciliation_transaction = self.conn.unchecked_transaction()?;
+        for (id, updated_at) in reconciliation_rows {
+            let Ok(item_id) = Uuid::parse_str(&id) else {
+                continue;
+            };
+            let action = load_connector_reconciliation_recovery_snapshot(
+                &reconciliation_transaction,
+                item_id,
+            )
+            .ok()
+            .filter(|snapshot| {
+                registry.supports(
+                    &snapshot.invocation.provider_id,
+                    snapshot.invocation.capability,
+                ) && DateTime::parse_from_rfc3339(&snapshot.next_reconciliation_at)
+                    .map(|scheduled| scheduled.with_timezone(&Utc) > Utc::now())
+                    .unwrap_or(false)
+            })
+            .and_then(|snapshot| {
+                connector_reconciliation_recovery_action_revision(&snapshot)
+                    .ok()
+                    .map(
+                        |action_revision| ConnectorRecoveryAction::InspectExternalResult {
+                            action_revision,
+                        },
+                    )
+            });
+            items.push(ConnectorRecoveryItem {
+                id: item_id,
+                kind: ConnectorRecoveryKind::Reconciliation,
+                status: ConnectorRecoveryStatus::ReconciliationRequired,
+                title: "External action".to_string(),
+                reason_code: ConnectorRecoveryReasonCode::ReconciliationRequired,
+                external_effect_state:
+                    ConnectorRecoveryExternalEffectState::ExternalResultUncertain,
+                next_step_code: ConnectorRecoveryNextStepCode::VerifyProviderState,
+                sync_capability: None,
+                action,
+                updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
+            });
+        }
+        reconciliation_transaction.commit()?;
+
+        items.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(items)
+    }
+
+    pub fn retry_connector_attachment_recovery(
+        &self,
+        landing_id: Uuid,
+        action_revision: &str,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorRecoveryAcceptance> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        const ACTION_KIND: &str = "attachment_cleanup";
+        if connector_recovery_action_was_accepted(
+            &transaction,
+            ACTION_KIND,
+            landing_id,
+            action_revision,
+        )? {
+            return Ok(ConnectorRecoveryAcceptance::AlreadyAccepted);
+        }
+        let (failure_kind, workspace_identity, storage_identity, updated_at, recovery_revision) =
+            transaction
+                .query_row(
+                    r#"SELECT failure_kind, workspace_identity, storage_identity, updated_at,
+                          recovery_revision
+                   FROM connector_attachment_landings
+                   WHERE id = ?1 AND status = 'repair_required'
+                     AND storage_identity IS NOT NULL AND trim(storage_identity) <> ''
+                     AND workspace_root IS NOT NULL AND workspace_identity IS NOT NULL"#,
+                    params![landing_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    EventStoreError::InvalidState(
+                        "connector recovery item is not safely retryable".to_string(),
+                    )
+                })?;
+        let current_fingerprint = connector_attachment_recovery_fingerprint(
+            &landing_id.to_string(),
+            failure_kind.as_deref(),
+            &workspace_identity,
+            &storage_identity,
+            &updated_at,
+            recovery_revision,
+        );
+        if action_revision.trim().is_empty()
+            || !constant_time_text_eq(&current_fingerprint, action_revision)
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector recovery card is stale".to_string(),
+            ));
+        }
+        let changed_at_text = changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let changed = transaction.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'cleanup_required', failure_kind = 'manual_retry',
+                   attempt_count = 0, next_cleanup_at = ?2,
+                   cleanup_claim_id = NULL, cleanup_claim_expires_at = NULL,
+                   updated_at = ?2
+               WHERE id = ?1 AND status = 'repair_required'
+                 AND storage_identity IS NOT NULL AND trim(storage_identity) <> ''
+                 AND workspace_root IS NOT NULL AND workspace_identity IS NOT NULL
+                 AND updated_at = ?3 AND recovery_revision = ?4"#,
+            params![
+                landing_id.to_string(),
+                changed_at_text,
+                updated_at,
+                recovery_revision
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector recovery item is not safely retryable".to_string(),
+            ));
+        }
+        let event = KernelEvent::new(
+            CONNECTOR_RECOVERY_RETRY_QUEUED_EVENT,
+            &serde_json::json!({
+                "landing_id": landing_id,
+                "kind": "attachment_cleanup",
+                "changed_at": changed_at,
+            }),
+        )?;
+        Self::insert_kernel_event(&transaction, &event)?;
+        record_connector_recovery_action_acceptance(
+            &transaction,
+            ACTION_KIND,
+            landing_id,
+            action_revision,
+            changed_at,
+        )?;
+        transaction.commit()?;
+        Ok(ConnectorRecoveryAcceptance::Accepted)
+    }
+
+    pub fn resume_connector_read_sync_from_recovery(
+        &self,
+        item_id: Uuid,
+        action_revision: &str,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorRecoveryAcceptance> {
+        self.resume_connector_read_sync_from_recovery_with_registry(
+            item_id,
+            action_revision,
+            None,
+            changed_at,
+        )
+    }
+
+    pub(crate) fn resume_connector_read_sync_from_recovery_with_sync_registry(
+        &self,
+        item_id: Uuid,
+        action_revision: &str,
+        registry: &dyn ConnectorSyncRegistry,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorRecoveryAcceptance> {
+        self.resume_connector_read_sync_from_recovery_with_registry(
+            item_id,
+            action_revision,
+            Some(registry),
+            changed_at,
+        )
+    }
+
+    fn resume_connector_read_sync_from_recovery_with_registry(
+        &self,
+        item_id: Uuid,
+        action_revision: &str,
+        sync_registry: Option<&dyn ConnectorSyncRegistry>,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorRecoveryAcceptance> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        const ACTION_KIND: &str = "read_sync";
+        if connector_recovery_action_was_accepted(
+            &transaction,
+            ACTION_KIND,
+            item_id,
+            action_revision,
+        )? {
+            return Ok(ConnectorRecoveryAcceptance::AlreadyAccepted);
+        }
+        let rows = {
+            let mut statement = transaction.prepare(
+                r#"SELECT account_id, capability, stream_fingerprint, state_json,
+                          revision, updated_at, request_json
+                   FROM connector_sync_streams"#,
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let (
+            account_id_text,
+            capability_text,
+            stream_fingerprint,
+            state_json,
+            revision,
+            updated_at,
+            request_json,
+        ) = rows
+            .into_iter()
+            .find(|(account_id, capability, stream_fingerprint, _, _, _, _)| {
+                connector_sync_recovery_item_id(account_id, capability, stream_fingerprint)
+                    == item_id
+            })
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector sync recovery action is invalid".to_string(),
+                )
+            })?;
+        if action_revision.trim().is_empty() {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery action is invalid".to_string(),
+            ));
+        }
+        let capability = match capability_text.as_str() {
+            "mail_sync_inbox" => ConnectorCapability::MailSyncInbox,
+            "calendar_sync_events" => ConnectorCapability::CalendarSyncEvents,
+            _ => {
+                return Err(EventStoreError::InvalidState(
+                    "connector sync recovery action is invalid".to_string(),
+                ))
+            }
+        };
+        let plan = request_json
+            .as_deref()
+            .ok_or_else(|| {
+                EventStoreError::InvalidState("connector sync recovery plan is missing".to_string())
+            })
+            .and_then(|value| {
+                ConnectorSyncPlan::from_persistence_json(value)
+                    .map_err(EventStoreError::InvalidState)
+            })?;
+        if !matches!(
+            (&plan, capability),
+            (
+                ConnectorSyncPlan::MailInbox { .. },
+                ConnectorCapability::MailSyncInbox
+            ) | (
+                ConnectorSyncPlan::CalendarRange { .. },
+                ConnectorCapability::CalendarSyncEvents
+            )
+        ) {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery plan capability is invalid".to_string(),
+            ));
+        }
+        let state = ConnectorSyncState::from_persistence_json(state_json.clone())
+            .map_err(EventStoreError::InvalidState)?;
+        let account_id = Uuid::parse_str(&account_id_text)?;
+        if state.account_id() != account_id
+            || state.capability() != capability
+            || state.stream_fingerprint() != stream_fingerprint
+            || i64::try_from(state.revision()).ok() != Some(revision)
+            || state.updated_at() != DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc)
+            || !state.stopped()
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery action is stale".to_string(),
+            ));
+        }
+        let (account_json, current_generation) = transaction.query_row(
+            r#"SELECT account.account_json, generation.generation
+               FROM connector_accounts AS account
+               JOIN connector_account_generations AS generation ON generation.account_id = account.id
+               WHERE account.id = ?1"#,
+            params![account_id_text],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let account: ConnectorAccount = serde_json::from_str(&account_json)?;
+        let current_generation = u64::try_from(current_generation).map_err(|_| {
+            EventStoreError::InvalidState("connector sync recovery action is invalid".to_string())
+        })?;
+        if account.id != account_id
+            || account.health != ConnectorHealth::Connected
+            || current_generation != state.account_generation()
+            || !account.granted_capabilities.contains(&capability)
+            || !constant_time_text_eq(
+                action_revision,
+                &connector_sync_recovery_action_revision(
+                    &state_json,
+                    &account,
+                    current_generation,
+                    capability,
+                ),
+            )
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery authority changed".to_string(),
+            ));
+        }
+        if !sync_registry.is_none_or(|registry| {
+            registry.execution_enabled()
+                && match capability {
+                    ConnectorCapability::MailSyncInbox => {
+                        registry.mail_provider(&account.provider_id).is_some()
+                    }
+                    ConnectorCapability::CalendarSyncEvents => {
+                        registry.calendar_provider(&account.provider_id).is_some()
+                    }
+                    _ => false,
+                }
+        }) {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery is unavailable".to_string(),
+            ));
+        }
+        let next = state
+            .resume_after_user_recovery(changed_at)
+            .map_err(EventStoreError::InvalidState)?;
+        let next_json = next
+            .persistence_json()
+            .map_err(EventStoreError::InvalidState)?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_sync_streams
+               SET state_json = ?4, revision = ?5, updated_at = ?6
+               WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                 AND revision = ?7 AND state_json = ?8"#,
+            params![
+                account_id_text,
+                capability_text,
+                stream_fingerprint,
+                next_json,
+                i64::try_from(next.revision()).map_err(|_| EventStoreError::InvalidState(
+                    "connector sync revision is too large".to_string()
+                ))?,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                revision,
+                state_json,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery action raced".to_string(),
+            ));
+        }
+        let job_id = Uuid::new_v4();
+        let changed_at_text = changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        transaction.execute(
+            r#"INSERT INTO connector_sync_recovery_jobs
+               (id, recovery_item_id, action_revision, account_id, account_generation,
+                capability, stream_fingerprint, expected_state_revision, status,
+                next_attempt_at, attempt_count, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?9, ?9)"#,
+            params![
+                job_id.to_string(),
+                item_id.to_string(),
+                action_revision,
+                account_id.to_string(),
+                i64::try_from(current_generation).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync account generation is too large".to_string(),
+                    )
+                })?,
+                capability.contract_name(),
+                stream_fingerprint,
+                i64::try_from(next.revision()).map_err(|_| EventStoreError::InvalidState(
+                    "connector sync revision is too large".to_string(),
+                ))?,
+                changed_at_text,
+            ],
+        )?;
+        let event = KernelEvent::new(
+            "connector.sync_recovery.resumed",
+            &serde_json::json!({
+                "recovery_item_id": item_id,
+                "kind": "read_sync",
+                "capability": match capability {
+                    ConnectorCapability::MailSyncInbox => "mail",
+                    ConnectorCapability::CalendarSyncEvents => "calendar",
+                    _ => unreachable!(),
+                },
+                "changed_at": changed_at,
+            }),
+        )?;
+        Self::insert_kernel_event(&transaction, &event)?;
+        record_connector_recovery_action_acceptance(
+            &transaction,
+            ACTION_KIND,
+            item_id,
+            action_revision,
+            changed_at,
+        )?;
+        transaction.commit()?;
+        Ok(ConnectorRecoveryAcceptance::Accepted)
+    }
+
+    pub(crate) fn claim_due_connector_sync_recovery_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> EventStoreResult<Vec<ConnectorSyncRecoveryClaim>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let now_text = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let mut claims = Vec::new();
+        while claims.len() < limit {
+            let rows = {
+                let mut statement = transaction.prepare(
+                    r#"SELECT id, recovery_item_id, action_revision, account_id,
+                          account_generation, capability, stream_fingerprint,
+                          expected_state_revision, attempt_count
+                   FROM connector_sync_recovery_jobs
+                   WHERE (status IN ('queued', 'backoff') AND next_attempt_at <= ?1
+                          AND (claim_expires_at IS NULL OR claim_expires_at <= ?1))
+                      OR (status = 'running' AND claim_expires_at <= ?1)
+                   ORDER BY next_attempt_at ASC, created_at ASC, id ASC
+                   LIMIT 64"#,
+                )?;
+                let rows = statement
+                    .query_map(params![now_text], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let row_count = rows.len();
+            for row in rows {
+                if claims.len() >= limit {
+                    break;
+                }
+                let (
+                    job_id,
+                    item_id,
+                    action_revision,
+                    account_id,
+                    generation,
+                    capability,
+                    stream,
+                    expected_revision,
+                    attempt_count,
+                ) = row;
+                let validated = (|| -> EventStoreResult<(Uuid, ConnectorAccount, ConnectorSyncState, ConnectorSyncPlan, u32)> {
+                let job_uuid = Uuid::parse_str(&job_id)?;
+                let item_uuid = Uuid::parse_str(&item_id)?;
+                let account_uuid = Uuid::parse_str(&account_id)?;
+                let generation = u64::try_from(generation).map_err(|_| EventStoreError::InvalidState("connector sync recovery generation is invalid".to_string()))?;
+                let expected_revision = u64::try_from(expected_revision).map_err(|_| EventStoreError::InvalidState("connector sync recovery revision is invalid".to_string()))?;
+                let attempt_count = u32::try_from(attempt_count).map_err(|_| EventStoreError::InvalidState("connector sync recovery attempt is invalid".to_string()))?;
+                let capability = match capability.as_str() {
+                    "mail_sync_inbox" => ConnectorCapability::MailSyncInbox,
+                    "calendar_sync_events" => ConnectorCapability::CalendarSyncEvents,
+                    _ => return Err(EventStoreError::InvalidState("connector sync recovery capability is invalid".to_string())),
+                };
+                if connector_sync_recovery_item_id(&account_id, capability.contract_name(), &stream) != item_uuid {
+                    return Err(EventStoreError::InvalidState("connector sync recovery binding is invalid".to_string()));
+                }
+                let accepted: i64 = transaction.query_row(
+                    r#"SELECT count(*) FROM connector_recovery_action_receipts
+                       WHERE action_kind = 'read_sync' AND item_id = ?1 AND action_revision = ?2"#,
+                    params![item_id, action_revision],
+                    |row| row.get(0),
+                )?;
+                if accepted != 1 {
+                    return Err(EventStoreError::InvalidState("connector sync recovery acceptance is invalid".to_string()));
+                }
+                let (account_json, current_generation) = transaction.query_row(
+                    r#"SELECT account.account_json, generation.generation
+                       FROM connector_accounts AS account
+                       JOIN connector_account_generations AS generation ON generation.account_id = account.id
+                       WHERE account.id = ?1"#,
+                    params![account_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )?;
+                let account: ConnectorAccount = serde_json::from_str(&account_json)?;
+                if account.id != account_uuid
+                    || account.health != ConnectorHealth::Connected
+                    || u64::try_from(current_generation).ok() != Some(generation)
+                    || !account.granted_capabilities.contains(&capability)
+                {
+                    return Err(EventStoreError::InvalidState("connector sync recovery account authority changed".to_string()));
+                }
+                let (state_json, revision, request_json) = transaction.query_row(
+                    r#"SELECT state_json, revision, request_json FROM connector_sync_streams
+                       WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3"#,
+                    params![account_id, capability.contract_name(), stream],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?)),
+                )?;
+                let state = ConnectorSyncState::from_persistence_json(state_json).map_err(EventStoreError::InvalidState)?;
+                if state.account_id() != account_uuid
+                    || state.account_generation() != generation
+                    || state.capability() != capability
+                    || state.stream_fingerprint() != stream
+                    || state.revision() != expected_revision
+                    || u64::try_from(revision).ok() != Some(expected_revision)
+                    || state.stopped()
+                {
+                    return Err(EventStoreError::InvalidState("connector sync recovery state changed".to_string()));
+                }
+                let plan = ConnectorSyncPlan::from_persistence_json(request_json.as_deref().ok_or_else(|| EventStoreError::InvalidState("connector sync recovery plan is missing".to_string()))?).map_err(EventStoreError::InvalidState)?;
+                if !matches!((&plan, capability), (ConnectorSyncPlan::MailInbox { .. }, ConnectorCapability::MailSyncInbox) | (ConnectorSyncPlan::CalendarRange { .. }, ConnectorCapability::CalendarSyncEvents)) {
+                    return Err(EventStoreError::InvalidState("connector sync recovery plan capability is invalid".to_string()));
+                }
+                Ok((job_uuid, account, state, plan, attempt_count))
+            })();
+                let Ok((job_uuid, account, state, plan, attempt_count)) = validated else {
+                    transaction.execute(
+                        r#"UPDATE connector_sync_recovery_jobs
+                       SET status = 'repair_required', quarantine_code = 'invalid_binding',
+                           claim_id = NULL, claim_expires_at = NULL, updated_at = ?2
+                       WHERE id = ?1
+                         AND (status IN ('queued', 'backoff')
+                              OR (status = 'running' AND claim_expires_at <= ?2))"#,
+                        params![job_id, now_text],
+                    )?;
+                    continue;
+                };
+                let claim_id = Uuid::new_v4();
+                let claim_expires_at =
+                    now + Duration::seconds(CONNECTOR_SYNC_RECOVERY_LEASE_SECONDS);
+                let changed = transaction.execute(
+                    r#"UPDATE connector_sync_recovery_jobs
+                   SET status = 'running', claim_id = ?2, claim_expires_at = ?3,
+                       attempt_count = attempt_count + 1, updated_at = ?4
+                   WHERE id = ?1
+                     AND ((status IN ('queued', 'backoff') AND next_attempt_at <= ?4
+                           AND (claim_expires_at IS NULL OR claim_expires_at <= ?4))
+                          OR (status = 'running' AND claim_expires_at <= ?4))"#,
+                    params![
+                        job_id,
+                        claim_id.to_string(),
+                        claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        now_text
+                    ],
+                )?;
+                if changed == 1 {
+                    claims.push(ConnectorSyncRecoveryClaim {
+                        job_id: job_uuid,
+                        claim_id,
+                        claim_expires_at,
+                        account,
+                        state,
+                        plan,
+                        attempt_count: attempt_count.saturating_add(1),
+                    });
+                }
+            }
+            if row_count < 64 {
+                break;
+            }
+        }
+        transaction.commit()?;
+        Ok(claims)
+    }
+
+    pub(crate) fn reset_expired_connector_sync_recovery_claims(
+        &self,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<usize> {
+        let now_text = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        Ok(self.conn.execute(
+            r#"UPDATE connector_sync_recovery_jobs
+               SET status = 'queued', next_attempt_at = ?1, claim_id = NULL,
+                   claim_expires_at = NULL, updated_at = ?1
+               WHERE rowid IN (
+                   SELECT rowid FROM connector_sync_recovery_jobs
+                   WHERE status = 'running' AND claim_expires_at <= ?1
+                   ORDER BY claim_expires_at ASC, rowid ASC LIMIT 64
+               )"#,
+            params![now_text],
+        )?)
+    }
+
+    pub(crate) fn renew_connector_sync_recovery_claim(
+        &self,
+        claim: &mut ConnectorSyncRecoveryClaim,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        if claim.claim_expires_at <= now {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery claim expired".to_string(),
+            ));
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let (account_json, generation) = transaction.query_row(
+            r#"SELECT account.account_json, generation.generation
+               FROM connector_accounts AS account
+               JOIN connector_account_generations AS generation ON generation.account_id = account.id
+               WHERE account.id = ?1"#,
+            params![claim.account.id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let account: ConnectorAccount = serde_json::from_str(&account_json)?;
+        let (state_json, request_json) = transaction.query_row(
+            r#"SELECT state_json, request_json FROM connector_sync_streams
+               WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                 AND revision = ?4"#,
+            params![
+                claim.state.account_id().to_string(),
+                claim.state.capability().contract_name(),
+                claim.state.stream_fingerprint(),
+                i64::try_from(claim.state.revision()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync revision is too large".to_string(),
+                    )
+                })?,
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        let current_state = ConnectorSyncState::from_persistence_json(state_json)
+            .map_err(EventStoreError::InvalidState)?;
+        let current_plan =
+            ConnectorSyncPlan::from_persistence_json(request_json.as_deref().ok_or_else(|| {
+                EventStoreError::InvalidState("connector sync recovery plan is missing".to_string())
+            })?)
+            .map_err(EventStoreError::InvalidState)?;
+        if account != claim.account
+            || account.health != ConnectorHealth::Connected
+            || u64::try_from(generation).ok() != Some(claim.state.account_generation())
+            || current_state != claim.state
+            || current_plan != claim.plan
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery authority changed".to_string(),
+            ));
+        }
+        let next_expires_at = now + Duration::seconds(CONNECTOR_SYNC_RECOVERY_LEASE_SECONDS);
+        let changed = transaction.execute(
+            r#"UPDATE connector_sync_recovery_jobs
+               SET claim_expires_at = ?4, updated_at = ?5
+               WHERE id = ?1 AND status = 'running' AND claim_id = ?2
+                 AND claim_expires_at = ?3 AND claim_expires_at > ?5
+                 AND account_id = ?6 AND account_generation = ?7
+                 AND capability = ?8 AND stream_fingerprint = ?9
+                 AND expected_state_revision = ?10"#,
+            params![
+                claim.job_id.to_string(),
+                claim.claim_id.to_string(),
+                claim
+                    .claim_expires_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                next_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                claim.state.account_id().to_string(),
+                i64::try_from(claim.state.account_generation()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync generation is too large".to_string(),
+                    )
+                })?,
+                claim.state.capability().contract_name(),
+                claim.state.stream_fingerprint(),
+                i64::try_from(claim.state.revision()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync revision is too large".to_string(),
+                    )
+                })?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery claim was lost".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        claim.claim_expires_at = next_expires_at;
+        Ok(())
+    }
+
+    pub(crate) fn relinquish_unavailable_connector_sync_recovery_claim(
+        &self,
+        claim: &ConnectorSyncRecoveryClaim,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let next_attempt_at = now + Duration::seconds(30);
+        let changed = self.conn.execute(
+            r#"UPDATE connector_sync_recovery_jobs
+               SET status = 'queued', next_attempt_at = ?4,
+                   attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,
+                   claim_id = NULL, claim_expires_at = NULL, updated_at = ?5
+               WHERE id = ?1 AND status = 'running' AND claim_id = ?2
+                 AND claim_expires_at = ?3 AND claim_expires_at > ?5"#,
+            params![
+                claim.job_id.to_string(),
+                claim.claim_id.to_string(),
+                claim
+                    .claim_expires_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                next_attempt_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery claim was lost".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_claimed_mail_sync_recovery(
+        &self,
+        claim: &ConnectorSyncRecoveryClaim,
+        page: &ConnectorSyncPage<MailMessage>,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorSyncState> {
+        claim
+            .plan
+            .mail_request()
+            .map_err(EventStoreError::InvalidState)?;
+        if claim.state.capability() != ConnectorCapability::MailSyncInbox {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery claim capability is invalid".to_string(),
+            ));
+        }
+        self.complete_claimed_connector_sync_recovery(
+            claim,
+            page,
+            &|message| message.remote_ref.as_str(),
+            now,
+        )
+    }
+
+    pub(crate) fn complete_claimed_calendar_sync_recovery(
+        &self,
+        claim: &ConnectorSyncRecoveryClaim,
+        page: &ConnectorSyncPage<CalendarEvent>,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorSyncState> {
+        claim
+            .plan
+            .calendar_request()
+            .map_err(EventStoreError::InvalidState)?;
+        if claim.state.capability() != ConnectorCapability::CalendarSyncEvents {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery claim capability is invalid".to_string(),
+            ));
+        }
+        self.complete_claimed_connector_sync_recovery(
+            claim,
+            page,
+            &|event| event.remote_ref.as_str(),
+            now,
+        )
+    }
+
+    fn complete_claimed_connector_sync_recovery<T, F>(
+        &self,
+        claim: &ConnectorSyncRecoveryClaim,
+        page: &ConnectorSyncPage<T>,
+        remote_ref: &F,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorSyncState>
+    where
+        T: serde::Serialize,
+        F: Fn(&T) -> &str,
+    {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        validate_connector_sync_recovery_claim(&transaction, claim, now)?;
+        let next = self.commit_connector_sync_page_in_transaction(
+            &transaction,
+            &claim.state,
+            page,
+            remote_ref,
+            now,
+        )?;
+        let status = match page.continuation() {
+            ConnectorSyncContinuation::Next(_) => "queued",
+            ConnectorSyncContinuation::Delta(_) => "completed",
+        };
+        let changed = transaction.execute(
+            r#"UPDATE connector_sync_recovery_jobs
+               SET expected_state_revision = ?4, status = ?5,
+                   next_attempt_at = ?6, claim_id = NULL, claim_expires_at = NULL,
+                   quarantine_code = NULL, updated_at = ?6
+               WHERE id = ?1 AND status = 'running' AND claim_id = ?2
+                 AND claim_expires_at = ?3 AND claim_expires_at > ?6
+                 AND account_id = ?7 AND account_generation = ?8
+                 AND capability = ?9 AND stream_fingerprint = ?10
+                 AND expected_state_revision = ?11"#,
+            params![
+                claim.job_id.to_string(),
+                claim.claim_id.to_string(),
+                claim
+                    .claim_expires_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                i64::try_from(next.revision()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync revision is too large".to_string(),
+                    )
+                })?,
+                status,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                claim.state.account_id().to_string(),
+                i64::try_from(claim.state.account_generation()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync generation is too large".to_string(),
+                    )
+                })?,
+                claim.state.capability().contract_name(),
+                claim.state.stream_fingerprint(),
+                i64::try_from(claim.state.revision()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync revision is too large".to_string(),
+                    )
+                })?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery claim was lost".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    pub(crate) fn finalize_claimed_connector_sync_recovery_failure(
+        &self,
+        claim: &ConnectorSyncRecoveryClaim,
+        failure: ConnectorProviderFailure,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorSyncState> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        validate_connector_sync_recovery_claim(&transaction, claim, now)?;
+        let (next, reason, repair_account) = match failure {
+            ConnectorProviderFailure::AuthorizationExpired
+            | ConnectorProviderFailure::PermissionDenied => (
+                claim
+                    .state
+                    .stop_after_recovery_failure(now)
+                    .map_err(EventStoreError::InvalidState)?,
+                "account_repair_required",
+                true,
+            ),
+            ConnectorProviderFailure::CursorExpired => (
+                claim
+                    .state
+                    .stop_after_recovery_failure(now)
+                    .map_err(EventStoreError::InvalidState)?,
+                "cursor_repair_required",
+                false,
+            ),
+            ConnectorProviderFailure::RateLimited {
+                retry_after_seconds,
+            } => match claim
+                .state
+                .recovery(
+                    ConnectorSyncFailure::RateLimited {
+                        retry_after_seconds,
+                    },
+                    claim.attempt_count,
+                    3,
+                    now,
+                )
+                .map_err(EventStoreError::InvalidState)?
+            {
+                ConnectorSyncStateRecovery::Persist { next, reason } => (next, reason, false),
+                ConnectorSyncStateRecovery::RepairAccount => unreachable!(),
+            },
+            ConnectorProviderFailure::NetworkUnavailable => match claim
+                .state
+                .recovery(
+                    ConnectorSyncFailure::NetworkUnavailable,
+                    claim.attempt_count,
+                    3,
+                    now,
+                )
+                .map_err(EventStoreError::InvalidState)?
+            {
+                ConnectorSyncStateRecovery::Persist { next, reason } => (next, reason, false),
+                ConnectorSyncStateRecovery::RepairAccount => unreachable!(),
+            },
+            ConnectorProviderFailure::RemoteNotFound
+            | ConnectorProviderFailure::InvalidResponse => match claim
+                .state
+                .recovery(
+                    ConnectorSyncFailure::InvalidResponse,
+                    claim.attempt_count,
+                    3,
+                    now,
+                )
+                .map_err(EventStoreError::InvalidState)?
+            {
+                ConnectorSyncStateRecovery::Persist { next, reason } => (next, reason, false),
+                ConnectorSyncStateRecovery::RepairAccount => unreachable!(),
+            },
+        };
+        if repair_account {
+            let mut next_account = claim.account.clone();
+            next_account.health = ConnectorHealth::NeedsRepair;
+            next_account.updated_at = now;
+            let changed = transaction.execute(
+                r#"UPDATE connector_accounts
+                   SET account_json = ?3, health = ?4, updated_at = ?5
+                   WHERE id = ?1 AND account_json = ?2 AND health = ?6
+                     AND EXISTS (
+                       SELECT 1 FROM connector_account_generations
+                       WHERE account_id = ?1 AND generation = ?7
+                     )"#,
+                params![
+                    claim.account.id.to_string(),
+                    serde_json::to_string(&claim.account)?,
+                    serde_json::to_string(&next_account)?,
+                    serde_json::to_string(&ConnectorHealth::NeedsRepair)?,
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    serde_json::to_string(&ConnectorHealth::Connected)?,
+                    i64::try_from(claim.state.account_generation()).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector sync generation is too large".to_string(),
+                        )
+                    })?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(EventStoreError::InvalidState(
+                    "connector sync recovery account changed".to_string(),
+                ));
+            }
+        }
+        let next_json = next
+            .persistence_json()
+            .map_err(EventStoreError::InvalidState)?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_sync_streams
+               SET state_json = ?4, revision = ?5, updated_at = ?6
+               WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                 AND state_json = ?7 AND revision = ?8"#,
+            params![
+                claim.state.account_id().to_string(),
+                claim.state.capability().contract_name(),
+                claim.state.stream_fingerprint(),
+                next_json,
+                i64::try_from(next.revision()).map_err(|_| EventStoreError::InvalidState(
+                    "connector sync revision is too large".to_string(),
+                ))?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                claim
+                    .state
+                    .persistence_json()
+                    .map_err(EventStoreError::InvalidState)?,
+                i64::try_from(claim.state.revision()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync revision is too large".to_string(),
+                    )
+                })?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery state changed".to_string(),
+            ));
+        }
+        let status = if next.stopped() {
+            "repair_required"
+        } else {
+            "backoff"
+        };
+        let next_attempt_at = next
+            .retry_state()
+            .map(|retry| retry.retry_at)
+            .unwrap_or(now);
+        let changed = transaction.execute(
+            r#"UPDATE connector_sync_recovery_jobs
+               SET expected_state_revision = ?4, status = ?5, next_attempt_at = ?6,
+                   claim_id = NULL, claim_expires_at = NULL,
+                   quarantine_code = ?7, updated_at = ?8
+               WHERE id = ?1 AND status = 'running' AND claim_id = ?2
+                 AND claim_expires_at = ?3 AND claim_expires_at > ?8
+                 AND expected_state_revision = ?9"#,
+            params![
+                claim.job_id.to_string(),
+                claim.claim_id.to_string(),
+                claim
+                    .claim_expires_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                i64::try_from(next.revision()).map_err(|_| EventStoreError::InvalidState(
+                    "connector sync revision is too large".to_string(),
+                ))?,
+                status,
+                next_attempt_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                if next.stopped() { Some(reason) } else { None },
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                i64::try_from(claim.state.revision()).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync revision is too large".to_string(),
+                    )
+                })?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector sync recovery claim was lost".to_string(),
+            ));
+        }
+        let event = KernelEvent::new(
+            "connector.sync_recovery.failed",
+            &serde_json::json!({
+                "kind": "read_sync",
+                "capability": match claim.state.capability() {
+                    ConnectorCapability::MailSyncInbox => "mail",
+                    ConnectorCapability::CalendarSyncEvents => "calendar",
+                    _ => "unsupported",
+                },
+                "outcome": if repair_account {
+                    "account_repair_required"
+                } else if next.stopped() {
+                    "repair_required"
+                } else {
+                    "deferred"
+                },
+                "changed_at": now,
+            }),
+        )?;
+        Self::insert_kernel_event(&transaction, &event)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    pub(crate) fn schedule_connector_reconciliation_from_recovery(
+        &self,
+        item_id: Uuid,
+        action_revision: &str,
+        registry: &dyn ConnectorReconcilerRegistry,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorRecoveryAcceptance> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        const ACTION_KIND: &str = "read_only_verification";
+        if connector_recovery_action_was_accepted(
+            &transaction,
+            ACTION_KIND,
+            item_id,
+            action_revision,
+        )? {
+            return Ok(ConnectorRecoveryAcceptance::AlreadyAccepted);
+        }
+        let snapshot = load_connector_reconciliation_recovery_snapshot(&transaction, item_id)?;
+        if action_revision.trim().is_empty()
+            || !constant_time_text_eq(
+                action_revision,
+                &connector_reconciliation_recovery_action_revision(&snapshot)?,
+            )
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation recovery action is invalid".to_string(),
+            ));
+        }
+        if !registry.supports(
+            &snapshot.invocation.provider_id,
+            snapshot.invocation.capability,
+        ) {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation recovery is unavailable".to_string(),
+            ));
+        }
+        let changed = transaction.execute(
+            r#"UPDATE connector_invocations
+               SET next_reconciliation_at = ?2
+               WHERE id = ?1 AND status = ?3
+                 AND reconciliation_quarantine_code IS NULL
+                 AND account_generation = ?4 AND invocation_json = ?5
+                 AND next_reconciliation_at = ?6
+                 AND reconciliation_attempt_count = ?7 AND updated_at = ?8
+                 AND recovery_revision = ?9
+                 AND reconciliation_claim_id IS NULL
+                 AND reconciliation_claim_expires_at IS NULL"#,
+            params![
+                item_id.to_string(),
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                snapshot.projected_generation,
+                snapshot.invocation_json,
+                snapshot.next_reconciliation_at,
+                snapshot.attempt_count,
+                snapshot.updated_at,
+                snapshot.recovery_revision,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation recovery action raced".to_string(),
+            ));
+        }
+        let event = KernelEvent::new(
+            "connector.reconciliation_inspection.scheduled",
+            &serde_json::json!({
+                "recovery_item_id": item_id,
+                "kind": "read_only_verification",
+                "changed_at": changed_at,
+            }),
+        )?;
+        Self::insert_kernel_event(&transaction, &event)?;
+        record_connector_recovery_action_acceptance(
+            &transaction,
+            ACTION_KIND,
+            item_id,
+            action_revision,
+            changed_at,
+        )?;
+        transaction.commit()?;
+        Ok(ConnectorRecoveryAcceptance::Accepted)
+    }
+
+    pub fn append_connector_invocation(
+        &self,
+        invocation: &ConnectorInvocation,
+    ) -> EventStoreResult<bool> {
+        if invocation.capability.external_mutation()
+            && invocation.mutation.as_ref().is_some_and(|mutation| {
+                mutation.account_generation != invocation.account_generation
+            })
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector mutation account generation projection is inconsistent".to_string(),
+            ));
+        }
+        let account_generation = invocation
+            .account_generation
+            .map(|generation| {
+                i64::try_from(generation).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector mutation account generation is too large".to_string(),
+                    )
+                })
+            })
+            .transpose()?;
+        let inserted = self.conn.execute(
+            r#"INSERT OR IGNORE INTO connector_invocations
+               (id, account_id, account_generation, idempotency_key, invocation_json, status, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            params![
+                invocation.id.to_string(),
+                invocation.account_id.to_string(),
+                account_generation,
+                invocation.idempotency_key,
+                serde_json::to_string(invocation)?,
+                serde_json::to_string(&invocation.status)?,
+                invocation
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    pub fn list_connector_invocations(&self) -> EventStoreResult<Vec<ConnectorInvocation>> {
+        let mut statement = self.conn.prepare(
+            "SELECT invocation_json FROM connector_invocations ORDER BY updated_at ASC, rowid ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn connector_invocation(&self, id: Uuid) -> EventStoreResult<ConnectorInvocation> {
+        let json = self.conn.query_row(
+            "SELECT invocation_json FROM connector_invocations WHERE id = ?1",
+            params![id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub(crate) fn prepare_connector_attachment_download_approval(
+        &self,
+        metadata: &ConnectorAttachmentMetadata,
+        workspace_root: &Path,
+        run_id: Option<Uuid>,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<(CapabilityAccessRecord, ToolInvocationRecord)> {
+        let (workspace_root, workspace_identity) =
+            connector_attachment_workspace_binding(workspace_root)
+                .map_err(EventStoreError::InvalidState)?;
+        let workspace_root_text = workspace_root
+            .to_str()
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector attachment workspace path encoding is unsupported".to_string(),
+                )
+            })?
+            .to_string();
+        let transaction = self.conn.unchecked_transaction()?;
+        let (account_json, generation) = transaction
+            .query_row(
+                r#"SELECT account.account_json, generation.generation
+                   FROM connector_accounts AS account
+                   JOIN connector_account_generations AS generation
+                     ON generation.account_id = account.id
+                   WHERE account.id = ?1 AND account.provider_id = ?2 AND account.health = ?3"#,
+                params![
+                    metadata.account_id.to_string(),
+                    metadata.provider_id,
+                    serde_json::to_string(&ConnectorHealth::Connected)?,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector attachment account is unavailable".to_string(),
+                )
+            })?;
+        let account: ConnectorAccount = serde_json::from_str(&account_json)?;
+        if !account
+            .granted_capabilities
+            .contains(&ConnectorCapability::MailReadAttachment)
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment account has no attachment-read grant".to_string(),
+            ));
+        }
+        let generation = u64::try_from(generation).map_err(|_| {
+            EventStoreError::InvalidState("connector account generation is invalid".to_string())
+        })?;
+        let exact_request = metadata
+            .tool_request(
+                generation,
+                &workspace_identity,
+                AccessMode::AskEveryStep,
+                run_id,
+            )
+            .map_err(EventStoreError::InvalidState)?;
+        let plan = prepare_tool_execution(&exact_request).map_err(EventStoreError::InvalidState)?;
+        if plan.policy_decision != PolicyDecision::Ask
+            || plan.contract.capability != CapabilityKind::ConnectorAttachmentRead
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment policy did not require exact approval".to_string(),
+            ));
+        }
+        let request_fingerprint = tool_request_fingerprint(&exact_request);
+        let existing = transaction
+            .query_row(
+                r#"SELECT request_id, tool_invocation_id
+                   FROM connector_attachment_sources WHERE request_fingerprint = ?1"#,
+                params![request_fingerprint],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((request_id, tool_invocation_id)) = existing {
+            transaction.commit()?;
+            return Ok((
+                self.capability_access_record_by_id(Uuid::parse_str(&request_id)?)?,
+                self.tool_invocation_by_id(Uuid::parse_str(&tool_invocation_id)?)?,
+            ));
+        }
+
+        let mut request = request_capability_access(
+            AccessMode::AskEveryStep,
+            CapabilityKind::ConnectorAttachmentRead,
+        )
+        .map_err(EventStoreError::InvalidState)?;
+        request.created_at = changed_at;
+        request
+            .bind_exact_tool(
+                plan.contract.id.clone(),
+                request_fingerprint.clone(),
+                tool_approval_preview(&exact_request),
+            )
+            .map_err(EventStoreError::InvalidState)?;
+        let audit = PermissionAuditEntry::evaluate(
+            AccessMode::AskEveryStep,
+            CapabilityKind::ConnectorAttachmentRead,
+        );
+        let tool = ToolInvocationRecord::waiting_for_confirmation(&plan, request.id);
+        let capability_invocation = CapabilityInvocation {
+            id: tool.id,
+            capability: CapabilityKind::ConnectorAttachmentRead,
+            status: CapabilityInvocationStatus::PendingApproval,
+            policy_decision: PolicyDecision::Ask,
+            approval_request_id: Some(request.id),
+            requested_resource: Some(metadata.file_name.trim().to_string()),
+            evidence_ref: None,
+            requested_url: None,
+            evidence_url: None,
+            title: Some("Connected attachment awaiting exact approval".to_string()),
+            excerpt: None,
+            warnings: vec!["Attachment content remains untrusted evidence.".to_string()],
+            elapsed_ms: 0,
+            created_at: changed_at,
+        };
+        transaction.execute(
+            r#"INSERT INTO connector_attachment_sources
+               (request_id, tool_invocation_id, request_fingerprint, metadata_json,
+                account_generation, workspace_root, workspace_identity, created_at, expires_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                request.id.to_string(),
+                tool.id.to_string(),
+                request_fingerprint,
+                serde_json::to_string(metadata)?,
+                i64::try_from(generation).map_err(|_| EventStoreError::InvalidState(
+                    "connector account generation is too large".to_string()
+                ))?,
+                workspace_root_text,
+                workspace_identity,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                (changed_at + Duration::minutes(15)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        for event in [
+            KernelEvent::new(CAPABILITY_ACCESS_REQUESTED_EVENT, &request)?,
+            KernelEvent::new(PERMISSION_AUDIT_RECORDED_EVENT, &audit)?,
+            KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool)?,
+            KernelEvent::new(CAPABILITY_INVOCATION_RECORDED_EVENT, &capability_invocation)?,
+        ] {
+            Self::insert_kernel_event(&transaction, &event)?;
+        }
+        transaction.commit()?;
+        Ok((self.capability_access_record_by_id(request.id)?, tool))
+    }
+
+    #[cfg(test)]
+    fn reserve_connector_attachment_download(
+        &self,
+        metadata: &ConnectorAttachmentMetadata,
+        workspace_root: &Path,
+        tool_invocation_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAttachmentDownloadPermit> {
+        let (workspace_root, workspace_identity) =
+            connector_attachment_workspace_binding(workspace_root)
+                .map_err(EventStoreError::InvalidState)?;
+        let workspace_root_text = workspace_root
+            .to_str()
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector attachment workspace path encoding is unsupported".to_string(),
+                )
+            })?
+            .to_string();
+        let account = self
+            .list_connector_accounts()?
+            .into_iter()
+            .find(|account| account.id == metadata.account_id)
+            .ok_or_else(|| EventStoreError::NotFound("connector account".to_string()))?;
+        let generation = self.connector_account_sync_generation(&account)?;
+        if account.health != ConnectorHealth::Connected
+            || account.provider_id != metadata.provider_id
+            || !account
+                .granted_capabilities
+                .contains(&crate::kernel::connectors::ConnectorCapability::MailReadAttachment)
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment account is not ready".to_string(),
+            ));
+        }
+        let mut tool_record = self.tool_invocation_by_id(tool_invocation_id)?;
+        let approval_request_id = tool_record.approval_request_id.ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "connector attachment approval request is missing".to_string(),
+            )
+        })?;
+        let approval = self.capability_access_record_by_id(approval_request_id)?;
+        if approval.request.capability != CapabilityKind::ConnectorAttachmentRead
+            || approval.effective_status != CapabilityAccessStatus::Approved
+            || approval.grant_state != CapabilityGrantState::OneShotAvailable
+        {
+            return Err(EventStoreError::InvalidState(
+                "exact connector attachment approval is unavailable".to_string(),
+            ));
+        }
+        let expected_request = metadata
+            .tool_request(
+                generation,
+                &workspace_identity,
+                approval.request.access_mode,
+                tool_record.run_id,
+            )
+            .map_err(EventStoreError::InvalidState)?;
+        let expected_request_fingerprint = tool_request_fingerprint(&expected_request);
+        let exact_scope_matches = approval.request.exact_tool.as_ref().is_some_and(|scope| {
+            scope.tool_id == CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID
+                && scope.request_fingerprint == expected_request_fingerprint
+                && scope.preview == tool_approval_preview(&expected_request)
+        });
+        if tool_record.tool_id != CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID
+            || tool_record.capability != CapabilityKind::ConnectorAttachmentRead
+            || tool_record.status != ToolExecutionStatus::WaitingForConfirmation
+            || tool_record.request_fingerprint != expected_request_fingerprint
+            || !exact_scope_matches
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment tool is not bound to the exact approved request".to_string(),
+            ));
+        }
+
+        let landing_id = Uuid::new_v4();
+        let landing_fingerprint = connector_attachment_landing_fingerprint(metadata, generation)
+            .map_err(EventStoreError::InvalidState)?;
+        tool_record.status = ToolExecutionStatus::Running;
+        tool_record.verification =
+            ToolVerificationResult::failed("connector attachment download is in progress");
+        tool_record.error = None;
+        tool_record.finished_at = None;
+        let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool_record)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            r#"INSERT INTO connector_attachment_approval_consumptions
+               (request_id, landing_id, consumed_at) VALUES (?1, ?2, ?3)"#,
+            params![
+                approval_request_id.to_string(),
+                landing_id.to_string(),
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        let inserted = transaction.execute(
+            r#"INSERT INTO connector_attachment_landings
+               (id, account_id, account_generation, metadata_json,
+                 tool_invocation_id, approval_request_id, request_fingerprint,
+                 landing_fingerprint, workspace_root, workspace_identity, status,
+                 receipt_json, failure_kind, created_at, updated_at, size_bytes)
+                SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                       'reserved', NULL, NULL, ?11, ?11, ?14
+                WHERE EXISTS (
+                  SELECT 1 FROM connector_accounts AS account
+                  JOIN connector_account_generations AS generation
+                    ON generation.account_id = account.id
+                  WHERE account.id = ?2
+                    AND account.provider_id = ?12
+                    AND account.health = ?13
+                    AND generation.generation = ?3
+                )
+                AND (SELECT COUNT(*) FROM connector_attachment_landings
+                     WHERE workspace_identity = ?10
+                       AND status IN ('reserved', 'staging', 'ready', 'completed',
+                                      'retention_cleanup')) < ?15
+                AND COALESCE((SELECT SUM(size_bytes) FROM connector_attachment_landings
+                              WHERE workspace_identity = ?10
+                                AND status IN ('reserved', 'staging', 'ready', 'completed',
+                                               'retention_cleanup')), 0) + ?14 <= ?16"#,
+            params![
+                landing_id.to_string(),
+                metadata.account_id.to_string(),
+                i64::try_from(generation).map_err(|_| EventStoreError::InvalidState(
+                    "connector account generation is too large".to_string()
+                ))?,
+                serde_json::to_string(&durable_connector_attachment_metadata(metadata))?,
+                tool_invocation_id.to_string(),
+                approval_request_id.to_string(),
+                expected_request_fingerprint,
+                landing_fingerprint,
+                workspace_root_text,
+                workspace_identity,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                metadata.provider_id,
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+                i64::try_from(metadata.size_bytes).map_err(|_| EventStoreError::InvalidState(
+                    "connector attachment size is too large".to_string()
+                ))?,
+                MAX_RETAINED_ATTACHMENTS_PER_WORKSPACE,
+                MAX_RETAINED_ATTACHMENT_BYTES_PER_WORKSPACE,
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment account changed before reservation".to_string(),
+            ));
+        }
+        Self::insert_kernel_event(&transaction, &tool_event)?;
+        transaction.commit()?;
+        ConnectorAttachmentDownloadPermit::reserved(
+            landing_id,
+            metadata,
+            generation,
+            landing_fingerprint,
+            workspace_identity,
+        )
+        .map_err(EventStoreError::InvalidState)
+    }
+
+    pub(crate) fn approve_and_reserve_connector_attachment_download(
+        &self,
+        request_id: Uuid,
+        expected_request_revision: u64,
+        expected_preview_revision: u32,
+        expected_preview_hash: &str,
+        note: String,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAttachmentDownloadPermit> {
+        let (
+            tool_invocation_id,
+            request_fingerprint,
+            metadata_json,
+            generation,
+            workspace_root,
+            stored_workspace_identity,
+            expires_at,
+        ) = self
+            .conn
+            .query_row(
+                r#"SELECT tool_invocation_id, request_fingerprint, metadata_json,
+                          account_generation, workspace_root, workspace_identity, expires_at
+                   FROM connector_attachment_sources WHERE request_id = ?1"#,
+                params![request_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                EventStoreError::NotFound(
+                    "connector attachment approval source is unavailable".to_string(),
+                )
+            })?;
+        let expires_at = DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc);
+        if expires_at <= changed_at {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval source expired".to_string(),
+            ));
+        }
+        let generation = u64::try_from(generation).map_err(|_| {
+            EventStoreError::InvalidState("connector account generation is invalid".to_string())
+        })?;
+        let metadata: ConnectorAttachmentMetadata = serde_json::from_str(&metadata_json)?;
+        let workspace_root = PathBuf::from(workspace_root);
+        let (workspace_root, workspace_identity) =
+            connector_attachment_workspace_binding(&workspace_root)
+                .map_err(EventStoreError::InvalidState)?;
+        if workspace_identity != stored_workspace_identity {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment workspace identity changed".to_string(),
+            ));
+        }
+        let workspace_root_text = workspace_root
+            .to_str()
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector attachment workspace path encoding is unsupported".to_string(),
+                )
+            })?
+            .to_string();
+        let approval = self.capability_access_record_by_id(request_id)?;
+        if approval.request.capability != CapabilityKind::ConnectorAttachmentRead
+            || approval.effective_status != CapabilityAccessStatus::PendingApproval
+            || approval.resolution.is_some()
+            || approval.projection_revision != expected_request_revision
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval is stale or unavailable".to_string(),
+            ));
+        }
+        let scope = approval.request.exact_tool.as_ref().ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "connector attachment exact preview evidence is missing".to_string(),
+            )
+        })?;
+        if scope.preview_revision != expected_preview_revision
+            || scope.preview_hash != expected_preview_hash
+            || scope.request_fingerprint != request_fingerprint
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval preview changed".to_string(),
+            ));
+        }
+        let tool_invocation_id = Uuid::parse_str(&tool_invocation_id)?;
+        let mut tool_record = self.tool_invocation_by_id(tool_invocation_id)?;
+        let expected_request = metadata
+            .tool_request(
+                generation,
+                &workspace_identity,
+                approval.request.access_mode,
+                tool_record.run_id,
+            )
+            .map_err(EventStoreError::InvalidState)?;
+        let expected_fingerprint = tool_request_fingerprint(&expected_request);
+        if expected_fingerprint != request_fingerprint
+            || scope.tool_id != CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID
+            || scope.preview != tool_approval_preview(&expected_request)
+            || tool_record.approval_request_id != Some(request_id)
+            || tool_record.tool_id != CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID
+            || tool_record.capability != CapabilityKind::ConnectorAttachmentRead
+            || tool_record.status != ToolExecutionStatus::WaitingForConfirmation
+            || tool_record.request_fingerprint != request_fingerprint
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment tool is not bound to the exact approved request".to_string(),
+            ));
+        }
+
+        let resolution = PermissionResolution::new_exact(
+            request_id,
+            true,
+            note,
+            expected_request_revision,
+            scope,
+        )
+        .map_err(EventStoreError::InvalidState)?;
+        let landing_id = Uuid::new_v4();
+        let landing_fingerprint = connector_attachment_landing_fingerprint(&metadata, generation)
+            .map_err(EventStoreError::InvalidState)?;
+        tool_record.status = ToolExecutionStatus::Running;
+        tool_record.verification =
+            ToolVerificationResult::failed("connector attachment download is in progress");
+        tool_record.error = None;
+        tool_record.finished_at = None;
+        let resolution_event = KernelEvent::new(PERMISSION_RESOLUTION_RECORDED_EVENT, &resolution)?;
+        let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool_record)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        Self::insert_kernel_event(&transaction, &resolution_event)?;
+        transaction.execute(
+            r#"INSERT INTO connector_attachment_approval_consumptions
+               (request_id, landing_id, consumed_at) VALUES (?1, ?2, ?3)"#,
+            params![
+                request_id.to_string(),
+                landing_id.to_string(),
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        let inserted = transaction.execute(
+            r#"INSERT INTO connector_attachment_landings
+               (id, account_id, account_generation, metadata_json,
+                tool_invocation_id, approval_request_id, request_fingerprint,
+                landing_fingerprint, workspace_root, workspace_identity, status,
+                receipt_json, failure_kind, created_at, updated_at, size_bytes)
+               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                      'reserved', NULL, NULL, ?11, ?11, ?14
+               WHERE EXISTS (
+                 SELECT 1 FROM connector_accounts AS account
+                 JOIN connector_account_generations AS generation
+                   ON generation.account_id = account.id
+                 WHERE account.id = ?2 AND account.provider_id = ?12
+                   AND account.health = ?13 AND generation.generation = ?3
+               )
+               AND (SELECT COUNT(*) FROM connector_attachment_landings
+                    WHERE workspace_identity = ?10
+                      AND status IN ('reserved', 'staging', 'ready', 'completed',
+                                     'retention_cleanup')) < ?15
+               AND COALESCE((SELECT SUM(size_bytes) FROM connector_attachment_landings
+                             WHERE workspace_identity = ?10
+                               AND status IN ('reserved', 'staging', 'ready', 'completed',
+                                              'retention_cleanup')), 0) + ?14 <= ?16"#,
+            params![
+                landing_id.to_string(),
+                metadata.account_id.to_string(),
+                i64::try_from(generation).map_err(|_| EventStoreError::InvalidState(
+                    "connector account generation is too large".to_string()
+                ))?,
+                serde_json::to_string(&durable_connector_attachment_metadata(&metadata))?,
+                tool_invocation_id.to_string(),
+                request_id.to_string(),
+                request_fingerprint,
+                landing_fingerprint,
+                workspace_root_text,
+                workspace_identity,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                metadata.provider_id,
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+                i64::try_from(metadata.size_bytes).map_err(|_| EventStoreError::InvalidState(
+                    "connector attachment size is too large".to_string()
+                ))?,
+                MAX_RETAINED_ATTACHMENTS_PER_WORKSPACE,
+                MAX_RETAINED_ATTACHMENT_BYTES_PER_WORKSPACE,
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment account changed before reservation".to_string(),
+            ));
+        }
+        transaction.execute(
+            r#"INSERT INTO connector_attachment_active_sources
+               (landing_id, metadata_json, created_at, expires_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                landing_id.to_string(),
+                serde_json::to_string(&metadata)?,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        let source_deleted = transaction.execute(
+            r#"DELETE FROM connector_attachment_sources
+               WHERE request_id = ?1 AND tool_invocation_id = ?2"#,
+            params![request_id.to_string(), tool_invocation_id.to_string()],
+        )?;
+        if source_deleted != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval source changed".to_string(),
+            ));
+        }
+        Self::insert_kernel_event(&transaction, &tool_event)?;
+        transaction.commit()?;
+        ConnectorAttachmentDownloadPermit::reserved(
+            landing_id,
+            &metadata,
+            generation,
+            landing_fingerprint,
+            stored_workspace_identity,
+        )
+        .map_err(EventStoreError::InvalidState)
+    }
+
+    pub(crate) fn reject_connector_attachment_download(
+        &self,
+        request_id: Uuid,
+        expected_request_revision: u64,
+        expected_preview_revision: u32,
+        expected_preview_hash: &str,
+        note: String,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<PermissionResolution> {
+        let tool_invocation_id = self
+            .conn
+            .query_row(
+                "SELECT tool_invocation_id FROM connector_attachment_sources WHERE request_id = ?1",
+                params![request_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                EventStoreError::NotFound(
+                    "connector attachment approval source is unavailable".to_string(),
+                )
+            })?;
+        let approval = self.capability_access_record_by_id(request_id)?;
+        if approval.request.capability != CapabilityKind::ConnectorAttachmentRead
+            || approval.effective_status != CapabilityAccessStatus::PendingApproval
+            || approval.resolution.is_some()
+            || approval.projection_revision != expected_request_revision
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval is stale or unavailable".to_string(),
+            ));
+        }
+        let scope = approval.request.exact_tool.as_ref().ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "connector attachment exact preview evidence is missing".to_string(),
+            )
+        })?;
+        if scope.preview_revision != expected_preview_revision
+            || scope.preview_hash != expected_preview_hash
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval preview changed".to_string(),
+            ));
+        }
+        let mut tool = self.tool_invocation_by_id(Uuid::parse_str(&tool_invocation_id)?)?;
+        if tool.approval_request_id != Some(request_id)
+            || tool.status != ToolExecutionStatus::WaitingForConfirmation
+            || tool.tool_id != CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval tool changed".to_string(),
+            ));
+        }
+        let resolution = PermissionResolution::new_exact(
+            request_id,
+            false,
+            note,
+            expected_request_revision,
+            scope,
+        )
+        .map_err(EventStoreError::InvalidState)?;
+        tool.status = ToolExecutionStatus::Blocked;
+        tool.output = None;
+        tool.evidence.clear();
+        tool.verification =
+            ToolVerificationResult::failed("connector attachment download was rejected");
+        tool.error = Some("local user rejected this exact attachment download".to_string());
+        tool.finished_at = Some(changed_at);
+        let capability_invocation = CapabilityInvocation {
+            id: tool.id,
+            capability: CapabilityKind::ConnectorAttachmentRead,
+            status: CapabilityInvocationStatus::Failed,
+            policy_decision: PolicyDecision::Ask,
+            approval_request_id: Some(request_id),
+            requested_resource: None,
+            evidence_ref: None,
+            requested_url: None,
+            evidence_url: None,
+            title: Some("Connected attachment rejected".to_string()),
+            excerpt: None,
+            warnings: vec!["No attachment bytes were downloaded.".to_string()],
+            elapsed_ms: 0,
+            created_at: changed_at,
+        };
+        let transaction = self.conn.unchecked_transaction()?;
+        for event in [
+            KernelEvent::new(PERMISSION_RESOLUTION_RECORDED_EVENT, &resolution)?,
+            KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool)?,
+            KernelEvent::new(CAPABILITY_INVOCATION_RECORDED_EVENT, &capability_invocation)?,
+        ] {
+            Self::insert_kernel_event(&transaction, &event)?;
+        }
+        let deleted = transaction.execute(
+            r#"DELETE FROM connector_attachment_sources
+               WHERE request_id = ?1 AND tool_invocation_id = ?2"#,
+            params![request_id.to_string(), tool_invocation_id],
+        )?;
+        if deleted != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval source changed".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(resolution)
+    }
+
+    pub(crate) fn complete_connector_attachment_landing(
+        &self,
+        landed: &LandedConnectorAttachment,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        self.complete_connector_attachment_landing_with_claim(landed, None, changed_at)
+    }
+
+    pub(crate) fn complete_recovered_connector_attachment_landing(
+        &self,
+        landed: &LandedConnectorAttachment,
+        claim_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        self.complete_connector_attachment_landing_with_claim(landed, Some(claim_id), changed_at)
+    }
+
+    fn complete_connector_attachment_landing_with_claim(
+        &self,
+        landed: &LandedConnectorAttachment,
+        recovery_claim_id: Option<Uuid>,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let receipt = landed.receipt();
+        if !receipt.untrusted_evidence
+            || receipt.landing_ref.trim().is_empty()
+            || receipt.landing_ref.contains(['/', '\\', ':'])
+            || receipt.sha256.len() != 64
+            || !receipt.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || receipt.byte_size == 0
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment receipt is invalid".to_string(),
+            ));
+        }
+        let (account_id, generation, metadata_json, tool_invocation_id, status, ready_receipt_json) =
+            self.conn.query_row(
+                r#"SELECT account_id, account_generation, metadata_json,
+                          tool_invocation_id, status, receipt_json
+                   FROM connector_attachment_landings WHERE id = ?1"#,
+                params![receipt.landing_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )?;
+        if status == "completed" && recovery_claim_id.is_none() {
+            let stored: String = self.conn.query_row(
+                "SELECT receipt_json FROM connector_attachment_landings WHERE id = ?1",
+                params![receipt.landing_id.to_string()],
+                |row| row.get(0),
+            )?;
+            let stored: ConnectorAttachmentLandingReceipt = serde_json::from_str(&stored)?;
+            return if stored == *receipt {
+                Ok(())
+            } else {
+                Err(EventStoreError::InvalidState(
+                    "connector attachment completion replay changed".to_string(),
+                ))
+            };
+        }
+        if status != "ready" {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment landing is not reserved".to_string(),
+            ));
+        }
+        let metadata: ConnectorAttachmentMetadata = serde_json::from_str(&metadata_json)?;
+        let ready_receipt = ready_receipt_json
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector attachment ready receipt is missing".to_string(),
+                )
+            })
+            .and_then(|json| {
+                serde_json::from_str::<ConnectorAttachmentLandingReceipt>(&json).map_err(Into::into)
+            })?;
+        if ready_receipt != *receipt {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment commit does not match the ready receipt".to_string(),
+            ));
+        }
+        let expected_account_id = Uuid::parse_str(&account_id)?;
+        let expected_generation = u64::try_from(generation).map_err(|_| {
+            EventStoreError::InvalidState("connector attachment generation is invalid".to_string())
+        })?;
+        if receipt.account_id != expected_account_id
+            || receipt.account_generation != expected_generation
+            || receipt.provider_id != metadata.provider_id
+            || receipt.media_type != metadata.declared_media_type
+            || receipt.byte_size != metadata.size_bytes
+            || receipt.landing_ref
+                != metadata
+                    .expected_landing_ref(receipt.landing_id)
+                    .map_err(EventStoreError::InvalidState)?
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment receipt does not match reservation".to_string(),
+            ));
+        }
+        let tool_invocation_id = Uuid::parse_str(&tool_invocation_id)?;
+        let mut tool_record = self.tool_invocation_by_id(tool_invocation_id)?;
+        if tool_record.status != ToolExecutionStatus::Running
+            || tool_record.capability != CapabilityKind::ConnectorAttachmentRead
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment tool is not running".to_string(),
+            ));
+        }
+        tool_record.status = ToolExecutionStatus::Succeeded;
+        tool_record.output = Some(serde_json::json!({
+            "landing_ref": receipt.landing_ref,
+            "sha256": receipt.sha256,
+            "byte_size": receipt.byte_size,
+            "media_type": receipt.media_type,
+        }));
+        tool_record.evidence = vec![ToolEvidence {
+            kind: "connector_attachment".to_string(),
+            reference: receipt.landing_ref.clone(),
+            summary: "Approved connector attachment landed as untrusted evidence.".to_string(),
+        }];
+        tool_record.verification =
+            ToolVerificationResult::passed("attachment hash, type, size, and generation verified");
+        tool_record.finished_at = Some(changed_at);
+        tool_record.error = None;
+        let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool_record)?;
+        let receipt_event = KernelEvent::new(CONNECTOR_ATTACHMENT_LANDED_EVENT, receipt)?;
+        let recovery_claim_id = recovery_claim_id.map(|value| value.to_string());
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'completed', receipt_json = ?2, updated_at = ?3,
+                   expires_at = ?4, next_cleanup_at = ?4, cleanup_claim_id = NULL,
+                   cleanup_claim_expires_at = NULL
+               WHERE id = ?1 AND status = 'ready' AND receipt_json = ?2
+                  AND ((?6 IS NULL AND cleanup_claim_id IS NULL)
+                       OR (cleanup_claim_id = ?6 AND cleanup_claim_expires_at > ?3))
+                 AND EXISTS (
+                 SELECT 1 FROM connector_accounts AS account
+                 JOIN connector_account_generations AS generation
+                   ON generation.account_id = account.id
+                 WHERE account.id = connector_attachment_landings.account_id
+                   AND account.health = ?5
+                   AND generation.generation = connector_attachment_landings.account_generation
+               )"#,
+            params![
+                receipt.landing_id.to_string(),
+                serde_json::to_string(receipt)?,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                (changed_at + Duration::days(CONNECTOR_ATTACHMENT_RETENTION_DAYS))
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+                recovery_claim_id,
+            ],
+        )?;
+        if changed != 1 {
+            let replay = transaction
+                .query_row(
+                    r#"SELECT status, receipt_json FROM connector_attachment_landings
+                       WHERE id = ?1"#,
+                    params![receipt.landing_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            if recovery_claim_id.is_none() {
+                if let Some((status, Some(stored))) = replay {
+                    if status == "completed"
+                        && serde_json::from_str::<ConnectorAttachmentLandingReceipt>(&stored)?
+                            == *receipt
+                    {
+                        transaction.commit()?;
+                        return Ok(());
+                    }
+                }
+            }
+            return Err(EventStoreError::InvalidState(
+                "connector attachment account changed before completion".to_string(),
+            ));
+        }
+        for event in [tool_event, receipt_event] {
+            Self::insert_kernel_event(&transaction, &event)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn assert_connector_attachment_execution_current(
+        &self,
+        landing_id: Uuid,
+    ) -> EventStoreResult<()> {
+        let binding = self
+            .conn
+            .query_row(
+                r#"SELECT landing.workspace_root, landing.workspace_identity
+                 FROM connector_attachment_landings AS landing
+                 JOIN connector_accounts AS account ON account.id = landing.account_id
+                 JOIN connector_account_generations AS generation
+                   ON generation.account_id = account.id
+                 WHERE landing.id = ?1
+                   AND landing.status IN ('reserved', 'staging')
+                   AND account.health = ?2
+                   AND generation.generation = landing.account_generation
+                   AND landing.workspace_root IS NOT NULL
+                   AND landing.workspace_identity IS NOT NULL"#,
+                params![
+                    landing_id.to_string(),
+                    serde_json::to_string(&ConnectorHealth::Connected)?,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((workspace_root, stored_workspace_identity)) = binding else {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment execution authority changed".to_string(),
+            ));
+        };
+        let (_, workspace_identity) =
+            connector_attachment_workspace_binding(Path::new(&workspace_root))
+                .map_err(EventStoreError::InvalidState)?;
+        if workspace_identity != stored_workspace_identity {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment workspace identity changed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn load_connector_attachment_execution(
+        &self,
+        landing_id: Uuid,
+    ) -> EventStoreResult<ConnectorAttachmentExecution> {
+        let (account_json, metadata_json, workspace_root, stored_workspace_identity) =
+            self.conn.query_row(
+                r#"SELECT account.account_json, source.metadata_json,
+                          landing.workspace_root, landing.workspace_identity
+                   FROM connector_attachment_landings AS landing
+                   JOIN connector_attachment_active_sources AS source
+                     ON source.landing_id = landing.id
+                   JOIN connector_accounts AS account ON account.id = landing.account_id
+                   JOIN connector_account_generations AS generation
+                     ON generation.account_id = account.id
+                   WHERE landing.id = ?1
+                     AND landing.status = 'reserved'
+                     AND account.health = ?2
+                     AND generation.generation = landing.account_generation"#,
+                params![
+                    landing_id.to_string(),
+                    serde_json::to_string(&ConnectorHealth::Connected)?,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
+        let workspace_root = std::path::PathBuf::from(workspace_root);
+        let (_, workspace_identity) = connector_attachment_workspace_binding(&workspace_root)
+            .map_err(EventStoreError::InvalidState)?;
+        if workspace_identity != stored_workspace_identity {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment workspace identity changed".to_string(),
+            ));
+        }
+        Ok(ConnectorAttachmentExecution {
+            account: serde_json::from_str(&account_json)?,
+            metadata: serde_json::from_str(&metadata_json)?,
+            workspace_root,
+            workspace_identity,
+        })
+    }
+
+    pub(crate) fn mark_connector_attachment_staging(
+        &self,
+        landing_id: Uuid,
+        storage_identity: &str,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        if storage_identity.trim().is_empty() || storage_identity.len() > 64 {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment storage identity is invalid".to_string(),
+            ));
+        }
+        let changed = self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'staging', storage_identity = ?2, updated_at = ?3
+               WHERE id = ?1 AND status = 'reserved' AND EXISTS (
+                 SELECT 1 FROM connector_accounts AS account
+                 JOIN connector_account_generations AS generation
+                   ON generation.account_id = account.id
+                 WHERE account.id = connector_attachment_landings.account_id
+                   AND account.health = ?4
+                   AND generation.generation = connector_attachment_landings.account_generation
+               )"#,
+            params![
+                landing_id.to_string(),
+                storage_identity,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+            ],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(EventStoreError::InvalidState(
+                "connector attachment account changed before staging".to_string(),
+            ))
+        }
+    }
+
+    pub(crate) fn mark_connector_attachment_ready(
+        &self,
+        staged: &StagedConnectorAttachment,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let receipt = staged.receipt();
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'ready', receipt_json = ?2, updated_at = ?3
+               WHERE id = ?1 AND status = 'staging' AND storage_identity = ?4 AND EXISTS (
+                 SELECT 1 FROM connector_accounts AS account
+                 JOIN connector_account_generations AS generation
+                   ON generation.account_id = account.id
+                 WHERE account.id = connector_attachment_landings.account_id
+                   AND account.health = ?5
+                   AND generation.generation = connector_attachment_landings.account_generation
+               )"#,
+            params![
+                receipt.landing_id.to_string(),
+                serde_json::to_string(receipt)?,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                receipt.storage_identity,
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+            ],
+        )?;
+        if changed == 1 {
+            transaction.execute(
+                "DELETE FROM connector_attachment_active_sources WHERE landing_id = ?1",
+                params![receipt.landing_id.to_string()],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        } else {
+            Err(EventStoreError::InvalidState(
+                "connector attachment account changed before file commit".to_string(),
+            ))
+        }
+    }
+
+    pub(crate) fn claim_startup_connector_attachment_cleanup_candidates(
+        &self,
+        changed_at: DateTime<Utc>,
+        limit: usize,
+    ) -> EventStoreResult<Vec<ConnectorAttachmentCleanupCandidate>> {
+        self.claim_connector_attachment_cleanup_candidates(changed_at, limit, true)
+    }
+
+    pub(crate) fn claim_runtime_connector_attachment_cleanup_candidates(
+        &self,
+        changed_at: DateTime<Utc>,
+        limit: usize,
+    ) -> EventStoreResult<Vec<ConnectorAttachmentCleanupCandidate>> {
+        self.claim_connector_attachment_cleanup_candidates(changed_at, limit, false)
+    }
+
+    fn claim_connector_attachment_cleanup_candidates(
+        &self,
+        changed_at: DateTime<Utc>,
+        limit: usize,
+        include_abandoned_executions: bool,
+    ) -> EventStoreResult<Vec<ConnectorAttachmentCleanupCandidate>> {
+        let limit = limit.clamp(1, 64);
+        let claim_id = Uuid::new_v4().to_string();
+        let claim_expires_at = (changed_at
+            + Duration::seconds(CONNECTOR_ATTACHMENT_RECOVERY_LEASE_SECONDS))
+        .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'cleanup_required', failure_kind = 'startup_recovery',
+                   attempt_count = attempt_count + 1, next_cleanup_at = NULL,
+                   cleanup_claim_id = ?3, cleanup_claim_expires_at = ?5,
+                   updated_at = ?1
+               WHERE id IN (
+                 SELECT id FROM connector_attachment_landings
+                 WHERE ((?4 = 1 AND status IN ('reserved', 'staging')) OR (
+                         status = 'cleanup_required'
+                         AND (next_cleanup_at IS NULL OR next_cleanup_at <= ?1)
+                         AND (cleanup_claim_id IS NULL OR cleanup_claim_expires_at <= ?1)
+                       ))
+                   AND workspace_root IS NOT NULL AND workspace_identity IS NOT NULL
+                 ORDER BY attempt_count ASC, updated_at ASC, id ASC LIMIT ?2
+               )"#,
+            params![
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                limit as i64,
+                claim_id,
+                include_abandoned_executions,
+                claim_expires_at,
+            ],
+        )?;
+        let mut statement = transaction.prepare(
+            r#"SELECT id, cleanup_claim_id, metadata_json, workspace_root, workspace_identity,
+                      storage_identity, receipt_json
+               FROM connector_attachment_landings
+               WHERE status = 'cleanup_required' AND cleanup_claim_id = ?1
+               ORDER BY id ASC LIMIT ?2"#,
+        )?;
+        let rows = statement
+            .query_map(params![claim_id, limit as i64,], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        transaction.commit()?;
+        let candidates = rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    claim_id,
+                    metadata,
+                    workspace_root,
+                    workspace_identity,
+                    storage_identity,
+                    receipt_json,
+                )| {
+                    let receipt = receipt_json
+                        .map(|json| {
+                            serde_json::from_str::<ConnectorAttachmentLandingReceipt>(&json)
+                        })
+                        .transpose()?;
+                    Ok(ConnectorAttachmentCleanupCandidate {
+                        landing_id: Uuid::parse_str(&id)?,
+                        claim_id: Uuid::parse_str(&claim_id)?,
+                        metadata: serde_json::from_str(&metadata)?,
+                        workspace_root: workspace_root.into(),
+                        workspace_identity,
+                        storage_identity,
+                        receipt,
+                    })
+                },
+            )
+            .collect::<EventStoreResult<Vec<_>>>()?;
+        let mut terminalized = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if self
+                .terminalize_connector_attachment_cleanup_tool(candidate.landing_id, changed_at)
+                .is_ok()
+            {
+                terminalized.push(candidate);
+            } else {
+                let _ = self.quarantine_connector_attachment_recovery_projection(
+                    candidate.landing_id,
+                    candidate.claim_id,
+                    changed_at,
+                );
+            }
+        }
+        Ok(terminalized)
+    }
+
+    pub(crate) fn reset_stale_connector_attachment_recovery_claims(
+        &self,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET cleanup_claim_id = NULL,
+                   cleanup_claim_expires_at = NULL,
+                   next_cleanup_at = CASE
+                     WHEN status IN ('ready', 'cleanup_required', 'retention_cleanup')
+                       THEN COALESCE(next_cleanup_at, ?1)
+                     ELSE next_cleanup_at
+                   END
+               WHERE cleanup_claim_id IS NOT NULL"#,
+            params![changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true)],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn renew_connector_attachment_recovery_claim(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let changed_at_text = changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let claim_expires_at = (changed_at
+            + Duration::seconds(CONNECTOR_ATTACHMENT_RECOVERY_LEASE_SECONDS))
+        .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let changed = self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET cleanup_claim_expires_at = ?3
+               WHERE id = ?1 AND cleanup_claim_id = ?2
+                 AND status IN ('ready', 'cleanup_required', 'retention_cleanup')
+                 AND cleanup_claim_expires_at > ?4"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                claim_expires_at,
+                changed_at_text,
+            ],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(EventStoreError::InvalidState(
+                "connector attachment recovery lease changed".to_string(),
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn claim_startup_ready_connector_attachment_recovery_candidates(
+        &self,
+        changed_at: DateTime<Utc>,
+        limit: usize,
+    ) -> EventStoreResult<Vec<ConnectorAttachmentCleanupCandidate>> {
+        self.claim_ready_connector_attachment_recovery_candidates(changed_at, limit, true)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn claim_runtime_ready_connector_attachment_recovery_candidates(
+        &self,
+        changed_at: DateTime<Utc>,
+        limit: usize,
+    ) -> EventStoreResult<Vec<ConnectorAttachmentCleanupCandidate>> {
+        self.claim_ready_connector_attachment_recovery_candidates(changed_at, limit, false)
+    }
+
+    #[cfg(windows)]
+    fn claim_ready_connector_attachment_recovery_candidates(
+        &self,
+        changed_at: DateTime<Utc>,
+        limit: usize,
+        include_abandoned_executions: bool,
+    ) -> EventStoreResult<Vec<ConnectorAttachmentCleanupCandidate>> {
+        let limit = limit.clamp(1, 64);
+        let claim_id = Uuid::new_v4().to_string();
+        let claim_expires_at = (changed_at
+            + Duration::seconds(CONNECTOR_ATTACHMENT_RECOVERY_LEASE_SECONDS))
+        .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let changed_at_text = changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            r#"UPDATE connector_attachment_landings
+               SET cleanup_claim_id = ?3, cleanup_claim_expires_at = ?4,
+                   next_cleanup_at = NULL, updated_at = ?1
+               WHERE id IN (
+                 SELECT id FROM connector_attachment_landings
+                 WHERE status = 'ready' AND workspace_root IS NOT NULL
+                   AND workspace_identity IS NOT NULL AND receipt_json IS NOT NULL
+                   AND (cleanup_claim_id IS NULL OR cleanup_claim_expires_at <= ?1)
+                   AND ((?5 = 1
+                         AND (next_cleanup_at IS NULL OR next_cleanup_at <= ?1))
+                        OR (?5 = 0 AND (
+                          (cleanup_claim_id IS NULL
+                           AND next_cleanup_at IS NOT NULL AND next_cleanup_at <= ?1)
+                          OR (cleanup_claim_id IS NOT NULL
+                              AND cleanup_claim_expires_at <= ?1)
+                        )))
+                 ORDER BY attempt_count ASC, COALESCE(next_cleanup_at, updated_at) ASC, id ASC
+                 LIMIT ?2
+               )"#,
+            params![
+                changed_at_text,
+                limit as i64,
+                claim_id,
+                claim_expires_at,
+                include_abandoned_executions,
+            ],
+        )?;
+        let mut statement = transaction.prepare(
+            r#"SELECT id, cleanup_claim_id, metadata_json, workspace_root, workspace_identity,
+                      storage_identity, receipt_json
+               FROM connector_attachment_landings
+               WHERE status = 'ready' AND cleanup_claim_id = ?1
+               ORDER BY id ASC
+               LIMIT ?2"#,
+        )?;
+        let rows = statement
+            .query_map(params![claim_id, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        transaction.commit()?;
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    claim_id,
+                    metadata,
+                    workspace_root,
+                    workspace_identity,
+                    storage_identity,
+                    receipt_json,
+                )| {
+                    Ok(ConnectorAttachmentCleanupCandidate {
+                        landing_id: Uuid::parse_str(&id)?,
+                        claim_id: Uuid::parse_str(&claim_id)?,
+                        metadata: serde_json::from_str(&metadata)?,
+                        workspace_root: workspace_root.into(),
+                        workspace_identity,
+                        storage_identity,
+                        receipt: Some(serde_json::from_str(&receipt_json)?),
+                    })
+                },
+            )
+            .collect()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn defer_connector_attachment_ready_recovery(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let changed_at_text = changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let attempt_count: u32 = self.conn.query_row(
+            r#"SELECT attempt_count FROM connector_attachment_landings
+               WHERE id = ?1 AND status = 'ready' AND cleanup_claim_id = ?2
+                 AND cleanup_claim_expires_at > ?3"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                changed_at_text,
+            ],
+            |row| row.get(0),
+        )?;
+        let exponent = attempt_count.min(9);
+        let delay_seconds = 5i64.saturating_mul(1i64 << exponent).min(3600);
+        let changed = self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET attempt_count = attempt_count + 1, next_cleanup_at = ?3,
+                   cleanup_claim_id = NULL, cleanup_claim_expires_at = NULL,
+                   updated_at = ?4
+               WHERE id = ?1 AND status = 'ready' AND cleanup_claim_id = ?2
+                 AND cleanup_claim_expires_at > ?4"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                (changed_at + Duration::seconds(delay_seconds))
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                changed_at_text,
+            ],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(EventStoreError::InvalidState(
+                "connector attachment ready recovery state changed".to_string(),
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn claim_expired_connector_attachment_retention_candidates(
+        &self,
+        changed_at: DateTime<Utc>,
+        limit: usize,
+    ) -> EventStoreResult<Vec<ConnectorAttachmentCleanupCandidate>> {
+        let limit = limit.clamp(1, 64);
+        let changed_at_text = changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let claim_id = Uuid::new_v4().to_string();
+        let claim_expires_at = (changed_at
+            + Duration::seconds(CONNECTOR_ATTACHMENT_RECOVERY_LEASE_SECONDS))
+        .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'retention_cleanup', attempt_count = attempt_count + 1,
+                   next_cleanup_at = NULL, cleanup_claim_id = ?3,
+                   cleanup_claim_expires_at = ?4, updated_at = ?1
+               WHERE id IN (
+                 SELECT id FROM connector_attachment_landings
+                 WHERE ((status = 'completed' AND expires_at IS NOT NULL AND expires_at <= ?1)
+                        OR (status = 'retention_cleanup'
+                            AND (next_cleanup_at IS NULL OR next_cleanup_at <= ?1)
+                            AND (cleanup_claim_id IS NULL OR cleanup_claim_expires_at <= ?1)))
+                   AND receipt_json IS NOT NULL AND workspace_root IS NOT NULL
+                   AND workspace_identity IS NOT NULL
+                 ORDER BY COALESCE(next_cleanup_at, expires_at) ASC, id ASC LIMIT ?2
+               )"#,
+            params![changed_at_text, limit as i64, claim_id, claim_expires_at],
+        )?;
+        let mut statement = transaction.prepare(
+            r#"SELECT id, cleanup_claim_id, metadata_json, workspace_root, workspace_identity,
+                      storage_identity, receipt_json
+               FROM connector_attachment_landings
+               WHERE status = 'retention_cleanup' AND cleanup_claim_id = ?1
+               ORDER BY id ASC LIMIT ?2"#,
+        )?;
+        let rows = statement
+            .query_map(params![claim_id, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        transaction.commit()?;
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    claim_id,
+                    metadata,
+                    workspace_root,
+                    workspace_identity,
+                    storage_identity,
+                    receipt_json,
+                )| {
+                    Ok(ConnectorAttachmentCleanupCandidate {
+                        landing_id: Uuid::parse_str(&id)?,
+                        claim_id: Uuid::parse_str(&claim_id)?,
+                        metadata: serde_json::from_str(&metadata)?,
+                        workspace_root: workspace_root.into(),
+                        workspace_identity,
+                        storage_identity,
+                        receipt: Some(serde_json::from_str(&receipt_json)?),
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub(crate) fn defer_connector_attachment_cleanup(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let changed_at_text = changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let attempt_count: u32 = self.conn.query_row(
+            r#"SELECT attempt_count FROM connector_attachment_landings
+               WHERE id = ?1 AND cleanup_claim_id = ?2
+                 AND status IN ('cleanup_required', 'retention_cleanup')
+                 AND cleanup_claim_expires_at > ?3"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                changed_at_text,
+            ],
+            |row| row.get(0),
+        )?;
+        let exponent = attempt_count.saturating_sub(1).min(9);
+        let delay_seconds = 5i64.saturating_mul(1i64 << exponent).min(3600);
+        let changed = self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET next_cleanup_at = ?3, cleanup_claim_id = NULL,
+                   cleanup_claim_expires_at = NULL, updated_at = ?4
+               WHERE id = ?1 AND cleanup_claim_id = ?2
+                 AND status IN ('cleanup_required', 'retention_cleanup')
+                 AND cleanup_claim_expires_at > ?4"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                (changed_at + Duration::seconds(delay_seconds))
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                changed_at_text,
+            ],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(EventStoreError::InvalidState(
+                "connector attachment cleanup state changed".to_string(),
+            ))
+        }
+    }
+
+    pub(crate) fn complete_connector_attachment_retention(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let changed = self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'expired', next_cleanup_at = NULL,
+                   cleanup_claim_id = NULL, cleanup_claim_expires_at = NULL,
+                   updated_at = ?3
+               WHERE id = ?1 AND status = 'retention_cleanup' AND cleanup_claim_id = ?2
+                 AND cleanup_claim_expires_at > ?3"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(EventStoreError::InvalidState(
+                "connector attachment retention completion raced".to_string(),
+            ))
+        }
+    }
+
+    pub(crate) fn mark_connector_attachment_retention_repair_required(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+        failure_kind: &str,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let changed = self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'repair_required', failure_kind = ?3,
+                   next_cleanup_at = NULL, cleanup_claim_id = NULL,
+                   cleanup_claim_expires_at = NULL,
+                   recovery_revision = recovery_revision + 1, updated_at = ?4
+               WHERE id = ?1 AND status = 'retention_cleanup' AND cleanup_claim_id = ?2
+                 AND cleanup_claim_expires_at > ?4"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                failure_kind,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(EventStoreError::InvalidState(
+                "connector attachment retention repair raced".to_string(),
+            ))
+        }
+    }
+
+    pub(crate) fn claim_connector_attachment_cleanup(
+        &self,
+        landing_id: Uuid,
+        failure_kind: &str,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAttachmentCleanupClaim> {
+        let claim_id = Uuid::new_v4();
+        let changed_at_text = changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let claim_expires_at = (changed_at
+            + Duration::seconds(CONNECTOR_ATTACHMENT_RECOVERY_LEASE_SECONDS))
+        .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let changed = self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'cleanup_required', failure_kind = ?2,
+                   cleanup_claim_id = ?4, cleanup_claim_expires_at = ?5,
+                   next_cleanup_at = NULL, updated_at = ?3
+               WHERE id = ?1 AND (
+                 (status IN ('reserved', 'staging', 'ready')
+                     AND (cleanup_claim_id IS NULL OR cleanup_claim_expires_at <= ?3))
+                 OR (status = 'cleanup_required'
+                     AND (cleanup_claim_id IS NULL OR cleanup_claim_expires_at <= ?3))
+               )"#,
+            params![
+                landing_id.to_string(),
+                failure_kind,
+                changed_at_text,
+                claim_id.to_string(),
+                claim_expires_at,
+            ],
+        )?;
+        if changed == 1 {
+            self.terminalize_connector_attachment_cleanup_tool(landing_id, changed_at)?;
+            return Ok(ConnectorAttachmentCleanupClaim::Owned(claim_id));
+        }
+        let status: String = self.conn.query_row(
+            "SELECT status FROM connector_attachment_landings WHERE id = ?1",
+            params![landing_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(if status == "cleanup_required" {
+            ConnectorAttachmentCleanupClaim::Busy
+        } else {
+            ConnectorAttachmentCleanupClaim::KeepFile
+        })
+    }
+
+    pub(crate) fn transition_ready_recovery_to_cleanup(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+        failure_kind: &str,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let changed = self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'cleanup_required', failure_kind = ?3,
+                   next_cleanup_at = NULL, updated_at = ?4
+               WHERE id = ?1 AND status = 'ready' AND cleanup_claim_id = ?2
+                 AND cleanup_claim_expires_at > ?4"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                failure_kind,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment ready recovery claim changed".to_string(),
+            ));
+        }
+        self.terminalize_connector_attachment_cleanup_tool(landing_id, changed_at)
+    }
+
+    fn terminalize_connector_attachment_cleanup_tool(
+        &self,
+        landing_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let tool_invocation_id: String = self.conn.query_row(
+            r#"SELECT tool_invocation_id FROM connector_attachment_landings
+               WHERE id = ?1 AND status IN ('cleanup_required', 'repair_required')"#,
+            params![landing_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut tool = self.tool_invocation_by_id(Uuid::parse_str(&tool_invocation_id)?)?;
+        if matches!(
+            tool.status,
+            ToolExecutionStatus::Succeeded
+                | ToolExecutionStatus::Failed
+                | ToolExecutionStatus::Blocked
+        ) {
+            return Ok(());
+        }
+        tool.status = ToolExecutionStatus::Failed;
+        tool.output = None;
+        tool.evidence.clear();
+        tool.verification = ToolVerificationResult::failed(
+            "connector attachment execution ended before durable file completion",
+        );
+        tool.error = Some("connector attachment download did not complete".to_string());
+        tool.finished_at = Some(changed_at);
+        self.append_tool_invocation(&tool)
+    }
+
+    fn quarantine_connector_attachment_recovery_projection(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let changed = self.conn.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'repair_required', failure_kind = 'recovery_projection_unavailable',
+                   next_cleanup_at = NULL, cleanup_claim_id = NULL,
+                   cleanup_claim_expires_at = NULL,
+                   recovery_revision = recovery_revision + 1, updated_at = ?3
+               WHERE id = ?1 AND status = 'cleanup_required' AND cleanup_claim_id = ?2
+                 AND cleanup_claim_expires_at > ?3"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(EventStoreError::InvalidState(
+                "connector attachment recovery quarantine raced".to_string(),
+            ))
+        }
+    }
+
+    pub(crate) fn connector_attachment_cleanup_candidate(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+    ) -> EventStoreResult<ConnectorAttachmentCleanupCandidate> {
+        let (metadata, workspace_root, workspace_identity, storage_identity, receipt_json) =
+            self.conn.query_row(
+                r#"SELECT metadata_json, workspace_root, workspace_identity,
+                      storage_identity, receipt_json
+               FROM connector_attachment_landings
+               WHERE id = ?1 AND status = 'cleanup_required' AND cleanup_claim_id = ?2"#,
+                params![landing_id.to_string(), claim_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )?;
+        Ok(ConnectorAttachmentCleanupCandidate {
+            landing_id,
+            claim_id,
+            metadata: serde_json::from_str(&metadata)?,
+            workspace_root: workspace_root.into(),
+            workspace_identity,
+            storage_identity,
+            receipt: receipt_json
+                .map(|json| serde_json::from_str::<ConnectorAttachmentLandingReceipt>(&json))
+                .transpose()?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connector_attachment_status(&self, landing_id: Uuid) -> EventStoreResult<String> {
+        Ok(self.conn.query_row(
+            "SELECT status FROM connector_attachment_landings WHERE id = ?1",
+            params![landing_id.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn mark_connector_attachment_repair_required(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+        failure_kind: &str,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let tool_invocation_id: String = self.conn.query_row(
+            r#"SELECT tool_invocation_id FROM connector_attachment_landings
+               WHERE id = ?1 AND status = 'cleanup_required' AND cleanup_claim_id = ?2"#,
+            params![landing_id.to_string(), claim_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut tool = self.tool_invocation_by_id(Uuid::parse_str(&tool_invocation_id)?)?;
+        tool.status = ToolExecutionStatus::Failed;
+        tool.output = None;
+        tool.evidence.clear();
+        tool.verification =
+            ToolVerificationResult::failed("attachment landing requires manual workspace repair");
+        tool.error = Some("connector attachment workspace identity changed".to_string());
+        tool.finished_at = Some(changed_at);
+        let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'repair_required', failure_kind = ?3,
+                   cleanup_claim_id = NULL, cleanup_claim_expires_at = NULL,
+                   recovery_revision = recovery_revision + 1, updated_at = ?4
+               WHERE id = ?1 AND status = 'cleanup_required' AND cleanup_claim_id = ?2
+                 AND cleanup_claim_expires_at > ?4"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                failure_kind,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment repair transition raced".to_string(),
+            ));
+        }
+        transaction.execute(
+            "DELETE FROM connector_attachment_active_sources WHERE landing_id = ?1",
+            params![landing_id.to_string()],
+        )?;
+        Self::insert_kernel_event(&transaction, &tool_event)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn fail_connector_attachment_after_cleanup(
+        &self,
+        landing_id: Uuid,
+        claim_id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let tool_invocation_id: String = self.conn.query_row(
+            r#"SELECT tool_invocation_id FROM connector_attachment_landings
+               WHERE id = ?1 AND status = 'cleanup_required' AND cleanup_claim_id = ?2"#,
+            params![landing_id.to_string(), claim_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let tool_invocation_id = Uuid::parse_str(&tool_invocation_id)?;
+        let mut tool = self.tool_invocation_by_id(tool_invocation_id)?;
+        tool.status = ToolExecutionStatus::Failed;
+        tool.output = None;
+        tool.evidence.clear();
+        tool.verification =
+            ToolVerificationResult::failed("incomplete attachment landing was removed");
+        tool.error = Some("connector attachment landing was interrupted".to_string());
+        tool.finished_at = Some(changed_at);
+        let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_attachment_landings
+               SET status = 'failed', receipt_json = NULL,
+                   cleanup_claim_id = NULL, cleanup_claim_expires_at = NULL,
+                   updated_at = ?3
+               WHERE id = ?1 AND status = 'cleanup_required' AND cleanup_claim_id = ?2
+                 AND cleanup_claim_expires_at > ?3"#,
+            params![
+                landing_id.to_string(),
+                claim_id.to_string(),
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment cleanup completion raced".to_string(),
+            ));
+        }
+        transaction.execute(
+            "DELETE FROM connector_attachment_active_sources WHERE landing_id = ?1",
+            params![landing_id.to_string()],
+        )?;
+        Self::insert_kernel_event(&transaction, &tool_event)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn start_approved_connector_invocation(
+        &self,
+        id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorInvocation> {
+        let mut invocation = self.connector_invocation(id)?;
+        if invocation.status != ConnectorInvocationStatus::PendingApproval {
+            return Err(EventStoreError::InvalidState(
+                "connector mutation is not waiting for approval".to_string(),
+            ));
+        }
+        let account = self
+            .list_connector_accounts()?
+            .into_iter()
+            .find(|account| account.id == invocation.account_id)
+            .ok_or_else(|| EventStoreError::NotFound("connector account".to_string()))?;
+        if account.health != ConnectorHealth::Connected
+            || account.provider_id != invocation.provider_id
+            || !account
+                .granted_capabilities
+                .contains(&invocation.capability)
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector account is not ready for this mutation".to_string(),
+            ));
+        }
+        let account_generation = invocation.account_generation.ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "legacy connector mutation has no frozen account generation".to_string(),
+            )
+        })?;
+        if self.connector_account_sync_generation(&account)? != account_generation {
+            return Err(EventStoreError::InvalidState(
+                "connector account changed after the exact mutation preview".to_string(),
+            ));
+        }
+        let account_generation = i64::try_from(account_generation).map_err(|_| {
+            EventStoreError::InvalidState(
+                "connector mutation account generation is too large".to_string(),
+            )
+        })?;
+        let tool_invocation_id = invocation.tool_invocation_id.ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "connector mutation is missing its exact tool invocation".to_string(),
+            )
+        })?;
+        let mut tool_record = self
+            .list_tool_invocations()?
+            .into_iter()
+            .find(|record| record.id == tool_invocation_id)
+            .ok_or_else(|| EventStoreError::NotFound("connector tool invocation".to_string()))?;
+        bind_connector_invocation_to_tool_record(&invocation, &tool_record)
+            .map_err(EventStoreError::InvalidState)?;
+        let approval_request_id = tool_record.approval_request_id.ok_or_else(|| {
+            EventStoreError::InvalidState("connector approval request is missing".to_string())
+        })?;
+        let approved = self
+            .list_capability_access_records()?
+            .into_iter()
+            .any(|record| {
+                record.request.id == approval_request_id
+                    && record.request.capability == CapabilityKind::ConnectorWrite
+                    && record.effective_status == CapabilityAccessStatus::Approved
+                    && record.grant_state == CapabilityGrantState::OneShotAvailable
+            });
+        if !approved {
+            return Err(EventStoreError::InvalidState(
+                "exact connector approval is not available".to_string(),
+            ));
+        }
+        if let Some(automation_run_id) = invocation.automation_run_id {
+            let linked_review = self.list_review_queue_items()?.into_iter().any(|item| {
+                item.automation_run_id == automation_run_id
+                    && item.tool_invocation_id == Some(tool_invocation_id)
+                    && item.status
+                        == crate::kernel::automation::ReviewQueueItemStatus::PendingApproval
+                    && item.preview_fingerprint.as_deref()
+                        == Some(invocation.request_fingerprint.as_str())
+            });
+            if !linked_review {
+                return Err(EventStoreError::InvalidState(
+                    "automation connector mutation is not bound to its frozen review".to_string(),
+                ));
+            }
+        }
+
+        tool_record.status = ToolExecutionStatus::Running;
+        tool_record.verification =
+            ToolVerificationResult::failed("connector mutation is in progress");
+        tool_record.error = None;
+        tool_record.finished_at = None;
+        invocation.status = ConnectorInvocationStatus::Running;
+        invocation.updated_at = changed_at;
+        let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool_record)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            r#"INSERT INTO connector_approval_consumptions
+               (request_id, connector_invocation_id, consumed_at)
+               VALUES (?1, ?2, ?3)"#,
+            params![
+                approval_request_id.to_string(),
+                invocation.id.to_string(),
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        let updated = transaction.execute(
+            r#"UPDATE connector_invocations
+               SET invocation_json = ?2, status = ?3, updated_at = ?4
+               WHERE id = ?1 AND status = ?5 AND account_generation = ?6
+                 AND EXISTS (
+                   SELECT 1
+                   FROM connector_accounts AS account
+                   JOIN connector_account_generations AS generation
+                     ON generation.account_id = account.id
+                   WHERE account.id = connector_invocations.account_id
+                     AND account.health = ?7
+                     AND account.provider_id = ?8
+                     AND generation.generation = ?6
+                 )"#,
+            params![
+                invocation.id.to_string(),
+                serde_json::to_string(&invocation)?,
+                serde_json::to_string(&invocation.status)?,
+                invocation
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorInvocationStatus::PendingApproval)?,
+                account_generation,
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+                invocation.provider_id,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector mutation was already started".to_string(),
+            ));
+        }
+        Self::insert_kernel_event(&transaction, &tool_event)?;
+        transaction.commit()?;
+        Ok(invocation)
+    }
+
+    pub(crate) fn mark_connector_invocation_reconciliation_required(
+        &self,
+        id: Uuid,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorInvocation> {
+        let mut invocation = self.connector_invocation(id)?;
+        if invocation.status != ConnectorInvocationStatus::Running
+            || !invocation.capability.external_mutation()
+        {
+            return Err(EventStoreError::InvalidState(
+                "only a running external mutation can require reconciliation".to_string(),
+            ));
+        }
+        let account_generation = invocation.account_generation.ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "legacy connector mutation has no frozen account generation".to_string(),
+            )
+        })?;
+        let account_generation = i64::try_from(account_generation).map_err(|_| {
+            EventStoreError::InvalidState(
+                "connector mutation account generation is too large".to_string(),
+            )
+        })?;
+        let tool_invocation_id = invocation.tool_invocation_id.ok_or_else(|| {
+            EventStoreError::InvalidState("connector mutation Tool is missing".to_string())
+        })?;
+        let mut tool = self.tool_invocation_by_id(tool_invocation_id)?;
+        bind_running_connector_invocation_to_tool_record(&invocation, &tool)
+            .map_err(EventStoreError::InvalidState)?;
+        tool.verification = ToolVerificationResult::failed(
+            "external result is uncertain; read-only reconciliation is pending",
+        );
+        tool.error = None;
+        tool.finished_at = None;
+        invocation.status = ConnectorInvocationStatus::ReconciliationRequired;
+        invocation.updated_at = changed_at;
+        let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let updated = transaction.execute(
+            r#"UPDATE connector_invocations
+               SET invocation_json = ?2, status = ?3, updated_at = ?4,
+                   next_reconciliation_at = ?4,
+                   reconciliation_claim_id = NULL,
+                   reconciliation_claim_expires_at = NULL,
+                   reconciliation_attempt_count = 0,
+                   recovery_revision = recovery_revision + 1
+               WHERE id = ?1 AND status = ?5 AND account_generation = ?6"#,
+            params![
+                invocation.id.to_string(),
+                serde_json::to_string(&invocation)?,
+                serde_json::to_string(&invocation.status)?,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorInvocationStatus::Running)?,
+                account_generation,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation transition raced with another writer".to_string(),
+            ));
+        }
+        Self::insert_kernel_event(&transaction, &tool_event)?;
+        transaction.commit()?;
+        Ok(invocation)
+    }
+
+    pub(crate) fn claim_due_connector_reconciliations(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> EventStoreResult<Vec<ConnectorReconciliationClaim>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        const MAX_RECONCILIATION_CANDIDATES_PER_SWEEP: usize = 64;
+        let candidate_budget = MAX_RECONCILIATION_CANDIDATES_PER_SWEEP;
+        let scan_limit = i64::try_from(candidate_budget).map_err(|_| {
+            EventStoreError::InvalidState(
+                "connector reconciliation claim limit is too large".to_string(),
+            )
+        })?;
+        let mut remaining_scan_budget = candidate_budget;
+        let now_text = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let mut claims = Vec::new();
+        while remaining_scan_budget > 0 {
+            let mut statement = self.conn.prepare(
+                r#"SELECT id FROM connector_invocations
+                   WHERE status = ?1 AND reconciliation_quarantine_code IS NULL
+                     AND account_generation IS NOT NULL
+                     AND next_reconciliation_at IS NOT NULL
+                     AND next_reconciliation_at <= ?2
+                     AND (
+                       reconciliation_claim_id IS NULL
+                       OR reconciliation_claim_expires_at IS NULL
+                       OR reconciliation_claim_expires_at <= ?2
+                     )
+                   ORDER BY next_reconciliation_at ASC,
+                            reconciliation_attempt_count ASC, rowid ASC
+                   LIMIT ?3"#,
+            )?;
+            let candidate_ids = statement
+                .query_map(
+                    params![
+                        serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                        now_text,
+                        scan_limit,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            if candidate_ids.is_empty() {
+                break;
+            }
+            let mut progressed = false;
+            for raw_id in candidate_ids {
+                if remaining_scan_budget == 0 {
+                    break;
+                }
+                remaining_scan_budget -= 1;
+                let candidate_id = match Uuid::parse_str(&raw_id) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        progressed |= self.quarantine_due_connector_reconciliation(&raw_id, now)?;
+                        continue;
+                    }
+                };
+                match self.claim_connector_reconciliation(candidate_id, now) {
+                    Ok(Some(claim)) => {
+                        progressed = true;
+                        claims.push(claim);
+                        if claims.len() == limit {
+                            return Ok(claims);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(EventStoreError::InvalidState(_))
+                    | Err(EventStoreError::NotFound(_))
+                    | Err(EventStoreError::Json(_))
+                    | Err(EventStoreError::Uuid(_))
+                    | Err(EventStoreError::Timestamp(_)) => {
+                        progressed |= self.quarantine_due_connector_reconciliation(&raw_id, now)?;
+                    }
+                    Err(error @ EventStoreError::Sqlite(_)) => return Err(error),
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Ok(claims)
+    }
+
+    fn quarantine_due_connector_reconciliation(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<bool> {
+        let changed = self.conn.execute(
+            r#"UPDATE connector_invocations
+               SET reconciliation_quarantine_code = 'invalid_projection_binding',
+                   reconciliation_quarantined_at = ?3
+               WHERE id = ?1 AND status = ?2
+                 AND reconciliation_quarantine_code IS NULL
+                 AND next_reconciliation_at IS NOT NULL
+                 AND next_reconciliation_at <= ?3
+                 AND (
+                   reconciliation_claim_id IS NULL
+                   OR reconciliation_claim_expires_at IS NULL
+                   OR reconciliation_claim_expires_at <= ?3
+                 )"#,
+            params![
+                id,
+                serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn reset_abandoned_connector_reconciliation_claims(
+        &self,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<usize> {
+        Ok(self.conn.execute(
+            r#"UPDATE connector_invocations
+               SET reconciliation_claim_id = NULL,
+                   reconciliation_claim_expires_at = NULL,
+                   next_reconciliation_at = COALESCE(next_reconciliation_at, ?2)
+               WHERE status = ?1 AND reconciliation_claim_id IS NOT NULL"#,
+            params![
+                serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?)
+    }
+
+    fn claim_connector_reconciliation(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<Option<ConnectorReconciliationClaim>> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let row = transaction
+            .query_row(
+                r#"SELECT invocation_json, account_generation,
+                          reconciliation_claim_id, reconciliation_claim_expires_at,
+                          next_reconciliation_at, reconciliation_attempt_count
+                   FROM connector_invocations WHERE id = ?1 AND status = ?2"#,
+                params![
+                    id.to_string(),
+                    serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            invocation_json,
+            projected_generation,
+            existing_claim_id,
+            existing_claim_expiry,
+            next_reconciliation_at,
+            attempt_count,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let due = next_reconciliation_at
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|value| value.with_timezone(&Utc) <= now)
+            .unwrap_or(false);
+        let claim_available = existing_claim_id.is_none()
+            || existing_claim_expiry
+                .as_deref()
+                .map(DateTime::parse_from_rfc3339)
+                .transpose()?
+                .map(|value| value.with_timezone(&Utc) <= now)
+                .unwrap_or(true);
+        if !due || !claim_available {
+            return Ok(None);
+        }
+        let invocation: ConnectorInvocation = serde_json::from_str(&invocation_json)?;
+        let (account, _) =
+            load_connector_reconciliation_binding(&transaction, &invocation, projected_generation)?;
+        let claim_id = Uuid::new_v4();
+        let claim_expires_at = now + Duration::seconds(CONNECTOR_RECONCILIATION_LEASE_SECONDS);
+        let updated = transaction.execute(
+            r#"UPDATE connector_invocations
+               SET reconciliation_claim_id = ?2,
+                   reconciliation_claim_expires_at = ?3
+               WHERE id = ?1 AND status = ?4 AND account_generation = ?5
+                 AND next_reconciliation_at IS NOT NULL
+                 AND next_reconciliation_at <= ?6
+                 AND (
+                   reconciliation_claim_id IS NULL
+                   OR reconciliation_claim_expires_at IS NULL
+                   OR reconciliation_claim_expires_at <= ?6
+                 )"#,
+            params![
+                id.to_string(),
+                claim_id.to_string(),
+                claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                projected_generation,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if updated != 1 {
+            return Ok(None);
+        }
+        transaction.commit()?;
+        Ok(Some(ConnectorReconciliationClaim {
+            claim_id,
+            invocation,
+            account,
+            attempt_count: u32::try_from(attempt_count).map_err(|_| {
+                EventStoreError::InvalidState(
+                    "connector reconciliation attempt count is invalid".to_string(),
+                )
+            })?,
+            claim_expires_at,
+        }))
+    }
+
+    pub(crate) fn renew_connector_reconciliation_claim(
+        &self,
+        claim: &mut ConnectorReconciliationClaim,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let next_expiry = now + Duration::seconds(CONNECTOR_RECONCILIATION_LEASE_SECONDS);
+        let generation = i64::try_from(claim.invocation.account_generation.ok_or_else(|| {
+            EventStoreError::InvalidState("legacy reconciliation cannot renew a claim".to_string())
+        })?)
+        .map_err(|_| {
+            EventStoreError::InvalidState(
+                "connector reconciliation account generation is too large".to_string(),
+            )
+        })?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let (current_json, projected_generation) = transaction
+            .query_row(
+                r#"SELECT invocation_json, account_generation
+                   FROM connector_invocations
+                   WHERE id = ?1 AND status = ?2
+                     AND reconciliation_claim_id = ?3
+                     AND reconciliation_claim_expires_at > ?4"#,
+                params![
+                    claim.invocation.id.to_string(),
+                    serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                    claim.claim_id.to_string(),
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector reconciliation claim is no longer live".to_string(),
+                )
+            })?;
+        let current: ConnectorInvocation = serde_json::from_str(&current_json)?;
+        if current != claim.invocation || projected_generation != generation {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation invocation changed after claim".to_string(),
+            ));
+        }
+        load_connector_reconciliation_binding(&transaction, &current, projected_generation)?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_invocations
+               SET reconciliation_claim_expires_at = ?3
+               WHERE id = ?1 AND status = ?4
+                 AND reconciliation_claim_id = ?2
+                 AND reconciliation_claim_expires_at > ?5
+                 AND account_generation = ?6
+                 AND EXISTS (
+                   SELECT 1 FROM connector_accounts AS account
+                   JOIN connector_account_generations AS current
+                     ON current.account_id = account.id
+                   WHERE account.id = connector_invocations.account_id
+                     AND account.health = ?7
+                     AND current.generation = ?6
+                 )"#,
+            params![
+                claim.invocation.id.to_string(),
+                claim.claim_id.to_string(),
+                next_expiry.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                generation,
+                serde_json::to_string(&ConnectorHealth::Connected)?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation claim could not be renewed".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        claim.claim_expires_at = next_expiry;
+        Ok(())
+    }
+
+    pub(crate) fn defer_connector_reconciliation(
+        &self,
+        claim: &ConnectorReconciliationClaim,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<DateTime<Utc>> {
+        let exponent = claim.attempt_count.min(6);
+        let backoff_seconds =
+            (30_i64 << exponent).min(CONNECTOR_RECONCILIATION_MAX_BACKOFF_SECONDS);
+        let next_reconciliation_at = now + Duration::seconds(backoff_seconds);
+        let changed = self.conn.execute(
+            r#"UPDATE connector_invocations
+               SET reconciliation_claim_id = NULL,
+                   reconciliation_claim_expires_at = NULL,
+                   next_reconciliation_at = ?3,
+                   reconciliation_attempt_count = reconciliation_attempt_count + 1
+               WHERE id = ?1 AND status = ?4
+                 AND reconciliation_claim_id = ?2
+                 AND reconciliation_claim_expires_at > ?5"#,
+            params![
+                claim.invocation.id.to_string(),
+                claim.claim_id.to_string(),
+                next_reconciliation_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation defer lost its claim".to_string(),
+            ));
+        }
+        Ok(next_reconciliation_at)
+    }
+
+    pub fn complete_connector_invocation(
+        &self,
+        id: Uuid,
+        receipt: ConnectorMutationReceipt,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorInvocation> {
+        self.complete_connector_invocation_internal(id, receipt, changed_at, None)
+    }
+
+    pub(crate) fn complete_claimed_connector_reconciliation(
+        &self,
+        claim: &ConnectorReconciliationClaim,
+        receipt: ConnectorMutationReceipt,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorInvocation> {
+        if claim.invocation.account_id != receipt.account_id {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation receipt is bound to another account".to_string(),
+            ));
+        }
+        self.complete_connector_invocation_internal(
+            claim.invocation.id,
+            receipt,
+            changed_at,
+            Some(claim),
+        )
+    }
+
+    pub(crate) fn fail_claimed_connector_reconciliation_known_not_applied(
+        &self,
+        claim: &ConnectorReconciliationClaim,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorInvocation> {
+        if claim.claim_expires_at <= changed_at {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation claim expired before completion".to_string(),
+            ));
+        }
+        let mut invocation = self.connector_invocation(claim.invocation.id)?;
+        if invocation != claim.invocation
+            || invocation.status != ConnectorInvocationStatus::ReconciliationRequired
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation changed after the read-only query".to_string(),
+            ));
+        }
+        let account_generation = i64::try_from(invocation.account_generation.ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "legacy connector mutation has no frozen account generation".to_string(),
+            )
+        })?)
+        .map_err(|_| {
+            EventStoreError::InvalidState(
+                "connector reconciliation account generation is too large".to_string(),
+            )
+        })?;
+        let tool_invocation_id = invocation.tool_invocation_id.ok_or_else(|| {
+            EventStoreError::InvalidState("connector tool invocation is missing".to_string())
+        })?;
+        let mut tool = self.tool_invocation_by_id(tool_invocation_id)?;
+        if tool.status != ToolExecutionStatus::Running
+            || tool.request_fingerprint != invocation.request_fingerprint
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector tool audit changed before reconciliation completed".to_string(),
+            ));
+        }
+        tool.status = ToolExecutionStatus::Failed;
+        tool.output = Some(serde_json::json!({ "outcome": "known_not_applied" }));
+        tool.evidence.clear();
+        tool.verification = ToolVerificationResult::passed(
+            "provider read-only reconciliation confirmed no external mutation",
+        );
+        tool.error = None;
+        tool.finished_at = Some(changed_at);
+        let capability_invocation = CapabilityInvocation {
+            id: tool.id,
+            capability: CapabilityKind::ConnectorWrite,
+            status: CapabilityInvocationStatus::Failed,
+            policy_decision: tool.policy_decision,
+            approval_request_id: tool.approval_request_id,
+            requested_resource: None,
+            evidence_ref: None,
+            requested_url: None,
+            evidence_url: None,
+            title: Some("Connected account change was not applied".to_string()),
+            excerpt: None,
+            warnings: Vec::new(),
+            elapsed_ms: tool.elapsed_ms,
+            created_at: changed_at,
+        };
+        let mut review_item = match invocation.automation_run_id {
+            Some(automation_run_id) => self.list_review_queue_items()?.into_iter().find(|item| {
+                item.automation_run_id == automation_run_id
+                    && item.tool_invocation_id == Some(tool_invocation_id)
+            }),
+            None => None,
+        };
+        let review_previous_revision = review_item.as_ref().map(|item| item.revision);
+        if let Some(item) = review_item.as_mut() {
+            item.resolve(false, changed_at)
+                .map_err(EventStoreError::InvalidState)?;
+        }
+        invocation.status = ConnectorInvocationStatus::Failed;
+        invocation.evidence.clear();
+        invocation.updated_at = changed_at;
+        let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool)?;
+        let capability_event =
+            KernelEvent::new(CAPABILITY_INVOCATION_RECORDED_EVENT, &capability_invocation)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        load_connector_reconciliation_binding(&transaction, &claim.invocation, account_generation)?;
+        let updated = transaction.execute(
+            r#"UPDATE connector_invocations
+               SET invocation_json = ?2, status = ?3, updated_at = ?4,
+                   reconciliation_claim_id = NULL,
+                   reconciliation_claim_expires_at = NULL,
+                   next_reconciliation_at = NULL
+               WHERE id = ?1 AND status = ?5 AND account_generation = ?6
+                 AND reconciliation_claim_id = ?7
+                 AND reconciliation_claim_expires_at > ?4"#,
+            params![
+                invocation.id.to_string(),
+                serde_json::to_string(&invocation)?,
+                serde_json::to_string(&invocation.status)?,
+                changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorInvocationStatus::ReconciliationRequired)?,
+                account_generation,
+                claim.claim_id.to_string(),
+            ],
+        )?;
+        if updated != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation completion lost its claim".to_string(),
+            ));
+        }
+        for event in [tool_event, capability_event] {
+            Self::insert_kernel_event(&transaction, &event)?;
+        }
+        if let Some(item) = review_item {
+            let changed = transaction.execute(
+                r#"UPDATE review_queue_items
+                   SET item_json = ?2, status = ?3, revision = ?4, updated_at = ?5
+                   WHERE id = ?1 AND revision = ?6"#,
+                params![
+                    item.id.to_string(),
+                    serde_json::to_string(&item)?,
+                    serde_json::to_string(&item.status)?,
+                    item.revision,
+                    item.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    review_previous_revision,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(EventStoreError::InvalidState(
+                    "review reconciliation raced with another writer".to_string(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        Ok(invocation)
+    }
+
+    fn complete_connector_invocation_internal(
+        &self,
+        id: Uuid,
+        receipt: ConnectorMutationReceipt,
+        changed_at: DateTime<Utc>,
+        claim: Option<&ConnectorReconciliationClaim>,
+    ) -> EventStoreResult<ConnectorInvocation> {
+        let mut invocation = self.connector_invocation(id)?;
+        let mutation = invocation.mutation.as_ref().ok_or_else(|| {
+            EventStoreError::InvalidState("connector mutation envelope is missing".to_string())
+        })?;
+        let receipt_matches = receipt.provider_id == mutation.provider_id
+            && receipt.account_id == mutation.account_id
+            && mutation.account_generation == invocation.account_generation
+            && receipt.capability == mutation.capability
+            && receipt.target_ref == mutation.target_ref
+            && receipt.request_fingerprint == invocation.request_fingerprint
+            && receipt.idempotency_key == mutation.idempotency_key
+            && receipt.evidence.provider_id == mutation.provider_id
+            && receipt.evidence.account_id == mutation.account_id
+            && !receipt.evidence.remote_object_ref.trim().is_empty();
+        if !receipt_matches {
+            return Err(EventStoreError::InvalidState(
+                "connector receipt does not match the frozen mutation".to_string(),
+            ));
+        }
+        if invocation.status == ConnectorInvocationStatus::Succeeded && claim.is_some() {
+            return Err(EventStoreError::InvalidState(
+                "connector reconciliation claim cannot replay a completed invocation".to_string(),
+            ));
+        }
+        if invocation.status == ConnectorInvocationStatus::Succeeded {
+            if invocation.evidence.as_slice() == [receipt.evidence.clone()] {
+                return Ok(invocation);
+            }
+            return Err(EventStoreError::InvalidState(
+                "connector completion replay has different evidence".to_string(),
+            ));
+        }
+        let account_generation = invocation.account_generation.ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "legacy connector mutation has no frozen account generation".to_string(),
+            )
+        })?;
+        let account_generation = i64::try_from(account_generation).map_err(|_| {
+            EventStoreError::InvalidState(
+                "connector mutation account generation is too large".to_string(),
+            )
+        })?;
+        if !matches!(
+            invocation.status,
+            ConnectorInvocationStatus::Running | ConnectorInvocationStatus::ReconciliationRequired
+        ) {
+            return Err(EventStoreError::InvalidState(
+                "connector mutation is not ready to complete".to_string(),
+            ));
+        }
+        if invocation.status == ConnectorInvocationStatus::Running && claim.is_some() {
+            return Err(EventStoreError::InvalidState(
+                "a reconciliation claim cannot complete a running mutation".to_string(),
+            ));
+        }
+        if invocation.status == ConnectorInvocationStatus::ReconciliationRequired && claim.is_none()
+        {
+            return Err(EventStoreError::InvalidState(
+                "uncertain connector mutation requires a fenced reconciliation claim".to_string(),
+            ));
+        }
+        if invocation.status == ConnectorInvocationStatus::ReconciliationRequired
+            && !receipt.reconciled
+        {
+            return Err(EventStoreError::InvalidState(
+                "uncertain connector mutation requires reconciled provider evidence".to_string(),
+            ));
+        }
+        let tool_invocation_id = invocation.tool_invocation_id.ok_or_else(|| {
+            EventStoreError::InvalidState("connector tool invocation is missing".to_string())
+        })?;
+        let mut tool_record = self
+            .list_tool_invocations()?
+            .into_iter()
+            .find(|record| record.id == tool_invocation_id)
+            .ok_or_else(|| EventStoreError::NotFound("connector tool invocation".to_string()))?;
+        if tool_record.status != ToolExecutionStatus::Running
+            || tool_record.request_fingerprint != invocation.request_fingerprint
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector tool audit is not running for this exact request".to_string(),
+            ));
+        }
+        let evidence = receipt.evidence.clone();
+        tool_record.status = ToolExecutionStatus::Succeeded;
+        tool_record.output = Some(serde_json::json!({
+            "remote_object_ref": evidence.remote_object_ref,
+            "outcome": "applied",
+        }));
+        tool_record.evidence = vec![ToolEvidence {
+            kind: "connector_remote_state".to_string(),
+            reference: evidence.remote_object_ref.clone(),
+            summary: evidence
+                .bounded_summary
+                .clone()
+                .unwrap_or_else(|| "Provider confirmed the remote mutation.".to_string()),
+        }];
+        tool_record.verification =
+            ToolVerificationResult::passed("provider remote state reconciled");
+        tool_record.error = None;
+        tool_record.finished_at = Some(changed_at);
+        let capability_invocation = CapabilityInvocation {
+            id: tool_record.id,
+            capability: CapabilityKind::ConnectorWrite,
+            status: CapabilityInvocationStatus::Succeeded,
+            policy_decision: tool_record.policy_decision,
+            approval_request_id: tool_record.approval_request_id,
+            requested_resource: Some(format!(
+                "{}:{}:{}",
+                invocation.provider_id, invocation.account_id, invocation.idempotency_key
+            )),
+            evidence_ref: Some(evidence.remote_object_ref.clone()),
+            requested_url: None,
+            evidence_url: None,
+            title: Some("Connected account change".to_string()),
+            excerpt: evidence.bounded_summary.clone(),
+            warnings: Vec::new(),
+            elapsed_ms: tool_record.elapsed_ms,
+            created_at: changed_at,
+        };
+        let mut review_item = match invocation.automation_run_id {
+            Some(automation_run_id) => self.list_review_queue_items()?.into_iter().find(|item| {
+                item.automation_run_id == automation_run_id
+                    && item.tool_invocation_id == Some(tool_invocation_id)
+            }),
+            None => None,
+        };
+        let review_previous_revision = review_item.as_ref().map(|item| item.revision);
+        if let Some(item) = review_item.as_mut() {
+            item.complete_approved_action(evidence.remote_object_ref.clone(), changed_at)
+                .map_err(EventStoreError::InvalidState)?;
+        }
+        let previous_status = invocation.status;
+        let reconciliation_binding = claim.map(|_| invocation.clone());
+        invocation.status = ConnectorInvocationStatus::Succeeded;
+        invocation.evidence = vec![evidence];
+        invocation.updated_at = changed_at;
+        let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool_record)?;
+        let capability_event =
+            KernelEvent::new(CAPABILITY_INVOCATION_RECORDED_EVENT, &capability_invocation)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        if let Some(binding) = reconciliation_binding.as_ref() {
+            load_connector_reconciliation_binding(&transaction, binding, account_generation)?;
+        }
+        let updated = if let Some(claim) = claim {
+            if claim.invocation.id != invocation.id
+                || claim.invocation.account_generation != invocation.account_generation
+                || claim.claim_expires_at <= changed_at
+            {
+                return Err(EventStoreError::InvalidState(
+                    "connector reconciliation claim is stale or mismatched".to_string(),
+                ));
+            }
+            transaction.execute(
+                r#"UPDATE connector_invocations
+                   SET invocation_json = ?2, status = ?3, updated_at = ?4,
+                       reconciliation_claim_id = NULL,
+                       reconciliation_claim_expires_at = NULL,
+                       next_reconciliation_at = NULL
+                   WHERE id = ?1 AND status = ?5 AND account_generation = ?6
+                     AND reconciliation_claim_id = ?9
+                     AND reconciliation_claim_expires_at > ?4
+                     AND EXISTS (
+                       SELECT 1
+                       FROM connector_accounts AS account
+                       JOIN connector_account_generations AS generation
+                         ON generation.account_id = account.id
+                       WHERE account.id = connector_invocations.account_id
+                         AND account.health = ?7
+                         AND account.provider_id = ?8
+                         AND generation.generation = ?6
+                     )"#,
+                params![
+                    invocation.id.to_string(),
+                    serde_json::to_string(&invocation)?,
+                    serde_json::to_string(&invocation.status)?,
+                    invocation
+                        .updated_at
+                        .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    serde_json::to_string(&previous_status)?,
+                    account_generation,
+                    serde_json::to_string(&ConnectorHealth::Connected)?,
+                    invocation.provider_id,
+                    claim.claim_id.to_string(),
+                ],
+            )?
+        } else {
+            transaction.execute(
+                r#"UPDATE connector_invocations
+                   SET invocation_json = ?2, status = ?3, updated_at = ?4
+                   WHERE id = ?1 AND status = ?5 AND account_generation = ?6
+                     AND EXISTS (
+                       SELECT 1
+                       FROM connector_accounts AS account
+                       JOIN connector_account_generations AS generation
+                         ON generation.account_id = account.id
+                       WHERE account.id = connector_invocations.account_id
+                         AND account.health = ?7
+                         AND account.provider_id = ?8
+                         AND generation.generation = ?6
+                     )"#,
+                params![
+                    invocation.id.to_string(),
+                    serde_json::to_string(&invocation)?,
+                    serde_json::to_string(&invocation.status)?,
+                    invocation
+                        .updated_at
+                        .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    serde_json::to_string(&previous_status)?,
+                    account_generation,
+                    serde_json::to_string(&ConnectorHealth::Connected)?,
+                    invocation.provider_id,
+                ],
+            )?
+        };
+        if updated != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector mutation completion raced with another worker".to_string(),
+            ));
+        }
+        for event in [tool_event, capability_event] {
+            Self::insert_kernel_event(&transaction, &event)?;
+        }
+        if let Some(item) = review_item {
+            let changed = transaction.execute(
+                r#"UPDATE review_queue_items
+                   SET item_json = ?2, status = ?3, revision = ?4, updated_at = ?5
+                   WHERE id = ?1 AND revision = ?6"#,
+                params![
+                    item.id.to_string(),
+                    serde_json::to_string(&item)?,
+                    serde_json::to_string(&item.status)?,
+                    item.revision,
+                    item.updated_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    review_previous_revision,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(EventStoreError::InvalidState(
+                    "review completion raced with another writer".to_string(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        Ok(invocation)
+    }
+
+    pub fn transition_connector_invocation(
+        &self,
+        id: Uuid,
+        status: ConnectorInvocationStatus,
+        evidence: Vec<ConnectorEvidenceRef>,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorInvocation> {
+        let mut invocation = self.connector_invocation(id)?;
+        if invocation.capability.external_mutation()
+            && matches!(
+                status,
+                ConnectorInvocationStatus::Running
+                    | ConnectorInvocationStatus::Succeeded
+                    | ConnectorInvocationStatus::ReconciliationRequired
+            )
+        {
+            return Err(EventStoreError::InvalidState(
+                "external connector mutation must use its approval and evidence boundary"
+                    .to_string(),
+            ));
+        }
+        if !connector_invocation_transition_allowed(invocation.status, status) {
+            return Err(EventStoreError::InvalidState(format!(
+                "connector invocation cannot transition from {:?} to {:?}",
+                invocation.status, status
+            )));
+        }
+        if status == ConnectorInvocationStatus::Succeeded && evidence.is_empty() {
+            return Err(EventStoreError::InvalidState(
+                "successful connector invocation requires evidence".to_string(),
+            ));
+        }
+        invocation.status = status;
+        invocation.evidence = evidence;
+        invocation.updated_at = changed_at;
+        self.conn.execute(
+            r#"UPDATE connector_invocations
+               SET invocation_json = ?2, status = ?3, updated_at = ?4
+               WHERE id = ?1"#,
+            params![
+                invocation.id.to_string(),
+                serde_json::to_string(&invocation)?,
+                serde_json::to_string(&invocation.status)?,
+                invocation
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        Ok(invocation)
+    }
+
+    pub fn upsert_connector_authorization_session(
+        &self,
+        session: &ConnectorAuthorizationSession,
+    ) -> EventStoreResult<()> {
+        self.conn.execute(
+            r#"INSERT INTO connector_authorization_sessions
+               (id, session_json, expires_at, consumed_at, status, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(id) DO UPDATE SET
+                 session_json = excluded.session_json,
+                 expires_at = excluded.expires_at,
+                 consumed_at = excluded.consumed_at,
+                 status = excluded.status,
+                 updated_at = excluded.updated_at
+               WHERE connector_authorization_sessions.status = ?7"#,
+            params![
+                session.id.to_string(),
+                serde_json::to_string(session)?,
+                session
+                    .expires_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                session
+                    .consumed_at
+                    .map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true)),
+                serde_json::to_string(&session.status)?,
+                Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorAuthorizationStatus::Pending)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn insert_preparing_connector_authorization(
+        &self,
+        session: &ConnectorAuthorizationSession,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        if session.status != ConnectorAuthorizationStatus::Preparing
+            || session.revision != 0
+            || session.consumed_at.is_some()
+            || session.cleanup_required
+            || session.cleanup_completed_at.is_some()
+            || session.expires_at <= now
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization preparation is invalid".to_string(),
+            ));
+        }
+        let inserted = self.conn.execute(
+            r#"INSERT INTO connector_authorization_sessions
+               (id, session_json, expires_at, consumed_at, status, revision,
+                cleanup_required, cleanup_completed_at, account_id, updated_at)
+               VALUES (?1, ?2, ?3, NULL, ?4, 0, 0, NULL, NULL, ?5)"#,
+            params![
+                session.id.to_string(),
+                serde_json::to_string(session)?,
+                session
+                    .expires_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&session.status)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization preparation raced".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn activate_preparing_connector_authorization(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationSession> {
+        let mut session = self.connector_authorization_session(id)?;
+        if session.status != ConnectorAuthorizationStatus::Preparing
+            || session.revision != 0
+            || session.expires_at <= now
+            || session.cleanup_required
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization preparation is stale".to_string(),
+            ));
+        }
+        let previous_json = serde_json::to_string(&session)?;
+        session.status = ConnectorAuthorizationStatus::Pending;
+        session.revision = 1;
+        let changed = self.conn.execute(
+            r#"UPDATE connector_authorization_sessions
+               SET session_json = ?2, status = ?3, revision = 1, updated_at = ?4
+               WHERE id = ?1 AND session_json = ?5 AND status = ?6
+                 AND revision = 0 AND cleanup_required = 0
+                 AND consumed_at IS NULL AND expires_at > ?4"#,
+            params![
+                id.to_string(),
+                serde_json::to_string(&session)?,
+                serde_json::to_string(&ConnectorAuthorizationStatus::Pending)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                previous_json,
+                serde_json::to_string(&ConnectorAuthorizationStatus::Preparing)?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization preparation raced".to_string(),
+            ));
+        }
+        Ok(session)
+    }
+
+    pub fn connector_authorization_session(
+        &self,
+        id: Uuid,
+    ) -> EventStoreResult<ConnectorAuthorizationSession> {
+        let (
+            json,
+            expires_at,
+            consumed_at,
+            status,
+            revision,
+            cleanup_required,
+            cleanup_completed_at,
+        ) = self.conn.query_row(
+            r#"SELECT session_json, expires_at, consumed_at, status, revision,
+                      cleanup_required, cleanup_completed_at
+               FROM connector_authorization_sessions WHERE id = ?1"#,
+            params![id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )?;
+        let session: ConnectorAuthorizationSession = serde_json::from_str(&json)?;
+        let projected_expires_at = DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc);
+        let projected_consumed_at = consumed_at
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value).map(|value| value.with_timezone(&Utc))
+            })
+            .transpose()?;
+        let projected_status: ConnectorAuthorizationStatus = serde_json::from_str(&status)?;
+        let projected_revision = u64::try_from(revision).map_err(|_| {
+            EventStoreError::InvalidState("OAuth authorization revision is invalid".to_string())
+        })?;
+        let projected_cleanup_completed_at = cleanup_completed_at
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value).map(|value| value.with_timezone(&Utc))
+            })
+            .transpose()?;
+        if session.id != id
+            || session.expires_at != projected_expires_at
+            || session.consumed_at != projected_consumed_at
+            || session.status != projected_status
+            || session.revision != projected_revision
+            || session.cleanup_required != (cleanup_required != 0)
+            || session.cleanup_completed_at != projected_cleanup_completed_at
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization session projection is invalid".to_string(),
+            ));
+        }
+        Ok(session)
+    }
+
+    pub(crate) fn prepare_connector_authorization_review(
+        &self,
+        authorization_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationActionProvision> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let (session_json, expires_at, consumed_at, status) = transaction.query_row(
+            r#"SELECT session_json, expires_at, consumed_at, status
+               FROM connector_authorization_sessions WHERE id = ?1"#,
+            params![authorization_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let session: ConnectorAuthorizationSession = serde_json::from_str(&session_json)?;
+        let projected_expires_at = DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc);
+        let projected_status: ConnectorAuthorizationStatus = serde_json::from_str(&status)?;
+        if session.id != authorization_id
+            || session.status != ConnectorAuthorizationStatus::Pending
+            || projected_status != ConnectorAuthorizationStatus::Pending
+            || session.consumed_at.is_some()
+            || consumed_at.is_some()
+            || session.expires_at != projected_expires_at
+            || session.expires_at <= now
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization review is unavailable".to_string(),
+            ));
+        }
+        let review_id = Uuid::new_v4();
+        let authority_handle = ConnectorCredentialHandle::new();
+        let authority = ConnectorSecret::new(Uuid::new_v4().to_string())
+            .map_err(EventStoreError::InvalidState)?;
+        transaction.execute(
+            r#"INSERT INTO connector_authorization_actions
+               (authorization_id, token_hash, session_hash, expires_at, created_at,
+                review_id, authority_handle_json, action_status, activated_at, resolved_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'preparing', NULL, NULL)"#,
+            params![
+                authorization_id.to_string(),
+                connector_authorization_action_token_hash(authority.expose()),
+                connector_authorization_session_hash(&session_json),
+                expires_at,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                review_id.to_string(),
+                serde_json::to_string(&authority_handle)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(ConnectorAuthorizationActionProvision {
+            review_id,
+            authorization_id,
+            authority_handle,
+            authority,
+        })
+    }
+
+    pub(crate) fn activate_connector_authorization_review(
+        &self,
+        review_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationActiveReview> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let (authorization_id, authority_handle_json, session_hash, expires_at, action_status) =
+            transaction.query_row(
+                r#"SELECT authorization_id, authority_handle_json, session_hash, expires_at,
+                          action_status
+                   FROM connector_authorization_actions WHERE review_id = ?1"#,
+                params![review_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )?;
+        let authorization_id = Uuid::parse_str(&authorization_id)?;
+        let authority_handle: ConnectorCredentialHandle =
+            serde_json::from_str(authority_handle_json.as_deref().ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector authorization review authority is unavailable".to_string(),
+                )
+            })?)?;
+        let action_expires_at = DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc);
+        let session_json = transaction.query_row(
+            r#"SELECT session_json FROM connector_authorization_sessions
+               WHERE id = ?1 AND status = ?2 AND consumed_at IS NULL AND expires_at > ?3"#,
+            params![
+                authorization_id.to_string(),
+                serde_json::to_string(&ConnectorAuthorizationStatus::Pending)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        if action_status.as_deref() != Some("preparing")
+            || action_expires_at <= now
+            || !constant_time_text_eq(
+                &session_hash,
+                &connector_authorization_session_hash(&session_json),
+            )
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization review is stale".to_string(),
+            ));
+        }
+        let changed = transaction.execute(
+            r#"UPDATE connector_authorization_actions
+               SET action_status = 'active', activated_at = ?2
+               WHERE review_id = ?1 AND action_status = 'preparing'
+                 AND resolved_at IS NULL AND expires_at > ?2"#,
+            params![
+                review_id.to_string(),
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true)
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization review activation raced".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(ConnectorAuthorizationActiveReview {
+            review_id,
+            authorization_id,
+            authority_handle,
+        })
+    }
+
+    pub(crate) fn connector_authorization_active_review(
+        &self,
+        review_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationActiveReview> {
+        let (authorization_id, authority_handle_json, session_hash, expires_at) =
+            self.conn.query_row(
+                r#"SELECT authorization_id, authority_handle_json, session_hash, expires_at
+                   FROM connector_authorization_actions
+                   WHERE review_id = ?1 AND action_status = 'active'
+                     AND activated_at IS NOT NULL AND resolved_at IS NULL"#,
+                params![review_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
+        let authorization_id = Uuid::parse_str(&authorization_id)?;
+        let action_expires_at = DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc);
+        let session = self.connector_authorization_session(authorization_id)?;
+        let session_json = serde_json::to_string(&session)?;
+        if session.status != ConnectorAuthorizationStatus::Pending
+            || session.consumed_at.is_some()
+            || session.expires_at <= now
+            || action_expires_at != session.expires_at
+            || action_expires_at <= now
+            || !constant_time_text_eq(
+                &session_hash,
+                &connector_authorization_session_hash(&session_json),
+            )
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization review is stale".to_string(),
+            ));
+        }
+        let authority_handle =
+            serde_json::from_str(authority_handle_json.as_deref().ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector authorization review authority is unavailable".to_string(),
+                )
+            })?)?;
+        Ok(ConnectorAuthorizationActiveReview {
+            review_id,
+            authorization_id,
+            authority_handle,
+        })
+    }
+
+    pub(crate) fn validate_connector_authorization_active_review_authority(
+        &self,
+        review_id: Uuid,
+        authority: &ConnectorSecret,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        self.connector_authorization_active_review(review_id, now)?;
+        let token_hash = self.conn.query_row(
+            r#"SELECT token_hash FROM connector_authorization_actions
+               WHERE review_id = ?1 AND action_status = 'active'"#,
+            params![review_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        if !constant_time_text_eq(
+            &token_hash,
+            &connector_authorization_action_token_hash(authority.expose()),
+        ) {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization review authority is invalid".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn connector_authorization_review_ids(
+        &self,
+        limit: usize,
+    ) -> EventStoreResult<Vec<Uuid>> {
+        let limit = i64::try_from(limit.min(32)).map_err(|_| {
+            EventStoreError::InvalidState(
+                "connector authorization review limit is invalid".to_string(),
+            )
+        })?;
+        let mut statement = self.conn.prepare(
+            r#"SELECT review_id FROM connector_authorization_actions
+               WHERE review_id IS NOT NULL AND action_status != 'preparing'
+               ORDER BY COALESCE(resolved_at, activated_at, created_at) DESC, rowid DESC
+               LIMIT ?1"#,
+        )?;
+        let review_ids = statement
+            .query_map(params![limit], |row| row.get::<_, String>(0))?
+            .filter_map(|value| value.ok().and_then(|value| Uuid::parse_str(&value).ok()))
+            .collect();
+        Ok(review_ids)
+    }
+
+    pub(crate) fn connector_authorization_review_snapshot(
+        &self,
+        review_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationReviewSnapshot> {
+        let (authorization_id, action_status, resolved_intent, authority_handle_json) =
+            self.conn.query_row(
+                r#"SELECT authorization_id, action_status, resolved_intent,
+                          authority_handle_json
+                   FROM connector_authorization_actions WHERE review_id = ?1"#,
+                params![review_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?;
+        let intent_state = match (action_status.as_str(), resolved_intent.as_deref()) {
+            ("active", None) => ConnectorAuthorizationReviewIntentState::Active,
+            ("consumed" | "resolved", Some("approve")) => {
+                ConnectorAuthorizationReviewIntentState::Approve
+            }
+            ("consumed" | "resolved", Some("cancel" | "expired")) => {
+                ConnectorAuthorizationReviewIntentState::Cancel
+            }
+            _ => {
+                return Err(EventStoreError::InvalidState(
+                    "connector authorization review projection is invalid".to_string(),
+                ))
+            }
+        };
+        let authorization_id = Uuid::parse_str(&authorization_id)?;
+        let session = self.connector_authorization_session(authorization_id)?;
+        let (exchange_claim_id, exchange_claim_expires_at, account_id) = self.conn.query_row(
+            r#"SELECT exchange_claim_id, exchange_claim_expires_at, account_id
+               FROM connector_authorization_sessions WHERE id = ?1"#,
+            params![authorization_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        let exchange_claim_live = match (exchange_claim_id, exchange_claim_expires_at) {
+            (Some(claim_id), Some(expires_at)) => {
+                Uuid::parse_str(&claim_id).is_ok()
+                    && DateTime::parse_from_rfc3339(&expires_at)
+                        .map(|value| value.with_timezone(&Utc) > now)
+                        .unwrap_or(false)
+            }
+            (None, None) => false,
+            _ => false,
+        };
+        let authority_handle = authority_handle_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+        let account = account_id
+            .as_deref()
+            .and_then(|account_id| Uuid::parse_str(account_id).ok())
+            .and_then(|account_id| {
+                self.list_connector_accounts()
+                    .ok()?
+                    .into_iter()
+                    .find(|account| account.id == account_id)
+            });
+        let account_generation = account.as_ref().and_then(|account| {
+            self.conn
+                .query_row(
+                    "SELECT generation FROM connector_account_generations WHERE account_id = ?1",
+                    params![account.id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        });
+        let account_binding_valid = account.as_ref().is_some_and(|account| {
+            session.status == ConnectorAuthorizationStatus::Completed
+                && session.consumed_at.is_some()
+                && !session.cleanup_required
+                && account.provider_id == session.provider_id
+                && account.credential_handle == session.result_credential_handle
+                && account.granted_capabilities == session.requested_capabilities
+                && account.health == ConnectorHealth::Connected
+                && account_generation == Some(0)
+        });
+        Ok(ConnectorAuthorizationReviewSnapshot {
+            review_id,
+            session,
+            intent_state,
+            authority_handle,
+            exchange_claim_live,
+            account,
+            account_binding_valid,
+        })
+    }
+
+    pub(crate) fn connector_authorization_authority_cleanup_candidates(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> EventStoreResult<Vec<Uuid>> {
+        let limit = i64::try_from(limit.min(64)).map_err(|_| {
+            EventStoreError::InvalidState(
+                "connector authorization authority cleanup limit is invalid".to_string(),
+            )
+        })?;
+        let mut statement = self.conn.prepare(
+            r#"SELECT review_id FROM connector_authorization_actions
+               WHERE action_status = 'consumed' AND authority_cleanup_required = 1
+                 AND review_id IS NOT NULL AND authority_handle_json IS NOT NULL
+                 AND (authority_cleanup_claim_expires_at IS NULL
+                      OR authority_cleanup_claim_expires_at <= ?1)
+               ORDER BY resolved_at ASC, rowid ASC LIMIT ?2"#,
+        )?;
+        let candidates = statement
+            .query_map(
+                params![now.to_rfc3339_opts(SecondsFormat::Nanos, true), limit],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|value| Ok(Uuid::parse_str(&value?)?))
+            .collect();
+        candidates
+    }
+
+    pub(crate) fn begin_connector_authorization_authority_cleanup(
+        &self,
+        review_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationAuthorityCleanupClaim> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let (authorization_id, authority_handle_json, current_claim_expires_at) = transaction
+            .query_row(
+                r#"SELECT authorization_id, authority_handle_json,
+                          authority_cleanup_claim_expires_at
+                   FROM connector_authorization_actions
+                   WHERE review_id = ?1 AND action_status = 'consumed'
+                     AND authority_cleanup_required = 1 AND resolved_at IS NOT NULL"#,
+                params![review_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?;
+        let current_claim_expires_at = current_claim_expires_at
+            .as_deref()
+            .map(|value| DateTime::parse_from_rfc3339(value).map(|value| value.with_timezone(&Utc)))
+            .transpose()?;
+        if current_claim_expires_at.is_some_and(|expires_at| expires_at > now) {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization authority cleanup is already claimed".to_string(),
+            ));
+        }
+        let authority_handle: ConnectorCredentialHandle =
+            serde_json::from_str(authority_handle_json.as_deref().ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector authorization authority cleanup handle is unavailable".to_string(),
+                )
+            })?)?;
+        let claim_id = Uuid::new_v4();
+        let claim_expires_at = now + Duration::minutes(5);
+        let changed = transaction.execute(
+            r#"UPDATE connector_authorization_actions
+               SET authority_cleanup_claim_id = ?2,
+                   authority_cleanup_claim_expires_at = ?3
+               WHERE review_id = ?1 AND action_status = 'consumed'
+                 AND authority_cleanup_required = 1
+                 AND (authority_cleanup_claim_expires_at IS NULL
+                      OR authority_cleanup_claim_expires_at <= ?4)"#,
+            params![
+                review_id.to_string(),
+                claim_id.to_string(),
+                claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization authority cleanup raced".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(ConnectorAuthorizationAuthorityCleanupClaim {
+            review_id,
+            authorization_id: Uuid::parse_str(&authorization_id)?,
+            authority_handle,
+            claim_id,
+            claim_expires_at,
+        })
+    }
+
+    pub(crate) fn finish_connector_authorization_authority_cleanup(
+        &self,
+        claim: &ConnectorAuthorizationAuthorityCleanupClaim,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let changed = self.conn.execute(
+            r#"UPDATE connector_authorization_actions
+               SET token_hash = 'redacted', session_hash = 'redacted',
+                   authority_handle_json = NULL, action_status = 'resolved',
+                   authority_cleanup_required = 0,
+                   authority_cleanup_claim_id = NULL,
+                   authority_cleanup_claim_expires_at = NULL,
+                   authority_cleanup_completed_at = ?5
+               WHERE review_id = ?1 AND authorization_id = ?2
+                 AND action_status = 'consumed' AND authority_cleanup_required = 1
+                 AND authority_cleanup_claim_id = ?3
+                 AND authority_cleanup_claim_expires_at = ?4
+                 AND authority_cleanup_claim_expires_at > ?5"#,
+            params![
+                claim.review_id.to_string(),
+                claim.authorization_id.to_string(),
+                claim.claim_id.to_string(),
+                claim
+                    .claim_expires_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization authority cleanup raced".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue_connector_authorization_action(
+        &self,
+        authorization_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<String> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let (session_json, expires_at, consumed_at, status) = transaction.query_row(
+            r#"SELECT session_json, expires_at, consumed_at, status
+               FROM connector_authorization_sessions WHERE id = ?1"#,
+            params![authorization_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let session: ConnectorAuthorizationSession = serde_json::from_str(&session_json)?;
+        let projected_expires_at = DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc);
+        let projected_status: ConnectorAuthorizationStatus = serde_json::from_str(&status)?;
+        if session.id != authorization_id
+            || session.status != ConnectorAuthorizationStatus::Pending
+            || projected_status != ConnectorAuthorizationStatus::Pending
+            || session.consumed_at.is_some()
+            || consumed_at.is_some()
+            || session.expires_at != projected_expires_at
+            || session.expires_at <= now
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization action is unavailable".to_string(),
+            ));
+        }
+        let token = Uuid::new_v4().to_string();
+        transaction.execute(
+            r#"INSERT INTO connector_authorization_actions
+               (authorization_id, token_hash, session_hash, expires_at, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            params![
+                authorization_id.to_string(),
+                connector_authorization_action_token_hash(&token),
+                connector_authorization_session_hash(&session_json),
+                expires_at,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(token)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claim_connector_authorization_action(
+        &self,
+        authorization_id: Uuid,
+        action_token: &str,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationExchangeClaim> {
+        match self.resolve_connector_authorization_action(
+            authorization_id,
+            action_token,
+            ConnectorAuthorizationIntent::Approve,
+            now,
+        )? {
+            ConnectorAuthorizationResolution::Approved(claim) => Ok(claim),
+            ConnectorAuthorizationResolution::Cancelled(_) => Err(EventStoreError::InvalidState(
+                "connector authorization action resolved unexpectedly".to_string(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_connector_authorization_action(
+        &self,
+        authorization_id: Uuid,
+        action_token: &str,
+        intent: ConnectorAuthorizationIntent,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationResolution> {
+        self.resolve_connector_authorization_action_inner(
+            authorization_id,
+            None,
+            action_token,
+            intent,
+            now,
+        )
+    }
+
+    pub(crate) fn resolve_connector_authorization_review(
+        &self,
+        review_id: Uuid,
+        authority: &ConnectorSecret,
+        intent: ConnectorAuthorizationIntent,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationResolution> {
+        let authorization_id = self.conn.query_row(
+            r#"SELECT authorization_id FROM connector_authorization_actions
+               WHERE review_id = ?1"#,
+            params![review_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        self.resolve_connector_authorization_action_inner(
+            Uuid::parse_str(&authorization_id)?,
+            Some(review_id),
+            authority.expose(),
+            intent,
+            now,
+        )
+    }
+
+    fn resolve_connector_authorization_action_inner(
+        &self,
+        authorization_id: Uuid,
+        expected_review_id: Option<Uuid>,
+        action_token: &str,
+        intent: ConnectorAuthorizationIntent,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationResolution> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let (
+            token_hash,
+            session_hash,
+            action_expires_at,
+            stored_review_id,
+            authority_handle_json,
+            action_status,
+            resolved_at,
+        ) = transaction.query_row(
+            r#"SELECT token_hash, session_hash, expires_at, review_id,
+                      authority_handle_json, action_status, resolved_at
+                   FROM connector_authorization_actions WHERE authorization_id = ?1"#,
+            params![authorization_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )?;
+        let stored_review_id = stored_review_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()?;
+        let action_authority_handle = authority_handle_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+        let valid_authority_kind = match expected_review_id {
+            Some(review_id) => {
+                stored_review_id == Some(review_id)
+                    && action_status.as_deref() == Some("active")
+                    && action_authority_handle.is_some()
+                    && resolved_at.is_none()
+            }
+            None => stored_review_id.is_none(),
+        };
+        if action_token.trim().is_empty()
+            || !valid_authority_kind
+            || !constant_time_text_eq(
+                &token_hash,
+                &connector_authorization_action_token_hash(action_token),
+            )
+            || DateTime::parse_from_rfc3339(&action_expires_at)?.with_timezone(&Utc) <= now
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization action is invalid".to_string(),
+            ));
+        }
+        let (session_json, expires_at, consumed_at, status) = transaction.query_row(
+            r#"SELECT session_json, expires_at, consumed_at, status
+               FROM connector_authorization_sessions WHERE id = ?1"#,
+            params![authorization_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let mut session: ConnectorAuthorizationSession = serde_json::from_str(&session_json)?;
+        let projected_expires_at = DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc);
+        let projected_status: ConnectorAuthorizationStatus = serde_json::from_str(&status)?;
+        if session.id != authorization_id
+            || session.status != ConnectorAuthorizationStatus::Pending
+            || projected_status != ConnectorAuthorizationStatus::Pending
+            || session.consumed_at.is_some()
+            || consumed_at.is_some()
+            || session.expires_at != projected_expires_at
+            || session.expires_at <= now
+            || !constant_time_text_eq(
+                &session_hash,
+                &connector_authorization_session_hash(&session_json),
+            )
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization action is stale".to_string(),
+            ));
+        }
+        let resolved_intent = match intent {
+            ConnectorAuthorizationIntent::Approve => "approve",
+            ConnectorAuthorizationIntent::Cancel => "cancel",
+        };
+        if intent == ConnectorAuthorizationIntent::Cancel {
+            session.status = ConnectorAuthorizationStatus::Cancelled;
+            session.cleanup_required = true;
+            session.cleanup_completed_at = None;
+            session.revision = session.revision.checked_add(1).ok_or_else(|| {
+                EventStoreError::InvalidState("OAuth authorization revision overflowed".to_string())
+            })?;
+            let claim_id = Uuid::new_v4();
+            let claim_expires_at = now + Duration::minutes(5);
+            let changed = transaction.execute(
+                r#"UPDATE connector_authorization_sessions
+                   SET session_json = ?2, status = ?3, revision = ?7, updated_at = ?4,
+                       cleanup_required = 1, cleanup_completed_at = NULL,
+                       cleanup_claim_id = ?8, cleanup_claim_expires_at = ?9
+                   WHERE id = ?1 AND session_json = ?5 AND status = ?6
+                     AND consumed_at IS NULL AND expires_at > ?4"#,
+                params![
+                    authorization_id.to_string(),
+                    serde_json::to_string(&session)?,
+                    serde_json::to_string(&ConnectorAuthorizationStatus::Cancelled)?,
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    session_json,
+                    serde_json::to_string(&ConnectorAuthorizationStatus::Pending)?,
+                    i64::try_from(session.revision).map_err(|_| EventStoreError::InvalidState(
+                        "OAuth authorization revision is too large".to_string()
+                    ))?,
+                    claim_id.to_string(),
+                    claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(EventStoreError::InvalidState(
+                    "connector authorization action raced".to_string(),
+                ));
+            }
+            let consumed = if let Some(review_id) = expected_review_id {
+                transaction.execute(
+                    r#"UPDATE connector_authorization_actions
+                       SET action_status = 'consumed', resolved_at = ?3,
+                           resolved_intent = ?4, authority_cleanup_required = 1
+                       WHERE authorization_id = ?1 AND review_id = ?2
+                         AND token_hash = ?5 AND action_status = 'active'
+                         AND resolved_at IS NULL"#,
+                    params![
+                        authorization_id.to_string(),
+                        review_id.to_string(),
+                        now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        resolved_intent,
+                        token_hash,
+                    ],
+                )?
+            } else {
+                transaction.execute(
+                    r#"DELETE FROM connector_authorization_actions
+                       WHERE authorization_id = ?1 AND token_hash = ?2
+                         AND review_id IS NULL"#,
+                    params![authorization_id.to_string(), token_hash],
+                )?
+            };
+            if consumed != 1 {
+                return Err(EventStoreError::InvalidState(
+                    "connector authorization action raced".to_string(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(ConnectorAuthorizationResolution::Cancelled(
+                ConnectorAuthorizationCleanupClaim {
+                    session,
+                    claim_id,
+                    claim_expires_at,
+                    action_authority_handle,
+                },
+            ));
+        }
+        session.status = ConnectorAuthorizationStatus::Exchanging;
+        session.revision = session.revision.checked_add(1).ok_or_else(|| {
+            EventStoreError::InvalidState("OAuth authorization revision overflowed".to_string())
+        })?;
+        let claim_id = Uuid::new_v4();
+        let claim_expires_at = now + Duration::minutes(5);
+        let next_json = serde_json::to_string(&session)?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_authorization_sessions
+               SET session_json = ?2, status = ?3, revision = ?7, updated_at = ?4,
+                   exchange_claim_id = ?8, exchange_claim_expires_at = ?9
+               WHERE id = ?1 AND session_json = ?5 AND status = ?6
+                 AND consumed_at IS NULL AND expires_at > ?4"#,
+            params![
+                authorization_id.to_string(),
+                next_json,
+                serde_json::to_string(&ConnectorAuthorizationStatus::Exchanging)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                session_json,
+                serde_json::to_string(&ConnectorAuthorizationStatus::Pending)?,
+                i64::try_from(session.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                claim_id.to_string(),
+                claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization action raced".to_string(),
+            ));
+        }
+        let consumed = if let Some(review_id) = expected_review_id {
+            transaction.execute(
+                r#"UPDATE connector_authorization_actions
+                   SET action_status = 'consumed', resolved_at = ?3,
+                       resolved_intent = ?4, authority_cleanup_required = 1
+                   WHERE authorization_id = ?1 AND review_id = ?2
+                     AND token_hash = ?5 AND action_status = 'active'
+                     AND resolved_at IS NULL"#,
+                params![
+                    authorization_id.to_string(),
+                    review_id.to_string(),
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    resolved_intent,
+                    token_hash,
+                ],
+            )?
+        } else {
+            transaction.execute(
+                r#"DELETE FROM connector_authorization_actions
+                   WHERE authorization_id = ?1 AND token_hash = ?2
+                     AND review_id IS NULL"#,
+                params![authorization_id.to_string(), token_hash],
+            )?
+        };
+        if consumed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector authorization action raced".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(ConnectorAuthorizationResolution::Approved(
+            ConnectorAuthorizationExchangeClaim {
+                session,
+                claim_id,
+                claim_expires_at,
+                action_authority_handle,
+            },
+        ))
+    }
+
+    pub(crate) fn validate_connector_authorization_exchange_claim(
+        &self,
+        claim: &ConnectorAuthorizationExchangeClaim,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let (session_json, status, revision, claim_id, claim_expires_at) = self.conn.query_row(
+            r#"SELECT session_json, status, revision, exchange_claim_id,
+                      exchange_claim_expires_at
+               FROM connector_authorization_sessions WHERE id = ?1"#,
+            params![claim.session.id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )?;
+        let revision = u64::try_from(revision).map_err(|_| {
+            EventStoreError::InvalidState("OAuth authorization revision is invalid".to_string())
+        })?;
+        let claim_expires_at = claim_expires_at
+            .as_deref()
+            .map(|value| DateTime::parse_from_rfc3339(value).map(|value| value.with_timezone(&Utc)))
+            .transpose()?;
+        if session_json != serde_json::to_string(&claim.session)?
+            || serde_json::from_str::<ConnectorAuthorizationStatus>(&status)?
+                != ConnectorAuthorizationStatus::Exchanging
+            || revision != claim.session.revision
+            || claim_id != Some(claim.claim_id.to_string())
+            || claim_expires_at != Some(claim.claim_expires_at)
+            || claim.claim_expires_at <= now
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization exchange claim is stale".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn claim_connector_authorization_session(
+        &self,
+        id: Uuid,
+        returned_state: &str,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationExchangeClaim> {
+        let mut session = self.connector_authorization_session(id)?;
+        if session.status != ConnectorAuthorizationStatus::Pending
+            || session.consumed_at.is_some()
+            || session.expires_at <= now
+            || session.state != returned_state
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization session cannot be claimed".to_string(),
+            ));
+        }
+        session.status = ConnectorAuthorizationStatus::Exchanging;
+        session.revision = session.revision.checked_add(1).ok_or_else(|| {
+            EventStoreError::InvalidState("OAuth authorization revision overflowed".to_string())
+        })?;
+        let claim_id = Uuid::new_v4();
+        let claim_expires_at = now + Duration::minutes(5);
+        let updated = self.conn.execute(
+            r#"UPDATE connector_authorization_sessions
+               SET session_json = ?2, status = ?3, revision = ?6, updated_at = ?4,
+                   exchange_claim_id = ?7, exchange_claim_expires_at = ?8
+               WHERE id = ?1 AND status = ?5 AND consumed_at IS NULL AND expires_at > ?4"#,
+            params![
+                session.id.to_string(),
+                serde_json::to_string(&session)?,
+                serde_json::to_string(&session.status)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorAuthorizationStatus::Pending)?,
+                i64::try_from(session.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                claim_id.to_string(),
+                claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if updated != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization session was already claimed".to_string(),
+            ));
+        }
+        Ok(ConnectorAuthorizationExchangeClaim {
+            session,
+            claim_id,
+            claim_expires_at,
+            action_authority_handle: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn finish_connector_authorization_session(
+        &self,
+        session: &ConnectorAuthorizationSession,
+        claim_id: Uuid,
+        claim_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        if session.status != ConnectorAuthorizationStatus::Completed
+            || session.consumed_at.is_none()
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization session is not completed".to_string(),
+            ));
+        }
+        let updated = self.conn.execute(
+            r#"UPDATE connector_authorization_sessions
+               SET session_json = ?2, consumed_at = ?3, status = ?4,
+                   revision = ?7, updated_at = ?5,
+                   exchange_claim_id = NULL, exchange_claim_expires_at = NULL
+               WHERE id = ?1 AND status = ?6 AND consumed_at IS NULL
+                 AND exchange_claim_id = ?8 AND exchange_claim_expires_at = ?9
+                 AND exchange_claim_expires_at > ?5"#,
+            params![
+                session.id.to_string(),
+                serde_json::to_string(session)?,
+                session
+                    .consumed_at
+                    .map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true)),
+                serde_json::to_string(&session.status)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorAuthorizationStatus::Exchanging)?,
+                i64::try_from(session.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                claim_id.to_string(),
+                claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if updated != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization session finalization raced".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_connector_authorization_with_account(
+        &self,
+        session: &ConnectorAuthorizationSession,
+        account: &ConnectorAccount,
+        claim_id: Uuid,
+        claim_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        if session.status != ConnectorAuthorizationStatus::Completed
+            || session.consumed_at.is_none()
+            || session.cleanup_required
+            || account.provider_id != session.provider_id
+            || account.credential_handle != session.result_credential_handle
+            || account.granted_capabilities != session.requested_capabilities
+            || account.health != ConnectorHealth::Connected
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization account binding is invalid".to_string(),
+            ));
+        }
+        let mut claimed = session.clone();
+        claimed.status = ConnectorAuthorizationStatus::Exchanging;
+        claimed.consumed_at = None;
+        claimed.revision = claimed.revision.checked_sub(1).ok_or_else(|| {
+            EventStoreError::InvalidState("OAuth authorization revision is invalid".to_string())
+        })?;
+        let claimed_json = serde_json::to_string(&claimed)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let inserted = transaction.execute(
+            r#"INSERT INTO connector_accounts (id, provider_id, account_json, health, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            params![
+                account.id.to_string(),
+                account.provider_id,
+                serde_json::to_string(account)?,
+                serde_json::to_string(&account.health)?,
+                account
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization account materialization raced".to_string(),
+            ));
+        }
+        transaction.execute(
+            r#"INSERT INTO connector_account_generations (account_id, generation)
+               VALUES (?1, 0)"#,
+            params![account.id.to_string()],
+        )?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_authorization_sessions
+               SET session_json = ?2, consumed_at = ?3, status = ?4,
+                   revision = ?5, account_id = ?6, updated_at = ?7,
+                   exchange_claim_id = NULL, exchange_claim_expires_at = NULL
+               WHERE id = ?1 AND session_json = ?8 AND status = ?9
+                 AND revision = ?10 AND consumed_at IS NULL
+                 AND cleanup_required = 0
+                 AND exchange_claim_id = ?11 AND exchange_claim_expires_at = ?12
+                 AND exchange_claim_expires_at > ?7"#,
+            params![
+                session.id.to_string(),
+                serde_json::to_string(session)?,
+                session
+                    .consumed_at
+                    .map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true)),
+                serde_json::to_string(&ConnectorAuthorizationStatus::Completed)?,
+                i64::try_from(session.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                account.id.to_string(),
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                claimed_json,
+                serde_json::to_string(&ConnectorAuthorizationStatus::Exchanging)?,
+                i64::try_from(claimed.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                claim_id.to_string(),
+                claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization account finalization raced".to_string(),
+            ));
+        }
+        transaction.execute(
+            r#"DELETE FROM connector_authorization_actions
+               WHERE authorization_id = ?1 AND review_id IS NULL"#,
+            params![session.id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_connector_authorization_repair(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        let mut session = self.connector_authorization_session(id)?;
+        if matches!(
+            session.status,
+            ConnectorAuthorizationStatus::Completed | ConnectorAuthorizationStatus::Exchanging
+        ) {
+            return Err(EventStoreError::InvalidState(
+                "claimed OAuth authorization cannot be generically repaired".to_string(),
+            ));
+        }
+        session.status = ConnectorAuthorizationStatus::RepairRequired;
+        session.cleanup_required = true;
+        session.cleanup_completed_at = None;
+        session.revision = session.revision.checked_add(1).ok_or_else(|| {
+            EventStoreError::InvalidState("OAuth authorization revision overflowed".to_string())
+        })?;
+        let updated = self.conn.execute(
+            r#"UPDATE connector_authorization_sessions
+               SET session_json = ?2, status = ?3, revision = ?6,
+                   cleanup_required = 1, cleanup_completed_at = NULL, updated_at = ?4
+               WHERE id = ?1 AND status != ?5"#,
+            params![
+                session.id.to_string(),
+                serde_json::to_string(&session)?,
+                serde_json::to_string(&session.status)?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                serde_json::to_string(&ConnectorAuthorizationStatus::Completed)?,
+                i64::try_from(session.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization repair state did not persist".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_connector_authorization_exchange_repair(
+        &self,
+        id: Uuid,
+        claim_id: Uuid,
+        claim_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<()> {
+        if claim_expires_at <= now {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization exchange claim expired".to_string(),
+            ));
+        }
+        let mut session = self.connector_authorization_session(id)?;
+        if session.status != ConnectorAuthorizationStatus::Exchanging {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization exchange is not active".to_string(),
+            ));
+        }
+        let previous_json = serde_json::to_string(&session)?;
+        let previous_revision = session.revision;
+        session.status = ConnectorAuthorizationStatus::RepairRequired;
+        session.cleanup_required = true;
+        session.cleanup_completed_at = None;
+        session.revision = session.revision.checked_add(1).ok_or_else(|| {
+            EventStoreError::InvalidState("OAuth authorization revision overflowed".to_string())
+        })?;
+        let changed = self.conn.execute(
+            r#"UPDATE connector_authorization_sessions
+               SET session_json = ?2, status = ?3, revision = ?4,
+                   cleanup_required = 1, cleanup_completed_at = NULL,
+                   exchange_claim_id = NULL, exchange_claim_expires_at = NULL,
+                   updated_at = ?5
+               WHERE id = ?1 AND session_json = ?6 AND status = ?7 AND revision = ?8
+                 AND exchange_claim_id = ?9 AND exchange_claim_expires_at = ?10
+                 AND exchange_claim_expires_at > ?5"#,
+            params![
+                id.to_string(),
+                serde_json::to_string(&session)?,
+                serde_json::to_string(&ConnectorAuthorizationStatus::RepairRequired)?,
+                i64::try_from(session.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                previous_json,
+                serde_json::to_string(&ConnectorAuthorizationStatus::Exchanging)?,
+                i64::try_from(previous_revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                claim_id.to_string(),
+                claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization exchange repair raced".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn connector_authorization_cleanup_candidates(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> EventStoreResult<Vec<Uuid>> {
+        let limit = i64::try_from(limit.min(64)).map_err(|_| {
+            EventStoreError::InvalidState("OAuth cleanup limit is invalid".to_string())
+        })?;
+        let mut statement = self.conn.prepare(
+            r#"SELECT id FROM connector_authorization_sessions
+               WHERE cleanup_required = 1
+                  OR status = ?1
+                  OR EXISTS (
+                    SELECT 1 FROM connector_authorization_actions action
+                    WHERE action.authorization_id = connector_authorization_sessions.id
+                      AND action.action_status = 'preparing'
+                  )
+                  OR (status = ?2 AND
+                      (exchange_claim_expires_at IS NULL OR exchange_claim_expires_at <= ?4))
+                  OR (status = ?3 AND expires_at <= ?4)
+               ORDER BY updated_at ASC LIMIT ?5"#,
+        )?;
+        let candidates = statement
+            .query_map(
+                params![
+                    serde_json::to_string(&ConnectorAuthorizationStatus::Preparing)?,
+                    serde_json::to_string(&ConnectorAuthorizationStatus::Exchanging)?,
+                    serde_json::to_string(&ConnectorAuthorizationStatus::Pending)?,
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    limit,
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|id| Ok(Uuid::parse_str(&id?)?))
+            .collect();
+        candidates
+    }
+
+    pub(crate) fn begin_connector_authorization_cleanup(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationCleanupClaim> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let (
+            session_json,
+            status,
+            revision,
+            cleanup_required,
+            expires_at,
+            current_claim_expiry,
+            exchange_claim_expiry,
+            action_authority_handle_json,
+            action_status,
+        ) = transaction.query_row(
+            r#"SELECT session_json, status, revision, cleanup_required, expires_at,
+                          cleanup_claim_expires_at, exchange_claim_expires_at,
+                          (SELECT authority_handle_json FROM connector_authorization_actions
+                           WHERE authorization_id = connector_authorization_sessions.id
+                             AND action_status = 'preparing'),
+                          (SELECT action_status FROM connector_authorization_actions
+                           WHERE authorization_id = connector_authorization_sessions.id)
+               FROM connector_authorization_sessions WHERE id = ?1"#,
+            params![id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )?;
+        let mut session: ConnectorAuthorizationSession = serde_json::from_str(&session_json)?;
+        let projected_status: ConnectorAuthorizationStatus = serde_json::from_str(&status)?;
+        let projected_revision = u64::try_from(revision).map_err(|_| {
+            EventStoreError::InvalidState("OAuth authorization revision is invalid".to_string())
+        })?;
+        let projected_expiry = DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc);
+        let current_claim_expiry = current_claim_expiry
+            .as_deref()
+            .map(|value| DateTime::parse_from_rfc3339(value).map(|value| value.with_timezone(&Utc)))
+            .transpose()?;
+        let exchange_claim_expiry = exchange_claim_expiry
+            .as_deref()
+            .map(|value| DateTime::parse_from_rfc3339(value).map(|value| value.with_timezone(&Utc)))
+            .transpose()?;
+        let action_authority_handle = action_authority_handle_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+        let preparing_action_requires_cleanup =
+            matches!(action_status.as_deref(), Some("preparing"));
+        let active_action_expired =
+            matches!(action_status.as_deref(), Some("active")) && projected_expiry <= now;
+        let action_requires_cleanup = preparing_action_requires_cleanup || active_action_expired;
+        if session.id != id
+            || session.status != projected_status
+            || session.revision != projected_revision
+            || session.cleanup_required != (cleanup_required != 0)
+            || session.expires_at != projected_expiry
+            || session.status == ConnectorAuthorizationStatus::Completed
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization cleanup projection is invalid".to_string(),
+            ));
+        }
+        if current_claim_expiry.is_some_and(|expiry| expiry > now) {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization cleanup is already claimed".to_string(),
+            ));
+        }
+        if session.status == ConnectorAuthorizationStatus::Exchanging
+            && exchange_claim_expiry.is_some_and(|expiry| expiry > now)
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization exchange is still active".to_string(),
+            ));
+        }
+        let next_status = match session.status {
+            ConnectorAuthorizationStatus::Preparing => ConnectorAuthorizationStatus::Cancelled,
+            ConnectorAuthorizationStatus::Pending if preparing_action_requires_cleanup => {
+                ConnectorAuthorizationStatus::RepairRequired
+            }
+            ConnectorAuthorizationStatus::Pending if active_action_expired => {
+                ConnectorAuthorizationStatus::Cancelled
+            }
+            ConnectorAuthorizationStatus::Pending if session.expires_at <= now => {
+                ConnectorAuthorizationStatus::Cancelled
+            }
+            ConnectorAuthorizationStatus::Exchanging
+            | ConnectorAuthorizationStatus::RepairRequired => {
+                ConnectorAuthorizationStatus::RepairRequired
+            }
+            ConnectorAuthorizationStatus::Cancelled if session.cleanup_required => {
+                ConnectorAuthorizationStatus::Cancelled
+            }
+            _ if session.cleanup_required || action_requires_cleanup => session.status,
+            _ => {
+                return Err(EventStoreError::InvalidState(
+                    "OAuth authorization cleanup is not due".to_string(),
+                ))
+            }
+        };
+        if !session.cleanup_required || session.status != next_status {
+            session.status = next_status;
+            session.cleanup_required = true;
+            session.cleanup_completed_at = None;
+            session.revision = session.revision.checked_add(1).ok_or_else(|| {
+                EventStoreError::InvalidState("OAuth authorization revision overflowed".to_string())
+            })?;
+        }
+        let claim_id = Uuid::new_v4();
+        let claim_expires_at = now + Duration::minutes(5);
+        let changed = transaction.execute(
+            r#"UPDATE connector_authorization_sessions
+                   SET session_json = ?2, status = ?3, revision = ?4,
+                       cleanup_required = 1, cleanup_completed_at = NULL, updated_at = ?5,
+                       exchange_claim_id = NULL, exchange_claim_expires_at = NULL,
+                       cleanup_claim_id = ?9, cleanup_claim_expires_at = ?10
+                   WHERE id = ?1 AND session_json = ?6 AND status = ?7
+                     AND revision = ?8
+                     AND (cleanup_claim_expires_at IS NULL OR cleanup_claim_expires_at <= ?5)"#,
+            params![
+                id.to_string(),
+                serde_json::to_string(&session)?,
+                serde_json::to_string(&session.status)?,
+                i64::try_from(session.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                session_json,
+                status,
+                revision,
+                claim_id.to_string(),
+                claim_expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization cleanup raced".to_string(),
+            ));
+        }
+        transaction.execute(
+            r#"UPDATE connector_authorization_actions
+               SET action_status = 'cleanup_required', resolved_at = ?2
+               WHERE authorization_id = ?1 AND authority_handle_json IS NOT NULL
+                 AND action_status = 'preparing'"#,
+            params![
+                id.to_string(),
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true)
+            ],
+        )?;
+        transaction.execute(
+            r#"UPDATE connector_authorization_actions
+               SET action_status = 'consumed', resolved_at = ?2,
+                   resolved_intent = 'expired', authority_cleanup_required = 1
+               WHERE authorization_id = ?1 AND action_status = 'active'
+                 AND resolved_at IS NULL AND expires_at <= ?2"#,
+            params![
+                id.to_string(),
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true)
+            ],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM connector_authorization_actions
+               WHERE authorization_id = ?1 AND authority_handle_json IS NULL"#,
+            params![id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(ConnectorAuthorizationCleanupClaim {
+            session,
+            claim_id,
+            claim_expires_at,
+            action_authority_handle,
+        })
+    }
+
+    pub(crate) fn finish_connector_authorization_cleanup(
+        &self,
+        claim: &ConnectorAuthorizationCleanupClaim,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorAuthorizationSession> {
+        let current = self.connector_authorization_session(claim.session.id)?;
+        if current != claim.session
+            || !current.cleanup_required
+            || !matches!(
+                current.status,
+                ConnectorAuthorizationStatus::Cancelled
+                    | ConnectorAuthorizationStatus::RepairRequired
+            )
+        {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization cleanup is stale".to_string(),
+            ));
+        }
+        let previous_json = serde_json::to_string(&current)?;
+        let mut next = current;
+        next.cleanup_required = false;
+        next.cleanup_completed_at = Some(now);
+        next.revision = next.revision.checked_add(1).ok_or_else(|| {
+            EventStoreError::InvalidState("OAuth authorization revision overflowed".to_string())
+        })?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            r#"UPDATE connector_authorization_sessions
+               SET session_json = ?2, revision = ?3, cleanup_required = 0,
+                   cleanup_completed_at = ?4, updated_at = ?4,
+                   cleanup_claim_id = NULL, cleanup_claim_expires_at = NULL
+               WHERE id = ?1 AND session_json = ?5 AND revision = ?6
+                 AND cleanup_required = 1 AND cleanup_claim_id = ?7
+                 AND cleanup_claim_expires_at = ?8 AND cleanup_claim_expires_at > ?4"#,
+            params![
+                next.id.to_string(),
+                serde_json::to_string(&next)?,
+                i64::try_from(next.revision).map_err(|_| EventStoreError::InvalidState(
+                    "OAuth authorization revision is too large".to_string()
+                ))?,
+                now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                previous_json,
+                i64::try_from(claim.session.revision).map_err(
+                    |_| EventStoreError::InvalidState(
+                        "OAuth authorization revision is too large".to_string()
+                    )
+                )?,
+                claim.claim_id.to_string(),
+                claim
+                    .claim_expires_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "OAuth authorization cleanup raced".to_string(),
+            ));
+        }
+        transaction.execute(
+            r#"DELETE FROM connector_authorization_actions
+               WHERE authorization_id = ?1 AND action_status = 'cleanup_required'"#,
+            params![claim.session.id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    pub fn connector_sync_state(
+        &self,
+        account_id: Uuid,
+        capability: crate::kernel::connectors::ConnectorCapability,
+        stream_fingerprint: &str,
+    ) -> EventStoreResult<Option<ConnectorSyncState>> {
+        let json = self
+            .conn
+            .query_row(
+                r#"SELECT state_json FROM connector_sync_streams
+                   WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3"#,
+                params![
+                    account_id.to_string(),
+                    capability.contract_name(),
+                    stream_fingerprint,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        json.map(|value| {
+            let state = ConnectorSyncState::from_persistence_json(value)
+                .map_err(EventStoreError::InvalidState)?;
+            if state.account_id() != account_id
+                || state.capability() != capability
+                || state.stream_fingerprint() != stream_fingerprint
+            {
+                return Err(EventStoreError::InvalidState(
+                    "connector sync state identity is invalid".to_string(),
+                ));
+            }
+            Ok(state)
+        })
+        .transpose()
+    }
+
+    pub(crate) fn record_connector_sync_plan(
+        &self,
+        state: &ConnectorSyncState,
+        request_json: &str,
+    ) -> EventStoreResult<()> {
+        let plan = ConnectorSyncPlan::from_persistence_json(request_json)
+            .map_err(EventStoreError::InvalidState)?;
+        let capability_matches = matches!(
+            (&plan, state.capability()),
+            (
+                ConnectorSyncPlan::MailInbox { .. },
+                ConnectorCapability::MailSyncInbox
+            ) | (
+                ConnectorSyncPlan::CalendarRange { .. },
+                ConnectorCapability::CalendarSyncEvents
+            )
+        );
+        if !capability_matches {
+            return Err(EventStoreError::InvalidState(
+                "connector sync plan capability is invalid".to_string(),
+            ));
+        }
+        let canonical_json = plan
+            .persistence_json()
+            .map_err(EventStoreError::InvalidState)?;
+        let state_json = state
+            .persistence_json()
+            .map_err(EventStoreError::InvalidState)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        ensure_connector_sync_account_active(&transaction, state)?;
+        let existing = transaction
+            .query_row(
+                r#"SELECT request_json FROM connector_sync_streams
+                   WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                     AND revision = ?4 AND state_json = ?5"#,
+                params![
+                    state.account_id().to_string(),
+                    state.capability().contract_name(),
+                    state.stream_fingerprint(),
+                    i64::try_from(state.revision()).map_err(|_| EventStoreError::InvalidState(
+                        "connector sync revision is too large".to_string()
+                    ))?,
+                    state_json,
+                ],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        match existing {
+            Some(Some(value)) if constant_time_text_eq(&value, &canonical_json) => {}
+            Some(None) => {
+                let changed = transaction.execute(
+                    r#"UPDATE connector_sync_streams SET request_json = ?6
+                       WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                         AND revision = ?4 AND state_json = ?5 AND request_json IS NULL"#,
+                    params![
+                        state.account_id().to_string(),
+                        state.capability().contract_name(),
+                        state.stream_fingerprint(),
+                        i64::try_from(state.revision()).map_err(|_| {
+                            EventStoreError::InvalidState(
+                                "connector sync revision is too large".to_string(),
+                            )
+                        })?,
+                        state_json,
+                        canonical_json,
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(EventStoreError::InvalidState(
+                        "connector sync plan raced with another worker".to_string(),
+                    ));
+                }
+            }
+            Some(Some(_)) => {
+                return Err(EventStoreError::InvalidState(
+                    "connector sync plan changed for an existing stream".to_string(),
+                ));
+            }
+            None if state.revision() == 0 => {
+                let inserted = transaction.execute(
+                    r#"INSERT OR IGNORE INTO connector_sync_streams
+                       (account_id, capability, stream_fingerprint, state_json, revision,
+                        request_json, updated_at)
+                       VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)"#,
+                    params![
+                        state.account_id().to_string(),
+                        state.capability().contract_name(),
+                        state.stream_fingerprint(),
+                        state_json,
+                        canonical_json,
+                        state
+                            .updated_at()
+                            .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    ],
+                )?;
+                if inserted != 1 {
+                    return Err(EventStoreError::InvalidState(
+                        "connector sync plan raced with another worker".to_string(),
+                    ));
+                }
+            }
+            None => {
+                return Err(EventStoreError::InvalidState(
+                    "connector sync state changed before its plan was recorded".to_string(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn connector_account_sync_health_snapshot(
+        &self,
+        account: &ConnectorAccount,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorSyncHealthSnapshot> {
+        let generation = self.connector_account_sync_generation(account)?;
+        let mut statement = self.conn.prepare(
+            r#"SELECT state_json, last_successful_at FROM connector_sync_streams
+               WHERE account_id = ?1 ORDER BY updated_at DESC"#,
+        )?;
+        let rows = statement.query_map(params![account.id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut snapshot = ConnectorSyncHealthSnapshot::default();
+        for row in rows {
+            let Ok((value, last_successful_at)) = row else {
+                continue;
+            };
+            let Ok(state) = ConnectorSyncState::from_persistence_json(value) else {
+                continue;
+            };
+            if state.account_id() != account.id || state.account_generation() != generation {
+                continue;
+            }
+            snapshot.stream_count = snapshot.stream_count.saturating_add(1);
+            snapshot.any_stopped |= state.stopped();
+            snapshot.any_delayed |= state
+                .retry_state()
+                .is_some_and(|retry| retry.retry_at > now);
+            if let Some(last_successful_at) = last_successful_at {
+                let parsed = DateTime::parse_from_rfc3339(&last_successful_at)?.with_timezone(&Utc);
+                snapshot.last_successful_sync_at = Some(
+                    snapshot
+                        .last_successful_sync_at
+                        .map_or(parsed, |current| current.max(parsed)),
+                );
+            }
+        }
+        Ok(snapshot)
+    }
+
+    pub fn commit_connector_sync_page<T>(
+        &self,
+        state: &ConnectorSyncState,
+        page: &ConnectorSyncPage<T>,
+        remote_ref: impl Fn(&T) -> &str,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorSyncState>
+    where
+        T: serde::Serialize,
+    {
+        let transaction = self.conn.unchecked_transaction()?;
+        let next = self.commit_connector_sync_page_in_transaction(
+            &transaction,
+            state,
+            page,
+            &remote_ref,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    fn commit_connector_sync_page_in_transaction<T, F>(
+        &self,
+        transaction: &Transaction<'_>,
+        state: &ConnectorSyncState,
+        page: &ConnectorSyncPage<T>,
+        remote_ref: &F,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorSyncState>
+    where
+        T: serde::Serialize,
+        F: Fn(&T) -> &str,
+    {
+        if page.changes().len() > 100 {
+            return Err(EventStoreError::InvalidState(
+                "connector sync page exceeded the shared item budget".to_string(),
+            ));
+        }
+        let next = state
+            .advance(page, now)
+            .map_err(EventStoreError::InvalidState)?;
+        let state_json = next
+            .persistence_json()
+            .map_err(EventStoreError::InvalidState)?;
+        let receipt = ConnectorSyncReceipt {
+            account_id: next.account_id(),
+            account_generation: next.account_generation(),
+            capability: next.capability(),
+            stream_fingerprint: next.stream_fingerprint().to_string(),
+            change_count: page.changes().len(),
+            has_resume_page: next.has_resume_page(),
+            has_committed_delta: next.has_committed_delta(),
+            revision: next.revision(),
+            committed_at: now,
+        };
+        let event = KernelEvent::new(
+            "connector.sync_page.committed",
+            &serde_json::json!({
+                "kind": "read_sync",
+                "capability": match next.capability() {
+                    ConnectorCapability::MailSyncInbox => "mail",
+                    ConnectorCapability::CalendarSyncEvents => "calendar",
+                    _ => "unsupported",
+                },
+                "change_count": receipt.change_count,
+                "has_more": receipt.has_resume_page,
+                "committed_at": receipt.committed_at,
+            }),
+        )?;
+        ensure_connector_sync_account_active(transaction, &next)?;
+        for change in page.changes() {
+            let (remote_ref, item_json, deleted) = match change {
+                ConnectorSyncChange::Upsert(item) => (
+                    remote_ref(item).trim().to_string(),
+                    Some(serde_json::to_string(item)?),
+                    0,
+                ),
+                ConnectorSyncChange::Deleted { remote_ref } => {
+                    (remote_ref.trim().to_string(), None, 1)
+                }
+            };
+            if remote_ref.is_empty() || remote_ref.chars().count() > 1024 {
+                return Err(EventStoreError::InvalidState(
+                    "connector sync remote reference is invalid".to_string(),
+                ));
+            }
+            if item_json
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_SYNC_PROJECTION_ITEM_BYTES)
+            {
+                return Err(EventStoreError::InvalidState(
+                    "connector sync projection item exceeded the byte budget".to_string(),
+                ));
+            }
+            transaction.execute(
+                r#"INSERT INTO connector_sync_projection
+                   (account_id, capability, stream_fingerprint, remote_ref, item_json, deleted, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                   ON CONFLICT(account_id, capability, stream_fingerprint, remote_ref)
+                   DO UPDATE SET item_json = excluded.item_json,
+                                 deleted = excluded.deleted,
+                                 updated_at = excluded.updated_at"#,
+                params![
+                    next.account_id().to_string(),
+                    next.capability().contract_name(),
+                    next.stream_fingerprint(),
+                    remote_ref,
+                    item_json,
+                    deleted,
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )?;
+        }
+        transaction.execute(
+            r#"DELETE FROM connector_sync_projection
+               WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                 AND rowid NOT IN (
+                   SELECT rowid FROM connector_sync_projection
+                   WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                   ORDER BY updated_at DESC, rowid DESC
+                   LIMIT ?4
+                 )"#,
+            params![
+                next.account_id().to_string(),
+                next.capability().contract_name(),
+                next.stream_fingerprint(),
+                i64::try_from(MAX_SYNC_PROJECTION_ITEMS_PER_STREAM).map_err(|_| {
+                    EventStoreError::InvalidState(
+                        "connector sync projection budget is invalid".to_string(),
+                    )
+                })?,
+            ],
+        )?;
+        let changed = if state.revision() == 0 {
+            let updated = transaction.execute(
+                r#"UPDATE connector_sync_streams
+                   SET state_json = ?4, revision = ?5, updated_at = ?6,
+                       last_successful_at = ?6
+                   WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                     AND revision = 0 AND request_json IS NOT NULL"#,
+                params![
+                    next.account_id().to_string(),
+                    next.capability().contract_name(),
+                    next.stream_fingerprint(),
+                    state_json,
+                    i64::try_from(next.revision()).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector sync revision is too large".to_string(),
+                        )
+                    })?,
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )?;
+            if updated == 1 {
+                updated
+            } else {
+                transaction.execute(
+                    r#"INSERT OR IGNORE INTO connector_sync_streams
+                       (account_id, capability, stream_fingerprint, state_json, revision,
+                        last_successful_at, updated_at)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)"#,
+                    params![
+                        next.account_id().to_string(),
+                        next.capability().contract_name(),
+                        next.stream_fingerprint(),
+                        state_json,
+                        i64::try_from(next.revision()).map_err(|_| {
+                            EventStoreError::InvalidState(
+                                "connector sync revision is too large".to_string(),
+                            )
+                        })?,
+                        now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    ],
+                )?
+            }
+        } else {
+            transaction.execute(
+                r#"UPDATE connector_sync_streams
+                   SET state_json = ?4, revision = ?5, updated_at = ?6,
+                       last_successful_at = ?6
+                   WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                     AND revision = ?7"#,
+                params![
+                    next.account_id().to_string(),
+                    next.capability().contract_name(),
+                    next.stream_fingerprint(),
+                    state_json,
+                    i64::try_from(next.revision()).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector sync revision is too large".to_string(),
+                        )
+                    })?,
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    i64::try_from(state.revision()).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector sync revision is too large".to_string(),
+                        )
+                    })?,
+                ],
+            )?
+        };
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector sync page raced with another worker".to_string(),
+            ));
+        }
+        prune_connector_sync_retention(transaction, next.account_id(), now)?;
+        transaction.execute(
+            r#"INSERT INTO kernel_events (id, event_type, payload_json, created_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                event.id.to_string(),
+                event.event_type,
+                event.payload_json,
+                event.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        Ok(next)
+    }
+
+    pub fn connector_sync_projection_summaries(
+        &self,
+        account_id: Uuid,
+        capability: crate::kernel::connectors::ConnectorCapability,
+        stream_fingerprint: &str,
+    ) -> EventStoreResult<Vec<ConnectorSyncProjectionSummary>> {
+        let mut statement = self.conn.prepare(
+            r#"SELECT remote_ref, deleted, updated_at
+               FROM connector_sync_projection
+               WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+               ORDER BY remote_ref ASC"#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                account_id.to_string(),
+                capability.contract_name(),
+                stream_fingerprint,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            let (remote_ref, deleted, updated_at) = row?;
+            summaries.push(ConnectorSyncProjectionSummary {
+                remote_ref,
+                deleted: deleted != 0,
+                updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
+            });
+        }
+        Ok(summaries)
+    }
+
+    pub fn compare_and_swap_connector_sync_state(
+        &self,
+        current: &ConnectorSyncState,
+        next: &ConnectorSyncState,
+        reason: &str,
+    ) -> EventStoreResult<()> {
+        if current.account_id() != next.account_id()
+            || current.account_generation() != next.account_generation()
+            || current.capability() != next.capability()
+            || current.stream_fingerprint() != next.stream_fingerprint()
+            || next.revision() != current.revision().saturating_add(1)
+            || !matches!(
+                reason,
+                "cursor_rebuilt" | "retry_scheduled" | "retry_exhausted"
+            )
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector sync state transition is invalid".to_string(),
+            ));
+        }
+        let state_json = next
+            .persistence_json()
+            .map_err(EventStoreError::InvalidState)?;
+        let receipt = ConnectorSyncStateReceipt {
+            account_id: next.account_id(),
+            account_generation: next.account_generation(),
+            capability: next.capability(),
+            stream_fingerprint: next.stream_fingerprint().to_string(),
+            reason: reason.to_string(),
+            has_resume_page: next.has_resume_page(),
+            has_committed_delta: next.has_committed_delta(),
+            retry_at: next.retry_state().map(|retry| retry.retry_at),
+            stopped: next.stopped(),
+            rebuild_attempt: next.rebuild_attempt(),
+            revision: next.revision(),
+            changed_at: next.updated_at(),
+        };
+        let event = KernelEvent::new(
+            "connector.sync_state.changed",
+            &serde_json::json!({
+                "kind": "read_sync",
+                "capability": match next.capability() {
+                    ConnectorCapability::MailSyncInbox => "mail",
+                    ConnectorCapability::CalendarSyncEvents => "calendar",
+                    _ => "unsupported",
+                },
+                "reason": receipt.reason,
+                "stopped": receipt.stopped,
+                "changed_at": receipt.changed_at,
+            }),
+        )?;
+        let transaction = self.conn.unchecked_transaction()?;
+        ensure_connector_sync_account_active(&transaction, next)?;
+        let changed = if current.revision() == 0 {
+            let updated = transaction.execute(
+                r#"UPDATE connector_sync_streams
+                   SET state_json = ?4, revision = ?5, updated_at = ?6
+                   WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                     AND revision = 0 AND request_json IS NOT NULL"#,
+                params![
+                    next.account_id().to_string(),
+                    next.capability().contract_name(),
+                    next.stream_fingerprint(),
+                    state_json,
+                    i64::try_from(next.revision()).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector sync revision is too large".to_string(),
+                        )
+                    })?,
+                    next.updated_at()
+                        .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )?;
+            if updated == 1 {
+                updated
+            } else {
+                transaction.execute(
+                    r#"INSERT OR IGNORE INTO connector_sync_streams
+                       (account_id, capability, stream_fingerprint, state_json, revision, updated_at)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                    params![
+                        next.account_id().to_string(),
+                        next.capability().contract_name(),
+                        next.stream_fingerprint(),
+                        state_json,
+                        i64::try_from(next.revision()).map_err(|_| {
+                            EventStoreError::InvalidState(
+                                "connector sync revision is too large".to_string(),
+                            )
+                        })?,
+                        next.updated_at()
+                            .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    ],
+                )?
+            }
+        } else {
+            transaction.execute(
+                r#"UPDATE connector_sync_streams
+                   SET state_json = ?4, revision = ?5, updated_at = ?6
+                   WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3
+                     AND revision = ?7"#,
+                params![
+                    next.account_id().to_string(),
+                    next.capability().contract_name(),
+                    next.stream_fingerprint(),
+                    state_json,
+                    i64::try_from(next.revision()).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector sync revision is too large".to_string(),
+                        )
+                    })?,
+                    next.updated_at()
+                        .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    i64::try_from(current.revision()).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector sync revision is too large".to_string(),
+                        )
+                    })?,
+                ],
+            )?
+        };
+        if changed != 1 {
+            return Err(EventStoreError::InvalidState(
+                "connector sync state raced with another worker".to_string(),
+            ));
+        }
+        if reason == "cursor_rebuilt" {
+            transaction.execute(
+                r#"DELETE FROM connector_sync_projection
+                   WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3"#,
+                params![
+                    next.account_id().to_string(),
+                    next.capability().contract_name(),
+                    next.stream_fingerprint(),
+                ],
+            )?;
+        }
+        prune_connector_sync_retention(&transaction, next.account_id(), next.updated_at())?;
+        transaction.execute(
+            r#"INSERT INTO kernel_events (id, event_type, payload_json, created_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                event.id.to_string(),
+                event.event_type,
+                event.payload_json,
+                event.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn append(&self, event: &KernelEvent) -> EventStoreResult<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        Self::insert_kernel_event(&transaction, event)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -224,9 +9970,12 @@ impl EventStore {
             let parent_id = start.parent_run_id.ok_or_else(|| {
                 EventStoreError::InvalidState("subagent run requires a parent run".to_string())
             })?;
-            let parent = starts.iter().find(|record| record.id == parent_id).ok_or_else(|| {
-                EventStoreError::InvalidState("subagent parent run does not exist".to_string())
-            })?;
+            let parent = starts
+                .iter()
+                .find(|record| record.id == parent_id)
+                .ok_or_else(|| {
+                    EventStoreError::InvalidState("subagent parent run does not exist".to_string())
+                })?;
             if parent.role != AgentRunRole::Parent || parent.parent_run_id.is_some() {
                 return Err(EventStoreError::InvalidState(
                     "recursive subagent delegation is not supported".to_string(),
@@ -277,13 +10026,19 @@ impl EventStore {
                 "only a parent run may create subagents".to_string(),
             ));
         }
-        if !matches!(parent.status, AgentRunStatus::Queued | AgentRunStatus::Running) {
+        if !matches!(
+            parent.status,
+            AgentRunStatus::Queued | AgentRunStatus::Running
+        ) {
             return Err(EventStoreError::InvalidState(format!(
                 "parent run cannot create subagents from status {:?}",
                 parent.status
             )));
         }
-        if records.iter().any(|record| record.parent_run_id == Some(parent_run_id)) {
+        if records
+            .iter()
+            .any(|record| record.parent_run_id == Some(parent_run_id))
+        {
             return Err(EventStoreError::InvalidState(
                 "parent run already has a subagent plan".to_string(),
             ));
@@ -311,7 +10066,10 @@ impl EventStore {
         for start in &starts {
             self.append_agent_run_start(start)?;
         }
-        let child_ids = starts.iter().map(|start| start.id).collect::<std::collections::HashSet<_>>();
+        let child_ids = starts
+            .iter()
+            .map(|start| start.id)
+            .collect::<std::collections::HashSet<_>>();
         Ok(self
             .list_agent_run_records()?
             .into_iter()
@@ -336,7 +10094,9 @@ impl EventStore {
         }
         let target_ids = records
             .iter()
-            .filter(|record| record.id == parent_run_id || record.parent_run_id == Some(parent_run_id))
+            .filter(|record| {
+                record.id == parent_run_id || record.parent_run_id == Some(parent_run_id)
+            })
             .filter(|record| {
                 !matches!(
                     record.status,
@@ -3018,14 +12778,18 @@ impl EventStore {
     pub fn list_capability_access_requests(
         &self,
     ) -> EventStoreResult<Vec<CapabilityAccessRequest>> {
-        let events = self.list_by_type(CAPABILITY_ACCESS_REQUESTED_EVENT, 200)?;
-        events
+        let mut statement = self
+            .conn
+            .prepare("SELECT request_json FROM capability_access_state")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut requests = rows
             .into_iter()
-            .map(|event| {
-                serde_json::from_str::<CapabilityAccessRequest>(&event.payload_json)
-                    .map_err(Into::into)
-            })
-            .collect()
+            .map(|json| serde_json::from_str::<CapabilityAccessRequest>(&json).map_err(Into::into))
+            .collect::<EventStoreResult<Vec<_>>>()?;
+        requests.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        Ok(requests)
     }
 
     pub fn append_permission_resolution(
@@ -3037,50 +12801,73 @@ impl EventStore {
     }
 
     pub fn list_permission_resolutions(&self) -> EventStoreResult<Vec<PermissionResolution>> {
-        let events = self.list_by_type(PERMISSION_RESOLUTION_RECORDED_EVENT, 200)?;
-        events
+        let mut statement = self.conn.prepare(
+            r#"SELECT resolution_json FROM capability_access_state
+               WHERE resolution_json IS NOT NULL"#,
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut resolutions = rows
             .into_iter()
-            .map(|event| {
-                serde_json::from_str::<PermissionResolution>(&event.payload_json)
-                    .map_err(Into::into)
-            })
-            .collect()
+            .map(|json| serde_json::from_str::<PermissionResolution>(&json).map_err(Into::into))
+            .collect::<EventStoreResult<Vec<_>>>()?;
+        resolutions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        Ok(resolutions)
     }
 
     pub fn list_capability_access_records(&self) -> EventStoreResult<Vec<CapabilityAccessRecord>> {
-        let mut latest_resolution_by_request_id = std::collections::HashMap::new();
-        for resolution in self.list_permission_resolutions()? {
-            latest_resolution_by_request_id
-                .entry(resolution.request_id)
-                .or_insert(resolution);
-        }
-        let invocations = self.list_capability_invocations()?;
+        let mut statement = self.conn.prepare(
+            r#"SELECT request_id FROM connector_approval_consumptions
+               UNION SELECT request_id FROM connector_attachment_approval_consumptions
+               UNION SELECT request_id FROM capability_approval_consumptions"#,
+        )?;
+        let consumptions = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .filter_map(|value| Uuid::parse_str(&value).ok())
+            .collect::<std::collections::HashSet<_>>();
+        drop(statement);
+        let mut statement = self.conn.prepare(
+            r#"SELECT request_json, resolution_json, effective_status, row_revision
+               FROM capability_access_state ORDER BY created_at DESC, rowid DESC"#,
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(request_json, resolution_json, effective_status_json, projection_revision)| {
+                    let request: CapabilityAccessRequest = serde_json::from_str(&request_json)?;
+                    let resolution = resolution_json
+                        .map(|json| serde_json::from_str::<PermissionResolution>(&json))
+                        .transpose()?;
+                    let effective_status: CapabilityAccessStatus =
+                        serde_json::from_str(&effective_status_json)?;
+                    let grant_state = capability_grant_state(
+                        &request,
+                        resolution.as_ref(),
+                        effective_status,
+                        &[],
+                        &consumptions,
+                    );
 
-        self.list_capability_access_requests()?
-            .into_iter()
-            .map(|request| {
-                let resolution = latest_resolution_by_request_id
-                    .remove(&request.id)
-                    .map(|resolution| resolution.to_owned());
-                let effective_status = match &resolution {
-                    Some(resolution) if resolution.approved => CapabilityAccessStatus::Approved,
-                    Some(_) => CapabilityAccessStatus::Rejected,
-                    None => request.status,
-                };
-                let grant_state = capability_grant_state(
-                    &request,
-                    resolution.as_ref(),
-                    effective_status,
-                    &invocations,
-                );
-
-                Ok(CapabilityAccessRecord {
-                    request,
-                    resolution,
-                    effective_status,
-                    grant_state,
-                })
-            })
+                    Ok(CapabilityAccessRecord {
+                        request,
+                        resolution,
+                        effective_status,
+                        projection_revision,
+                        grant_state,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -3126,13 +12913,14 @@ impl EventStore {
         approved: bool,
         note: String,
     ) -> EventStoreResult<PermissionResolution> {
-        let record = self
-            .list_capability_access_records()?
-            .into_iter()
-            .find(|record| record.request.id == request_id)
-            .ok_or_else(|| {
-                EventStoreError::NotFound("capability access request does not exist".to_string())
-            })?;
+        let record = self.capability_access_record_by_id(request_id)?;
+
+        if record.request.capability == CapabilityKind::ConnectorAttachmentRead {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval requires the dedicated exact-preview resolver"
+                    .to_string(),
+            ));
+        }
 
         if record.resolution.is_some() {
             return Err(EventStoreError::InvalidState(
@@ -3146,7 +12934,52 @@ impl EventStore {
             ));
         }
 
-        let resolution = PermissionResolution::new(request_id, approved, note);
+        let mut resolution = PermissionResolution::new(request_id, approved, note);
+        resolution.expected_request_revision = Some(record.projection_revision);
+        self.append_permission_resolution(&resolution)?;
+        Ok(resolution)
+    }
+
+    #[cfg(test)]
+    fn resolve_connector_attachment_access_request(
+        &self,
+        request_id: Uuid,
+        approved: bool,
+        note: String,
+        expected_request_revision: u64,
+        expected_preview_revision: u32,
+        expected_preview_hash: &str,
+    ) -> EventStoreResult<PermissionResolution> {
+        let record = self.capability_access_record_by_id(request_id)?;
+        if record.request.capability != CapabilityKind::ConnectorAttachmentRead
+            || record.effective_status != CapabilityAccessStatus::PendingApproval
+            || record.resolution.is_some()
+            || record.projection_revision != expected_request_revision
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval is stale or unavailable".to_string(),
+            ));
+        }
+        let scope = record.request.exact_tool.as_ref().ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "connector attachment approval has no exact preview evidence".to_string(),
+            )
+        })?;
+        if scope.preview_revision != expected_preview_revision
+            || scope.preview_hash != expected_preview_hash
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector attachment approval preview changed".to_string(),
+            ));
+        }
+        let resolution = PermissionResolution::new_exact(
+            request_id,
+            approved,
+            note,
+            expected_request_revision,
+            scope,
+        )
+        .map_err(EventStoreError::InvalidState)?;
         self.append_permission_resolution(&resolution)?;
         Ok(resolution)
     }
@@ -3181,16 +13014,87 @@ impl EventStore {
     }
 
     pub fn list_tool_invocations(&self) -> EventStoreResult<Vec<ToolInvocationRecord>> {
-        let events = self.list_by_type(TOOL_INVOCATION_RECORDED_EVENT, 500)?;
-        let mut seen = std::collections::HashSet::new();
-        let mut invocations = Vec::new();
-        for event in events {
-            let invocation = serde_json::from_str::<ToolInvocationRecord>(&event.payload_json)?;
-            if seen.insert(invocation.id) {
-                invocations.push(invocation);
-            }
-        }
-        Ok(invocations)
+        let mut statement = self.conn.prepare(
+            r#"SELECT invocation_json FROM tool_invocation_state
+               ORDER BY updated_at DESC, rowid DESC LIMIT 500"#,
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|json| serde_json::from_str::<ToolInvocationRecord>(&json).map_err(Into::into))
+            .collect()
+    }
+
+    fn tool_invocation_by_id(&self, invocation_id: Uuid) -> EventStoreResult<ToolInvocationRecord> {
+        let json = self
+            .conn
+            .query_row(
+                "SELECT invocation_json FROM tool_invocation_state WHERE id = ?1",
+                params![invocation_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| EventStoreError::NotFound("connector attachment tool".to_string()))?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    fn capability_access_record_by_id(
+        &self,
+        request_id: Uuid,
+    ) -> EventStoreResult<CapabilityAccessRecord> {
+        let (request_json, resolution_json, effective_status_json, projection_revision) = self
+            .conn
+            .query_row(
+                r#"SELECT request_json, resolution_json, effective_status, row_revision
+                   FROM capability_access_state WHERE request_id = ?1"#,
+                params![request_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                EventStoreError::NotFound("connector attachment approval".to_string())
+            })?;
+        let request: CapabilityAccessRequest = serde_json::from_str(&request_json)?;
+        let resolution = resolution_json
+            .map(|json| serde_json::from_str::<PermissionResolution>(&json))
+            .transpose()?;
+        let effective_status: CapabilityAccessStatus =
+            serde_json::from_str(&effective_status_json)?;
+        let consumed: i64 = self.conn.query_row(
+            r#"SELECT EXISTS (
+                 SELECT 1 FROM connector_approval_consumptions WHERE request_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM connector_attachment_approval_consumptions WHERE request_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM capability_approval_consumptions WHERE request_id = ?1
+               )"#,
+            params![request_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let grant_state = if effective_status != CapabilityAccessStatus::Approved {
+            CapabilityGrantState::NotGranted
+        } else if consumed == 1 {
+            CapabilityGrantState::OneShotConsumed
+        } else if capability_risk(request.capability) == RiskLevel::Critical {
+            CapabilityGrantState::OneShotAvailable
+        } else {
+            CapabilityGrantState::Reusable
+        };
+        Ok(CapabilityAccessRecord {
+            request,
+            resolution,
+            effective_status,
+            projection_revision,
+            grant_state,
+        })
     }
 
     pub fn append_operations_briefing_run(
@@ -3276,6 +13180,45 @@ impl EventStore {
 
         Ok(events)
     }
+}
+
+fn due_automation_window(
+    transaction: &rusqlite::Transaction<'_>,
+    definition: &AutomationDefinition,
+    now: DateTime<Utc>,
+) -> EventStoreResult<Option<DateTime<Utc>>> {
+    let last_scheduled = transaction
+        .query_row(
+            "SELECT scheduled_for FROM automation_runs WHERE definition_id = ?1 ORDER BY scheduled_for DESC LIMIT 1",
+            params![definition.id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|value| DateTime::parse_from_rfc3339(&value).map(|time| time.with_timezone(&Utc)))
+        .transpose()?;
+    let next = match (&definition.schedule, last_scheduled) {
+        (crate::kernel::automation::AutomationSchedule::Once { run_at }, None) => Some(*run_at),
+        (crate::kernel::automation::AutomationSchedule::Once { .. }, Some(_)) => None,
+        (_, last) => {
+            let mut candidate = next_scheduled_at(
+                definition,
+                last.unwrap_or(definition.created_at - chrono::Duration::nanoseconds(1)),
+            )
+            .map_err(EventStoreError::InvalidState)?;
+            for _ in 0..5_000 {
+                let Some(current) = candidate else { break };
+                let following = next_scheduled_at(definition, current)
+                    .map_err(EventStoreError::InvalidState)?;
+                if following.is_some_and(|value| value <= now) {
+                    candidate = following;
+                } else {
+                    break;
+                }
+            }
+            candidate
+        }
+    };
+    Ok(next.filter(|scheduled_for| *scheduled_for <= now))
 }
 
 fn push_unique_link(
@@ -3408,6 +13351,7 @@ fn capability_grant_state(
     resolution: Option<&PermissionResolution>,
     effective_status: CapabilityAccessStatus,
     invocations: &[CapabilityInvocation],
+    connector_consumptions: &std::collections::HashSet<Uuid>,
 ) -> CapabilityGrantState {
     if effective_status != CapabilityAccessStatus::Approved {
         return CapabilityGrantState::NotGranted;
@@ -3424,18 +13368,19 @@ fn capability_grant_state(
         return CapabilityGrantState::NotGranted;
     };
 
-    let consumed = invocations.iter().any(|invocation| {
-        if invocation.capability != request.capability
-            || invocation.created_at < resolution.created_at
-        {
-            return false;
-        }
+    let consumed = connector_consumptions.contains(&request.id)
+        || invocations.iter().any(|invocation| {
+            if invocation.capability != request.capability
+                || invocation.created_at < resolution.created_at
+            {
+                return false;
+            }
 
-        match invocation.approval_request_id {
-            Some(approval_request_id) => approval_request_id == request.id,
-            None => false,
-        }
-    });
+            match invocation.approval_request_id {
+                Some(approval_request_id) => approval_request_id == request.id,
+                None => false,
+            }
+        });
 
     if consumed {
         CapabilityGrantState::OneShotConsumed
@@ -3446,11 +13391,617 @@ fn capability_grant_state(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, SecondsFormat, Utc};
+    use rusqlite::{params, Connection};
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{EventStore, EventStoreError, MEMORY_RECORD_LINKED_EVENT};
+    use super::{
+        ConnectorAttachmentCleanupClaim, EventStore, EventStoreError,
+        CONNECTOR_RECOVERY_RETRY_QUEUED_EVENT, MEMORY_RECORD_LINKED_EVENT,
+    };
+    use crate::kernel::automation::{
+        AutomationCheckpoint, AutomationDefinition, AutomationDefinitionStatus,
+        AutomationRunStatus, AutomationSchedule, MissedRunPolicy, ReviewQueueItem,
+        ReviewQueueItemStatus,
+    };
+    use crate::kernel::connectors::landing::ConnectorAttachmentMetadata;
+
+    #[test]
+    fn durable_automation_claim_is_deduplicated_across_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("automation.sqlite3");
+        let definition = AutomationDefinition::once(
+            "Prepare a durable result.".to_string(),
+            "Asia/Shanghai".to_string(),
+            Utc::now() - Duration::minutes(1),
+        )
+        .expect("definition is valid");
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            store
+                .upsert_automation_definition(&definition)
+                .expect("definition persists");
+            assert!(store
+                .claim_due_automation_run(definition.id, Utc::now(), "worker-1".to_string())
+                .expect("claim succeeds")
+                .is_some());
+        }
+        let store = EventStore::open(&path).expect("store reopens");
+        assert!(store
+            .claim_due_automation_run(definition.id, Utc::now(), "worker-2".to_string())
+            .expect("duplicate is safe")
+            .is_none());
+        assert_eq!(store.list_automation_runs().expect("runs load").len(), 1);
+    }
+
+    #[test]
+    fn paused_automation_is_not_claimed() {
+        let store = EventStore::open_memory().expect("store opens");
+        let definition = AutomationDefinition::once(
+            "Prepare a reviewable result.".to_string(),
+            "Asia/Shanghai".to_string(),
+            Utc::now() - Duration::minutes(1),
+        )
+        .expect("definition is valid");
+        store
+            .upsert_automation_definition(&definition)
+            .expect("definition persists");
+        store
+            .set_automation_definition_status(
+                definition.id,
+                AutomationDefinitionStatus::Paused,
+                Utc::now(),
+            )
+            .expect("pause persists");
+        assert!(store
+            .claim_due_automation_run(definition.id, Utc::now(), "worker".to_string())
+            .expect("paused claim is safe")
+            .is_none());
+    }
+
+    #[test]
+    fn waiting_automation_states_are_not_retryable_failures() {
+        let store = EventStore::open_memory().expect("store opens");
+        let definition = AutomationDefinition::once(
+            "Create a result for review.".to_string(),
+            "Asia/Shanghai".to_string(),
+            Utc::now() - Duration::minutes(1),
+        )
+        .expect("definition is valid");
+        store
+            .upsert_automation_definition(&definition)
+            .expect("definition persists");
+        let run = store
+            .claim_due_automation_run(definition.id, Utc::now(), "worker".to_string())
+            .expect("claim succeeds")
+            .expect("run is due");
+        let running = store
+            .transition_automation_run(
+                run.id,
+                AutomationRunStatus::Running,
+                Some(Uuid::new_v4()),
+                None,
+                Utc::now(),
+            )
+            .expect("run starts");
+        let waiting = store
+            .transition_automation_run(
+                running.id,
+                AutomationRunStatus::WaitingApproval,
+                None,
+                None,
+                Utc::now(),
+            )
+            .expect("run waits");
+        assert_eq!(waiting.status, AutomationRunStatus::WaitingApproval);
+        assert!(store
+            .transition_automation_run(
+                waiting.id,
+                AutomationRunStatus::Queued,
+                None,
+                None,
+                Utc::now()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn retry_limit_and_checkpoint_survive_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("automation-retry.sqlite3");
+        let mut definition = AutomationDefinition::once(
+            "Retry a bounded local task.".to_string(),
+            "Asia/Shanghai".to_string(),
+            Utc::now() - Duration::minutes(1),
+        )
+        .expect("definition is valid");
+        definition.retry_limit = 1;
+        let run_id;
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            store
+                .upsert_automation_definition(&definition)
+                .expect("definition persists");
+            let run = store
+                .claim_due_automation_run(definition.id, Utc::now(), "worker".to_string())
+                .expect("claim succeeds")
+                .expect("run exists");
+            run_id = run.id;
+            store
+                .transition_automation_run(
+                    run.id,
+                    AutomationRunStatus::Running,
+                    None,
+                    None,
+                    Utc::now(),
+                )
+                .expect("run starts");
+            store
+                .transition_automation_run(
+                    run.id,
+                    AutomationRunStatus::Failed,
+                    None,
+                    Some("temporary failure".to_string()),
+                    Utc::now(),
+                )
+                .expect("run fails");
+            store
+                .transition_automation_run(
+                    run.id,
+                    AutomationRunStatus::Queued,
+                    None,
+                    None,
+                    Utc::now(),
+                )
+                .expect("one retry queues");
+            store
+                .upsert_automation_checkpoint(&AutomationCheckpoint {
+                    automation_run_id: run.id,
+                    dedup_key: run.trigger_window_key,
+                    tool_invocation_id: None,
+                    evidence_ref: Some("evidence://bounded".to_string()),
+                    recorded_at: Utc::now(),
+                })
+                .expect("checkpoint persists");
+        }
+        let store = EventStore::open(&path).expect("store reopens");
+        let run = store.automation_run(run_id).expect("run reloads");
+        assert_eq!(run.attempt, 1);
+        store
+            .transition_automation_run(run.id, AutomationRunStatus::Running, None, None, Utc::now())
+            .expect("retry starts");
+        store
+            .transition_automation_run(
+                run.id,
+                AutomationRunStatus::Failed,
+                None,
+                Some("still failing".to_string()),
+                Utc::now(),
+            )
+            .expect("retry fails");
+        assert!(store
+            .transition_automation_run(run.id, AutomationRunStatus::Queued, None, None, Utc::now())
+            .is_err());
+    }
+
+    #[test]
+    fn missed_skip_policy_records_window_without_queueing_work() {
+        let store = EventStore::open_memory().expect("store opens");
+        let mut definition = AutomationDefinition::once(
+            "Do not replay stale work.".to_string(),
+            "Asia/Shanghai".to_string(),
+            Utc::now() - Duration::hours(1),
+        )
+        .expect("definition is valid");
+        definition.missed_run_policy = MissedRunPolicy::Skip;
+        definition.missed_after_seconds = 60;
+        store
+            .upsert_automation_definition(&definition)
+            .expect("definition persists");
+        assert!(store
+            .claim_due_automation_run(definition.id, Utc::now(), "worker".to_string())
+            .expect("claim checks policy")
+            .is_none());
+        let runs = store.list_automation_runs().expect("runs load");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, AutomationRunStatus::Cancelled);
+        assert!(store
+            .claim_due_automation_run(definition.id, Utc::now(), "worker-2".to_string())
+            .expect("repeat wake is safe")
+            .is_none());
+        assert_eq!(store.list_automation_runs().expect("runs reload").len(), 1);
+    }
+
+    #[test]
+    fn recurring_run_once_claims_only_latest_missed_window() {
+        let store = EventStore::open_memory().expect("store opens");
+        let now = DateTime::parse_from_rfc3339("2026-07-12T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut definition = AutomationDefinition::once(
+            "Daily summary".to_string(),
+            "Asia/Shanghai".to_string(),
+            now,
+        )
+        .expect("definition is valid");
+        definition.created_at = now - Duration::days(10);
+        definition.schedule = AutomationSchedule::Daily { hour: 9, minute: 0 };
+        definition.missed_run_policy = MissedRunPolicy::RunOnce;
+        store
+            .upsert_automation_definition(&definition)
+            .expect("definition persists");
+        let run = store
+            .claim_due_automation_run(definition.id, now, "scheduler".to_string())
+            .expect("claim succeeds")
+            .expect("latest window queues");
+        assert_eq!(
+            run.scheduled_for,
+            DateTime::parse_from_rfc3339("2026-07-12T01:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+        assert!(store
+            .claim_due_automation_run(definition.id, now, "scheduler-2".to_string())
+            .expect("same wake is safe")
+            .is_none());
+        let next_day = now + Duration::days(1);
+        let next = store
+            .claim_due_automation_run(definition.id, next_day, "scheduler-3".to_string())
+            .expect("next day succeeds")
+            .expect("next window queues");
+        assert_eq!(
+            next.scheduled_for,
+            DateTime::parse_from_rfc3339("2026-07-13T01:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn review_item_and_checkpoint_links_survive_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("automation-review.sqlite3");
+        let run_id;
+        let item_id = Uuid::new_v4();
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            let definition = AutomationDefinition::once(
+                "Prepare a draft for review.".to_string(),
+                "Asia/Shanghai".to_string(),
+                Utc::now() - Duration::minutes(1),
+            )
+            .expect("definition is valid");
+            store
+                .upsert_automation_definition(&definition)
+                .expect("definition persists");
+            let run = store
+                .claim_due_automation_run(definition.id, Utc::now(), "worker".to_string())
+                .expect("claim succeeds")
+                .expect("run exists");
+            run_id = run.id;
+            let now = Utc::now();
+            store
+                .upsert_review_queue_item(&ReviewQueueItem {
+                    id: item_id,
+                    automation_run_id: run.id,
+                    agent_run_id: None,
+                    tool_invocation_id: None,
+                    status: ReviewQueueItemStatus::PendingReview,
+                    preview_fingerprint: Some("sha256:draft".to_string()),
+                    revision: 0,
+                    title: "Review generated draft".to_string(),
+                    evidence_ref: Some("evidence://draft".to_string()),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .expect("review item persists");
+            store
+                .upsert_automation_checkpoint(&AutomationCheckpoint {
+                    automation_run_id: run.id,
+                    dedup_key: run.trigger_window_key,
+                    tool_invocation_id: None,
+                    evidence_ref: Some("evidence://draft".to_string()),
+                    recorded_at: now,
+                })
+                .expect("checkpoint persists");
+        }
+        let store = EventStore::open(&path).expect("store reopens");
+        assert_eq!(
+            store
+                .automation_run(run_id)
+                .expect("run loads")
+                .review_queue_item_id,
+            Some(item_id)
+        );
+        assert_eq!(
+            store.list_review_queue_items().expect("items load").len(),
+            1
+        );
+        assert_eq!(
+            store
+                .automation_checkpoint(run_id)
+                .expect("checkpoint loads")
+                .evidence_ref
+                .as_deref(),
+            Some("evidence://draft")
+        );
+    }
+
+    #[test]
+    fn editing_review_item_invalidates_old_exact_approval() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("review-edit.sqlite3");
+        let item_id = Uuid::new_v4();
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            let definition = AutomationDefinition::once(
+                "Review draft".to_string(),
+                "Asia/Shanghai".to_string(),
+                Utc::now() - Duration::minutes(1),
+            )
+            .expect("definition valid");
+            store
+                .upsert_automation_definition(&definition)
+                .expect("definition persists");
+            let run = store
+                .claim_due_automation_run(definition.id, Utc::now(), "worker".to_string())
+                .expect("claim succeeds")
+                .expect("run exists");
+            let now = Utc::now();
+            let access_request = request_capability_access(
+                crate::kernel::models::AccessMode::FullAccess,
+                CapabilityKind::ConnectorWrite,
+            )
+            .expect("connector write requires an approval request");
+            store
+                .append_capability_access_request(&access_request)
+                .expect("approval request persists");
+            let plan = prepare_tool_execution(&ToolExecutionRequest {
+                tool_id: CONNECTOR_MUTATE_TOOL_ID.to_string(),
+                input: json!({
+                    "provider_id": "fake",
+                    "account_id": Uuid::new_v4().to_string(),
+                    "account_generation": 0,
+                    "capability": "mail_send_draft",
+                    "target_ref": "draft:1",
+                    "preview_hash": "sha256:preview-a",
+                    "idempotency_key": "send:1:once",
+                    "automation_run_id": run.id.to_string()
+                }),
+                access_mode: crate::kernel::models::AccessMode::FullAccess,
+                run_id: None,
+            })
+            .expect("tool plan valid");
+            let tool_record =
+                ToolInvocationRecord::waiting_for_confirmation(&plan, access_request.id);
+            store
+                .append_tool_invocation(&tool_record)
+                .expect("tool approval persists");
+            let mut item = ReviewQueueItem {
+                id: item_id,
+                automation_run_id: run.id,
+                agent_run_id: None,
+                tool_invocation_id: None,
+                status: ReviewQueueItemStatus::PendingReview,
+                preview_fingerprint: Some("sha256:preview-a".to_string()),
+                revision: 0,
+                title: "Original draft".to_string(),
+                evidence_ref: None,
+                created_at: now,
+                updated_at: now,
+            };
+            item.request_approval(tool_record.id, "sha256:preview-a".to_string(), now)
+                .expect("approval requested");
+            store
+                .upsert_review_queue_item(&item)
+                .expect("item persists");
+            let edited = store
+                .edit_review_queue_item(
+                    item.id,
+                    "Edited draft".to_string(),
+                    Some("sha256:preview-b".to_string()),
+                    Utc::now(),
+                )
+                .expect("item edits");
+            assert_eq!(edited.status, ReviewQueueItemStatus::PendingReview);
+            assert!(edited.tool_invocation_id.is_none());
+            assert_eq!(edited.revision, 2);
+            let access = store
+                .list_capability_access_records()
+                .expect("access records load");
+            let record = access
+                .iter()
+                .find(|record| record.request.id == access_request.id)
+                .expect("approval record exists");
+            assert_eq!(record.effective_status, CapabilityAccessStatus::Rejected);
+            let mut edited = edited;
+            assert!(edited
+                .request_approval(Uuid::new_v4(), "sha256:preview-a".to_string(), Utc::now())
+                .is_err());
+            edited
+                .request_approval(Uuid::new_v4(), "sha256:preview-b".to_string(), Utc::now())
+                .expect("new approval binds");
+            store
+                .upsert_review_queue_item(&edited)
+                .expect("new approval persists");
+            store
+                .resolve_review_queue_item(item.id, false, Utc::now())
+                .expect("review rejects");
+            assert!(store.upsert_review_queue_item(&item).is_err());
+        }
+        let store = EventStore::open(&path).expect("store reopens");
+        assert_eq!(
+            store
+                .review_queue_item(item_id)
+                .expect("item reloads")
+                .status,
+            ReviewQueueItemStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn automation_run_links_once_to_existing_agent_run() {
+        let store = EventStore::open_memory().expect("store opens");
+        let definition = AutomationDefinition::once(
+            "Execute through the existing Agent worker.".to_string(),
+            "Asia/Shanghai".to_string(),
+            Utc::now() - Duration::minutes(1),
+        )
+        .expect("definition is valid");
+        store
+            .upsert_automation_definition(&definition)
+            .expect("definition persists");
+        let automation_run = store
+            .claim_due_automation_run(definition.id, Utc::now(), "scheduler".to_string())
+            .expect("claim succeeds")
+            .expect("run exists");
+        let agent_run =
+            AgentRunStart::queued("automation-conversation".to_string(), definition.goal, 0)
+                .expect("agent run is valid");
+        store
+            .append_agent_run_start(&agent_run)
+            .expect("agent run persists");
+        let linked = store
+            .link_automation_run_to_agent_run(automation_run.id, agent_run.id, Utc::now())
+            .expect("link persists");
+        assert_eq!(linked.agent_run_id, Some(agent_run.id));
+        assert_eq!(
+            store
+                .link_automation_run_to_agent_run(automation_run.id, agent_run.id, Utc::now())
+                .expect("same link is idempotent")
+                .agent_run_id,
+            Some(agent_run.id)
+        );
+
+        let other_agent_run = AgentRunStart::queued(
+            "automation-conversation".to_string(),
+            "Different run".to_string(),
+            0,
+        )
+        .expect("other run is valid");
+        store
+            .append_agent_run_start(&other_agent_run)
+            .expect("other run persists");
+        assert!(store
+            .link_automation_run_to_agent_run(automation_run.id, other_agent_run.id, Utc::now())
+            .is_err());
+    }
+
+    #[test]
+    fn due_automation_and_agent_run_enqueue_in_one_deduplicated_transaction() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("automation-enqueue.sqlite3");
+        let definition = AutomationDefinition::once(
+            "Run through the durable Agent worker.".to_string(),
+            "Asia/Shanghai".to_string(),
+            Utc::now() - Duration::minutes(1),
+        )
+        .expect("definition is valid");
+        let automation_run_id;
+        let agent_run_id;
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            store
+                .upsert_automation_definition(&definition)
+                .expect("definition persists");
+            let (automation_run, agent_run) = store
+                .enqueue_due_automation_agent_run(
+                    definition.id,
+                    Utc::now(),
+                    "scheduler-1".to_string(),
+                    "automation-conversation".to_string(),
+                )
+                .expect("enqueue succeeds")
+                .expect("window is due");
+            automation_run_id = automation_run.id;
+            agent_run_id = agent_run.id;
+            assert_eq!(automation_run.agent_run_id, Some(agent_run.id));
+            assert!(store
+                .enqueue_due_automation_agent_run(
+                    definition.id,
+                    Utc::now(),
+                    "scheduler-2".to_string(),
+                    "automation-conversation".to_string(),
+                )
+                .expect("duplicate wake is safe")
+                .is_none());
+        }
+        let store = EventStore::open(&path).expect("store reopens");
+        assert_eq!(
+            store
+                .automation_run(automation_run_id)
+                .expect("automation run loads")
+                .agent_run_id,
+            Some(agent_run_id)
+        );
+        let agent_runs = store.list_agent_run_records().expect("agent runs load");
+        assert_eq!(
+            agent_runs
+                .iter()
+                .filter(|run| run.id == agent_run_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_automation_runs()
+                .expect("automation runs load")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn automation_edit_manual_run_and_delete_are_durable() {
+        let store = EventStore::open_memory().expect("store opens");
+        let definition = AutomationDefinition::once(
+            "Original goal".to_string(),
+            "Asia/Shanghai".to_string(),
+            Utc::now() + Duration::days(1),
+        )
+        .expect("definition is valid");
+        store
+            .upsert_automation_definition(&definition)
+            .expect("definition persists");
+        let edited = store
+            .update_automation_goal(definition.id, "Edited goal".to_string(), Utc::now())
+            .expect("goal edits");
+        assert_eq!(edited.goal, "Edited goal");
+        let invocation_id = Uuid::new_v4();
+        let (manual, agent) = store
+            .enqueue_manual_automation_agent_run(
+                definition.id,
+                invocation_id,
+                Utc::now(),
+                format!("automation:{}", definition.id),
+            )
+            .expect("manual run queues");
+        assert_eq!(manual.agent_run_id, Some(agent.id));
+        assert!(store
+            .enqueue_manual_automation_agent_run(
+                definition.id,
+                invocation_id,
+                Utc::now(),
+                format!("automation:{}", definition.id),
+            )
+            .is_err());
+        store
+            .set_automation_definition_status(
+                definition.id,
+                AutomationDefinitionStatus::Deleted,
+                Utc::now(),
+            )
+            .expect("definition deletes");
+        assert!(store
+            .enqueue_manual_automation_agent_run(
+                definition.id,
+                Uuid::new_v4(),
+                Utc::now(),
+                format!("automation:{}", definition.id),
+            )
+            .is_err());
+    }
     use crate::kernel::agent_context::AgentContextReceipt;
     use crate::kernel::agent_run::{
         AgentRunArtifactRecord, AgentRunCancelRequest, AgentRunClaim, AgentRunContinuationQueued,
@@ -3459,6 +14010,190 @@ mod tests {
         AgentRunStart, AgentRunStatus, AgentRunStepRecord, AgentRunStepStatus, AgentRunTransition,
     };
     use crate::kernel::capability::{CapabilityInvocation, CapabilityInvocationStatus};
+    use crate::kernel::connectors::{
+        ConnectorAccount, ConnectorCapability, ConnectorCredentialHandle, ConnectorEvidenceRef,
+        ConnectorHealth, ConnectorInvocation, ConnectorInvocationStatus,
+    };
+
+    #[test]
+    fn connector_account_and_idempotent_invocation_survive_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("connectors.sqlite3");
+        let now = Utc::now();
+        let account = ConnectorAccount {
+            id: Uuid::new_v4(),
+            provider_id: "fake".to_string(),
+            display_name: "Test account".to_string(),
+            tenant_ref: None,
+            credential_handle: ConnectorCredentialHandle::new(),
+            granted_capabilities: vec![ConnectorCapability::MailSearch],
+            health: ConnectorHealth::Connected,
+            connected_at: now,
+            updated_at: now,
+        };
+        let invocation = ConnectorInvocation {
+            id: Uuid::new_v4(),
+            provider_id: "fake".to_string(),
+            account_id: account.id,
+            account_generation: None,
+            capability: ConnectorCapability::MailSearch,
+            automation_run_id: None,
+            tool_invocation_id: None,
+            request_fingerprint: "sha256:bounded-request".to_string(),
+            idempotency_key: "fake:mail-search:window-1".to_string(),
+            mutation: None,
+            status: ConnectorInvocationStatus::Succeeded,
+            evidence: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            store
+                .upsert_connector_account(&account)
+                .expect("account persists");
+            assert!(store
+                .append_connector_invocation(&invocation)
+                .expect("invocation persists"));
+            let mut duplicate = invocation.clone();
+            duplicate.id = Uuid::new_v4();
+            assert!(!store
+                .append_connector_invocation(&duplicate)
+                .expect("duplicate is safe"));
+        }
+        let store = EventStore::open(&path).expect("store reopens");
+        assert_eq!(
+            store.list_connector_accounts().expect("accounts load"),
+            vec![account]
+        );
+        assert_eq!(
+            store
+                .list_connector_invocations()
+                .expect("invocations load"),
+            vec![invocation]
+        );
+    }
+
+    #[test]
+    fn automation_reconciliation_projects_agent_completion_after_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("automation-reconcile.sqlite3");
+        let automation_run_id;
+        let agent_run_id;
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            let definition = AutomationDefinition::once(
+                "Complete through the Agent worker.".to_string(),
+                "Asia/Shanghai".to_string(),
+                Utc::now() - Duration::minutes(1),
+            )
+            .expect("definition is valid");
+            store
+                .upsert_automation_definition(&definition)
+                .expect("definition persists");
+            let (automation_run, agent_run) = store
+                .enqueue_due_automation_agent_run(
+                    definition.id,
+                    Utc::now(),
+                    "scheduler".to_string(),
+                    "automation-conversation".to_string(),
+                )
+                .expect("enqueue succeeds")
+                .expect("window is due");
+            automation_run_id = automation_run.id;
+            agent_run_id = agent_run.id;
+            store
+                .append_agent_run_finish(
+                    &AgentRunFinish::new(
+                        agent_run.id,
+                        AgentRunStatus::Completed,
+                        Some("Verified result".to_string()),
+                        None,
+                    )
+                    .expect("finish is valid"),
+                )
+                .expect("finish persists");
+        }
+        let store = EventStore::open(&path).expect("store reopens");
+        assert_eq!(
+            store
+                .reconcile_automation_agent_runs(Utc::now())
+                .expect("reconcile succeeds"),
+            1
+        );
+        let run = store
+            .automation_run(automation_run_id)
+            .expect("automation run loads");
+        assert_eq!(run.agent_run_id, Some(agent_run_id));
+        assert_eq!(run.status, AutomationRunStatus::Completed);
+        assert_eq!(
+            store
+                .reconcile_automation_agent_runs(Utc::now())
+                .expect("second reconcile is idempotent"),
+            0
+        );
+    }
+
+    #[test]
+    fn external_connector_mutation_cannot_bypass_approval_boundary() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("connector-reconcile.sqlite3");
+        let now = Utc::now();
+        let account_id = Uuid::new_v4();
+        let request = ToolExecutionRequest {
+            tool_id: CONNECTOR_MUTATE_TOOL_ID.to_string(),
+            input: json!({
+                "provider_id": "fake",
+                "account_id": account_id.to_string(),
+                "account_generation": 0,
+                "capability": "mail_send_draft",
+                "target_ref": "draft:only-once",
+                "preview_hash": "sha256:frozen-preview",
+                "idempotency_key": "send:only-once",
+                "automation_run_id": Uuid::new_v4().to_string()
+            }),
+            access_mode: AccessMode::FullAccess,
+            run_id: Some(Uuid::new_v4()),
+        };
+        let plan = prepare_tool_execution(&request).expect("tool plan is valid");
+        let tool = ToolInvocationRecord::waiting_for_confirmation(&plan, Uuid::new_v4());
+        let invocation =
+            ConnectorInvocation::from_tool_request(&request, &tool).expect("invocation is valid");
+        let store = EventStore::open(&path).expect("store opens");
+        assert!(store
+            .append_connector_invocation(&invocation)
+            .expect("invocation persists"));
+        assert!(store
+            .transition_connector_invocation(
+                invocation.id,
+                ConnectorInvocationStatus::Running,
+                vec![],
+                now
+            )
+            .is_err());
+        let evidence = ConnectorEvidenceRef {
+            provider_id: "fake".to_string(),
+            account_id,
+            remote_object_ref: "remote:sent-message-42".to_string(),
+            retrieved_at: Utc::now(),
+            bounded_summary: Some("Provider confirms one sent message.".to_string()),
+        };
+        assert!(store
+            .transition_connector_invocation(
+                invocation.id,
+                ConnectorInvocationStatus::Succeeded,
+                vec![evidence],
+                Utc::now()
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .connector_invocation(invocation.id)
+                .expect("invocation stays pending")
+                .status,
+            ConnectorInvocationStatus::PendingApproval
+        );
+    }
     use crate::kernel::deepseek::{DeepSeekChatCacheStatus, DeepSeekChatTelemetry};
     use crate::kernel::models::{AccessMode, FoundationState};
     use crate::kernel::models::{
@@ -3473,8 +14208,9 @@ mod tests {
         PermissionAuditEntry, PolicyDecision,
     };
     use crate::kernel::tool_runtime::{
-        prepare_tool_execution, ToolEvidence, ToolExecutionRequest, ToolInvocationRecord,
-        ToolVerificationResult, APP_UPDATE_CHECK_TOOL_ID,
+        prepare_tool_execution, ToolEvidence, ToolExecutionRequest, ToolExecutionStatus,
+        ToolInvocationRecord, ToolVerificationResult, APP_UPDATE_CHECK_TOOL_ID,
+        CONNECTOR_MUTATE_TOOL_ID,
     };
     use crate::kernel::work_package::export_work_package;
     use crate::kernel::workflow::WorkflowTemplatePackage;
@@ -3605,7 +14341,9 @@ mod tests {
             0,
         )
         .expect("parent is valid");
-        store.append_agent_run_start(&parent).expect("parent appends");
+        store
+            .append_agent_run_start(&parent)
+            .expect("parent appends");
 
         let mut children = Vec::new();
         for index in 1..=3 {
@@ -3616,7 +14354,9 @@ mod tests {
                 format!("Read source {index} and return evidence."),
             )
             .expect("subagent is valid");
-            store.append_agent_run_start(&child).expect("subagent appends");
+            store
+                .append_agent_run_start(&child)
+                .expect("subagent appends");
             children.push(child);
         }
 
@@ -3638,10 +14378,16 @@ mod tests {
         )
         .expect("nested subagent shape is valid");
         let recursion_error = store.append_agent_run_start(&recursive);
-        assert!(matches!(recursion_error, Err(EventStoreError::InvalidState(_))));
+        assert!(matches!(
+            recursion_error,
+            Err(EventStoreError::InvalidState(_))
+        ));
 
         let records = store.list_agent_run_records().expect("records load");
-        let parent_record = records.iter().find(|record| record.id == parent.id).unwrap();
+        let parent_record = records
+            .iter()
+            .find(|record| record.id == parent.id)
+            .unwrap();
         assert_eq!(parent_record.role, AgentRunRole::Parent);
         assert!(parent_record.parent_run_id.is_none());
         for child in children {
@@ -3662,7 +14408,9 @@ mod tests {
             0,
         )
         .expect("parent is valid");
-        store.append_agent_run_start(&parent).expect("parent appends");
+        store
+            .append_agent_run_start(&parent)
+            .expect("parent appends");
 
         let children = store
             .append_subagent_runs(
@@ -3674,13 +14422,18 @@ mod tests {
             )
             .expect("subagent plan appends");
         assert_eq!(children.len(), 2);
-        assert!(children.iter().all(|record| record.role == AgentRunRole::Subagent));
+        assert!(children
+            .iter()
+            .all(|record| record.role == AgentRunRole::Subagent));
 
         let duplicate_plan = store.append_subagent_runs(
             parent.id,
             vec![("source-c".to_string(), "Read source C.".to_string())],
         );
-        assert!(matches!(duplicate_plan, Err(EventStoreError::InvalidState(_))));
+        assert!(matches!(
+            duplicate_plan,
+            Err(EventStoreError::InvalidState(_))
+        ));
 
         let cancelled = store
             .request_agent_run_tree_cancel(parent.id, "User cancelled the parent task.".to_string())
@@ -3689,9 +14442,9 @@ mod tests {
         assert!(cancelled
             .iter()
             .all(|record| record.status == AgentRunStatus::CancelRequested));
-        assert!(cancelled
-            .iter()
-            .all(|record| record.cancel_reason.as_deref() == Some("User cancelled the parent task.")));
+        assert!(cancelled.iter().all(
+            |record| record.cancel_reason.as_deref() == Some("User cancelled the parent task.")
+        ));
     }
 
     #[test]
@@ -3703,7 +14456,9 @@ mod tests {
             0,
         )
         .expect("parent is valid");
-        store.append_agent_run_start(&parent).expect("parent appends");
+        store
+            .append_agent_run_start(&parent)
+            .expect("parent appends");
         store
             .claim_agent_run(parent.id, "planning-worker".to_string(), 60)
             .expect("planning worker claims parent");
@@ -3737,7 +14492,10 @@ mod tests {
         assert_eq!(queued.status, AgentRunStatus::Queued);
         assert!(queued.worker_id.is_none());
         assert!(queued.lease_expires_at.is_none());
-        assert_eq!(queued.status_reason.as_deref(), Some("Subagents finished; synthesize."));
+        assert_eq!(
+            queued.status_reason.as_deref(),
+            Some("Subagents finished; synthesize.")
+        );
     }
 
     #[test]
@@ -7095,5 +17853,2781 @@ mod tests {
             second_record.grant_state,
             CapabilityGrantState::OneShotAvailable
         );
+    }
+
+    #[test]
+    fn connector_attachment_reservation_consumes_exact_tool_approval_atomically() {
+        use crate::kernel::connectors::landing::ConnectorAttachmentMetadata;
+        use crate::kernel::connectors::{
+            ConnectorAccount, ConnectorCapability, ConnectorCredentialHandle, ConnectorHealth,
+        };
+        use crate::kernel::policy::CapabilityGrantState;
+        use crate::kernel::tool_runtime::ToolExecutionStatus;
+
+        let store = EventStore::open_memory().unwrap();
+        let now = Utc::now();
+        let account = ConnectorAccount {
+            id: Uuid::new_v4(),
+            provider_id: "microsoft".to_string(),
+            display_name: "Attachment test account".to_string(),
+            tenant_ref: Some("tenant:test".to_string()),
+            credential_handle: ConnectorCredentialHandle::new(),
+            granted_capabilities: vec![ConnectorCapability::MailReadAttachment],
+            health: ConnectorHealth::Connected,
+            connected_at: now,
+            updated_at: now,
+        };
+        store.upsert_connector_account(&account).unwrap();
+        let metadata = ConnectorAttachmentMetadata {
+            account_id: account.id,
+            provider_id: "microsoft".to_string(),
+            parent_remote_ref: "private-message-marker".to_string(),
+            attachment_remote_ref: "private-attachment-marker".to_string(),
+            file_name: "report.pdf".to_string(),
+            declared_media_type: "application/pdf".to_string(),
+            size_bytes: 4096,
+            contains_macros: false,
+            untrusted_evidence: true,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (approval, tool_record) = store
+            .prepare_connector_attachment_download_approval(&metadata, workspace.path(), None, now)
+            .expect("exact attachment approval prepares atomically");
+        let request = approval.request;
+        let scope = request.exact_tool.clone().unwrap();
+        let (replayed_approval, replayed_tool) = store
+            .prepare_connector_attachment_download_approval(&metadata, workspace.path(), None, now)
+            .expect("prepare retry returns the existing exact approval");
+        assert_eq!(replayed_approval.request.id, request.id);
+        assert_eq!(replayed_tool.id, tool_record.id);
+        let pending_events = serde_json::to_string(&store.list_recent(100).unwrap()).unwrap();
+        assert!(!pending_events.contains("private-message-marker"));
+        assert!(!pending_events.contains("private-attachment-marker"));
+        let permit = store
+            .approve_and_reserve_connector_attachment_download(
+                request.id,
+                0,
+                scope.preview_revision,
+                &scope.preview_hash,
+                "Download this exact attachment".to_string(),
+                now,
+            )
+            .expect("approval and reservation commit atomically");
+        assert_eq!(permit.generation(), 0);
+        assert!(store
+            .approve_and_reserve_connector_attachment_download(
+                request.id,
+                0,
+                scope.preview_revision,
+                &scope.preview_hash,
+                "Replay".to_string(),
+                now,
+            )
+            .is_err());
+        let record = store
+            .list_capability_access_records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.request.id == request.id)
+            .unwrap();
+        assert_eq!(record.grant_state, CapabilityGrantState::OneShotConsumed);
+        let latest_tool = store
+            .list_tool_invocations()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == tool_record.id)
+            .unwrap();
+        assert_eq!(latest_tool.status, ToolExecutionStatus::Running);
+        let candidates = store
+            .claim_startup_connector_attachment_cleanup_candidates(now, 32)
+            .unwrap();
+        let candidate = candidates
+            .into_iter()
+            .find(|candidate| candidate.landing_id == permit.reservation_id())
+            .expect("startup claims the incomplete durable reservation");
+        let terminal_tool = store
+            .list_tool_invocations()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == tool_record.id)
+            .unwrap();
+        assert_eq!(terminal_tool.status, ToolExecutionStatus::Failed);
+        crate::kernel::connectors::landing::cleanup_incomplete_connector_attachment(&candidate)
+            .expect("missing landing files need no manual repair");
+        store
+            .fail_connector_attachment_after_cleanup(
+                permit.reservation_id(),
+                candidate.claim_id,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .connector_attachment_status(permit.reservation_id())
+                .unwrap(),
+            "failed"
+        );
+        let failed_tool = store
+            .list_tool_invocations()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == tool_record.id)
+            .unwrap();
+        assert_eq!(failed_tool.status, ToolExecutionStatus::Failed);
+        let events = serde_json::to_string(&store.list_recent(100).unwrap()).unwrap();
+        assert!(!events.contains("private-message-marker"));
+        assert!(!events.contains("private-attachment-marker"));
+        let stored_metadata: String = store
+            .conn
+            .query_row(
+                "SELECT metadata_json FROM connector_attachment_landings WHERE id = ?1",
+                rusqlite::params![permit.reservation_id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stored_metadata.contains("private-message-marker"));
+        assert!(!stored_metadata.contains("private-attachment-marker"));
+        assert!(stored_metadata.contains("redacted:parent"));
+    }
+
+    #[test]
+    fn execution_projections_scale_beyond_legacy_event_scan_limits() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        for _ in 0..256 {
+            let request = request_capability_access(
+                AccessMode::AskOnRisk,
+                CapabilityKind::ComputerScreenshot,
+            )
+            .expect("request builds");
+            store
+                .append_capability_access_request(&request)
+                .expect("request projects");
+        }
+        assert_eq!(
+            store
+                .list_capability_access_records()
+                .expect("all projected requests load")
+                .len(),
+            256
+        );
+
+        let plan = prepare_tool_execution(&ToolExecutionRequest {
+            tool_id: APP_UPDATE_CHECK_TOOL_ID.to_string(),
+            input: json!({}),
+            access_mode: AccessMode::FullAccess,
+            run_id: None,
+        })
+        .expect("tool plan prepares");
+        let mut oldest_id = None;
+        for index in 0..520 {
+            let mut invocation = ToolInvocationRecord::running(&plan, None);
+            invocation.id = Uuid::new_v4();
+            if index == 0 {
+                oldest_id = Some(invocation.id);
+            }
+            store
+                .append_tool_invocation(&invocation)
+                .expect("tool invocation projects");
+        }
+        assert_eq!(
+            store
+                .tool_invocation_by_id(oldest_id.expect("oldest id captured"))
+                .expect("oldest invocation remains addressable")
+                .tool_id,
+            APP_UPDATE_CHECK_TOOL_ID
+        );
+        assert_eq!(
+            store
+                .list_tool_invocations()
+                .expect("bounded recent tool list loads")
+                .len(),
+            500
+        );
+    }
+
+    #[test]
+    fn execution_projection_replay_is_idempotent_across_restarts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("execution-projection.sqlite3");
+        let request_id;
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            let request = request_capability_access(
+                AccessMode::AskOnRisk,
+                CapabilityKind::ComputerScreenshot,
+            )
+            .expect("request builds");
+            request_id = request.id;
+            store
+                .append_capability_access_request(&request)
+                .expect("request appends");
+            store
+                .resolve_capability_access_request(
+                    request.id,
+                    true,
+                    "Approve this screenshot".to_string(),
+                )
+                .expect("request resolves");
+            assert_eq!(
+                store
+                    .capability_access_record_by_id(request.id)
+                    .expect("projection loads")
+                    .projection_revision,
+                1
+            );
+        }
+        for _ in 0..2 {
+            let store = EventStore::open(&path).expect("store reopens");
+            let record = store
+                .capability_access_record_by_id(request_id)
+                .expect("projection survives restart");
+            assert_eq!(record.projection_revision, 1);
+            assert_eq!(record.effective_status, CapabilityAccessStatus::Approved);
+            let applied: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM execution_projection_applied_events",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("applied event count loads");
+            assert_eq!(applied, 2);
+        }
+    }
+
+    #[test]
+    fn legacy_execution_projection_schema_migrates_once_and_reopens_idempotently() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("legacy-execution-projection.sqlite3");
+        let request =
+            request_capability_access(AccessMode::AskOnRisk, CapabilityKind::ComputerScreenshot)
+                .expect("request builds");
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        {
+            let connection = Connection::open(&path).expect("legacy database opens");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE capability_access_state (
+                      request_id TEXT PRIMARY KEY NOT NULL,
+                      request_json TEXT NOT NULL,
+                      resolution_json TEXT,
+                      effective_status TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE tool_invocation_state (
+                      id TEXT PRIMARY KEY NOT NULL,
+                      invocation_json TEXT NOT NULL,
+                      tool_id TEXT NOT NULL,
+                      capability TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      approval_request_id TEXT,
+                      request_fingerprint TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE connector_authorization_sessions (
+                      id TEXT PRIMARY KEY NOT NULL,
+                      session_json TEXT NOT NULL,
+                      expires_at TEXT NOT NULL,
+                      consumed_at TEXT,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE review_queue_items (
+                      id TEXT PRIMARY KEY NOT NULL,
+                      automation_run_id TEXT NOT NULL UNIQUE,
+                      item_json TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE connector_attachment_landings (
+                      id TEXT PRIMARY KEY NOT NULL,
+                      account_id TEXT NOT NULL,
+                      account_generation INTEGER NOT NULL,
+                      metadata_json TEXT NOT NULL,
+                      tool_invocation_id TEXT NOT NULL UNIQUE,
+                      approval_request_id TEXT NOT NULL UNIQUE,
+                      request_fingerprint TEXT NOT NULL,
+                      landing_fingerprint TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      receipt_json TEXT,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE connector_invocations (
+                      id TEXT PRIMARY KEY NOT NULL,
+                      account_id TEXT NOT NULL,
+                      idempotency_key TEXT NOT NULL,
+                      invocation_json TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    "#,
+                )
+                .expect("legacy schema builds");
+            connection
+                .execute(
+                    r#"INSERT INTO capability_access_state
+                       (request_id, request_json, resolution_json, effective_status, updated_at)
+                       VALUES (?1, ?2, NULL, ?3, ?4)"#,
+                    params![
+                        request.id.to_string(),
+                        serde_json::to_string(&request).expect("request serializes"),
+                        serde_json::to_string(&CapabilityAccessStatus::PendingApproval)
+                            .expect("status serializes"),
+                        now,
+                    ],
+                )
+                .expect("legacy request inserts");
+        }
+
+        for _ in 0..2 {
+            let store = EventStore::open(&path).expect("legacy store migrates and reopens");
+            let record = store
+                .capability_access_record_by_id(request.id)
+                .expect("legacy request remains projected");
+            assert_eq!(record.projection_revision, 0);
+            assert_eq!(
+                record.effective_status,
+                CapabilityAccessStatus::PendingApproval
+            );
+            for (table, column) in [
+                ("capability_access_state", "row_revision"),
+                ("capability_access_state", "created_at"),
+                ("tool_invocation_state", "row_revision"),
+                ("tool_invocation_state", "created_at"),
+                ("connector_attachment_landings", "cleanup_claim_id"),
+                ("connector_attachment_landings", "cleanup_claim_expires_at"),
+                ("connector_invocations", "account_generation"),
+                ("connector_invocations", "reconciliation_claim_id"),
+                ("connector_invocations", "reconciliation_claim_expires_at"),
+                ("connector_invocations", "next_reconciliation_at"),
+                ("connector_invocations", "reconciliation_attempt_count"),
+                ("connector_invocations", "reconciliation_quarantine_code"),
+                ("connector_invocations", "reconciliation_quarantined_at"),
+            ] {
+                let present = store
+                    .conn
+                    .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                    .expect("table info prepares")
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .expect("columns query")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("columns load")
+                    .iter()
+                    .any(|candidate| candidate == column);
+                assert!(present, "missing migrated column {table}.{column}");
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_retry_is_fingerprint_bound_audited_and_secret_free() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let landing_id = Uuid::new_v4();
+        let now = Utc::now();
+        let metadata = ConnectorAttachmentMetadata {
+            account_id: Uuid::new_v4(),
+            provider_id: "microsoft".to_string(),
+            parent_remote_ref: "private-parent-marker".to_string(),
+            attachment_remote_ref: "private-attachment-marker".to_string(),
+            file_name: "quarterly-report.pdf".to_string(),
+            declared_media_type: "application/pdf".to_string(),
+            size_bytes: 128,
+            contains_macros: false,
+            untrusted_evidence: true,
+        };
+        store
+            .conn
+            .execute(
+                r#"INSERT INTO connector_attachment_landings
+                   (id, account_id, account_generation, metadata_json, size_bytes,
+                    tool_invocation_id, approval_request_id, request_fingerprint,
+                    landing_fingerprint, workspace_root, workspace_identity,
+                    storage_identity, status, failure_kind, attempt_count,
+                    created_at, updated_at)
+                   VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, 'request-fingerprint',
+                           'landing-fingerprint', ?7, 'workspace-file-id',
+                           'attachment-file-id', 'repair_required',
+                           'unsafe_cleanup_boundary', 1, ?8, ?8)"#,
+                params![
+                    landing_id.to_string(),
+                    metadata.account_id.to_string(),
+                    serde_json::to_string(&metadata).expect("metadata serializes"),
+                    metadata.size_bytes as i64,
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    r"D:\private-workspace",
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("repair row inserts");
+
+        let item = store
+            .list_connector_recovery_items()
+            .expect("recovery items load")
+            .into_iter()
+            .find(|item| item.id == landing_id)
+            .expect("attachment recovery item exists");
+        let fingerprint = match &item.action {
+            Some(crate::kernel::connectors::ConnectorRecoveryAction::RetryAttachmentCleanup {
+                action_revision,
+            }) => action_revision.clone(),
+            Some(crate::kernel::connectors::ConnectorRecoveryAction::ResumeSync { .. }) => {
+                panic!("attachment recovery cannot resume sync")
+            }
+            Some(crate::kernel::connectors::ConnectorRecoveryAction::InspectExternalResult {
+                ..
+            }) => panic!("attachment recovery cannot inspect an external result"),
+            None => panic!("retryable attachment action exists"),
+        };
+        let serialized = serde_json::to_string(&item).expect("item serializes");
+        for secret in [
+            "private-parent-marker",
+            "private-attachment-marker",
+            r"D:\private-workspace",
+            "workspace-file-id",
+            "attachment-file-id",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+        assert!(store
+            .retry_connector_attachment_recovery(landing_id, "stale-fingerprint", Utc::now())
+            .is_err());
+        assert_eq!(
+            store
+                .connector_attachment_status(landing_id)
+                .expect("status remains repair"),
+            "repair_required"
+        );
+
+        assert_eq!(
+            store
+                .retry_connector_attachment_recovery(landing_id, &fingerprint, Utc::now())
+                .expect("exact recovery queues"),
+            crate::kernel::connectors::ConnectorRecoveryAcceptance::Accepted
+        );
+        for _ in 0..100 {
+            assert_eq!(
+                store
+                    .retry_connector_attachment_recovery(landing_id, &fingerprint, Utc::now())
+                    .expect("accepted cleanup replay is idempotent"),
+                crate::kernel::connectors::ConnectorRecoveryAcceptance::AlreadyAccepted
+            );
+        }
+        assert_eq!(
+            store
+                .connector_attachment_status(landing_id)
+                .expect("status loads"),
+            "cleanup_required"
+        );
+        let events = store
+            .conn
+            .prepare("SELECT payload_json FROM kernel_events WHERE event_type = ?1")
+            .expect("retry event query prepares")
+            .query_map(params![CONNECTOR_RECOVERY_RETRY_QUEUED_EVENT], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("retry events query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("retry events load");
+        assert_eq!(events.len(), 1);
+        for secret in [
+            "private-parent-marker",
+            "private-attachment-marker",
+            r"D:\private-workspace",
+            "workspace-file-id",
+            "attachment-file-id",
+        ] {
+            assert!(!events[0].contains(secret));
+        }
+    }
+
+    #[test]
+    fn concurrent_recovery_acceptance_is_exactly_once_and_durable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("recovery-acceptance.sqlite3");
+        let landing_id = Uuid::new_v4();
+        let now = Utc::now();
+        let metadata = ConnectorAttachmentMetadata {
+            account_id: Uuid::new_v4(),
+            provider_id: "fake".to_string(),
+            parent_remote_ref: "parent".to_string(),
+            attachment_remote_ref: "attachment".to_string(),
+            file_name: "report.pdf".to_string(),
+            declared_media_type: "application/pdf".to_string(),
+            size_bytes: 1,
+            contains_macros: false,
+            untrusted_evidence: true,
+        };
+        let store = EventStore::open(&path).expect("store opens");
+        store
+            .conn
+            .execute(
+                r#"INSERT INTO connector_attachment_landings
+                   (id, account_id, account_generation, metadata_json, size_bytes,
+                    tool_invocation_id, approval_request_id, request_fingerprint,
+                    landing_fingerprint, workspace_root, workspace_identity,
+                    storage_identity, status, failure_kind, attempt_count,
+                    created_at, updated_at)
+                   VALUES (?1, ?2, 0, ?3, 1, ?4, ?5, 'request', 'landing',
+                           'private-root', 'workspace-id', 'storage-id',
+                           'repair_required', 'unsafe_cleanup_boundary', 1, ?6, ?6)"#,
+                params![
+                    landing_id.to_string(),
+                    metadata.account_id.to_string(),
+                    serde_json::to_string(&metadata).expect("metadata serializes"),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("repair row inserts");
+        let action_revision = match store
+            .list_connector_recovery_items()
+            .expect("recovery item loads")
+            .into_iter()
+            .find(|item| item.id == landing_id)
+            .and_then(|item| item.action)
+        {
+            Some(crate::kernel::connectors::ConnectorRecoveryAction::RetryAttachmentCleanup {
+                action_revision,
+            }) => action_revision,
+            _ => panic!("attachment action exists"),
+        };
+        drop(store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            let action_revision = action_revision.clone();
+            workers.push(std::thread::spawn(move || {
+                let store = EventStore::open(path).expect("concurrent store opens");
+                barrier.wait();
+                store
+                    .retry_connector_attachment_recovery(
+                        landing_id,
+                        &action_revision,
+                        now + Duration::seconds(1),
+                    )
+                    .expect("concurrent request resolves")
+            }));
+        }
+        let mut outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker joins"))
+            .collect::<Vec<_>>();
+        outcomes.sort_by_key(|outcome| match outcome {
+            crate::kernel::connectors::ConnectorRecoveryAcceptance::Accepted => 0,
+            crate::kernel::connectors::ConnectorRecoveryAcceptance::AlreadyAccepted => 1,
+        });
+        assert_eq!(
+            outcomes,
+            vec![
+                crate::kernel::connectors::ConnectorRecoveryAcceptance::Accepted,
+                crate::kernel::connectors::ConnectorRecoveryAcceptance::AlreadyAccepted,
+            ]
+        );
+
+        let store = EventStore::open(&path).expect("store restarts");
+        assert_eq!(
+            store
+                .retry_connector_attachment_recovery(
+                    landing_id,
+                    &action_revision,
+                    now + Duration::seconds(2),
+                )
+                .expect("receipt survives restart"),
+            crate::kernel::connectors::ConnectorRecoveryAcceptance::AlreadyAccepted
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM connector_recovery_action_receipts",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("receipt count loads"),
+            1
+        );
+
+        let next_episode_at = now + Duration::seconds(1);
+        store
+            .conn
+            .execute(
+                r#"UPDATE connector_attachment_landings
+                   SET status = 'repair_required', failure_kind = 'unsafe_cleanup_boundary',
+                       recovery_revision = recovery_revision + 1, updated_at = ?2
+                   WHERE id = ?1"#,
+                params![
+                    landing_id.to_string(),
+                    next_episode_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("next recovery episode is projected");
+        let next_revision = match store
+            .list_connector_recovery_items()
+            .expect("next recovery item loads")
+            .into_iter()
+            .find(|item| item.id == landing_id)
+            .and_then(|item| item.action)
+        {
+            Some(crate::kernel::connectors::ConnectorRecoveryAction::RetryAttachmentCleanup {
+                action_revision,
+            }) => action_revision,
+            _ => panic!("next attachment episode has an action"),
+        };
+        assert_ne!(next_revision, action_revision);
+        assert_eq!(
+            store
+                .retry_connector_attachment_recovery(landing_id, &action_revision, next_episode_at,)
+                .expect("old episode remains an accepted receipt"),
+            crate::kernel::connectors::ConnectorRecoveryAcceptance::AlreadyAccepted
+        );
+        assert_eq!(
+            store
+                .connector_attachment_status(landing_id)
+                .expect("new episode remains untouched"),
+            "repair_required"
+        );
+        assert_eq!(
+            store
+                .retry_connector_attachment_recovery(
+                    landing_id,
+                    &next_revision,
+                    next_episode_at + Duration::seconds(1),
+                )
+                .expect("new episode is independently accepted"),
+            crate::kernel::connectors::ConnectorRecoveryAcceptance::Accepted
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM kernel_events WHERE event_type = ?1",
+                    params![CONNECTOR_RECOVERY_RETRY_QUEUED_EVENT],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("event count loads"),
+            2
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM connector_recovery_action_receipts",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("episode receipt count loads"),
+            2
+        );
+    }
+
+    #[test]
+    fn expired_recovery_receipt_cleanup_is_bounded_to_sixty_four_rows() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("recovery-receipt-retention.sqlite3");
+        let store = EventStore::open(&path).expect("store opens");
+        for index in 0..70 {
+            store
+                .conn
+                .execute(
+                    r#"INSERT INTO connector_recovery_action_receipts
+                       (action_kind, item_id, action_revision, accepted_at, retain_until)
+                       VALUES ('attachment_cleanup', ?1, ?2, ?3, ?3)"#,
+                    params![
+                        Uuid::new_v4().to_string(),
+                        format!("{index:064x}"),
+                        (Utc::now() - Duration::days(100))
+                            .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    ],
+                )
+                .expect("expired receipt inserts");
+        }
+        drop(store);
+
+        let store = EventStore::open(&path).expect("migration performs bounded cleanup");
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM connector_recovery_action_receipts",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("remaining receipt count loads"),
+            6
+        );
+    }
+
+    #[test]
+    fn recovery_cards_project_structured_effects_without_connector_secrets() {
+        use crate::kernel::connectors::domain::{MailAddress, MailMessage};
+        use crate::kernel::connectors::provider::ConnectorProviderFailure;
+        use crate::kernel::connectors::sync::{
+            ConnectorOpaqueContinuation, ConnectorSyncContinuation, ConnectorSyncFailure,
+            ConnectorSyncPage, ConnectorSyncPlan, ConnectorSyncState, ConnectorSyncStateRecovery,
+        };
+        use crate::kernel::connectors::{
+            ConnectorAccount, ConnectorCapability, ConnectorCredentialHandle, ConnectorEvidenceRef,
+            ConnectorHealth, ConnectorInvocation, ConnectorInvocationStatus,
+            ConnectorRecoveryAction, ConnectorRecoveryExternalEffectState, ConnectorRecoveryKind,
+            ConnectorRecoveryNextStepCode, ConnectorRecoveryReasonCode, ConnectorRecoveryStatus,
+            ConnectorRecoverySyncCapability,
+        };
+
+        let store = EventStore::open_memory().expect("memory store opens");
+        let now = Utc::now();
+        let account = |display_name: &str, health: ConnectorHealth| ConnectorAccount {
+            id: Uuid::new_v4(),
+            provider_id: "secret-provider-marker".to_string(),
+            display_name: display_name.to_string(),
+            tenant_ref: Some("secret-tenant-marker".to_string()),
+            credential_handle: ConnectorCredentialHandle::new(),
+            granted_capabilities: vec![ConnectorCapability::MailSyncInbox],
+            health,
+            connected_at: now,
+            updated_at: now,
+        };
+        let needs_repair = account("Repair account", ConnectorHealth::NeedsRepair);
+        let disconnect_pending = account("Disconnect account", ConnectorHealth::DisconnectPending);
+        let revocation_pending = account("Revocation account", ConnectorHealth::Connected);
+        let sync_account = account("Sync account", ConnectorHealth::Connected);
+        let credential_markers = [
+            &needs_repair,
+            &disconnect_pending,
+            &revocation_pending,
+            &sync_account,
+        ]
+        .into_iter()
+        .map(|account| {
+            serde_json::to_value(&account.credential_handle)
+                .expect("credential handle serializes")
+                .as_str()
+                .expect("credential handle is text")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+        for account in [
+            &needs_repair,
+            &disconnect_pending,
+            &revocation_pending,
+            &sync_account,
+        ] {
+            store
+                .upsert_connector_account(account)
+                .expect("account persists");
+        }
+        store
+            .begin_connector_revocation(revocation_pending.id, now)
+            .expect("revocation begins");
+
+        let stream_fingerprint = "secret-stream-fingerprint-marker";
+        let initial = ConnectorSyncState::initial(
+            sync_account.id,
+            ConnectorCapability::MailSyncInbox,
+            stream_fingerprint.to_string(),
+            now,
+        )
+        .expect("sync state initializes");
+        let page = ConnectorSyncPage::<serde_json::Value>::new(
+            Vec::new(),
+            ConnectorSyncContinuation::Delta(
+                ConnectorOpaqueContinuation::new("secret-continuation-marker".to_string())
+                    .expect("continuation builds"),
+            ),
+        );
+        let advanced = initial
+            .advance(&page, now + Duration::seconds(1))
+            .expect("sync state advances");
+        let retry = match advanced
+            .recovery(
+                ConnectorSyncFailure::NetworkUnavailable,
+                0,
+                3,
+                now + Duration::seconds(2),
+            )
+            .expect("retry state builds")
+        {
+            ConnectorSyncStateRecovery::Persist { next, .. } => next,
+            ConnectorSyncStateRecovery::RepairAccount => panic!("network failure should retry"),
+        };
+        let stopped = match retry
+            .recovery(
+                ConnectorSyncFailure::NetworkUnavailable,
+                3,
+                3,
+                now + Duration::seconds(3),
+            )
+            .expect("stopped state builds")
+        {
+            ConnectorSyncStateRecovery::Persist { next, .. } => next,
+            ConnectorSyncStateRecovery::RepairAccount => panic!("exhausted retry should stop"),
+        };
+        assert!(stopped.stopped());
+        store
+            .conn
+            .execute(
+                r#"INSERT INTO connector_sync_streams
+                   (account_id, capability, stream_fingerprint, state_json, revision,
+                    request_json, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                params![
+                    sync_account.id.to_string(),
+                    ConnectorCapability::MailSyncInbox.contract_name(),
+                    stream_fingerprint,
+                    stopped.persistence_json().expect("sync state serializes"),
+                    stopped.revision() as i64,
+                    ConnectorSyncPlan::MailInbox { max_changes: 25 }
+                        .persistence_json()
+                        .expect("sync plan serializes"),
+                    stopped
+                        .updated_at()
+                        .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("stopped sync state persists");
+        store
+            .conn
+            .execute(
+                r#"INSERT INTO connector_sync_streams
+                   (account_id, capability, stream_fingerprint, state_json, revision, updated_at)
+                   VALUES (?1, ?2, 'malformed-stream', '{not-json', 0, ?3)"#,
+                params![
+                    Uuid::new_v4().to_string(),
+                    ConnectorCapability::MailSyncInbox.contract_name(),
+                    (now + Duration::seconds(4)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("malformed sync state persists ahead of healthy row");
+
+        let invocation = ConnectorInvocation {
+            id: Uuid::new_v4(),
+            provider_id: "secret-provider-marker".to_string(),
+            account_id: sync_account.id,
+            account_generation: None,
+            capability: ConnectorCapability::CalendarCreateEvent,
+            automation_run_id: Some(Uuid::new_v4()),
+            tool_invocation_id: Some(Uuid::new_v4()),
+            request_fingerprint: "secret-request-fingerprint-marker".to_string(),
+            idempotency_key: "secret-idempotency-marker".to_string(),
+            mutation: None,
+            status: ConnectorInvocationStatus::ReconciliationRequired,
+            evidence: vec![ConnectorEvidenceRef {
+                provider_id: "secret-provider-marker".to_string(),
+                account_id: sync_account.id,
+                remote_object_ref: "secret-remote-ref-marker".to_string(),
+                retrieved_at: now,
+                bounded_summary: Some("secret-provider-body-marker".to_string()),
+            }],
+            created_at: now,
+            updated_at: now,
+        };
+        store
+            .append_connector_invocation(&invocation)
+            .expect("reconciliation invocation persists");
+
+        let items = store
+            .list_connector_recovery_items()
+            .expect("recovery items load");
+        let sync_item = items
+            .iter()
+            .find(|item| item.kind == ConnectorRecoveryKind::Sync)
+            .expect("stopped sync is projected");
+        assert_eq!(sync_item.status, ConnectorRecoveryStatus::SyncExhausted);
+        assert_eq!(
+            sync_item.reason_code,
+            ConnectorRecoveryReasonCode::SyncRetryExhausted
+        );
+        assert_eq!(
+            sync_item.external_effect_state,
+            ConnectorRecoveryExternalEffectState::NoExternalWrite
+        );
+        assert_eq!(
+            sync_item.next_step_code,
+            ConnectorRecoveryNextStepCode::ReviewAccountConnection
+        );
+        assert_eq!(
+            sync_item.sync_capability,
+            Some(ConnectorRecoverySyncCapability::Mail)
+        );
+        let changes_before_reads = store.conn.total_changes();
+        let event_count_before_reads: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM kernel_events", [], |row| row.get(0))
+            .unwrap();
+        let legacy_action_count_before_reads: i64 = store
+            .conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM connector_sync_recovery_actions) + (SELECT count(*) FROM connector_reconciliation_recovery_actions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut reloaded_sync_item = None;
+        for _ in 0..100 {
+            reloaded_sync_item = store
+                .list_connector_recovery_items()
+                .expect("recovery items reload")
+                .into_iter()
+                .find(|item| item.kind == ConnectorRecoveryKind::Sync);
+        }
+        assert_eq!(store.conn.total_changes(), changes_before_reads);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM kernel_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            event_count_before_reads
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT (SELECT count(*) FROM connector_sync_recovery_actions) + (SELECT count(*) FROM connector_reconciliation_recovery_actions)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            legacy_action_count_before_reads
+        );
+        let reloaded_sync_item =
+            reloaded_sync_item.expect("stopped sync remains projected after repeated reads");
+        assert_eq!(sync_item.id, reloaded_sync_item.id);
+        let sync_token = match reloaded_sync_item.action {
+            Some(ConnectorRecoveryAction::ResumeSync { action_revision }) => action_revision,
+            _ => panic!("stopped sync has an exact Recovery action"),
+        };
+        let production_syncs =
+            crate::kernel::connectors::runtime_registry::ConnectorRuntimeRegistries::empty()
+                .syncs();
+        let production_items = store
+            .list_connector_recovery_items_with_runtime_registries(
+                &crate::kernel::connectors::reconciliation::EmptyConnectorReconcilerRegistry,
+                production_syncs.as_ref(),
+            )
+            .expect("production recovery items load without execution authority");
+        let production_sync_item = production_items
+            .iter()
+            .find(|item| item.id == sync_item.id)
+            .expect("unavailable sync remains visible");
+        assert!(production_sync_item.action.is_none());
+        let changes_before_unavailable_resume = store.conn.total_changes();
+        assert!(store
+            .resume_connector_read_sync_from_recovery_with_sync_registry(
+                sync_item.id,
+                &sync_token,
+                production_syncs.as_ref(),
+                now + Duration::seconds(4),
+            )
+            .is_err());
+        assert_eq!(
+            store.conn.total_changes(),
+            changes_before_unavailable_resume
+        );
+
+        let account_item = |reason_code| {
+            items
+                .iter()
+                .find(|item| item.reason_code == reason_code)
+                .expect("account recovery item exists")
+        };
+        assert_eq!(
+            account_item(ConnectorRecoveryReasonCode::AccountNeedsRepair).next_step_code,
+            ConnectorRecoveryNextStepCode::ReviewAccountConnection
+        );
+        assert_eq!(
+            account_item(ConnectorRecoveryReasonCode::AccountDisconnectPending)
+                .external_effect_state,
+            ConnectorRecoveryExternalEffectState::LocalCredentialRemovalPending
+        );
+        assert_eq!(
+            account_item(ConnectorRecoveryReasonCode::AccountRevocationPending)
+                .external_effect_state,
+            ConnectorRecoveryExternalEffectState::NoExternalWrite
+        );
+        let reconciliation = items
+            .iter()
+            .find(|item| item.kind == ConnectorRecoveryKind::Reconciliation)
+            .expect("reconciliation is projected");
+        assert_eq!(
+            reconciliation.external_effect_state,
+            ConnectorRecoveryExternalEffectState::ExternalResultUncertain
+        );
+        assert_eq!(
+            reconciliation.next_step_code,
+            ConnectorRecoveryNextStepCode::VerifyProviderState
+        );
+        assert!(reconciliation.action.is_none());
+
+        let serialized = serde_json::to_string(&items).expect("recovery items serialize");
+        for secret in [
+            "secret-provider-marker",
+            "secret-tenant-marker",
+            "secret-stream-fingerprint-marker",
+            "secret-continuation-marker",
+            "secret-request-fingerprint-marker",
+            "secret-idempotency-marker",
+            "secret-remote-ref-marker",
+            "secret-provider-body-marker",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+        for credential_marker in credential_markers {
+            assert!(!serialized.contains(&credential_marker));
+        }
+        assert!(!serialized.contains(&sync_account.id.to_string()));
+        assert!(!serialized.contains("retry_at"));
+
+        assert!(store
+            .resume_connector_read_sync_from_recovery(
+                sync_item.id,
+                &format!("{sync_token}x"),
+                now + Duration::seconds(4),
+            )
+            .is_err());
+        for authority_tamper in ["provider", "credential", "capability"] {
+            let mut tampered = sync_account.clone();
+            match authority_tamper {
+                "provider" => tampered.provider_id = "tampered-provider".to_string(),
+                "credential" => tampered.credential_handle = ConnectorCredentialHandle::new(),
+                "capability" => tampered.granted_capabilities.clear(),
+                _ => unreachable!(),
+            }
+            store
+                .conn
+                .execute(
+                    "UPDATE connector_accounts SET account_json = ?2 WHERE id = ?1",
+                    params![
+                        sync_account.id.to_string(),
+                        serde_json::to_string(&tampered).unwrap()
+                    ],
+                )
+                .unwrap();
+            assert!(store
+                .resume_connector_read_sync_from_recovery(
+                    sync_item.id,
+                    &sync_token,
+                    now + Duration::seconds(4),
+                )
+                .is_err());
+            store
+                .conn
+                .execute(
+                    "UPDATE connector_accounts SET account_json = ?2 WHERE id = ?1",
+                    params![
+                        sync_account.id.to_string(),
+                        serde_json::to_string(&sync_account).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE connector_account_generations SET generation = generation + 1 WHERE account_id = ?1",
+                params![sync_account.id.to_string()],
+            )
+            .unwrap();
+        assert!(store
+            .resume_connector_read_sync_from_recovery(
+                sync_item.id,
+                &sync_token,
+                now + Duration::seconds(4),
+            )
+            .is_err());
+        store
+            .conn
+            .execute(
+                "UPDATE connector_account_generations SET generation = generation - 1 WHERE account_id = ?1",
+                params![sync_account.id.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .resume_connector_read_sync_from_recovery(
+                    sync_item.id,
+                    &sync_token,
+                    now + Duration::seconds(4),
+                )
+                .expect("stopped read sync is rescheduled"),
+            crate::kernel::connectors::ConnectorRecoveryAcceptance::Accepted
+        );
+        let resumed = store
+            .connector_sync_state(
+                sync_account.id,
+                ConnectorCapability::MailSyncInbox,
+                stream_fingerprint,
+            )
+            .unwrap()
+            .expect("resumed state loads");
+        assert!(!resumed.stopped());
+        assert!(resumed.retry_state().is_none());
+        assert_eq!(resumed.revision(), stopped.revision() + 1);
+        for _ in 0..100 {
+            assert_eq!(
+                store
+                    .resume_connector_read_sync_from_recovery(
+                        sync_item.id,
+                        &sync_token,
+                        now + Duration::seconds(5),
+                    )
+                    .expect("accepted sync replay is idempotent"),
+                crate::kernel::connectors::ConnectorRecoveryAcceptance::AlreadyAccepted
+            );
+        }
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM connector_sync_recovery_jobs",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        for malformed_index in 1_u128..=64 {
+            store
+                .conn
+                .execute(
+                    r#"INSERT INTO connector_sync_recovery_jobs
+                   (id, recovery_item_id, action_revision, account_id, account_generation,
+                    capability, stream_fingerprint, expected_state_revision, status,
+                    next_attempt_at, attempt_count, created_at, updated_at)
+                   VALUES (?1, ?2, ?3,
+                           'malformed', 0, 'mail_sync_inbox', 'malformed', 0, 'queued',
+                           ?4, 0, ?4, ?4)"#,
+                    params![
+                        Uuid::from_u128(malformed_index).to_string(),
+                        format!("malformed-item-{malformed_index}"),
+                        format!("malformed-action-{malformed_index}"),
+                        now.to_rfc3339_opts(SecondsFormat::Nanos, true)
+                    ],
+                )
+                .expect("malformed job is inserted ahead of healthy job");
+        }
+        let cross_capability_plan = ConnectorSyncPlan::CalendarRange {
+            starts_at: now,
+            ends_at: now + Duration::days(1),
+            max_changes: 25,
+        }
+        .persistence_json()
+        .unwrap();
+        store
+            .conn
+            .execute(
+                r#"UPDATE connector_sync_streams SET request_json = ?2
+                   WHERE account_id = ?1"#,
+                params![sync_account.id.to_string(), cross_capability_plan],
+            )
+            .expect("valid cross-capability plan tampers the due row");
+        assert!(store
+            .claim_due_connector_sync_recovery_jobs(now + Duration::seconds(6), 1)
+            .expect("cross-capability row is isolated after the malformed first page")
+            .is_empty());
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT status FROM connector_sync_recovery_jobs WHERE account_id = ?1",
+                    params![sync_account.id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "repair_required"
+        );
+        store
+            .conn
+            .execute(
+                r#"UPDATE connector_sync_streams SET request_json = ?2
+                   WHERE account_id = ?1"#,
+                params![
+                    sync_account.id.to_string(),
+                    ConnectorSyncPlan::MailInbox { max_changes: 25 }
+                        .persistence_json()
+                        .unwrap(),
+                ],
+            )
+            .expect("healthy Mail plan is restored");
+        store
+            .conn
+            .execute(
+                r#"UPDATE connector_sync_recovery_jobs
+                   SET status = 'queued', quarantine_code = NULL
+                   WHERE account_id = ?1"#,
+                params![sync_account.id.to_string()],
+            )
+            .expect("isolated test job is restored for the remaining claim tests");
+        let mut claims = store
+            .claim_due_connector_sync_recovery_jobs(now + Duration::seconds(6), 1)
+            .expect("healthy job is claimable after malformed job");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].account().id, sync_account.id);
+        assert_eq!(claims[0].state().revision(), resumed.revision());
+        assert!(matches!(
+            claims[0].plan(),
+            ConnectorSyncPlan::MailInbox { max_changes: 25 }
+        ));
+        assert_eq!(claims[0].attempt_count(), 1);
+        let first_claim_id = claims[0].claim_id();
+        let first_expiry = claims[0].claim_expires_at();
+        store
+            .renew_connector_sync_recovery_claim(&mut claims[0], now + Duration::seconds(7))
+            .expect("live claim renews");
+        assert!(claims[0].claim_expires_at() > first_expiry);
+        for tamper in [
+            "provider",
+            "tenant",
+            "credential",
+            "capability",
+            "health",
+            "generation",
+            "state",
+            "plan",
+        ] {
+            match tamper {
+                "generation" => {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE connector_account_generations SET generation = generation + 1 WHERE account_id = ?1",
+                            params![sync_account.id.to_string()],
+                        )
+                        .unwrap();
+                }
+                "state" => {
+                    let (tampered_state, _) = match resumed
+                        .recovery(
+                            ConnectorSyncFailure::NetworkUnavailable,
+                            0,
+                            3,
+                            now + Duration::seconds(8),
+                        )
+                        .unwrap()
+                    {
+                        ConnectorSyncStateRecovery::Persist { next, reason } => (next, reason),
+                        ConnectorSyncStateRecovery::RepairAccount => unreachable!(),
+                    };
+                    store
+                        .conn
+                        .execute(
+                            r#"UPDATE connector_sync_streams SET state_json = ?4
+                               WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3"#,
+                            params![
+                                sync_account.id.to_string(),
+                                ConnectorCapability::MailSyncInbox.contract_name(),
+                                stream_fingerprint,
+                                tampered_state.persistence_json().unwrap(),
+                            ],
+                        )
+                        .unwrap();
+                }
+                "plan" => {
+                    let tampered_plan = ConnectorSyncPlan::CalendarRange {
+                        starts_at: now,
+                        ends_at: now + Duration::days(1),
+                        max_changes: 25,
+                    }
+                    .persistence_json()
+                    .unwrap();
+                    store
+                        .conn
+                        .execute(
+                            r#"UPDATE connector_sync_streams SET request_json = ?4
+                               WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3"#,
+                            params![
+                                sync_account.id.to_string(),
+                                ConnectorCapability::MailSyncInbox.contract_name(),
+                                stream_fingerprint,
+                                tampered_plan,
+                            ],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    let mut tampered = sync_account.clone();
+                    match tamper {
+                        "provider" => tampered.provider_id = "tampered-provider".to_string(),
+                        "tenant" => tampered.tenant_ref = Some("tampered-tenant".to_string()),
+                        "credential" => {
+                            tampered.credential_handle = ConnectorCredentialHandle::new()
+                        }
+                        "capability" => tampered.granted_capabilities.clear(),
+                        "health" => tampered.health = ConnectorHealth::NeedsRepair,
+                        _ => unreachable!(),
+                    }
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE connector_accounts SET account_json = ?2 WHERE id = ?1",
+                            params![
+                                sync_account.id.to_string(),
+                                serde_json::to_string(&tampered).unwrap()
+                            ],
+                        )
+                        .unwrap();
+                }
+            }
+            assert!(
+                store
+                    .renew_connector_sync_recovery_claim(
+                        &mut claims[0],
+                        now + Duration::seconds(8),
+                    )
+                    .is_err(),
+                "{tamper} tamper must fail the post-I/O authority fence"
+            );
+            match tamper {
+                "generation" => {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE connector_account_generations SET generation = generation - 1 WHERE account_id = ?1",
+                            params![sync_account.id.to_string()],
+                        )
+                        .unwrap();
+                }
+                "state" => {
+                    store
+                        .conn
+                        .execute(
+                            r#"UPDATE connector_sync_streams SET state_json = ?4
+                               WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3"#,
+                            params![
+                                sync_account.id.to_string(),
+                                ConnectorCapability::MailSyncInbox.contract_name(),
+                                stream_fingerprint,
+                                resumed.persistence_json().unwrap(),
+                            ],
+                        )
+                        .unwrap();
+                }
+                "plan" => {
+                    store
+                        .conn
+                        .execute(
+                            r#"UPDATE connector_sync_streams SET request_json = ?4
+                               WHERE account_id = ?1 AND capability = ?2 AND stream_fingerprint = ?3"#,
+                            params![
+                                sync_account.id.to_string(),
+                                ConnectorCapability::MailSyncInbox.contract_name(),
+                                stream_fingerprint,
+                                ConnectorSyncPlan::MailInbox { max_changes: 25 }
+                                    .persistence_json()
+                                    .unwrap(),
+                            ],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE connector_accounts SET account_json = ?2 WHERE id = ?1",
+                            params![
+                                sync_account.id.to_string(),
+                                serde_json::to_string(&sync_account).unwrap()
+                            ],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT status FROM connector_sync_recovery_jobs WHERE id = '00000000-0000-0000-0000-000000000001'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "repair_required"
+        );
+        assert!(store
+            .claim_due_connector_sync_recovery_jobs(now + Duration::seconds(306), 1)
+            .unwrap()
+            .is_empty());
+        let takeover_at = now + Duration::seconds(308);
+        let takeover = store
+            .claim_due_connector_sync_recovery_jobs(takeover_at, 1)
+            .expect("expired running job is taken over");
+        assert_eq!(takeover.len(), 1);
+        assert_ne!(takeover[0].claim_id(), first_claim_id);
+        assert!(store
+            .renew_connector_sync_recovery_claim(&mut claims[0], takeover_at)
+            .is_err());
+        let completed_at = takeover_at + Duration::seconds(1);
+        let next_page = ConnectorSyncPage::new(
+            vec![
+                crate::kernel::connectors::sync::ConnectorSyncChange::Upsert(MailMessage {
+                    remote_ref: "private-remote-message".to_string(),
+                    thread_ref: "private-thread".to_string(),
+                    from: MailAddress {
+                        display_name: None,
+                        address: "sender@example.com".to_string(),
+                    },
+                    to: Vec::new(),
+                    subject: "Untrusted".to_string(),
+                    received_at: completed_at,
+                    bounded_body_summary: None,
+                    attachments: Vec::new(),
+                    has_attachments: false,
+                    untrusted_evidence: true,
+                }),
+            ],
+            ConnectorSyncContinuation::Next(
+                ConnectorOpaqueContinuation::new("private-next-page".to_string()).unwrap(),
+            ),
+        );
+        assert!(store
+            .complete_claimed_mail_sync_recovery(&claims[0], &next_page, completed_at)
+            .is_err());
+        let paged = store
+            .complete_claimed_mail_sync_recovery(&takeover[0], &next_page, completed_at)
+            .expect("current lease commits page, cursor and queued job atomically");
+        assert_eq!(paged.revision(), resumed.revision() + 1);
+        assert!(paged.has_committed_delta());
+        assert!(paged.has_resume_page());
+        let final_claim = store
+            .claim_due_connector_sync_recovery_jobs(completed_at, 1)
+            .expect("next page is immediately claimable");
+        assert_eq!(final_claim.len(), 1);
+        assert!(final_claim[0].state() == &paged);
+        let delta_page = ConnectorSyncPage::<MailMessage>::new(
+            Vec::new(),
+            ConnectorSyncContinuation::Delta(
+                ConnectorOpaqueContinuation::new("private-final-delta".to_string()).unwrap(),
+            ),
+        );
+        let completed = store
+            .complete_claimed_mail_sync_recovery(
+                &final_claim[0],
+                &delta_page,
+                completed_at + Duration::seconds(1),
+            )
+            .expect("final delta commits cursor and completed job atomically");
+        assert_eq!(completed.revision(), paged.revision() + 1);
+        assert!(completed.has_committed_delta());
+        assert!(!completed.has_resume_page());
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT status FROM connector_sync_recovery_jobs WHERE id = ?1",
+                    params![final_claim[0].job_id().to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "completed"
+        );
+        assert!(store
+            .claim_due_connector_sync_recovery_jobs(completed_at + Duration::seconds(1), 1)
+            .unwrap()
+            .is_empty());
+        let failure_at = completed_at + Duration::seconds(2);
+        store
+            .conn
+            .execute(
+                r#"UPDATE connector_sync_recovery_jobs
+                   SET status = 'queued', expected_state_revision = ?2,
+                       next_attempt_at = ?3, attempt_count = 0,
+                       claim_id = NULL, claim_expires_at = NULL
+                   WHERE id = ?1"#,
+                params![
+                    final_claim[0].job_id().to_string(),
+                    completed.revision() as i64,
+                    failure_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("test schedules another recovery page");
+        let transient_claim = store
+            .claim_due_connector_sync_recovery_jobs(failure_at, 1)
+            .expect("transient page is claimed");
+        let deferred = store
+            .finalize_claimed_connector_sync_recovery_failure(
+                &transient_claim[0],
+                ConnectorProviderFailure::NetworkUnavailable,
+                failure_at + Duration::seconds(1),
+            )
+            .expect("transient failure atomically schedules backoff");
+        assert!(!deferred.stopped());
+        let retry_at = deferred.retry_state().unwrap().retry_at;
+        assert!(store
+            .finalize_claimed_connector_sync_recovery_failure(
+                &transient_claim[0],
+                ConnectorProviderFailure::NetworkUnavailable,
+                failure_at + Duration::seconds(1),
+            )
+            .is_err());
+        let cursor_claim = store
+            .claim_due_connector_sync_recovery_jobs(retry_at, 1)
+            .expect("deferred page is reclaimed when due");
+        let preserved_cursor = cursor_claim[0]
+            .state()
+            .locator()
+            .unwrap()
+            .expose()
+            .to_string();
+        let stopped = store
+            .finalize_claimed_connector_sync_recovery_failure(
+                &cursor_claim[0],
+                ConnectorProviderFailure::CursorExpired,
+                retry_at + Duration::seconds(1),
+            )
+            .expect("expired cursor becomes explicit repair state");
+        assert!(stopped.stopped());
+        assert_eq!(stopped.locator().unwrap().expose(), preserved_cursor);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT status FROM connector_sync_recovery_jobs WHERE id = ?1",
+                    params![cursor_claim[0].job_id().to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "repair_required"
+        );
+        let events = serde_json::to_string(&store.list_recent(100).unwrap()).unwrap();
+        assert!(!events.contains(&sync_token));
+        assert!(!events.contains(stream_fingerprint));
+        assert!(!events.contains("secret-continuation-marker"));
+        assert!(!events.contains("private-final-delta"));
+        assert!(!events.contains("private-next-page"));
+        assert!(!events.contains("private-remote-message"));
+        assert!(!events.contains(&retry_at.to_rfc3339()));
+        assert!(!events.contains("attempt_count"));
+        assert_eq!(events.matches("connector.sync_recovery.resumed").count(), 1);
+    }
+
+    #[test]
+    fn revocation_pending_account_cannot_be_overwritten_by_local_disconnect() {
+        use crate::kernel::connectors::{
+            ConnectorAccount, ConnectorCapability, ConnectorCredentialHandle, ConnectorHealth,
+        };
+
+        let store = EventStore::open_memory().expect("memory store opens");
+        let now = Utc::now();
+        let account = ConnectorAccount {
+            id: Uuid::new_v4(),
+            provider_id: "fake".to_string(),
+            display_name: "Uncertain revocation".to_string(),
+            tenant_ref: Some("tenant:private".to_string()),
+            credential_handle: ConnectorCredentialHandle::new(),
+            granted_capabilities: vec![ConnectorCapability::MailSearch],
+            health: ConnectorHealth::RevocationPending,
+            connected_at: now,
+            updated_at: now,
+        };
+        store
+            .upsert_connector_account(&account)
+            .expect("legacy pending account persists");
+
+        assert!(store
+            .begin_connector_disconnect(account.id, now + Duration::seconds(1))
+            .is_err());
+        let stored = store
+            .list_connector_accounts()
+            .expect("accounts load")
+            .into_iter()
+            .find(|candidate| candidate.id == account.id)
+            .expect("account remains");
+        assert_eq!(stored.health, ConnectorHealth::RevocationPending);
+        let generation: i64 = store
+            .conn
+            .query_row(
+                "SELECT generation FROM connector_account_generations WHERE account_id = ?1",
+                params![account.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("generation loads");
+        assert_eq!(generation, 0);
+    }
+
+    #[test]
+    fn runtime_recovery_does_not_claim_active_attachment_execution() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let landing_id = Uuid::new_v4();
+        let now = Utc::now();
+        let metadata = ConnectorAttachmentMetadata {
+            account_id: Uuid::new_v4(),
+            provider_id: "microsoft".to_string(),
+            parent_remote_ref: "redacted:parent".to_string(),
+            attachment_remote_ref: "redacted:attachment".to_string(),
+            file_name: "active.pdf".to_string(),
+            declared_media_type: "application/pdf".to_string(),
+            size_bytes: 64,
+            contains_macros: false,
+            untrusted_evidence: true,
+        };
+        store
+            .conn
+            .execute(
+                r#"INSERT INTO connector_attachment_landings
+                   (id, account_id, account_generation, metadata_json, size_bytes,
+                    tool_invocation_id, approval_request_id, request_fingerprint,
+                    landing_fingerprint, workspace_root, workspace_identity,
+                    storage_identity, status, attempt_count, created_at, updated_at)
+                   VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, 'request-fingerprint',
+                           'landing-fingerprint', 'D:\workspace', 'workspace-file-id',
+                           'attachment-file-id', 'staging', 0, ?7, ?7)"#,
+                params![
+                    landing_id.to_string(),
+                    metadata.account_id.to_string(),
+                    serde_json::to_string(&metadata).expect("metadata serializes"),
+                    metadata.size_bytes as i64,
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("active staging row inserts");
+
+        assert!(store
+            .claim_runtime_connector_attachment_cleanup_candidates(Utc::now(), 32)
+            .expect("runtime recovery query succeeds")
+            .is_empty());
+        assert_eq!(
+            store
+                .connector_attachment_status(landing_id)
+                .expect("active status loads"),
+            "staging"
+        );
+    }
+
+    #[test]
+    fn broken_tool_projection_is_quarantined_without_starving_cleanup_batch() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let now = Utc::now();
+        let plan = prepare_tool_execution(&ToolExecutionRequest {
+            tool_id: APP_UPDATE_CHECK_TOOL_ID.to_string(),
+            input: json!({}),
+            access_mode: AccessMode::FullAccess,
+            run_id: None,
+        })
+        .expect("tool plan prepares");
+        let good_tool = ToolInvocationRecord::running(&plan, None);
+        store
+            .append_tool_invocation(&good_tool)
+            .expect("good tool projects");
+        let good_landing_id = Uuid::new_v4();
+        let bad_landing_id = Uuid::new_v4();
+        for (landing_id, tool_id, suffix) in [
+            (good_landing_id, good_tool.id, "good"),
+            (bad_landing_id, Uuid::new_v4(), "bad"),
+        ] {
+            let account_id = Uuid::new_v4();
+            let metadata = ConnectorAttachmentMetadata {
+                account_id,
+                provider_id: "microsoft".to_string(),
+                parent_remote_ref: "redacted:parent".to_string(),
+                attachment_remote_ref: "redacted:attachment".to_string(),
+                file_name: format!("projection-{suffix}.pdf"),
+                declared_media_type: "application/pdf".to_string(),
+                size_bytes: 64,
+                contains_macros: false,
+                untrusted_evidence: true,
+            };
+            store
+                .conn
+                .execute(
+                    r#"INSERT INTO connector_attachment_landings
+                       (id, account_id, account_generation, metadata_json, size_bytes,
+                        tool_invocation_id, approval_request_id, request_fingerprint,
+                        landing_fingerprint, workspace_root, workspace_identity,
+                        storage_identity, status, failure_kind, attempt_count,
+                        created_at, updated_at)
+                       VALUES (?1, ?2, 0, ?3, 64, ?4, ?5, ?6, ?7,
+                               'D:\workspace', 'workspace-file-id', ?8,
+                               'cleanup_required', 'test_cleanup', 0, ?9, ?9)"#,
+                    params![
+                        landing_id.to_string(),
+                        account_id.to_string(),
+                        serde_json::to_string(&metadata).expect("metadata serializes"),
+                        tool_id.to_string(),
+                        Uuid::new_v4().to_string(),
+                        format!("request-{suffix}"),
+                        format!("landing-{suffix}"),
+                        format!("file-id-{suffix}"),
+                        now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    ],
+                )
+                .expect("cleanup fixture inserts");
+        }
+
+        let candidates = store
+            .claim_runtime_connector_attachment_cleanup_candidates(now, 32)
+            .expect("mixed cleanup batch is isolated");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].landing_id, good_landing_id);
+        assert_eq!(
+            store
+                .connector_attachment_status(bad_landing_id)
+                .expect("bad projection status loads"),
+            "repair_required"
+        );
+        let failure_kind: String = store
+            .conn
+            .query_row(
+                "SELECT failure_kind FROM connector_attachment_landings WHERE id = ?1",
+                params![bad_landing_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("quarantine failure kind loads");
+        assert_eq!(failure_kind, "recovery_projection_unavailable");
+        let recovery_item = store
+            .list_connector_recovery_items()
+            .expect("recovery items load")
+            .into_iter()
+            .find(|item| item.id == bad_landing_id)
+            .expect("bad projection is visible for recovery");
+        assert!(recovery_item.action.is_none());
+        let serialized = serde_json::to_string(&recovery_item).expect("item serializes");
+        assert!(!serialized.contains("cleanup_claim"));
+        assert!(!serialized.contains(r"D:\workspace"));
+        assert_eq!(
+            store
+                .tool_invocation_by_id(good_tool.id)
+                .expect("good tool remains projected")
+                .status,
+            ToolExecutionStatus::Failed
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ready_recovery_backoff_prevents_first_batch_starvation() {
+        use crate::kernel::connectors::landing::ConnectorAttachmentLandingReceipt;
+
+        let store = EventStore::open_memory().expect("memory store opens");
+        let now = Utc::now();
+        let account_id = Uuid::new_v4();
+        let mut landing_ids = Vec::new();
+        for index in 0..65 {
+            let landing_id = Uuid::new_v4();
+            landing_ids.push(landing_id);
+            let metadata = ConnectorAttachmentMetadata {
+                account_id,
+                provider_id: "microsoft".to_string(),
+                parent_remote_ref: "redacted:parent".to_string(),
+                attachment_remote_ref: "redacted:attachment".to_string(),
+                file_name: format!("ready-{index}.pdf"),
+                declared_media_type: "application/pdf".to_string(),
+                size_bytes: 64,
+                contains_macros: false,
+                untrusted_evidence: true,
+            };
+            let receipt = ConnectorAttachmentLandingReceipt {
+                landing_id,
+                account_id,
+                provider_id: "microsoft".to_string(),
+                account_generation: 0,
+                landing_ref: format!("ready-{index}.pdf"),
+                media_type: "application/pdf".to_string(),
+                byte_size: 64,
+                sha256: "a".repeat(64),
+                storage_identity: format!("file-id-{index}"),
+                untrusted_evidence: true,
+                completed_at: now,
+            };
+            store
+                .conn
+                .execute(
+                    r#"INSERT INTO connector_attachment_landings
+                       (id, account_id, account_generation, metadata_json, size_bytes,
+                        tool_invocation_id, approval_request_id, request_fingerprint,
+                        landing_fingerprint, workspace_root, workspace_identity,
+                        storage_identity, status, receipt_json, attempt_count,
+                        created_at, updated_at)
+                       VALUES (?1, ?2, 0, ?3, 64, ?4, ?5, ?6, ?7,
+                               'D:\workspace', 'workspace-file-id', ?8,
+                               'ready', ?9, 0, ?10, ?10)"#,
+                    params![
+                        landing_id.to_string(),
+                        account_id.to_string(),
+                        serde_json::to_string(&metadata).expect("metadata serializes"),
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string(),
+                        format!("request-{index}"),
+                        format!("landing-{index}"),
+                        receipt.storage_identity,
+                        serde_json::to_string(&receipt).expect("receipt serializes"),
+                        now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    ],
+                )
+                .expect("ready row inserts");
+        }
+
+        let first_batch = store
+            .claim_startup_ready_connector_attachment_recovery_candidates(now, 64)
+            .expect("first ready batch loads");
+        assert_eq!(first_batch.len(), 64);
+        let deferred_at = now;
+        for candidate in &first_batch {
+            store
+                .defer_connector_attachment_ready_recovery(
+                    candidate.landing_id,
+                    candidate.claim_id,
+                    deferred_at,
+                )
+                .expect("ready retry defers");
+        }
+        let next_batch = store
+            .claim_startup_ready_connector_attachment_recovery_candidates(deferred_at, 64)
+            .expect("next ready batch loads");
+        assert_eq!(next_batch.len(), 1);
+        assert!(landing_ids.contains(&next_batch[0].landing_id));
+        assert!(!first_batch
+            .iter()
+            .any(|candidate| candidate.landing_id == next_batch[0].landing_id));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn attachment_recovery_claims_are_persistent_fenced_and_runtime_retryable() {
+        use crate::kernel::connectors::landing::ConnectorAttachmentLandingReceipt;
+
+        fn insert_ready(store: &EventStore, landing_id: Uuid, suffix: &str, now: DateTime<Utc>) {
+            let account_id = Uuid::new_v4();
+            let metadata = ConnectorAttachmentMetadata {
+                account_id,
+                provider_id: "microsoft".to_string(),
+                parent_remote_ref: "redacted:parent".to_string(),
+                attachment_remote_ref: "redacted:attachment".to_string(),
+                file_name: format!("claim-{suffix}.pdf"),
+                declared_media_type: "application/pdf".to_string(),
+                size_bytes: 64,
+                contains_macros: false,
+                untrusted_evidence: true,
+            };
+            let receipt = ConnectorAttachmentLandingReceipt {
+                landing_id,
+                account_id,
+                provider_id: "microsoft".to_string(),
+                account_generation: 0,
+                landing_ref: format!("claim-{suffix}.pdf"),
+                media_type: "application/pdf".to_string(),
+                byte_size: 64,
+                sha256: "a".repeat(64),
+                storage_identity: format!("file-id-{suffix}"),
+                untrusted_evidence: true,
+                completed_at: now,
+            };
+            store
+                .conn
+                .execute(
+                    r#"INSERT INTO connector_attachment_landings
+                       (id, account_id, account_generation, metadata_json, size_bytes,
+                        tool_invocation_id, approval_request_id, request_fingerprint,
+                        landing_fingerprint, workspace_root, workspace_identity,
+                        storage_identity, status, receipt_json, attempt_count,
+                        created_at, updated_at)
+                       VALUES (?1, ?2, 0, ?3, 64, ?4, ?5, ?6, ?7,
+                               'D:\workspace', 'workspace-file-id', ?8,
+                               'ready', ?9, 0, ?10, ?10)"#,
+                    params![
+                        landing_id.to_string(),
+                        account_id.to_string(),
+                        serde_json::to_string(&metadata).expect("metadata serializes"),
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string(),
+                        format!("request-{suffix}"),
+                        format!("landing-{suffix}"),
+                        receipt.storage_identity,
+                        serde_json::to_string(&receipt).expect("receipt serializes"),
+                        now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    ],
+                )
+                .expect("ready claim fixture inserts");
+        }
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database = temp_dir.path().join("attachment-recovery-claims.sqlite3");
+        let landing_id = Uuid::new_v4();
+        let now = Utc::now();
+        let first_claim;
+        {
+            let store = EventStore::open(&database).expect("store opens");
+            insert_ready(&store, landing_id, "primary", now);
+            let candidate = store
+                .claim_startup_ready_connector_attachment_recovery_candidates(now, 8)
+                .expect("startup ready claim succeeds")
+                .into_iter()
+                .find(|candidate| candidate.landing_id == landing_id)
+                .expect("ready candidate is claimed");
+            first_claim = candidate.claim_id;
+            assert!(store
+                .claim_startup_ready_connector_attachment_recovery_candidates(now, 8)
+                .expect("second startup scan succeeds")
+                .is_empty());
+            assert_eq!(
+                store
+                    .claim_connector_attachment_cleanup(landing_id, "competing_cleanup", now)
+                    .expect("competing cleanup claim is evaluated"),
+                ConnectorAttachmentCleanupClaim::KeepFile
+            );
+            assert!(store
+                .defer_connector_attachment_ready_recovery(landing_id, Uuid::new_v4(), now,)
+                .is_err());
+            assert!(store
+                .transition_ready_recovery_to_cleanup(
+                    landing_id,
+                    Uuid::new_v4(),
+                    "wrong_token",
+                    now,
+                )
+                .is_err());
+        }
+
+        let store = EventStore::open(&database).expect("store reopens");
+        assert!(store
+            .claim_runtime_ready_connector_attachment_recovery_candidates(now, 8)
+            .expect("runtime ready scan succeeds")
+            .is_empty());
+        let takeover_at = now + Duration::seconds(301);
+        store
+            .conn
+            .execute(
+                r#"UPDATE connector_attachment_landings
+                   SET cleanup_claim_expires_at = ?2 WHERE id = ?1"#,
+                params![
+                    landing_id.to_string(),
+                    (now - Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("first claim expires");
+        let takeover = store
+            .claim_runtime_ready_connector_attachment_recovery_candidates(takeover_at, 8)
+            .expect("expired ready claim is reclaimed")
+            .into_iter()
+            .find(|candidate| candidate.landing_id == landing_id)
+            .expect("runtime takes expired claim");
+        assert_ne!(takeover.claim_id, first_claim);
+        assert!(store
+            .defer_connector_attachment_ready_recovery(landing_id, first_claim, takeover_at)
+            .is_err());
+        store
+            .defer_connector_attachment_ready_recovery(landing_id, takeover.claim_id, takeover_at)
+            .expect("current owner defers ready recovery");
+        assert!(store
+            .claim_runtime_ready_connector_attachment_recovery_candidates(takeover_at, 8)
+            .expect("early runtime retry scan succeeds")
+            .is_empty());
+        let runtime_retry = store
+            .claim_runtime_ready_connector_attachment_recovery_candidates(
+                takeover_at + Duration::seconds(6),
+                8,
+            )
+            .expect("due runtime retry claims")
+            .into_iter()
+            .find(|candidate| candidate.landing_id == landing_id)
+            .expect("deferred ready recovery is retried at runtime");
+        assert_ne!(runtime_retry.claim_id, takeover.claim_id);
+
+        let reset_landing_id = Uuid::new_v4();
+        insert_ready(&store, reset_landing_id, "reset", takeover_at);
+        let before_reset = store
+            .claim_startup_ready_connector_attachment_recovery_candidates(takeover_at, 8)
+            .expect("second ready claim succeeds")
+            .into_iter()
+            .find(|candidate| candidate.landing_id == reset_landing_id)
+            .expect("reset candidate is claimed");
+        store
+            .reset_stale_connector_attachment_recovery_claims(takeover_at)
+            .expect("single-instance startup resets old-process claims");
+        let after_reset = store
+            .claim_startup_ready_connector_attachment_recovery_candidates(takeover_at, 8)
+            .expect("reset candidate is reclaimed")
+            .into_iter()
+            .find(|candidate| candidate.landing_id == reset_landing_id)
+            .expect("reset candidate receives a new claim");
+        assert_ne!(after_reset.claim_id, before_reset.claim_id);
+        assert!(store
+            .defer_connector_attachment_ready_recovery(
+                reset_landing_id,
+                before_reset.claim_id,
+                takeover_at,
+            )
+            .is_err());
+
+        let cleanup_landing_id = Uuid::new_v4();
+        let cleanup_claim_id = Uuid::new_v4();
+        insert_ready(&store, cleanup_landing_id, "cleanup", now);
+        store
+            .conn
+            .execute(
+                r#"UPDATE connector_attachment_landings
+                   SET status = 'cleanup_required', cleanup_claim_id = ?2,
+                       cleanup_claim_expires_at = ?3
+                   WHERE id = ?1"#,
+                params![
+                    cleanup_landing_id.to_string(),
+                    cleanup_claim_id.to_string(),
+                    (takeover_at + Duration::seconds(300))
+                        .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("cleanup claim fixture updates");
+        let wrong_cleanup_token = Uuid::new_v4();
+        assert!(store
+            .defer_connector_attachment_cleanup(
+                cleanup_landing_id,
+                wrong_cleanup_token,
+                takeover_at,
+            )
+            .is_err());
+        assert!(store
+            .mark_connector_attachment_repair_required(
+                cleanup_landing_id,
+                wrong_cleanup_token,
+                "wrong_token",
+                takeover_at,
+            )
+            .is_err());
+        assert!(store
+            .fail_connector_attachment_after_cleanup(
+                cleanup_landing_id,
+                wrong_cleanup_token,
+                takeover_at,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .connector_attachment_status(cleanup_landing_id)
+                .expect("cleanup status loads"),
+            "cleanup_required"
+        );
+        store
+            .defer_connector_attachment_cleanup(cleanup_landing_id, cleanup_claim_id, takeover_at)
+            .expect("current cleanup owner defers");
+
+        let retention_landing_id = Uuid::new_v4();
+        insert_ready(&store, retention_landing_id, "retention", now);
+        store
+            .conn
+            .execute(
+                r#"UPDATE connector_attachment_landings
+                   SET status = 'completed', expires_at = ?2, next_cleanup_at = ?2
+                   WHERE id = ?1"#,
+                params![
+                    retention_landing_id.to_string(),
+                    (now - Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("retention fixture becomes due");
+        let retention = store
+            .claim_expired_connector_attachment_retention_candidates(now, 8)
+            .expect("retention claim succeeds")
+            .into_iter()
+            .find(|candidate| candidate.landing_id == retention_landing_id)
+            .expect("retention candidate is claimed");
+        let wrong_token = Uuid::new_v4();
+        assert!(store
+            .complete_connector_attachment_retention(retention_landing_id, wrong_token, now,)
+            .is_err());
+        assert!(store
+            .mark_connector_attachment_retention_repair_required(
+                retention_landing_id,
+                wrong_token,
+                "wrong_token",
+                now,
+            )
+            .is_err());
+        store
+            .conn
+            .execute(
+                r#"UPDATE connector_attachment_landings
+                   SET cleanup_claim_expires_at = ?2 WHERE id = ?1"#,
+                params![
+                    retention_landing_id.to_string(),
+                    (now - Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+                ],
+            )
+            .expect("retention claim expires");
+        let retention_takeover = store
+            .claim_expired_connector_attachment_retention_candidates(takeover_at, 8)
+            .expect("retention takeover succeeds")
+            .into_iter()
+            .find(|candidate| candidate.landing_id == retention_landing_id)
+            .expect("retention is reclaimed");
+        assert_ne!(retention_takeover.claim_id, retention.claim_id);
+        assert!(store
+            .complete_connector_attachment_retention(
+                retention_landing_id,
+                retention.claim_id,
+                takeover_at,
+            )
+            .is_err());
+        store
+            .complete_connector_attachment_retention(
+                retention_landing_id,
+                retention_takeover.claim_id,
+                takeover_at,
+            )
+            .expect("current retention owner completes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ready_attachment_recovers_before_and_after_handle_rename_across_restart() {
+        use std::io::Cursor;
+
+        use crate::kernel::connectors::landing::{
+            recover_ready_connector_attachment, stage_connector_attachment,
+            ConnectorAttachmentMetadata,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database = temp_dir.path().join("ready-recovery.sqlite3");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let bytes = b"%PDF-1.7\nready crash recovery";
+        let now = Utc::now();
+        let account = ConnectorAccount {
+            id: Uuid::new_v4(),
+            provider_id: "microsoft".to_string(),
+            display_name: "Ready recovery account".to_string(),
+            tenant_ref: None,
+            credential_handle: ConnectorCredentialHandle::new(),
+            granted_capabilities: vec![ConnectorCapability::MailReadAttachment],
+            health: ConnectorHealth::Connected,
+            connected_at: now,
+            updated_at: now,
+        };
+        let metadata = ConnectorAttachmentMetadata {
+            account_id: account.id,
+            provider_id: "microsoft".to_string(),
+            parent_remote_ref: "ready-message".to_string(),
+            attachment_remote_ref: "ready-attachment".to_string(),
+            file_name: "recovery.pdf".to_string(),
+            declared_media_type: "application/pdf".to_string(),
+            size_bytes: bytes.len() as u64,
+            contains_macros: false,
+            untrusted_evidence: true,
+        };
+
+        let first_landing_id;
+        {
+            let store = EventStore::open(&database).expect("store opens");
+            store
+                .upsert_connector_account(&account)
+                .expect("account persists");
+            let (approval, _) = store
+                .prepare_connector_attachment_download_approval(
+                    &metadata,
+                    workspace.path(),
+                    None,
+                    now,
+                )
+                .expect("approval prepares");
+            let scope = approval.request.exact_tool.as_ref().expect("scope exists");
+            let permit = store
+                .approve_and_reserve_connector_attachment_download(
+                    approval.request.id,
+                    approval.projection_revision,
+                    scope.preview_revision,
+                    &scope.preview_hash,
+                    "Approve pre-rename crash".to_string(),
+                    now,
+                )
+                .expect("reservation commits");
+            first_landing_id = permit.reservation_id();
+            let staged =
+                stage_connector_attachment(workspace.path(), &metadata, permit, Cursor::new(bytes))
+                    .expect("attachment stages");
+            store
+                .mark_connector_attachment_staging(
+                    first_landing_id,
+                    &staged.receipt().storage_identity,
+                    now,
+                )
+                .expect("staging identity persists");
+            store
+                .mark_connector_attachment_ready(&staged, now)
+                .expect("ready persists");
+            drop(staged);
+        }
+        {
+            let store = EventStore::open(&database).expect("store reopens");
+            let candidate = store
+                .claim_startup_ready_connector_attachment_recovery_candidates(Utc::now(), 8)
+                .expect("ready candidates load")
+                .into_iter()
+                .find(|candidate| candidate.landing_id == first_landing_id)
+                .expect("pre-rename candidate exists");
+            let landed = recover_ready_connector_attachment(&candidate)
+                .expect("temp file is committed during recovery");
+            assert!(store
+                .complete_recovered_connector_attachment_landing(
+                    &landed,
+                    Uuid::new_v4(),
+                    Utc::now(),
+                )
+                .is_err());
+            store
+                .complete_recovered_connector_attachment_landing(
+                    &landed,
+                    candidate.claim_id,
+                    Utc::now(),
+                )
+                .expect("completion is repaired");
+            assert!(store
+                .complete_recovered_connector_attachment_landing(
+                    &landed,
+                    candidate.claim_id,
+                    Utc::now(),
+                )
+                .is_err());
+            assert_eq!(
+                store
+                    .connector_attachment_status(first_landing_id)
+                    .expect("status loads"),
+                "completed"
+            );
+        }
+
+        let second_landing_id;
+        {
+            let store = EventStore::open(&database).expect("store reopens");
+            let (approval, _) = store
+                .prepare_connector_attachment_download_approval(
+                    &metadata,
+                    workspace.path(),
+                    None,
+                    Utc::now(),
+                )
+                .expect("second approval prepares");
+            let scope = approval.request.exact_tool.as_ref().expect("scope exists");
+            let permit = store
+                .approve_and_reserve_connector_attachment_download(
+                    approval.request.id,
+                    approval.projection_revision,
+                    scope.preview_revision,
+                    &scope.preview_hash,
+                    "Approve post-rename crash".to_string(),
+                    Utc::now(),
+                )
+                .expect("second reservation commits");
+            second_landing_id = permit.reservation_id();
+            let staged =
+                stage_connector_attachment(workspace.path(), &metadata, permit, Cursor::new(bytes))
+                    .expect("second attachment stages");
+            store
+                .mark_connector_attachment_staging(
+                    second_landing_id,
+                    &staged.receipt().storage_identity,
+                    Utc::now(),
+                )
+                .expect("second staging identity persists");
+            store
+                .mark_connector_attachment_ready(&staged, Utc::now())
+                .expect("second ready persists");
+            let landed = staged.commit().expect("handle rename commits");
+            drop(landed);
+        }
+        {
+            let store = EventStore::open(&database).expect("store reopens again");
+            let candidate = store
+                .claim_startup_ready_connector_attachment_recovery_candidates(Utc::now(), 8)
+                .expect("ready candidates load")
+                .into_iter()
+                .find(|candidate| candidate.landing_id == second_landing_id)
+                .expect("post-rename candidate exists");
+            let landed = recover_ready_connector_attachment(&candidate)
+                .expect("final file is recognized during recovery");
+            store
+                .complete_recovered_connector_attachment_landing(
+                    &landed,
+                    candidate.claim_id,
+                    Utc::now(),
+                )
+                .expect("post-rename completion is repaired");
+            let retained_path = landed.path().to_path_buf();
+            drop(landed);
+            assert_eq!(
+                store
+                    .connector_attachment_status(second_landing_id)
+                    .expect("status loads"),
+                "completed"
+            );
+            let expired_at = Utc::now() - Duration::seconds(1);
+            store
+                .conn
+                .execute(
+                    r#"UPDATE connector_attachment_landings
+                       SET expires_at = ?2, next_cleanup_at = ?2 WHERE id = ?1"#,
+                    rusqlite::params![second_landing_id.to_string(), expired_at.to_rfc3339(),],
+                )
+                .expect("retention is made due");
+            let retention = store
+                .claim_expired_connector_attachment_retention_candidates(Utc::now(), 8)
+                .expect("retention claims")
+                .into_iter()
+                .find(|candidate| candidate.landing_id == second_landing_id)
+                .expect("expired candidate exists");
+            crate::kernel::connectors::landing::cleanup_incomplete_connector_attachment(&retention)
+                .expect("exact retained file is deleted");
+            store
+                .complete_connector_attachment_retention(
+                    second_landing_id,
+                    retention.claim_id,
+                    Utc::now(),
+                )
+                .expect("retention completes");
+            assert!(!retained_path.exists());
+            assert_eq!(
+                store
+                    .connector_attachment_status(second_landing_id)
+                    .expect("expired status loads"),
+                "expired"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staging_attachment_persists_identity_before_bytes_and_cleans_exact_file_after_restart() {
+        use std::io::Write;
+
+        use crate::kernel::connectors::landing::ConnectorAttachmentMetadata;
+        use crate::kernel::connectors::landing_windows::ManagedLandingRoot;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database = temp_dir.path().join("staging-recovery.sqlite3");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let now = Utc::now();
+        let account = ConnectorAccount {
+            id: Uuid::new_v4(),
+            provider_id: "microsoft".to_string(),
+            display_name: "Staging recovery account".to_string(),
+            tenant_ref: None,
+            credential_handle: ConnectorCredentialHandle::new(),
+            granted_capabilities: vec![ConnectorCapability::MailReadAttachment],
+            health: ConnectorHealth::Connected,
+            connected_at: now,
+            updated_at: now,
+        };
+        let metadata = ConnectorAttachmentMetadata {
+            account_id: account.id,
+            provider_id: "microsoft".to_string(),
+            parent_remote_ref: "staging-message".to_string(),
+            attachment_remote_ref: "staging-attachment".to_string(),
+            file_name: "staging.pdf".to_string(),
+            declared_media_type: "application/pdf".to_string(),
+            size_bytes: 4096,
+            contains_macros: false,
+            untrusted_evidence: true,
+        };
+        let landing_id;
+        let temp_path;
+        {
+            let store = EventStore::open(&database).expect("store opens");
+            store
+                .upsert_connector_account(&account)
+                .expect("account persists");
+            let (approval, _) = store
+                .prepare_connector_attachment_download_approval(
+                    &metadata,
+                    workspace.path(),
+                    None,
+                    now,
+                )
+                .expect("approval prepares");
+            let scope = approval.request.exact_tool.as_ref().expect("scope exists");
+            let permit = store
+                .approve_and_reserve_connector_attachment_download(
+                    approval.request.id,
+                    approval.projection_revision,
+                    scope.preview_revision,
+                    &scope.preview_hash,
+                    "Approve staging crash".to_string(),
+                    now,
+                )
+                .expect("reservation commits");
+            landing_id = permit.reservation_id();
+            let managed = ManagedLandingRoot::open(workspace.path()).expect("managed root opens");
+            let basename = format!(".{landing_id}.part");
+            temp_path = managed.landing_root().join(&basename);
+            let mut file = managed
+                .create_staged_file(&basename)
+                .expect("staging file opens");
+            let identity = managed
+                .file_identity(&file)
+                .expect("identity loads")
+                .encoded();
+            store
+                .mark_connector_attachment_staging(landing_id, &identity, now)
+                .expect("identity persists before bytes");
+            file.write_all(b"%PDF-partial")
+                .expect("partial bytes write");
+            file.sync_all().expect("partial bytes sync");
+            store
+                .begin_connector_disconnect(account.id, now)
+                .expect("disconnect invalidates staging generation");
+            assert!(store
+                .assert_connector_attachment_execution_current(landing_id)
+                .is_err());
+            let locked_candidate = store
+                .claim_runtime_connector_attachment_cleanup_candidates(now, 8)
+                .expect("disconnect cleanup claims")
+                .into_iter()
+                .find(|candidate| candidate.landing_id == landing_id)
+                .expect("disconnect cleanup candidate loads");
+            assert_eq!(
+                crate::kernel::connectors::landing::cleanup_incomplete_connector_attachment(
+                    &locked_candidate
+                ),
+                Err(crate::kernel::connectors::landing::ConnectorAttachmentCleanupFailure::Transient)
+            );
+            store
+                .defer_connector_attachment_cleanup(landing_id, locked_candidate.claim_id, now)
+                .expect("locked cleanup is deferred");
+            assert!(store
+                .claim_startup_connector_attachment_cleanup_candidates(now, 8)
+                .expect("immediate retry scan succeeds")
+                .is_empty());
+        }
+        assert!(temp_path.exists());
+        {
+            let store = EventStore::open(&database).expect("store reopens");
+            store
+                .conn
+                .execute(
+                    r#"UPDATE connector_attachment_landings
+                       SET next_cleanup_at = ?2 WHERE id = ?1"#,
+                    rusqlite::params![
+                        landing_id.to_string(),
+                        (Utc::now() - Duration::seconds(1)).to_rfc3339(),
+                    ],
+                )
+                .expect("deferred cleanup is made due");
+            let candidate = store
+                .claim_startup_connector_attachment_cleanup_candidates(Utc::now(), 8)
+                .expect("staging cleanup claims")
+                .into_iter()
+                .find(|candidate| candidate.landing_id == landing_id)
+                .expect("staging candidate exists");
+            assert!(candidate.receipt.is_none());
+            assert!(candidate.storage_identity.is_some());
+            crate::kernel::connectors::landing::cleanup_incomplete_connector_attachment(&candidate)
+                .expect("exact partial file is removed");
+            store
+                .fail_connector_attachment_after_cleanup(landing_id, candidate.claim_id, Utc::now())
+                .expect("staging landing terminalizes");
+            assert_eq!(
+                store
+                    .connector_attachment_status(landing_id)
+                    .expect("status loads"),
+                "failed"
+            );
+        }
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn attachment_reservation_budget_fails_closed_without_consuming_approval() {
+        use crate::kernel::connectors::landing::ConnectorAttachmentMetadata;
+
+        let store = EventStore::open_memory().expect("store opens");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let now = Utc::now();
+        let account = ConnectorAccount {
+            id: Uuid::new_v4(),
+            provider_id: "microsoft".to_string(),
+            display_name: "Budget account".to_string(),
+            tenant_ref: None,
+            credential_handle: ConnectorCredentialHandle::new(),
+            granted_capabilities: vec![ConnectorCapability::MailReadAttachment],
+            health: ConnectorHealth::Connected,
+            connected_at: now,
+            updated_at: now,
+        };
+        store
+            .upsert_connector_account(&account)
+            .expect("account persists");
+        let metadata = ConnectorAttachmentMetadata {
+            account_id: account.id,
+            provider_id: "microsoft".to_string(),
+            parent_remote_ref: "budget-message".to_string(),
+            attachment_remote_ref: "budget-attachment".to_string(),
+            file_name: "budget.pdf".to_string(),
+            declared_media_type: "application/pdf".to_string(),
+            size_bytes: 4096,
+            contains_macros: false,
+            untrusted_evidence: true,
+        };
+        let (approval, _) = store
+            .prepare_connector_attachment_download_approval(&metadata, workspace.path(), None, now)
+            .expect("approval prepares");
+        let scope = approval.request.exact_tool.as_ref().expect("scope exists");
+        let workspace_identity: String = store
+            .conn
+            .query_row(
+                "SELECT workspace_identity FROM connector_attachment_sources WHERE request_id = ?1",
+                rusqlite::params![approval.request.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("workspace identity loads");
+        for index in 0..super::MAX_RETAINED_ATTACHMENTS_PER_WORKSPACE {
+            store
+                .conn
+                .execute(
+                    r#"INSERT INTO connector_attachment_landings
+                       (id, account_id, account_generation, metadata_json, size_bytes,
+                        tool_invocation_id, approval_request_id, request_fingerprint,
+                        landing_fingerprint, workspace_root, workspace_identity, status,
+                        created_at, updated_at)
+                       VALUES (?1, ?2, 0, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9,
+                               'completed', ?10, ?10)"#,
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        account.id.to_string(),
+                        serde_json::to_string(&super::durable_connector_attachment_metadata(
+                            &metadata
+                        ))
+                        .unwrap(),
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string(),
+                        format!("budget-request-{index}"),
+                        format!("budget-landing-{index}"),
+                        workspace.path().to_string_lossy(),
+                        workspace_identity,
+                        now.to_rfc3339(),
+                    ],
+                )
+                .expect("budget row inserts");
+        }
+        assert!(store
+            .approve_and_reserve_connector_attachment_download(
+                approval.request.id,
+                approval.projection_revision,
+                scope.preview_revision,
+                &scope.preview_hash,
+                "Approve over budget".to_string(),
+                now,
+            )
+            .is_err());
+        let pending = store
+            .capability_access_record_by_id(approval.request.id)
+            .expect("approval remains projected");
+        assert_eq!(
+            pending.effective_status,
+            CapabilityAccessStatus::PendingApproval
+        );
+        assert!(store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM connector_attachment_sources WHERE request_id = ?1)",
+                rusqlite::params![approval.request.id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("source remains available"));
+    }
+
+    #[test]
+    fn connector_attachment_rejects_generic_and_stale_preview_resolution() {
+        use crate::kernel::connectors::landing::ConnectorAttachmentMetadata;
+
+        let store = EventStore::open_memory().expect("memory store opens");
+        let now = Utc::now();
+        let account = ConnectorAccount {
+            id: Uuid::new_v4(),
+            provider_id: "microsoft".to_string(),
+            display_name: "Attachment test account".to_string(),
+            tenant_ref: None,
+            credential_handle: ConnectorCredentialHandle::new(),
+            granted_capabilities: vec![ConnectorCapability::MailReadAttachment],
+            health: ConnectorHealth::Connected,
+            connected_at: now,
+            updated_at: now,
+        };
+        store
+            .upsert_connector_account(&account)
+            .expect("account persists");
+        let metadata = ConnectorAttachmentMetadata {
+            account_id: account.id,
+            provider_id: "microsoft".to_string(),
+            parent_remote_ref: "private-message-ref".to_string(),
+            attachment_remote_ref: "private-attachment-ref".to_string(),
+            file_name: "report.pdf".to_string(),
+            declared_media_type: "application/pdf".to_string(),
+            size_bytes: 4096,
+            contains_macros: false,
+            untrusted_evidence: true,
+        };
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (record, tool) = store
+            .prepare_connector_attachment_download_approval(&metadata, workspace.path(), None, now)
+            .expect("approval prepares");
+        let request = record.request;
+        let scope = request.exact_tool.clone().expect("scope exists");
+
+        assert!(store
+            .resolve_capability_access_request(request.id, true, "generic".to_string())
+            .is_err());
+        assert!(store
+            .approve_and_reserve_connector_attachment_download(
+                request.id,
+                0,
+                scope.preview_revision,
+                "stale-hash",
+                "stale preview".to_string(),
+                now,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .capability_access_record_by_id(request.id)
+                .expect("request remains pending")
+                .effective_status,
+            CapabilityAccessStatus::PendingApproval
+        );
+        let resolution = store
+            .reject_connector_attachment_download(
+                request.id,
+                0,
+                scope.preview_revision,
+                &scope.preview_hash,
+                "Do not download this attachment".to_string(),
+                now,
+            )
+            .expect("rejection terminalizes the exact tool atomically");
+        assert!(!resolution.approved);
+        assert_eq!(
+            store
+                .tool_invocation_by_id(tool.id)
+                .expect("tool projection loads")
+                .status,
+            crate::kernel::tool_runtime::ToolExecutionStatus::Blocked
+        );
+        let source_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM connector_attachment_sources WHERE request_id = ?1",
+                rusqlite::params![request.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("source count loads");
+        assert_eq!(source_count, 0);
+        let events = serde_json::to_string(&store.list_recent(100).unwrap()).unwrap();
+        assert!(!events.contains("private-message-ref"));
+        assert!(!events.contains("private-attachment-ref"));
+    }
+
+    fn revocation_test_account(now: DateTime<Utc>, label: &str) -> ConnectorAccount {
+        ConnectorAccount {
+            id: Uuid::new_v4(),
+            provider_id: "fake".to_string(),
+            display_name: label.to_string(),
+            tenant_ref: Some("tenant:revocation-test".to_string()),
+            credential_handle: crate::kernel::connectors::ConnectorCredentialHandle::new(),
+            granted_capabilities: vec![ConnectorCapability::MailSearch],
+            health: ConnectorHealth::Connected,
+            connected_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn malformed_due_revocations_are_quarantined_without_starving_healthy_work() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let now = Utc::now();
+        let mut malformed_ids = Vec::new();
+        for index in 0..9 {
+            let account = revocation_test_account(now, &format!("Malformed {index}"));
+            store.upsert_connector_account(&account).unwrap();
+            malformed_ids.push(
+                store
+                    .begin_connector_revocation(account.id, now)
+                    .unwrap()
+                    .id(),
+            );
+        }
+        let healthy = revocation_test_account(now, "Healthy");
+        store.upsert_connector_account(&healthy).unwrap();
+        let healthy_ticket = store.begin_connector_revocation(healthy.id, now).unwrap();
+        for id in &malformed_ids {
+            store
+                .conn
+                .execute(
+                    "UPDATE connector_revocations SET ticket_json = '{' WHERE id = ?1",
+                    params![id.to_string()],
+                )
+                .unwrap();
+        }
+
+        let claims = store.claim_due_connector_revocations(now, 1).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].ticket().id(), healthy_ticket.id());
+        let quarantined: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM connector_revocations WHERE quarantine_code = 'invalid_projection_binding'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, malformed_ids.len() as i64);
+    }
+
+    #[test]
+    fn preclaim_revocation_binding_tampering_fails_closed() {
+        for tamper in ["provider", "tenant", "credential", "generation"] {
+            let store = EventStore::open_memory().expect("memory store opens");
+            let now = Utc::now();
+            let account = revocation_test_account(now, tamper);
+            store.upsert_connector_account(&account).unwrap();
+            let ticket = store.begin_connector_revocation(account.id, now).unwrap();
+            if tamper == "generation" {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE connector_account_generations SET generation = generation + 1 WHERE account_id = ?1",
+                        params![account.id.to_string()],
+                    )
+                    .unwrap();
+            } else {
+                let mut current = store.list_connector_accounts().unwrap().pop().unwrap();
+                match tamper {
+                    "provider" => current.provider_id = "other-provider".to_string(),
+                    "tenant" => current.tenant_ref = Some("tenant:other".to_string()),
+                    "credential" => {
+                        current.credential_handle =
+                            crate::kernel::connectors::ConnectorCredentialHandle::new()
+                    }
+                    _ => unreachable!(),
+                }
+                store
+                    .conn
+                    .execute(
+                        "UPDATE connector_accounts SET account_json = ?2 WHERE id = ?1",
+                        params![
+                            account.id.to_string(),
+                            serde_json::to_string(&current).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            }
+
+            assert!(store
+                .claim_due_connector_revocations(now, 1)
+                .unwrap()
+                .is_empty());
+            let quarantine: Option<String> = store
+                .conn
+                .query_row(
+                    "SELECT quarantine_code FROM connector_revocations WHERE id = ?1",
+                    params![ticket.id().to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(quarantine.as_deref(), Some("invalid_projection_binding"));
+        }
     }
 }

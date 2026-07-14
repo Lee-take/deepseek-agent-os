@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-agent-os-desktop"
-version = "0.4.1"
+version = "0.5.0"
 description = "Local-first DeepSeek AI work platform"
 edition = "2021"
 license = "Apache-2.0"
@@ -11,8 +11,11 @@ tauri-build = { version = "2.2.0", features = [] }
 [dependencies]
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
 enigo = "0.6.1"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+quick-xml = "0.39.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -21,10 +24,12 @@ sha2 = "0.10"
 tauri = { version = "2.5.0", features = ["image-ico"] }
 tauri-plugin-dialog = "2.7.1"
 thiserror = "1"
+tempfile = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
-windows = { version = "0.61.3", features = ["Win32_UI_WindowsAndMessaging"] }
+wait-timeout = "0.2"
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
 xcap = "0.9.6"
+zeroize = "1"
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-tempfile = "3"

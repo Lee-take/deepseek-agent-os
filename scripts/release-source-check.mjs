@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-const expectedVersion = "0.4.1";
+const expectedVersion = "0.5.0";
 const maxSourceFileBytes = 2 * 1024 * 1024;
 const binaryReleaseExtensions = new Set([
   ".appimage",
@@ -47,6 +47,7 @@ const allowedSourceBinaryFiles = new Set([
 const requiredDocs = [
   "README.md",
   "docs/INSTALLATION.md",
+  "docs/RELEASE_NOTES_v0.5.0.md",
   "docs/RELEASE_NOTES_v0.4.1.md",
   "docs/RELEASE_NOTES_v0.4.0.md",
   "docs/RELEASE_NOTES_v0.3.0.md",
@@ -69,6 +70,7 @@ const publicReleaseCopyFiles = [
   "apps/desktop/package.json",
   "docs/INSTALLATION.md",
   "docs/OPEN_SOURCE_RELEASE.md",
+  "docs/RELEASE_NOTES_v0.5.0.md",
   "docs/RELEASE_NOTES_v0.4.1.md",
   "docs/RELEASE_NOTES_v0.4.0.md",
   "docs/RELEASE_NOTES_v0.3.0.md",
@@ -714,7 +716,7 @@ function checkRequiredDocs() {
       "README.md searchable DSAgent aliases",
     ],
     [
-      "Latest release: [DS Agent v0.4.1]",
+      "Latest release: [DS Agent v0.5.0]",
       "README.md latest release link",
     ],
     [
@@ -894,7 +896,7 @@ function checkRequiredDocs() {
   }
 
   for (const phrase of [
-    "The current 0.4.1 preview includes the permission loop",
+    "The current 0.5.0 preview includes the permission loop",
     "Harness architecture v1",
     "runs through a stable Agent OS Kernel plus Workflow Packs",
     "uses permissioned tool boundaries, source-linked evidence, bounded workflow runs, selective context assembly, and token-efficient DeepSeek routing",
@@ -1751,10 +1753,22 @@ function checkPublicReleaseCopyPositioning() {
     "release notes rc.11 update heading",
   );
   checkTextIncludes(
-    "apps/desktop/src-tauri/src/commands.rs",
-    readText("apps/desktop/src-tauri/src/commands.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.4.1"',
-    "app updater current release tag v0.4.1",
+    "apps/desktop/src-tauri/src/kernel/app_update.rs",
+    readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.5.0"',
+    "app updater current release tag v0.5.0",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.5.0.md",
+    readText("docs/RELEASE_NOTES_v0.5.0.md"),
+    "Bumps the package, desktop, Tauri, Cargo, and updater metadata to `0.5.0` / `v0.5.0` so installed Windows clients can detect this release as newer than `v0.4.1`.",
+    "v0.5.0 release notes updater version bump",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.5.0.md",
+    readText("docs/RELEASE_NOTES_v0.5.0.md"),
+    "durable Automation and Artifact Engine",
+    "v0.5.0 release notes durable automation and artifact positioning",
   );
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.4.1.md",
@@ -1769,14 +1783,14 @@ function checkPublicReleaseCopyPositioning() {
     "v0.4.1 release notes repository cleanliness positioning",
   );
   checkTextIncludes(
-    "apps/desktop/src-tauri/src/commands.rs",
-    readText("apps/desktop/src-tauri/src/commands.rs"),
+    "apps/desktop/src-tauri/src/app_update_commands.rs",
+    readText("apps/desktop/src-tauri/src/app_update_commands.rs"),
     'pub fn download_app_update() -> Result<AppUpdateDownloadResult, String>',
     "app updater has background download command",
   );
   checkTextIncludes(
-    "apps/desktop/src-tauri/src/commands.rs",
-    readText("apps/desktop/src-tauri/src/commands.rs"),
+    "apps/desktop/src-tauri/src/kernel/app_update.rs",
+    readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
     'args: vec!["/S".to_string()]',
     "app updater uses silent NSIS installer flag",
   );

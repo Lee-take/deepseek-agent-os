@@ -14,6 +14,8 @@ pub const BROWSER_BROWSE_TOOL_ID: &str = "browser.browse";
 pub const BROWSER_OPEN_TOOL_ID: &str = "browser.open";
 pub const COMPUTER_CONTROL_TOOL_ID: &str = "computer.control";
 pub const COMPUTER_SCREENSHOT_TOOL_ID: &str = "computer.screenshot";
+pub const CONNECTOR_MUTATE_TOOL_ID: &str = "connector.mutate";
+pub const CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID: &str = "connector.attachment.download";
 pub const FILESYSTEM_MUTATE_TOOL_ID: &str = "filesystem.mutate";
 pub const FILE_READ_TOOL_ID: &str = "file.read";
 pub const FILE_WRITE_TOOL_ID: &str = "file.write";
@@ -350,6 +352,125 @@ impl ToolInvocationRecord {
 pub fn builtin_tool_catalog() -> Vec<ToolContract> {
     vec![
         ToolContract {
+            id: CONNECTOR_MUTATE_TOOL_ID.to_string(),
+            version: "1.0.0".to_string(),
+            title: "Apply one approved connected-account change".to_string(),
+            description: "Apply one frozen, idempotent external mutation after exact approval."
+                .to_string(),
+            capability: CapabilityKind::ConnectorWrite,
+            risk_level: RiskLevel::Critical,
+            executor_id: "kernel.connector.mutate.v1".to_string(),
+            input_schema: object_schema(
+                vec![
+                    field("provider_id", ToolValueType::String, "Connector provider id."),
+                    field("account_id", ToolValueType::String, "Connector account id."),
+                    field(
+                        "account_generation",
+                        ToolValueType::Number,
+                        "Frozen durable account generation.",
+                    ),
+                    field("capability", ToolValueType::String, "Normalized capability."),
+                    field("target_ref", ToolValueType::String, "Normalized remote target."),
+                    field("preview_hash", ToolValueType::String, "Frozen preview hash."),
+                    field("idempotency_key", ToolValueType::String, "One-side-effect key."),
+                    field("automation_run_id", ToolValueType::String, "Owning automation run."),
+                ],
+                &[
+                    "provider_id",
+                    "account_id",
+                    "account_generation",
+                    "capability",
+                    "target_ref",
+                    "preview_hash",
+                    "idempotency_key",
+                    "automation_run_id",
+                ],
+            ),
+            output_schema: object_schema(
+                vec![
+                    field("remote_object_ref", ToolValueType::String, "Verified remote object."),
+                    field("outcome", ToolValueType::String, "Normalized mutation outcome."),
+                ],
+                &["remote_object_ref", "outcome"],
+            ),
+            constraints: ToolConstraints {
+                allowed_network_hosts: Vec::new(),
+                path_scope: ToolPathScope::None,
+                mutates_machine_state: true,
+                protected_path_policy: "connected account, exact approval, and idempotency key are mandatory".to_string(),
+                resource: None,
+            },
+            verification: ToolVerificationContract {
+                recipe_id: "connector.remote-mutation.v1".to_string(),
+                description: "Require provider evidence and remote-state verification before success.".to_string(),
+                required_evidence_kinds: vec!["connector_remote_state".to_string()],
+            },
+            recovery_hint: "Reconcile remote state before retrying; never replay an uncertain external mutation.".to_string(),
+        },
+        ToolContract {
+            id: CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID.to_string(),
+            version: "1.0.0".to_string(),
+            title: "Download one approved connected attachment".to_string(),
+            description: "Download one exact connected-account attachment into the managed workspace as untrusted evidence."
+                .to_string(),
+            capability: CapabilityKind::ConnectorAttachmentRead,
+            risk_level: RiskLevel::Critical,
+            executor_id: "kernel.connector.attachment.download.v1".to_string(),
+            input_schema: object_schema(
+                vec![
+                    field("provider_id", ToolValueType::String, "Connector provider id."),
+                    field("account_id", ToolValueType::String, "Connected account id."),
+                    field("parent_remote_ref", ToolValueType::String, "Private parent object reference."),
+                    field("attachment_remote_ref", ToolValueType::String, "Private attachment reference."),
+                    field("file_name", ToolValueType::String, "Approved original filename."),
+                    field("media_type", ToolValueType::String, "Approved media type."),
+                    field("size_bytes", ToolValueType::Number, "Approved byte size."),
+                    field("account_generation", ToolValueType::Number, "Durable account generation."),
+                    field("workspace_identity", ToolValueType::String, "Hashed managed workspace identity."),
+                ],
+                &[
+                    "provider_id",
+                    "account_id",
+                    "parent_remote_ref",
+                    "attachment_remote_ref",
+                    "file_name",
+                    "media_type",
+                    "size_bytes",
+                    "account_generation",
+                    "workspace_identity",
+                ],
+            ),
+            output_schema: object_schema(
+                vec![
+                    field("landing_ref", ToolValueType::String, "Managed relative landing reference."),
+                    field("media_type", ToolValueType::String, "Verified media type."),
+                    field("byte_size", ToolValueType::Number, "Verified byte size."),
+                    field("sha256", ToolValueType::String, "Verified SHA-256."),
+                ],
+                &["landing_ref", "media_type", "byte_size", "sha256"],
+            ),
+            constraints: ToolConstraints {
+                allowed_network_hosts: vec!["graph.microsoft.com".to_string()],
+                path_scope: ToolPathScope::Workspace,
+                mutates_machine_state: true,
+                protected_path_policy: "exact one-shot approval, connected account generation, and fixed managed landing directory are mandatory"
+                    .to_string(),
+                resource: Some(ToolResourceRequirement {
+                    key: "connector-attachment://managed-landing".to_string(),
+                    access: ToolResourceAccess::Write,
+                    lease_seconds: 2 * 60,
+                }),
+            },
+            verification: ToolVerificationContract {
+                recipe_id: "connector.attachment.sha256-type-size-generation.v1".to_string(),
+                description: "Require hash, type, size, workspace identity, and account generation verification before success."
+                    .to_string(),
+                required_evidence_kinds: vec!["connector_attachment".to_string()],
+            },
+            recovery_hint: "Recover or clean the durable landing reservation before requesting another one-shot download."
+                .to_string(),
+        },
+        ToolContract {
             id: FILE_READ_TOOL_ID.to_string(),
             version: "1.0.0".to_string(),
             title: "Read a sandboxed UTF-8 text file".to_string(),
@@ -456,10 +577,10 @@ pub fn builtin_tool_catalog() -> Vec<ToolContract> {
         },
         ToolContract {
             id: OFFICE_CREATE_TOOL_ID.to_string(),
-            version: "1.0.0".to_string(),
+            version: "1.1.0".to_string(),
             title: "Create a verified Office artifact".to_string(),
             description:
-                "Create one DOCX, XLSX, or PPTX artifact inside the managed workspace or desktop output boundary."
+                "Create one DOCX, XLSX, or PPTX artifact inside the managed workspace or desktop output boundary, including at most three DS Agent validation revisions as named siblings without overwriting the approved original."
                     .to_string(),
             capability: CapabilityKind::FileWrite,
             risk_level: RiskLevel::High,
@@ -493,7 +614,7 @@ pub fn builtin_tool_catalog() -> Vec<ToolContract> {
                 path_scope: ToolPathScope::Workspace,
                 mutates_machine_state: true,
                 protected_path_policy:
-                    "deny-first workspace and managed desktop output sandbox; protected paths always win"
+                    "exact approved target plus at most three same-parent .revision-N siblings; deny-first workspace and managed desktop output sandbox; protected paths always win"
                         .to_string(),
                 resource: Some(ToolResourceRequirement {
                     key: "local_filesystem://mutation".to_string(),
@@ -1322,6 +1443,93 @@ pub fn validate_tool_input(contract: &ToolContract, input: &Value) -> Result<(),
 }
 
 fn validate_tool_semantics(contract: &ToolContract, input: &Value) -> Result<(), String> {
+    if contract.id == CONNECTOR_MUTATE_TOOL_ID && input["account_generation"].as_u64().is_none() {
+        return Err(
+            "connector.mutate input field `account_generation` must be an unsigned integer"
+                .to_string(),
+        );
+    }
+    if contract.id == CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID {
+        for field in [
+            "provider_id",
+            "account_id",
+            "parent_remote_ref",
+            "attachment_remote_ref",
+            "file_name",
+            "media_type",
+            "workspace_identity",
+        ] {
+            let value = input[field].as_str().map(str::trim).unwrap_or_default();
+            if value.is_empty() {
+                return Err(format!(
+                    "connector.attachment.download input field `{field}` cannot be blank"
+                ));
+            }
+        }
+        let provider_id = input["provider_id"].as_str().unwrap_or_default();
+        let account_id = input["account_id"].as_str().unwrap_or_default();
+        let parent_ref = input["parent_remote_ref"].as_str().unwrap_or_default();
+        let attachment_ref = input["attachment_remote_ref"].as_str().unwrap_or_default();
+        let file_name = input["file_name"].as_str().unwrap_or_default().trim();
+        let media_type = input["media_type"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let workspace_identity = input["workspace_identity"].as_str().unwrap_or_default();
+        let workspace_identity_hash = workspace_identity
+            .strip_prefix("v2:")
+            .unwrap_or(workspace_identity);
+        let size_bytes = input["size_bytes"].as_u64().unwrap_or_default();
+        if provider_id.len() > 64
+            || Uuid::parse_str(account_id).is_err()
+            || parent_ref.len() > 1024
+            || attachment_ref.len() > 1024
+            || file_name.len() > 255
+            || file_name == "."
+            || file_name == ".."
+            || file_name.contains(['/', '\\', ':'])
+            || file_name.chars().any(char::is_control)
+            || size_bytes == 0
+            || size_bytes > 20 * 1024 * 1024
+            || input["account_generation"].as_u64().is_none()
+            || workspace_identity_hash.len() != 64
+            || !workspace_identity_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("connector.attachment.download input is unsafe".to_string());
+        }
+        let extension = std::path::Path::new(file_name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let supported = matches!(
+            (extension.as_str(), media_type.as_str()),
+            ("pdf", "application/pdf")
+                | ("png", "image/png")
+                | ("jpg" | "jpeg", "image/jpeg")
+                | ("txt", "text/plain")
+                | ("csv", "text/csv")
+                | ("json", "application/json")
+                | (
+                    "docx",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+                | (
+                    "xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                | (
+                    "pptx",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                )
+        );
+        if !supported {
+            return Err("connector.attachment.download file type is not supported".to_string());
+        }
+    }
     if contract.id == FILE_WRITE_TOOL_ID {
         for field in ["path", "summary", "content"] {
             let value = input
@@ -1711,6 +1919,36 @@ pub fn tool_request_fingerprint(request: &ToolExecutionRequest) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+pub fn tool_approval_preview(request: &ToolExecutionRequest) -> String {
+    if request.tool_id == CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID {
+        let provider = request.input["provider_id"]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or("connector");
+        let account = request.input["account_id"]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or("unknown account");
+        let file_name = request.input["file_name"]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or("attachment");
+        let media_type = request.input["media_type"]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or("unknown type");
+        let size_bytes = request.input["size_bytes"].as_u64().unwrap_or_default();
+        let workspace_identity = request.input["workspace_identity"]
+            .as_str()
+            .unwrap_or_default();
+        let workspace_short = workspace_identity.get(..12).unwrap_or(workspace_identity);
+        return format!(
+            "Download `{file_name}` ({size_bytes} bytes, {media_type}) from {provider} account {account} as untrusted evidence into managed workspace {workspace_short}/connector-downloads. The file will not be opened automatically."
+        );
+    }
+    format!("Approve this exact `{}` tool request.", request.tool_id)
+}
+
 fn canonical_json_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
@@ -1738,9 +1976,10 @@ mod tests {
         validate_tool_input, ToolEvidence, ToolExecutionRequest, ToolExecutionStatus,
         ToolInvocationRecord, ToolPathScope, ToolResourceAccess, ToolVerificationResult,
         APP_UPDATE_CHECK_TOOL_ID, APP_UPDATE_DOWNLOAD_TOOL_ID, APP_UPDATE_INSTALL_TOOL_ID,
-        BROWSER_OPEN_TOOL_ID, FILESYSTEM_MUTATE_TOOL_ID, FILE_READ_TOOL_ID, FILE_WRITE_TOOL_ID,
-        OFFICE_CREATE_TOOL_ID, OFFICE_OPEN_TOOL_ID, OFFICE_UPDATE_TOOL_ID,
-        OPERATIONS_BRIEFING_TOOL_ID, SKILL_ACTIVATE_TOOL_ID, TERMINAL_READ_TOOL_ID,
+        BROWSER_OPEN_TOOL_ID, CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID, CONNECTOR_MUTATE_TOOL_ID,
+        FILESYSTEM_MUTATE_TOOL_ID, FILE_READ_TOOL_ID, FILE_WRITE_TOOL_ID, OFFICE_CREATE_TOOL_ID,
+        OFFICE_OPEN_TOOL_ID, OFFICE_UPDATE_TOOL_ID, OPERATIONS_BRIEFING_TOOL_ID,
+        SKILL_ACTIVATE_TOOL_ID, TERMINAL_READ_TOOL_ID,
     };
     use crate::kernel::models::AccessMode;
     use crate::kernel::policy::{CapabilityKind, PolicyDecision, RiskLevel};
@@ -1789,6 +2028,43 @@ mod tests {
     }
 
     #[test]
+    fn connector_attachment_contract_is_critical_exact_and_semantically_bounded() {
+        let account_id = Uuid::new_v4();
+        let request = ToolExecutionRequest {
+            tool_id: CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID.to_string(),
+            input: json!({
+                "provider_id": "microsoft",
+                "account_id": account_id,
+                "parent_remote_ref": "message-one",
+                "attachment_remote_ref": "attachment-one",
+                "file_name": "report.pdf",
+                "media_type": "application/pdf",
+                "size_bytes": 4096,
+                "account_generation": 3,
+                "workspace_identity": "a".repeat(64),
+            }),
+            access_mode: AccessMode::FullAccess,
+            run_id: None,
+        };
+        let plan = prepare_tool_execution(&request).expect("attachment plan validates");
+        assert_eq!(
+            plan.contract.capability,
+            CapabilityKind::ConnectorAttachmentRead
+        );
+        assert_eq!(plan.contract.risk_level, RiskLevel::Critical);
+        assert_eq!(plan.policy_decision, PolicyDecision::Ask);
+        assert_eq!(
+            plan.contract.constraints.path_scope,
+            ToolPathScope::Workspace
+        );
+        assert!(plan.contract.constraints.mutates_machine_state);
+
+        let mut oversized = request;
+        oversized.input["size_bytes"] = json!(20 * 1024 * 1024 + 1);
+        assert!(prepare_tool_execution(&oversized).is_err());
+    }
+
+    #[test]
     fn builtin_catalog_declares_file_write_as_a_sandboxed_resource_tool() {
         let contract = builtin_tool_catalog()
             .into_iter()
@@ -1816,7 +2092,8 @@ mod tests {
             .find(|contract| contract.id == OFFICE_CREATE_TOOL_ID)
             .expect("office create contract");
 
-        assert_eq!(contract.version, "1.0.0");
+        assert_eq!(contract.version, "1.1.0");
+        assert!(contract.description.contains("at most three"));
         assert_eq!(contract.capability, CapabilityKind::FileWrite);
         assert_eq!(contract.risk_level, RiskLevel::High);
         assert_eq!(contract.constraints.path_scope, ToolPathScope::Workspace);
@@ -2443,6 +2720,36 @@ mod tests {
         assert_eq!(check.policy_decision, PolicyDecision::Allow);
         assert_eq!(download.policy_decision, PolicyDecision::Ask);
         assert_eq!(install.policy_decision, PolicyDecision::Ask);
+    }
+
+    #[test]
+    fn connector_mutation_exact_fingerprint_and_confirmation_are_mandatory() {
+        let input = json!({
+            "provider_id": "fake",
+            "account_id": Uuid::new_v4().to_string(),
+            "account_generation": 0,
+            "capability": "mail_send_draft",
+            "target_ref": "draft:42",
+            "preview_hash": "sha256:preview-a",
+            "idempotency_key": "send:42:once",
+            "automation_run_id": Uuid::new_v4().to_string()
+        });
+        let request = ToolExecutionRequest {
+            tool_id: CONNECTOR_MUTATE_TOOL_ID.to_string(),
+            input: input.clone(),
+            access_mode: AccessMode::FullAccess,
+            run_id: Some(Uuid::new_v4()),
+        };
+        let plan = prepare_tool_execution(&request).expect("connector mutation plan");
+        assert_eq!(plan.policy_decision, PolicyDecision::Ask);
+
+        let original = tool_request_fingerprint(&request);
+        let mut changed = request;
+        changed.input["preview_hash"] = json!("sha256:preview-b");
+        assert_ne!(original, tool_request_fingerprint(&changed));
+        changed.input["preview_hash"] = input["preview_hash"].clone();
+        changed.input["account_generation"] = json!(1);
+        assert_ne!(original, tool_request_fingerprint(&changed));
     }
 
     #[test]

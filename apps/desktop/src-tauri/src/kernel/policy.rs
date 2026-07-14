@@ -1,8 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kernel::models::AccessMode;
+
+pub const TOOL_APPROVAL_PREVIEW_REVISION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +18,8 @@ pub enum CapabilityKind {
     EmailRead,
     EmailDraft,
     EmailSend,
+    ConnectorAttachmentRead,
+    ConnectorWrite,
     DriveRead,
     DriveWrite,
     TerminalRead,
@@ -90,6 +95,27 @@ pub struct CapabilityDescriptor {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactToolApprovalScope {
+    pub tool_id: String,
+    pub request_fingerprint: String,
+    pub preview: String,
+    #[serde(default)]
+    pub preview_revision: u32,
+    #[serde(default)]
+    pub preview_hash: String,
+}
+
+pub fn exact_tool_preview_hash(preview_revision: u32, preview: &str) -> String {
+    let preview = preview.trim();
+    let mut digest = Sha256::new();
+    digest.update(b"ds-agent.tool-approval-preview.v1\0");
+    digest.update(preview_revision.to_be_bytes());
+    digest.update((preview.len() as u64).to_be_bytes());
+    digest.update(preview.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CapabilityAccessRequest {
     pub id: Uuid,
     pub access_mode: AccessMode,
@@ -101,7 +127,41 @@ pub struct CapabilityAccessRequest {
     pub decision: PolicyDecision,
     pub status: CapabilityAccessStatus,
     pub reason: String,
+    #[serde(default)]
+    pub exact_tool: Option<ExactToolApprovalScope>,
     pub created_at: DateTime<Utc>,
+}
+
+impl CapabilityAccessRequest {
+    pub fn bind_exact_tool(
+        &mut self,
+        tool_id: impl Into<String>,
+        request_fingerprint: impl Into<String>,
+        preview: impl Into<String>,
+    ) -> Result<(), String> {
+        let tool_id = tool_id.into();
+        let request_fingerprint = request_fingerprint.into();
+        let preview = preview.into();
+        if tool_id.trim().is_empty()
+            || tool_id.len() > 128
+            || request_fingerprint.len() != 64
+            || !request_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || preview.trim().is_empty()
+            || preview.len() > 512
+        {
+            return Err("exact tool approval scope is invalid".to_string());
+        }
+        self.exact_tool = Some(ExactToolApprovalScope {
+            tool_id,
+            request_fingerprint,
+            preview: preview.trim().to_string(),
+            preview_revision: TOOL_APPROVAL_PREVIEW_REVISION,
+            preview_hash: exact_tool_preview_hash(TOOL_APPROVAL_PREVIEW_REVISION, &preview),
+        });
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,6 +170,12 @@ pub struct PermissionResolution {
     pub request_id: Uuid,
     pub approved: bool,
     pub note: String,
+    #[serde(default)]
+    pub expected_request_revision: Option<u64>,
+    #[serde(default)]
+    pub exact_preview_revision: Option<u32>,
+    #[serde(default)]
+    pub exact_preview_hash: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -120,8 +186,35 @@ impl PermissionResolution {
             request_id,
             approved,
             note: note.trim().to_string(),
+            expected_request_revision: None,
+            exact_preview_revision: None,
+            exact_preview_hash: None,
             created_at: Utc::now(),
         }
+    }
+
+    pub fn new_exact(
+        request_id: Uuid,
+        approved: bool,
+        note: String,
+        expected_request_revision: u64,
+        scope: &ExactToolApprovalScope,
+    ) -> Result<Self, String> {
+        if scope.preview_revision == 0
+            || scope.preview_hash != exact_tool_preview_hash(scope.preview_revision, &scope.preview)
+        {
+            return Err("exact tool preview evidence is invalid".to_string());
+        }
+        Ok(Self {
+            id: Uuid::new_v4(),
+            request_id,
+            approved,
+            note: note.trim().to_string(),
+            expected_request_revision: Some(expected_request_revision),
+            exact_preview_revision: Some(scope.preview_revision),
+            exact_preview_hash: Some(scope.preview_hash.clone()),
+            created_at: Utc::now(),
+        })
     }
 }
 
@@ -130,6 +223,8 @@ pub struct CapabilityAccessRecord {
     pub request: CapabilityAccessRequest,
     pub resolution: Option<PermissionResolution>,
     pub effective_status: CapabilityAccessStatus,
+    #[serde(default)]
+    pub projection_revision: u64,
     #[serde(default)]
     pub grant_state: CapabilityGrantState,
 }
@@ -227,6 +322,22 @@ pub fn builtin_capability_catalog() -> Vec<CapabilityDescriptor> {
             "Send approved outbound email from a connected mailbox.",
             "email_send",
             false,
+        ),
+        descriptor(
+            CapabilityFamily::Email,
+            CapabilityKind::ConnectorAttachmentRead,
+            "Connected attachment download",
+            "Download one approved untrusted attachment into the managed workspace.",
+            "single_connector_attachment",
+            true,
+        ),
+        descriptor(
+            CapabilityFamily::Email,
+            CapabilityKind::ConnectorWrite,
+            "Connected account change",
+            "Apply one approved external account mutation.",
+            "single_external_change",
+            true,
         ),
         descriptor(
             CapabilityFamily::Drive,
@@ -343,6 +454,7 @@ pub fn request_capability_access(
         decision,
         status,
         reason: decision_reason(access_mode, capability, risk_level, decision).to_string(),
+        exact_tool: None,
         created_at: Utc::now(),
     })
 }
@@ -383,6 +495,8 @@ pub fn capability_risk(capability: CapabilityKind) -> RiskLevel {
         | CapabilityKind::TerminalWrite
         | CapabilityKind::AppUpdateDownload => RiskLevel::High,
         CapabilityKind::EmailSend
+        | CapabilityKind::ConnectorAttachmentRead
+        | CapabilityKind::ConnectorWrite
         | CapabilityKind::ComputerControl
         | CapabilityKind::AppUpdateInstall => RiskLevel::Critical,
     }
@@ -401,6 +515,8 @@ pub fn decide(access_mode: AccessMode, capability: CapabilityKind) -> PolicyDeci
         },
         AccessMode::FullAccess => match capability {
             CapabilityKind::EmailSend
+            | CapabilityKind::ConnectorAttachmentRead
+            | CapabilityKind::ConnectorWrite
             | CapabilityKind::ComputerControl
             | CapabilityKind::AppUpdateInstall => PolicyDecision::Ask,
             _ => PolicyDecision::Allow,
@@ -418,6 +534,8 @@ fn decision_reason(
         (
             _,
             CapabilityKind::EmailSend
+            | CapabilityKind::ConnectorAttachmentRead
+            | CapabilityKind::ConnectorWrite
             | CapabilityKind::ComputerControl
             | CapabilityKind::AppUpdateInstall,
             RiskLevel::Critical,

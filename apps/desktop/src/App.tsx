@@ -59,6 +59,7 @@ import {
   agentChatPendingStageIndex,
 } from "./agentChatPending";
 import { summarizeAgentContextReceipt } from "./agentContextReceipt";
+import { AutomationCenter } from "./AutomationCenter";
 import {
   conversationAttachmentMetadata,
   formatAgentPromptWithAttachments,
@@ -2426,6 +2427,28 @@ export function App() {
     setAgentRunRecords(runs);
     return runs;
   };
+
+  useEffect(() => {
+    if (!hasDesktopRuntime() || localDirectoryState.needs_setup) {
+      return;
+    }
+    let cancelled = false;
+    const sweepAutomations = async () => {
+      await invoke<number>("reconcile_automation_runs");
+      const queued = await invoke<number>("run_due_automation_sweep");
+      if (!cancelled && queued > 0) {
+        await refreshAgentRunRecords();
+      }
+    };
+    void sweepAutomations().catch(() => null);
+    const timer = window.setInterval(() => {
+      void sweepAutomations().catch(() => null);
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [localDirectoryState.needs_setup]);
 
   useEffect(() => {
     if (!hasDesktopRuntime() || (!agentChatPending && !hasOpenAgentRuns)) {
@@ -6900,6 +6923,13 @@ export function App() {
                 </section>
               </section>
 
+              <AutomationCenter
+                language={language}
+                onRunQueued={async () => {
+                  await refreshAgentRunRecords();
+                }}
+              />
+
               <div className="task-list" aria-live="polite">
                 {taskRecords.length === 0 ? (
                   <p className="empty-state">{copy.package.noRecords}</p>
@@ -7186,6 +7216,11 @@ export function App() {
                             {copy.riskOptions[record.request.risk_level]} ·{" "}
                             {copy.accessOptions[record.request.access_mode]}
                           </p>
+                          {record.request.exact_tool ? (
+                            <p className="approval-preview">
+                              {record.request.exact_tool.preview}
+                            </p>
+                          ) : null}
                         </div>
                         <div className="approval-actions">
                           <button

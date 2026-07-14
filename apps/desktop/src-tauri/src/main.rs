@@ -1,15 +1,30 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+mod app_update_commands;
+mod artifact_commands;
+mod automation_commands;
 mod commands;
+mod connector_commands;
 mod kernel;
+
+use app_update_commands::{check_app_update, download_app_update, install_app_update};
+use artifact_commands::{
+    get_artifact_visual_preview, list_artifact_deliveries, spawn_artifact_recovery_worker,
+};
+use automation_commands::{
+    create_once_automation, create_recurring_automation, delete_automation,
+    edit_automation_review_item, enqueue_due_automation, list_automation_definitions,
+    list_automation_review_items, list_automation_runs, reconcile_automation_runs,
+    resolve_automation_review_item, run_automation_now, run_due_automation_sweep,
+    set_automation_enabled, update_automation_goal,
+};
 
 use commands::{
     archive_memory_candidate_conflicts, archive_memory_from_maintenance_review, browse_url,
-    capture_computer_screenshot, check_app_update, claim_agent_run_record,
-    claim_next_agent_run_record, clear_deepseek_chat_cache, control_computer_boundary,
-    create_email_draft_boundary, create_generated_skill, create_task_record, delete_memory_record,
-    download_app_update, enqueue_agent_run_record, enqueue_subagent_run_records,
-    ensure_system_skill_builder, execute_agent_tool,
+    capture_computer_screenshot, claim_agent_run_record, claim_next_agent_run_record,
+    clear_deepseek_chat_cache, control_computer_boundary, create_email_draft_boundary,
+    create_generated_skill, create_task_record, delete_memory_record, enqueue_agent_run_record,
+    enqueue_subagent_run_records, ensure_system_skill_builder, execute_agent_tool,
     export_operations_briefing_html_report, export_operations_briefing_pdf_report,
     export_operations_briefing_report, export_work_package, finish_agent_run_record,
     get_agent_soul_profile, get_computer_control_unlock_status, get_computer_use_backend_status,
@@ -17,7 +32,7 @@ use commands::{
     get_deepseek_credential_status, get_deepseek_pricing_state, get_deepseek_user_balance,
     get_foundation_state, get_local_directory_state, get_model_driven_tool_strategy,
     get_network_search_route_status, get_network_search_route_status_for_model,
-    import_work_package, ingest_evidence_folder, install_app_update, install_local_skill_manifest,
+    import_work_package, ingest_evidence_folder, install_local_skill_manifest,
     install_local_skill_zip_package, install_remote_skill_zip_package,
     install_skill_from_repository_url, link_memory_candidate_to_conflicts, link_memory_records,
     list_agent_context_receipts, list_agent_run_records, list_agent_tool_contracts,
@@ -31,11 +46,11 @@ use commands::{
     preview_memory_candidate_merge, preview_memory_candidate_replace,
     preview_remote_skill_zip_package, preview_work_package_import, propose_memory_candidate,
     propose_memory_update_candidate_from_feedback, queue_agent_run_guidance_record,
-    read_drive_boundary, read_email_boundary, read_local_file, record_agent_run_artifact_record,
-    record_agent_run_step_record, record_memory_maintenance_review_action, record_permission_audit,
+    queue_parent_agent_synthesis, read_drive_boundary, read_email_boundary, read_local_file,
+    record_agent_run_artifact_record, record_agent_run_step_record,
+    record_memory_maintenance_review_action, record_permission_audit,
     record_selected_memory_feedback, replace_memory_candidate_conflicts,
-    queue_parent_agent_synthesis, request_agent_run_cancel_record, request_capability_access,
-    reset_skill_trust,
+    request_agent_run_cancel_record, request_capability_access, reset_skill_trust,
     resolve_capability_access_request, resolve_memory_candidate, resume_agent_chat_action,
     run_agent_chat, run_memory_background_maintenance, run_next_queued_agent_chat_worker,
     run_operations_briefing, run_skill_update_sweep, run_terminal_read, run_terminal_write,
@@ -46,12 +61,46 @@ use commands::{
     update_memory_candidate_conflict, update_memory_record, verify_skill_source,
     write_drive_boundary, write_file_boundary, AppState,
 };
+use connector_commands::{
+    disconnect_connector_account, get_connector_authorization_review,
+    inspect_connector_external_result, list_connector_account_summaries,
+    list_connector_authorization_reviews, list_connector_provider_catalog,
+    list_connector_read_activity, list_connector_recovery_items,
+    reconcile_incomplete_connector_attachment_landings, resolve_connector_authorization_review,
+    resume_connector_read_sync, retry_connector_attachment_cleanup,
+    spawn_connector_attachment_recovery_worker, spawn_connector_read_worker,
+    spawn_connector_reconciliation_worker, spawn_connector_sync_recovery_worker,
+    start_explicit_connector_calendar_list, start_explicit_connector_mail_search,
+};
+#[cfg(windows)]
+use connector_commands::{
+    reconcile_pending_connector_disconnects, recover_pending_connector_authorizations,
+};
 use kernel::event_store::EventStore;
 use tauri::{image::Image, Manager};
 
 const APP_ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
 #[cfg(windows)]
 const UI_SMOKE_REMOTE_DEBUGGING_PORT_ENV: &str = "DS_AGENT_UI_SMOKE_REMOTE_DEBUGGING_PORT";
+
+#[cfg(windows)]
+struct WindowsSingleInstanceGuard(#[allow(dead_code)] std::fs::File);
+
+#[cfg(windows)]
+impl WindowsSingleInstanceGuard {
+    fn acquire(app_data_dir: &std::path::Path) -> Result<Self, String> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(app_data_dir.join("runtime-instance.lock"))
+            .map(Self)
+            .map_err(|_| "another DS Agent instance already owns the runtime".to_string())
+    }
+}
 
 #[cfg(windows)]
 fn configure_ui_smoke_remote_debugging(context: &mut tauri::Context<tauri::Wry>) {
@@ -200,11 +249,36 @@ fn main() {
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
+            #[cfg(windows)]
+            app.manage(
+                WindowsSingleInstanceGuard::acquire(&app_data_dir)
+                    .map_err(std::io::Error::other)?,
+            );
             let event_store = EventStore::open(app_data_dir.join("kernel-events.sqlite3"))?;
             ensure_system_skill_builder(&event_store).map_err(|error| {
                 std::io::Error::other(format!("system Skill setup failed: {error}"))
             })?;
-            app.manage(AppState::new(event_store));
+            let state = AppState::new(event_store, app_data_dir.join("connector-vault"))
+                .map_err(std::io::Error::other)?;
+            #[cfg(windows)]
+            {
+                let _ = reconcile_pending_connector_disconnects(&state);
+                let _ = recover_pending_connector_authorizations(&state);
+            }
+            let reconciliation_store = state.event_store();
+            if let Ok(store) = reconciliation_store.lock() {
+                let _ = store.reset_abandoned_connector_revocation_claims(chrono::Utc::now());
+                let _ = store.reset_abandoned_connector_reconciliation_claims(chrono::Utc::now());
+                let _ = store.reset_expired_connector_sync_recovery_claims(chrono::Utc::now());
+                let _ = store.reset_connector_read_executions_after_restart(chrono::Utc::now());
+            }
+            let _ = reconcile_incomplete_connector_attachment_landings(&state);
+            spawn_connector_sync_recovery_worker(state.clone());
+            spawn_connector_read_worker(state.clone());
+            spawn_connector_reconciliation_worker(state.clone());
+            spawn_connector_attachment_recovery_worker(state.clone());
+            spawn_artifact_recovery_worker(state.clone());
+            app.manage(state);
             if let Some(window) = app.get_webview_window("main") {
                 apply_main_window_icon(&window)?;
             }
@@ -230,6 +304,35 @@ fn main() {
             run_next_queued_agent_chat_worker,
             resume_agent_chat_action,
             list_agent_run_records,
+            list_automation_definitions,
+            list_automation_runs,
+            list_automation_review_items,
+            list_artifact_deliveries,
+            get_artifact_visual_preview,
+            list_connector_account_summaries,
+            list_connector_read_activity,
+            list_connector_authorization_reviews,
+            get_connector_authorization_review,
+            resolve_connector_authorization_review,
+            list_connector_provider_catalog,
+            list_connector_recovery_items,
+            disconnect_connector_account,
+            retry_connector_attachment_cleanup,
+            resume_connector_read_sync,
+            start_explicit_connector_mail_search,
+            start_explicit_connector_calendar_list,
+            inspect_connector_external_result,
+            create_once_automation,
+            create_recurring_automation,
+            set_automation_enabled,
+            update_automation_goal,
+            delete_automation,
+            run_automation_now,
+            edit_automation_review_item,
+            resolve_automation_review_item,
+            enqueue_due_automation,
+            reconcile_automation_runs,
+            run_due_automation_sweep,
             start_agent_run_record,
             enqueue_agent_run_record,
             enqueue_subagent_run_records,
@@ -335,7 +438,18 @@ mod tests {
     use super::{select_ico_resource, APP_ICON_BYTES};
 
     #[cfg(windows)]
-    use super::ui_smoke_browser_arguments;
+    use super::{ui_smoke_browser_arguments, WindowsSingleInstanceGuard};
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_instance_file_lock_is_exclusive_and_recoverable() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = WindowsSingleInstanceGuard::acquire(temp.path()).unwrap();
+        assert!(WindowsSingleInstanceGuard::acquire(temp.path()).is_err());
+        drop(first);
+        WindowsSingleInstanceGuard::acquire(temp.path())
+            .expect("runtime lock is released when the owning process exits or guard drops");
+    }
 
     #[cfg(windows)]
     #[test]
@@ -361,5 +475,42 @@ mod tests {
     #[test]
     fn malformed_ico_bytes_do_not_select_resource() {
         assert!(select_ico_resource(b"not an icon", 32).is_none());
+    }
+
+    #[test]
+    fn startup_resets_recovery_claims_before_spawning_workers() {
+        let source = include_str!("main.rs");
+        let revocation = source
+            .find("reset_abandoned_connector_revocation_claims")
+            .expect("revocation reset remains wired");
+        let reconciliation = source
+            .find("reset_abandoned_connector_reconciliation_claims")
+            .expect("reconciliation reset remains wired");
+        let sync = source
+            .find("reset_expired_connector_sync_recovery_claims")
+            .expect("sync recovery reset remains wired");
+        let read = source
+            .find("reset_connector_read_executions_after_restart")
+            .expect("read execution reset remains wired");
+        let attachment = source
+            .find("reconcile_incomplete_connector_attachment_landings(&state)")
+            .expect("attachment recovery remains wired");
+        let worker = source
+            .find("            spawn_connector_reconciliation_worker(state.clone());")
+            .expect("reconciliation worker remains wired");
+        let sync_worker = source
+            .find("            spawn_connector_sync_recovery_worker(state.clone());")
+            .expect("sync recovery worker remains wired");
+        let read_worker = source
+            .find("            spawn_connector_read_worker(state.clone());")
+            .expect("read worker remains wired");
+
+        assert!(revocation < reconciliation);
+        assert!(reconciliation < sync);
+        assert!(sync < read);
+        assert!(read < attachment);
+        assert!(attachment < sync_worker);
+        assert!(sync_worker < read_worker);
+        assert!(read_worker < worker);
     }
 }

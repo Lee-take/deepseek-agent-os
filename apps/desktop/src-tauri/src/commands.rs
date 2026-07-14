@@ -4,14 +4,14 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
+
+#[cfg(windows)]
+use crate::kernel::connectors::{ConnectorRuntime, WindowsConnectorCredentialStore};
 
 use crate::kernel::agent_context::{
     agent_loop_mode_descriptor, classify_agent_action_loop_mode, AgentContextReceipt, AgentLoopMode,
@@ -21,6 +21,15 @@ use crate::kernel::agent_run::{
     AgentRunExecutionContext, AgentRunFinish, AgentRunGuidanceApplied, AgentRunQueuedGuidance,
     AgentRunRecord, AgentRunResourceAccess, AgentRunResourceClaim, AgentRunStart, AgentRunStatus,
     AgentRunStepRecord, AgentRunStepStatus, AgentRunTransition,
+};
+use crate::kernel::app_update::{
+    check_update as check_app_update, download_update as download_app_update,
+    schedule_install as schedule_app_update_install, validate_downloaded_update_installer_path,
+    APP_UPDATE_RELEASES_API_URL,
+};
+use crate::kernel::artifact_render::render_artifact_file;
+use crate::kernel::artifacts::{
+    ArtifactEngine, ArtifactGenerationRequest, ArtifactInput, ArtifactTemplate,
 };
 use crate::kernel::attachments::{stage_agent_attachment_paths, AgentAttachment};
 use crate::kernel::capability::{
@@ -42,6 +51,10 @@ use crate::kernel::capability::{
 };
 use crate::kernel::computer_use::{
     computer_use_backend_status_for_strategy, ComputerUseBackendStatus,
+};
+use crate::kernel::connectors::reconciliation::ConnectorReconcilerRegistry;
+use crate::kernel::connectors::runtime_registry::{
+    ConnectorOAuthRegistry, ConnectorRuntimeRegistries,
 };
 use crate::kernel::deepseek::{
     build_deepseek_chat_completion_request, current_deepseek_credential_status,
@@ -112,14 +125,15 @@ use crate::kernel::skill_source::{
     fetch_repository_snapshot, SkillRepositorySource,
 };
 use crate::kernel::tool_runtime::{
-    builtin_tool_catalog, prepare_tool_execution, tool_request_fingerprint, AgentToolExecutor,
-    ToolEvidence, ToolExecutionOutput, ToolExecutionPlan, ToolExecutionRequest,
+    builtin_tool_catalog, prepare_tool_execution, tool_approval_preview, tool_request_fingerprint,
+    AgentToolExecutor, ToolEvidence, ToolExecutionOutput, ToolExecutionPlan, ToolExecutionRequest,
     ToolExecutionStatus, ToolInvocationRecord, ToolResourceAccess, ToolVerificationResult,
     APP_UPDATE_CHECK_TOOL_ID, APP_UPDATE_DOWNLOAD_TOOL_ID, APP_UPDATE_INSTALL_TOOL_ID,
     BROWSER_BROWSE_TOOL_ID, BROWSER_OPEN_TOOL_ID, COMPUTER_CONTROL_TOOL_ID,
-    COMPUTER_SCREENSHOT_TOOL_ID, FILESYSTEM_MUTATE_TOOL_ID, FILE_READ_TOOL_ID, FILE_WRITE_TOOL_ID,
-    NETWORK_SEARCH_TOOL_ID, OFFICE_CREATE_TOOL_ID, OFFICE_OPEN_TOOL_ID, OFFICE_UPDATE_TOOL_ID,
-    OPERATIONS_BRIEFING_TOOL_ID, SKILL_ACTIVATE_TOOL_ID, TERMINAL_READ_TOOL_ID,
+    COMPUTER_SCREENSHOT_TOOL_ID, CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID, FILESYSTEM_MUTATE_TOOL_ID,
+    FILE_READ_TOOL_ID, FILE_WRITE_TOOL_ID, NETWORK_SEARCH_TOOL_ID, OFFICE_CREATE_TOOL_ID,
+    OFFICE_OPEN_TOOL_ID, OFFICE_UPDATE_TOOL_ID, OPERATIONS_BRIEFING_TOOL_ID,
+    SKILL_ACTIVATE_TOOL_ID, TERMINAL_READ_TOOL_ID,
 };
 use crate::kernel::tool_strategy::{
     model_driven_tool_strategy_for_current_platform, ModelDrivenToolStrategy,
@@ -141,19 +155,80 @@ use crate::kernel::workflow::{
     OPERATIONS_BRIEFING_WORKFLOW_ID,
 };
 
+#[derive(Clone)]
 pub struct AppState {
     event_store: Arc<Mutex<EventStore>>,
+    connector_registries: Arc<ConnectorRuntimeRegistries>,
+    #[cfg(windows)]
+    connector_runtime: Arc<ConnectorRuntime<WindowsConnectorCredentialStore>>,
     computer_control_unlock: Arc<Mutex<ComputerControlUnlockState>>,
     deepseek_chat_cache: Arc<DeepSeekMemoryChatCompletionCache>,
 }
 
 impl AppState {
-    pub fn new(event_store: EventStore) -> Self {
-        Self {
+    pub fn new(
+        event_store: EventStore,
+        #[cfg(windows)] connector_vault_root: impl AsRef<Path>,
+    ) -> Result<Self, String> {
+        Ok(Self {
             event_store: Arc::new(Mutex::new(event_store)),
+            connector_registries: Arc::new(ConnectorRuntimeRegistries::empty()),
+            #[cfg(windows)]
+            connector_runtime: Arc::new(ConnectorRuntime::new(
+                WindowsConnectorCredentialStore::new(connector_vault_root)?,
+            )),
             computer_control_unlock: Arc::new(Mutex::new(ComputerControlUnlockState::generated())),
             deepseek_chat_cache: Arc::new(DeepSeekMemoryChatCompletionCache::default()),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_connector_sync_registry_for_test(
+        mut self,
+        syncs: Arc<dyn crate::kernel::connectors::runtime_registry::ConnectorSyncRegistry>,
+    ) -> Self {
+        self.connector_registries = Arc::new(ConnectorRuntimeRegistries::with_sync_for_test(syncs));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_connector_read_registry_for_test(
+        mut self,
+        reads: Arc<dyn crate::kernel::connectors::runtime_registry::ConnectorReadRegistry>,
+    ) -> Self {
+        self.connector_registries = Arc::new(ConnectorRuntimeRegistries::with_read_for_test(reads));
+        self
+    }
+
+    pub(crate) fn event_store(&self) -> Arc<Mutex<EventStore>> {
+        Arc::clone(&self.event_store)
+    }
+
+    pub(crate) fn connector_reconcilers(&self) -> Arc<dyn ConnectorReconcilerRegistry> {
+        self.connector_registries.reconcilers()
+    }
+
+    pub(crate) fn connector_syncs(
+        &self,
+    ) -> Arc<dyn crate::kernel::connectors::runtime_registry::ConnectorSyncRegistry> {
+        self.connector_registries.syncs()
+    }
+
+    pub(crate) fn connector_reads(
+        &self,
+    ) -> Arc<dyn crate::kernel::connectors::runtime_registry::ConnectorReadRegistry> {
+        self.connector_registries.reads()
+    }
+
+    pub(crate) fn connector_oauth_providers(&self) -> Arc<dyn ConnectorOAuthRegistry> {
+        self.connector_registries.oauth()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn connector_runtime(
+        &self,
+    ) -> Arc<ConnectorRuntime<WindowsConnectorCredentialStore>> {
+        Arc::clone(&self.connector_runtime)
     }
 }
 
@@ -165,13 +240,6 @@ const AGENT_RUN_GUIDANCE_PROMPT_CHAR_LIMIT: usize = 12_000;
 const AGENT_SKILL_CATALOG_MAX_ITEMS: usize = 24;
 const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user from agent_actions, missing_prerequisites, required_confirmations, artifact_targets, memory_candidates, and subagent_plan. Use subagent_plan only when the request contains two or three concrete, independently useful read-only research or analysis subtasks that benefit from parallel work. Each item requires a short unique key and a self-contained prompt. Never create nested subagents, mutating subtasks, desktop-control subtasks, or more than three items. Leave subagent_plan empty for simple or dependent work. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
 const AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT: usize = 1200;
-const APP_UPDATE_RELEASES_API_URL: &str = "https://api.github.com/repos/Lee-take/dsagent/releases";
-const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
-    "https://github.com/Lee-take/dsagent/releases/download/";
-const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX: &str =
-    "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.4.1";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.4.1";
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
 const AGENT_SOUL_PROFILE_MAX_BYTES: usize = 16 * 1024;
@@ -190,9 +258,6 @@ const AGENT_MEMORY_CANDIDATE_GATE_MAX_RECORDS: usize = 3;
 const AGENT_MEMORY_CANDIDATE_EVIDENCE_CHARS: usize = 180;
 const AGENT_MEMORY_CANDIDATE_REASON_CHARS: usize = 220;
 const AGENT_SOUL_PROFILE_TEMPLATE: &str = "# DS Agent Soul\n\nschema_version: 1\n\n## User\n\n- preferred_name:\n- address_as:\n- language_preferences:\n- default_response_tone:\n- default_response_length:\n- formatting_preferences:\n- initiative_level:\n\n## DS Agent\n\n- user_calls_ds_agent:\n- ds_agent_should_refer_to_itself_as:\n- relationship_boundary:\n\n## Stable Preferences\n\n- workflow_preferences:\n- writing_preferences:\n- confirmation_preferences:\n- privacy_preferences:\n\n## Never Store\n\n- secrets\n- passwords\n- private account identifiers\n- sensitive personal data unless explicitly approved\n";
-#[cfg(windows)]
-const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentChatRequest {
     pub prompt: String,
@@ -478,29 +543,6 @@ pub struct AgentChatMissingPrerequisite {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AppUpdateStatus {
-    pub current_version: String,
-    pub latest_version: Option<String>,
-    pub update_available: bool,
-    pub asset_name: Option<String>,
-    pub release_url: Option<String>,
-    pub message: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AppUpdateDownloadResult {
-    pub latest_version: String,
-    pub asset_name: String,
-    pub installer_path: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AppUpdateInstallResult {
-    pub installer_path: String,
-    pub restart_scheduled: bool,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillRepositoryInstallOperation {
@@ -536,25 +578,6 @@ pub struct GeneratedSkillRequest {
 
 fn default_generated_skill_kind() -> String {
     "skill".to_string()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SilentUpdateInstallCommand {
-    program: PathBuf,
-    args: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-struct GithubReleaseAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-struct GithubRelease {
-    tag_name: String,
-    html_url: String,
-    assets: Vec<GithubReleaseAsset>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -803,6 +826,19 @@ impl OfficeArtifactClient for AgentFileWriteClient {
             Self::Unavailable(reason) => Err(reason.clone()),
         }
     }
+
+    fn verify_written_artifact_path(
+        &self,
+        spec: &OfficeCreateSpec,
+        result: &OfficeCreateResult,
+    ) -> Result<(), String> {
+        match self {
+            Self::Local { office_client, .. } => {
+                office_client.verify_written_artifact_path(spec, result)
+            }
+            Self::Unavailable(reason) => Err(reason.clone()),
+        }
+    }
 }
 
 impl OfficeOpenClient for AgentFileWriteClient {
@@ -827,6 +863,19 @@ impl OfficeUpdateClient for AgentFileWriteClient {
     ) -> Result<OfficeUpdateResult, String> {
         match self {
             Self::Local { office_client, .. } => office_client.update_office_artifact(spec),
+            Self::Unavailable(reason) => Err(reason.clone()),
+        }
+    }
+
+    fn verify_updated_artifact_path(
+        &self,
+        spec: &OfficeUpdateSpec,
+        result: &OfficeUpdateResult,
+    ) -> Result<(), String> {
+        match self {
+            Self::Local { office_client, .. } => {
+                office_client.verify_updated_artifact_path(spec, result)
+            }
             Self::Unavailable(reason) => Err(reason.clone()),
         }
     }
@@ -1058,13 +1107,7 @@ impl<T: OfficeArtifactClient + ?Sized> AgentToolExecutor for OfficeCreateAgentTo
         if result.path.trim().is_empty() || result.artifact_kind.trim().is_empty() {
             return Err("office.create executor returned incomplete artifact metadata".to_string());
         }
-        let expected_name = Path::new(&spec.path).file_name();
-        let actual_name = Path::new(&result.path).file_name();
-        if expected_name.is_none() || expected_name != actual_name {
-            return Err(
-                "office.create executor reported a different artifact filename".to_string(),
-            );
-        }
+        self.client.verify_written_artifact_path(&spec, &result)?;
 
         Ok(ToolExecutionOutput {
             output: serde_json::to_value(&result).map_err(event_store_error)?,
@@ -1172,13 +1215,7 @@ impl<T: OfficeUpdateClient + ?Sized> AgentToolExecutor for OfficeUpdateAgentTool
         {
             return Err("office.update executor returned incomplete artifact metadata".to_string());
         }
-        let expected_name = Path::new(&spec.path).file_name();
-        let actual_name = Path::new(&result.path).file_name();
-        if expected_name.is_none() || expected_name != actual_name {
-            return Err(
-                "office.update executor reported a different artifact filename".to_string(),
-            );
-        }
+        self.client.verify_updated_artifact_path(&spec, &result)?;
 
         Ok(ToolExecutionOutput {
             output: serde_json::to_value(&result).map_err(event_store_error)?,
@@ -1931,6 +1968,11 @@ fn ready_agent_tool_authorization(
     plan: ToolExecutionPlan,
     approval_request_id: Option<Uuid>,
 ) -> Result<AgentToolAuthorization, String> {
+    if plan.contract.id == CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID {
+        return Err(
+            "connected attachment execution requires its dedicated durable executor".to_string(),
+        );
+    }
     if let Some(resource) = &plan.contract.constraints.resource {
         let access = match resource.access {
             ToolResourceAccess::Read => AgentRunResourceAccess::Read,
@@ -2023,6 +2065,12 @@ fn authorize_agent_tool_execution(
     store: &EventStore,
     request: ToolExecutionRequest,
 ) -> Result<AgentToolAuthorization, String> {
+    if request.tool_id.trim() == CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID {
+        return Err(
+            "connected attachment authorization requires its dedicated exact-preview workflow"
+                .to_string(),
+        );
+    }
     let plan = prepare_tool_execution(&request)?;
     if let Some(run_id) = plan.request.run_id {
         let record = store
@@ -2089,17 +2137,23 @@ fn authorize_agent_tool_execution(
                     if record.request.capability != plan.contract.capability {
                         return false;
                     }
+                    let exact_scope_matches =
+                        record.request.exact_tool.as_ref().is_some_and(|scope| {
+                            scope.tool_id == plan.contract.id
+                                && scope.request_fingerprint == fingerprint
+                        });
                     match record.grant_state {
                         CapabilityGrantState::Reusable => true,
                         CapabilityGrantState::OneShotAvailable => {
-                            invocations.iter().any(|invocation| {
-                                invocation.status == ToolExecutionStatus::WaitingForConfirmation
-                                    && invocation.approval_request_id == Some(record.request.id)
-                                    && invocation.tool_id == plan.contract.id
-                                    && invocation.run_id == plan.request.run_id
-                                    && !invocation.request_fingerprint.is_empty()
-                                    && invocation.request_fingerprint == fingerprint
-                            })
+                            exact_scope_matches
+                                && invocations.iter().any(|invocation| {
+                                    invocation.status == ToolExecutionStatus::WaitingForConfirmation
+                                        && invocation.approval_request_id == Some(record.request.id)
+                                        && invocation.tool_id == plan.contract.id
+                                        && invocation.run_id == plan.request.run_id
+                                        && !invocation.request_fingerprint.is_empty()
+                                        && invocation.request_fingerprint == fingerprint
+                                })
                         }
                         CapabilityGrantState::NotGranted
                         | CapabilityGrantState::OneShotConsumed => false,
@@ -2119,6 +2173,10 @@ fn authorize_agent_tool_execution(
                 .into_iter()
                 .find(|record| {
                     record.request.capability == plan.contract.capability
+                        && record.request.exact_tool.as_ref().is_some_and(|scope| {
+                            scope.tool_id == plan.contract.id
+                                && scope.request_fingerprint == fingerprint
+                        })
                         && invocations.iter().any(|invocation| {
                             invocation.status == ToolExecutionStatus::WaitingForConfirmation
                                 && invocation.approval_request_id == Some(record.request.id)
@@ -2132,9 +2190,14 @@ fn authorize_agent_tool_execution(
             let approval_request_id = match pending_request_id {
                 Some(request_id) => request_id,
                 None => {
-                    let request = build_capability_access_request(
+                    let mut request = build_capability_access_request(
                         plan.request.access_mode,
                         plan.contract.capability,
+                    )?;
+                    request.bind_exact_tool(
+                        plan.contract.id.clone(),
+                        fingerprint.clone(),
+                        tool_approval_preview(&plan.request),
                     )?;
                     let entry = PermissionAuditEntry::evaluate(
                         plan.request.access_mode,
@@ -3445,11 +3508,20 @@ fn dispatch_agent_office_create_tool_with_executor(
     office_client: &impl OfficeArtifactClient,
 ) -> Result<ToolInvocationRecord, String> {
     let (request, spec) = agent_office_create_tool_request(action, access_mode, run_id)?;
-    action.target = Some(spec.path);
+    action.target = Some(spec.path.clone());
+    let request_fingerprint = tool_request_fingerprint(&request);
+    store
+        .record_artifact_generation_intent(
+            &request_fingerprint,
+            &ArtifactInput::Office { spec: spec.clone() },
+            Utc::now(),
+        )
+        .map_err(event_store_error)?;
     let executor = OfficeCreateAgentToolExecutor {
         client: office_client,
     };
     let invocation = execute_agent_tool_with_executor(store, request, &executor)?;
+    register_tool_office_artifact_if_succeeded(store, &invocation, &spec)?;
     apply_tool_invocation_to_agent_action(action, &invocation);
     Ok(invocation)
 }
@@ -3462,9 +3534,17 @@ fn dispatch_agent_office_create_tool_with_store_mutex(
     office_client: &impl OfficeArtifactClient,
 ) -> Result<ToolInvocationRecord, String> {
     let (request, spec) = agent_office_create_tool_request(action, access_mode, run_id)?;
-    action.target = Some(spec.path);
+    action.target = Some(spec.path.clone());
+    let request_fingerprint = tool_request_fingerprint(&request);
     let authorization = {
         let store = store_mutex.lock().map_err(|_| lock_error())?;
+        store
+            .record_artifact_generation_intent(
+                &request_fingerprint,
+                &ArtifactInput::Office { spec: spec.clone() },
+                Utc::now(),
+            )
+            .map_err(event_store_error)?;
         authorize_agent_tool_execution(&store, request)?
     };
     let invocation = match authorization {
@@ -3476,6 +3556,7 @@ fn dispatch_agent_office_create_tool_with_store_mutex(
             let invocation = run_authorized_agent_tool_execution(authorized, &executor);
             let store = store_mutex.lock().map_err(|_| lock_error())?;
             record_completed_agent_tool_execution(&store, &invocation)?;
+            register_tool_office_artifact_if_succeeded(&store, &invocation, &spec)?;
             invocation
         }
     };
@@ -4110,397 +4191,6 @@ fn current_work_package_tool_readiness(
         local_directories,
         tool_strategy,
     }
-}
-
-fn normalize_release_version(version: &str) -> String {
-    version
-        .trim()
-        .trim_start_matches('v')
-        .trim_start_matches('V')
-        .to_string()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ParsedReleaseVersion {
-    core: Vec<u64>,
-    prerelease: Option<ParsedPrereleaseVersion>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct ParsedPrereleaseVersion {
-    rank: u8,
-    number: u64,
-    label: String,
-}
-
-fn app_update_current_version() -> &'static str {
-    match option_env!("DS_AGENT_RELEASE_TAG") {
-        Some(value) if !value.is_empty() => value,
-        _ => APP_UPDATE_CURRENT_RELEASE_TAG,
-    }
-}
-
-fn parse_release_version(version: &str) -> Option<ParsedReleaseVersion> {
-    let normalized = normalize_release_version(version).to_ascii_lowercase();
-    let mut version_parts = normalized.splitn(2, '-');
-    let core_text = version_parts.next()?.trim();
-    if core_text.is_empty() {
-        return None;
-    }
-
-    let mut core = Vec::new();
-    for part in core_text.split('.') {
-        if part.trim().is_empty() {
-            core.push(0);
-            continue;
-        }
-        core.push(part.parse::<u64>().ok()?);
-    }
-    while core.len() < 3 {
-        core.push(0);
-    }
-
-    Some(ParsedReleaseVersion {
-        core,
-        prerelease: version_parts.next().and_then(parse_prerelease_version),
-    })
-}
-
-fn parse_prerelease_version(value: &str) -> Option<ParsedPrereleaseVersion> {
-    let tokens = value
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>();
-    let label = tokens
-        .iter()
-        .copied()
-        .find(|token| {
-            token
-                .chars()
-                .any(|character| character.is_ascii_alphabetic())
-        })?
-        .to_string();
-    let number = tokens
-        .iter()
-        .copied()
-        .find_map(|token| token.parse::<u64>().ok())
-        .unwrap_or(0);
-    let rank = match label.as_str() {
-        "alpha" | "a" => 0,
-        "beta" | "b" => 1,
-        "rc" | "candidate" => 2,
-        _ => 1,
-    };
-
-    Some(ParsedPrereleaseVersion {
-        rank,
-        number,
-        label,
-    })
-}
-
-fn compare_release_versions(left: &str, right: &str) -> std::cmp::Ordering {
-    let Some(left) = parse_release_version(left) else {
-        return std::cmp::Ordering::Equal;
-    };
-    let Some(right) = parse_release_version(right) else {
-        return std::cmp::Ordering::Equal;
-    };
-
-    let part_count = left.core.len().max(right.core.len());
-    for index in 0..part_count {
-        let left_part = *left.core.get(index).unwrap_or(&0);
-        let right_part = *right.core.get(index).unwrap_or(&0);
-        match left_part.cmp(&right_part) {
-            std::cmp::Ordering::Equal => {}
-            ordering => return ordering,
-        }
-    }
-
-    match (&left.prerelease, &right.prerelease) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(left), Some(right)) => left.cmp(right),
-    }
-}
-
-fn is_newer_version(latest_version: &str, current_version: &str) -> bool {
-    compare_release_versions(latest_version, current_version).is_gt()
-}
-
-fn is_windows_installer_asset(asset_name: &str) -> bool {
-    let normalized = asset_name.to_ascii_lowercase();
-    (normalized.ends_with(".exe") || normalized.ends_with(".msi"))
-        && !normalized.contains("debug")
-        && !normalized.contains("symbols")
-}
-
-fn release_asset_is_trusted(download_url: &str) -> bool {
-    download_url.starts_with(APP_UPDATE_RELEASE_DOWNLOAD_PREFIX)
-        || download_url.starts_with(APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX)
-}
-
-fn release_installable_asset(release: &GithubRelease) -> Option<&GithubReleaseAsset> {
-    release.assets.iter().find(|asset| {
-        is_windows_installer_asset(&asset.name)
-            && release_asset_is_trusted(&asset.browser_download_url)
-    })
-}
-
-fn app_update_http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .user_agent(APP_UPDATE_USER_AGENT)
-        .build()
-        .map_err(|error| format!("failed to build update client: {error}"))
-}
-
-fn fetch_github_releases() -> Result<Vec<GithubRelease>, String> {
-    app_update_http_client()?
-        .get(APP_UPDATE_RELEASES_API_URL)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .map_err(|error| format!("failed to check GitHub releases: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("GitHub releases check failed: {error}"))?
-        .json::<Vec<GithubRelease>>()
-        .map_err(|error| format!("failed to parse GitHub releases: {error}"))
-}
-
-fn sorted_releases_by_version(mut releases: Vec<GithubRelease>) -> Vec<GithubRelease> {
-    releases.sort_by(|left, right| {
-        compare_release_versions(&right.tag_name, &left.tag_name)
-            .then_with(|| right.tag_name.cmp(&left.tag_name))
-    });
-    releases
-}
-
-fn update_status_from_releases(
-    releases: Vec<GithubRelease>,
-    current_version: &str,
-) -> AppUpdateStatus {
-    let releases = sorted_releases_by_version(releases);
-    let latest_version = releases
-        .first()
-        .map(|release| normalize_release_version(&release.tag_name));
-    let latest_update_release = releases.iter().find(|release| {
-        is_newer_version(&release.tag_name, current_version)
-            && release_installable_asset(release).is_some()
-    });
-
-    if let Some(release) = latest_update_release {
-        let asset_name = release_installable_asset(release).map(|asset| asset.name.clone());
-        return AppUpdateStatus {
-            current_version: current_version.to_string(),
-            latest_version: Some(normalize_release_version(&release.tag_name)),
-            update_available: asset_name.is_some(),
-            asset_name,
-            release_url: Some(release.html_url.clone()),
-            message: None,
-        };
-    }
-
-    let has_newer_release = releases
-        .iter()
-        .any(|release| is_newer_version(&release.tag_name, current_version));
-    AppUpdateStatus {
-        current_version: current_version.to_string(),
-        latest_version,
-        update_available: false,
-        asset_name: None,
-        release_url: releases.first().map(|release| release.html_url.clone()),
-        message: if has_newer_release {
-            Some("latest release has no Windows installer asset".to_string())
-        } else {
-            None
-        },
-    }
-}
-
-#[cfg(test)]
-fn update_status_from_release(release: GithubRelease) -> AppUpdateStatus {
-    update_status_from_releases(vec![release], app_update_current_version())
-}
-
-fn latest_installable_update_release(
-    releases: &[GithubRelease],
-    current_version: &str,
-) -> Option<GithubRelease> {
-    let releases = sorted_releases_by_version(releases.to_vec());
-    releases.into_iter().find(|release| {
-        is_newer_version(&release.tag_name, current_version)
-            && release_installable_asset(release).is_some()
-    })
-}
-
-fn safe_update_asset_file_name(asset_name: &str) -> String {
-    let sanitized: String = asset_name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric()
-                || character == '.'
-                || character == '-'
-                || character == '_'
-            {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if sanitized.is_empty() {
-        "ds-agent-update-installer.exe".to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn app_update_dir() -> PathBuf {
-    std::env::temp_dir().join("ds-agent-updates")
-}
-
-fn download_release_asset(asset: &GithubReleaseAsset) -> Result<PathBuf, String> {
-    if !release_asset_is_trusted(&asset.browser_download_url) {
-        return Err("update asset URL is not trusted".to_string());
-    }
-
-    let file_name = safe_update_asset_file_name(&asset.name);
-    let update_dir = app_update_dir();
-    fs::create_dir_all(&update_dir)
-        .map_err(|error| format!("failed to prepare update directory: {error}"))?;
-    let installer_path = update_dir.join(file_name);
-    let bytes = app_update_http_client()?
-        .get(&asset.browser_download_url)
-        .send()
-        .map_err(|error| format!("failed to download update installer: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("update installer download failed: {error}"))?
-        .bytes()
-        .map_err(|error| format!("failed to read update installer: {error}"))?;
-    fs::write(&installer_path, bytes)
-        .map_err(|error| format!("failed to save update installer: {error}"))?;
-    Ok(installer_path)
-}
-
-fn validate_downloaded_update_installer_path(installer_path: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(installer_path);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "update installer path has no file name".to_string())?;
-    if !is_windows_installer_asset(file_name) {
-        return Err("downloaded update is not a Windows installer".to_string());
-    }
-
-    let update_dir = app_update_dir();
-    fs::create_dir_all(&update_dir)
-        .map_err(|error| format!("failed to prepare update directory: {error}"))?;
-    let canonical_dir = fs::canonicalize(&update_dir)
-        .map_err(|error| format!("failed to verify update directory: {error}"))?;
-    let canonical_path = fs::canonicalize(&path)
-        .map_err(|error| format!("downloaded update installer is unavailable: {error}"))?;
-    if !canonical_path.starts_with(&canonical_dir) {
-        return Err("downloaded update installer is outside the update directory".to_string());
-    }
-
-    Ok(canonical_path)
-}
-
-fn silent_update_install_command(installer_path: &Path) -> SilentUpdateInstallCommand {
-    let extension = installer_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if extension == "msi" {
-        return SilentUpdateInstallCommand {
-            program: PathBuf::from("msiexec.exe"),
-            args: vec![
-                "/i".to_string(),
-                installer_path.display().to_string(),
-                "/quiet".to_string(),
-                "/norestart".to_string(),
-            ],
-        };
-    }
-
-    SilentUpdateInstallCommand {
-        program: installer_path.to_path_buf(),
-        args: vec!["/S".to_string()],
-    }
-}
-
-fn powershell_single_quoted(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn app_update_runner_script(
-    installer_path: &Path,
-    app_path: &Path,
-    current_process_id: u32,
-) -> String {
-    let install_command = silent_update_install_command(installer_path);
-    let install_args = install_command
-        .args
-        .iter()
-        .map(|argument| powershell_single_quoted(argument))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    format!(
-        concat!(
-            "$ErrorActionPreference = 'Stop'\n",
-            "$parentPid = {current_process_id}\n",
-            "try {{ Wait-Process -Id $parentPid -Timeout 30 -ErrorAction SilentlyContinue }} catch {{ }}\n",
-            "$process = Start-Process -FilePath {installer_program} -ArgumentList @({install_args}) -Wait -PassThru -WindowStyle Hidden\n",
-            "if ($process.ExitCode -eq 0) {{\n",
-            "  Start-Process -FilePath {app_path}\n",
-            "}}\n"
-        ),
-        current_process_id = current_process_id,
-        installer_program = powershell_single_quoted(&install_command.program.display().to_string()),
-        install_args = install_args,
-        app_path = powershell_single_quoted(&app_path.display().to_string()),
-    )
-}
-
-#[cfg(windows)]
-fn spawn_silent_update_runner(installer_path: &Path) -> Result<(), String> {
-    let app_path =
-        std::env::current_exe().map_err(|error| format!("failed to locate DS Agent: {error}"))?;
-    let update_dir = app_update_dir();
-    fs::create_dir_all(&update_dir)
-        .map_err(|error| format!("failed to prepare update directory: {error}"))?;
-    let runner_path = update_dir.join("install-and-restart-ds-agent.ps1");
-    fs::write(
-        &runner_path,
-        app_update_runner_script(installer_path, &app_path, std::process::id()),
-    )
-    .map_err(|error| format!("failed to prepare silent update runner: {error}"))?;
-
-    let mut command = Command::new("powershell.exe");
-    command
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-WindowStyle",
-            "Hidden",
-            "-File",
-        ])
-        .arg(&runner_path)
-        .creation_flags(WINDOWS_CREATE_NO_WINDOW);
-    command
-        .spawn()
-        .map_err(|error| format!("failed to start silent update runner: {error}"))?;
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn spawn_silent_update_runner(_installer_path: &Path) -> Result<(), String> {
-    Err("silent app updates are only supported on Windows".to_string())
 }
 
 fn pending_memory_candidates_for_work_package(
@@ -10537,13 +10227,12 @@ fn dispatch_agent_action_proposals_with_desktop_dir_and_computer_use(
                 AgentActionApprovalState::Approved(approval_request_id),
             ) => {
                 if action.action_type == "office_create" {
-                    dispatch_agent_office_create_action(
+                    dispatch_agent_office_create_tool_with_executor(
                         store,
                         access_mode,
                         action,
+                        None,
                         file_write_client,
-                        true,
-                        Some(approval_request_id),
                     )?;
                 } else if action.action_type == "office_update" {
                     dispatch_agent_office_update_action(
@@ -10621,13 +10310,12 @@ fn dispatch_agent_action_proposals_with_desktop_dir_and_computer_use(
             }
             (Some(CapabilityKind::FileWrite), Some(PolicyDecision::Allow), _) => {
                 if action.action_type == "office_create" {
-                    dispatch_agent_office_create_action(
+                    dispatch_agent_office_create_tool_with_executor(
                         store,
                         access_mode,
                         action,
-                        file_write_client,
-                        false,
                         None,
+                        file_write_client,
                     )?;
                 } else if action.action_type == "office_update" {
                     dispatch_agent_office_update_action(
@@ -11583,6 +11271,16 @@ fn dispatch_agent_office_create_action(
         .append_capability_invocation(&invocation)
         .map_err(event_store_error)?;
 
+    if let Some(result) = outcome.result.as_ref() {
+        register_completed_office_artifact(
+            store,
+            invocation.id,
+            invocation.status == CapabilityInvocationStatus::Succeeded,
+            &spec,
+            result,
+        )?;
+    }
+
     if action.permission_request_id.is_none()
         && outcome.access_request.decision == PolicyDecision::Ask
     {
@@ -11605,6 +11303,282 @@ fn dispatch_agent_office_create_action(
         outcome.result,
         &spec,
     ));
+    Ok(())
+}
+
+pub(crate) fn register_tool_office_artifact_if_succeeded(
+    store: &EventStore,
+    invocation: &ToolInvocationRecord,
+    spec: &OfficeCreateSpec,
+) -> Result<(), String> {
+    if invocation.status != ToolExecutionStatus::Succeeded {
+        return Ok(());
+    }
+    let result = invocation
+        .output
+        .clone()
+        .ok_or_else(|| "office artifact result is missing".to_string())
+        .and_then(|value| {
+            serde_json::from_value::<OfficeCreateResult>(value).map_err(event_store_error)
+        })?;
+    register_completed_office_artifact(store, invocation.id, true, spec, &result).and_then(|_| {
+        store
+            .fulfill_artifact_generation_intent(&invocation.request_fingerprint, Utc::now())
+            .map_err(event_store_error)
+    })
+}
+
+fn register_completed_office_artifact(
+    store: &EventStore,
+    request_id: Uuid,
+    approved_write_succeeded: bool,
+    spec: &OfficeCreateSpec,
+    result: &OfficeCreateResult,
+) -> Result<(), String> {
+    if !approved_write_succeeded {
+        return Err(
+            "office artifact cannot enter delivery before the approved write succeeds".to_string(),
+        );
+    }
+    #[cfg(test)]
+    if !Path::new(&result.path).is_file() {
+        // Lightweight executor doubles validate routing and approval behavior; byte-level
+        // delivery validation is covered by LocalOfficeArtifactClient and artifact fixtures.
+        return Ok(());
+    }
+    let bytes = fs::read(&result.path)
+        .map_err(|_| "written office artifact could not be reopened for validation".to_string())?;
+    let template = ArtifactTemplate::new(
+        "default.office".to_string(),
+        1,
+        "DS Agent default office template".to_string(),
+        vec![
+            crate::kernel::artifacts::ArtifactFormat::Word,
+            crate::kernel::artifacts::ArtifactFormat::Excel,
+            crate::kernel::artifacts::ArtifactFormat::PowerPoint,
+        ],
+        "default-office-v1".to_string(),
+    );
+    store
+        .register_artifact_template(&template, Utc::now())
+        .map_err(event_store_error)?;
+    let request = ArtifactGenerationRequest {
+        request_id,
+        input: ArtifactInput::Office { spec: spec.clone() },
+        template: template.reference.clone(),
+        approved_storage_ref: format!("artifact-storage:{request_id}"),
+    };
+    let mut generated = ArtifactEngine::generate_with_template(&request, &template, Utc::now())?;
+    generated.record.artifact_hash = sha256_hex(&bytes);
+    if let Some((existing, _)) = store
+        .artifact_record_for_request(request_id)
+        .map_err(event_store_error)?
+    {
+        if existing.artifact_hash != generated.record.artifact_hash
+            || existing.input_fingerprint != generated.record.input_fingerprint
+            || existing.template != generated.record.template
+        {
+            return Err("artifact request binding changed".to_string());
+        }
+        return Ok(());
+    }
+    let canonical_path = Path::new(&result.path)
+        .canonicalize()
+        .map_err(|_| "written office artifact path could not be resolved".to_string())?;
+    store
+        .bind_artifact_storage_path(
+            &generated.record.storage_ref,
+            request_id,
+            &canonical_path.to_string_lossy(),
+            &generated.record.artifact_hash,
+            Utc::now(),
+        )
+        .map_err(event_store_error)?;
+    let row_revision = store
+        .insert_artifact_record(&generated.record)
+        .map_err(event_store_error)?;
+    let structure_result =
+        ArtifactEngine::check_structure(&mut generated.record, &bytes, Utc::now());
+    let row_revision = store
+        .update_artifact_record(&generated.record, row_revision)
+        .map_err(event_store_error)?;
+    if structure_result.is_err() {
+        return Ok(());
+    }
+    let rendered = render_artifact_file(generated.record.format, Path::new(&result.path))?;
+    let preview_ref = format!(
+        "artifact-preview:{}:{}",
+        generated.record.id, generated.record.artifact_revision
+    );
+    let visual_result = ArtifactEngine::check_actual_visual(
+        &mut generated.record,
+        &rendered.pages,
+        rendered.renderer_version,
+        preview_ref,
+        Utc::now(),
+    );
+    if visual_result.is_ok() {
+        store
+            .store_artifact_visual_previews(&generated.record, &rendered.pages)
+            .map_err(event_store_error)?;
+    }
+    let row_revision = store
+        .update_artifact_record(&generated.record, row_revision)
+        .map_err(event_store_error)?;
+    if visual_result.is_err() {
+        return Ok(());
+    }
+    generated.record.complete(Utc::now())?;
+    store
+        .update_artifact_record(&generated.record, row_revision)
+        .map_err(event_store_error)?;
+    Ok(())
+}
+
+fn register_completed_pdf_artifact(
+    store: &EventStore,
+    request_id: Uuid,
+    title: String,
+    paragraphs: Vec<String>,
+    bytes: &[u8],
+    storage_path: &str,
+) -> Result<(), String> {
+    let template = ArtifactTemplate::new(
+        "default.pdf".to_string(),
+        1,
+        "DS Agent default PDF template".to_string(),
+        vec![crate::kernel::artifacts::ArtifactFormat::Pdf],
+        "default-pdf-v1".to_string(),
+    );
+    store
+        .register_artifact_template(&template, Utc::now())
+        .map_err(event_store_error)?;
+    let request = ArtifactGenerationRequest {
+        request_id,
+        input: ArtifactInput::Pdf { title, paragraphs },
+        template: template.reference.clone(),
+        approved_storage_ref: format!("artifact-storage:{request_id}"),
+    };
+    let mut generated = ArtifactEngine::generate_with_template(&request, &template, Utc::now())?;
+    generated.record.artifact_hash = sha256_hex(bytes);
+    let row_revision = if let Some((existing, revision)) = store
+        .artifact_record_for_request(request_id)
+        .map_err(event_store_error)?
+    {
+        if existing.artifact_hash != generated.record.artifact_hash
+            || existing.input_fingerprint != generated.record.input_fingerprint
+            || existing.template != generated.record.template
+        {
+            return Err("artifact request binding changed".to_string());
+        }
+        generated.record = existing;
+        revision
+    } else {
+        let canonical_path = Path::new(storage_path)
+            .canonicalize()
+            .map_err(|_| "written PDF artifact path could not be resolved".to_string())?;
+        store
+            .bind_artifact_storage_path(
+                &generated.record.storage_ref,
+                request_id,
+                &canonical_path.to_string_lossy(),
+                &generated.record.artifact_hash,
+                Utc::now(),
+            )
+            .map_err(event_store_error)?;
+        store
+            .insert_artifact_record(&generated.record)
+            .map_err(event_store_error)?
+    };
+    let structure_result =
+        ArtifactEngine::check_structure(&mut generated.record, bytes, Utc::now());
+    let row_revision = store
+        .update_artifact_record(&generated.record, row_revision)
+        .map_err(event_store_error)?;
+    if structure_result.is_err() {
+        return Ok(());
+    }
+    let temp =
+        tempfile::tempdir().map_err(|_| "PDF render workspace could not be created".to_string())?;
+    let path = temp.path().join("artifact.pdf");
+    fs::write(&path, bytes).map_err(|_| "PDF render input could not be prepared".to_string())?;
+    let rendered = render_artifact_file(generated.record.format, &path)?;
+    let preview_ref = format!(
+        "artifact-preview:{}:{}",
+        generated.record.id, generated.record.artifact_revision
+    );
+    let visual_result = ArtifactEngine::check_actual_visual(
+        &mut generated.record,
+        &rendered.pages,
+        rendered.renderer_version,
+        preview_ref,
+        Utc::now(),
+    );
+    if visual_result.is_ok() {
+        store
+            .store_artifact_visual_previews(&generated.record, &rendered.pages)
+            .map_err(event_store_error)?;
+    }
+    let row_revision = store
+        .update_artifact_record(&generated.record, row_revision)
+        .map_err(event_store_error)?;
+    if visual_result.is_err() {
+        return Ok(());
+    }
+    generated.record.complete(Utc::now())?;
+    store
+        .update_artifact_record(&generated.record, row_revision)
+        .map_err(event_store_error)?;
+    Ok(())
+}
+
+fn prepare_pdf_artifact_before_write(
+    store: &EventStore,
+    request_id: Uuid,
+    title: String,
+    paragraphs: Vec<String>,
+    bytes: &[u8],
+    intended_path: &Path,
+) -> Result<(), String> {
+    let template = ArtifactTemplate::new(
+        "default.pdf".to_string(),
+        1,
+        "DS Agent default PDF template".to_string(),
+        vec![crate::kernel::artifacts::ArtifactFormat::Pdf],
+        "default-pdf-v1".to_string(),
+    );
+    store
+        .register_artifact_template(&template, Utc::now())
+        .map_err(event_store_error)?;
+    let request = ArtifactGenerationRequest {
+        request_id,
+        input: ArtifactInput::Pdf { title, paragraphs },
+        template: template.reference.clone(),
+        approved_storage_ref: format!("artifact-storage:{request_id}"),
+    };
+    let mut generated = ArtifactEngine::generate_with_template(&request, &template, Utc::now())?;
+    generated.record.artifact_hash = sha256_hex(bytes);
+    let parent = intended_path
+        .parent()
+        .ok_or_else(|| "PDF target parent is invalid".to_string())?
+        .canonicalize()
+        .map_err(|_| "PDF target parent could not be resolved".to_string())?;
+    let file_name = intended_path
+        .file_name()
+        .ok_or_else(|| "PDF target filename is invalid".to_string())?;
+    let canonical_target = parent.join(file_name);
+    store
+        .bind_artifact_storage_path(
+            &generated.record.storage_ref,
+            request_id,
+            &canonical_target.to_string_lossy(),
+            &generated.record.artifact_hash,
+            Utc::now(),
+        )
+        .map_err(event_store_error)?;
+    store
+        .insert_artifact_record(&generated.record)
+        .map_err(event_store_error)?;
     Ok(())
 }
 
@@ -12421,12 +12395,6 @@ pub fn get_foundation_state() -> FoundationState {
     FoundationState::default()
 }
 
-#[tauri::command]
-pub fn check_app_update() -> Result<AppUpdateStatus, String> {
-    fetch_github_releases()
-        .map(|releases| update_status_from_releases(releases, app_update_current_version()))
-}
-
 struct BuiltinAgentToolExecutor;
 
 impl AgentToolExecutor for BuiltinAgentToolExecutor {
@@ -12500,6 +12468,9 @@ impl AgentToolExecutor for BuiltinAgentToolExecutor {
 #[tauri::command]
 pub fn list_agent_tool_contracts() -> Vec<crate::kernel::tool_runtime::ToolContract> {
     builtin_tool_catalog()
+        .into_iter()
+        .filter(|contract| contract.id != CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID)
+        .collect()
 }
 
 #[tauri::command]
@@ -12517,6 +12488,12 @@ pub fn execute_agent_tool(
     state: State<'_, AppState>,
 ) -> Result<ToolInvocationRecord, String> {
     let tool_id = request.tool_id.trim();
+    if tool_id == CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID {
+        return Err(
+            "connected attachment download is not activated until its dedicated durable executor is complete"
+                .to_string(),
+        );
+    }
     if tool_id == COMPUTER_CONTROL_TOOL_ID {
         let approval_available = {
             let store = state.event_store.lock().map_err(|_| lock_error())?;
@@ -12659,42 +12636,6 @@ pub fn execute_agent_tool(
         app.exit(0);
     }
     Ok(invocation)
-}
-
-#[tauri::command]
-pub fn download_app_update() -> Result<AppUpdateDownloadResult, String> {
-    let releases = fetch_github_releases()?;
-    let release = latest_installable_update_release(&releases, app_update_current_version())
-        .ok_or_else(|| "DS Agent is already up to date".to_string())?;
-    let latest_version = normalize_release_version(&release.tag_name);
-    let asset = release_installable_asset(&release)
-        .ok_or_else(|| "latest release has no Windows installer asset".to_string())?;
-    let installer_path = download_release_asset(asset)?;
-
-    Ok(AppUpdateDownloadResult {
-        latest_version,
-        asset_name: asset.name.clone(),
-        installer_path: installer_path.display().to_string(),
-    })
-}
-
-#[tauri::command]
-pub fn install_app_update(
-    app: AppHandle,
-    installer_path: String,
-) -> Result<AppUpdateInstallResult, String> {
-    let result = schedule_app_update_install(&installer_path)?;
-    app.exit(0);
-    Ok(result)
-}
-
-fn schedule_app_update_install(installer_path: &str) -> Result<AppUpdateInstallResult, String> {
-    let installer_path = validate_downloaded_update_installer_path(installer_path)?;
-    spawn_silent_update_runner(&installer_path)?;
-    Ok(AppUpdateInstallResult {
-        installer_path: installer_path.display().to_string(),
-        restart_scheduled: true,
-    })
 }
 
 #[tauri::command]
@@ -13295,7 +13236,9 @@ pub fn queue_parent_agent_synthesis(
             )
         })
     {
-        return Err("Parent synthesis requires every Subagent to reach a terminal state.".to_string());
+        return Err(
+            "Parent synthesis requires every Subagent to reach a terminal state.".to_string(),
+        );
     }
     if parent.status == AgentRunStatus::Queued {
         return Ok(parent.clone());
@@ -13327,7 +13270,8 @@ pub fn queue_parent_agent_synthesis(
         "You are resuming the single parent task after its bounded parallel Subagents finished. Synthesize one final user-facing answer for the original goal. Preserve failures or uncertainty; do not claim failed work succeeded. Do not create another subagent_plan.\n\nOriginal goal:\n{}\n\nSubagent results:\n{}",
         parent.prompt, child_results
     );
-    let context = AgentRunExecutionContext::new(parent_run_id, prompt).map_err(event_store_error)?;
+    let context =
+        AgentRunExecutionContext::new(parent_run_id, prompt).map_err(event_store_error)?;
     store
         .append_agent_run_execution_context(&context)
         .map_err(event_store_error)?;
@@ -14490,6 +14434,12 @@ pub fn request_capability_access(
     capability: CapabilityKind,
     state: State<'_, AppState>,
 ) -> Result<CapabilityAccessRecord, String> {
+    if capability == CapabilityKind::ConnectorAttachmentRead {
+        return Err(
+            "connected attachment approval must be created from an exact validated tool request"
+                .to_string(),
+        );
+    }
     let request = build_capability_access_request(access_mode, capability)?;
     let entry = PermissionAuditEntry::evaluate(access_mode, capability);
     let store = state.event_store.lock().map_err(|_| lock_error())?;
@@ -14502,6 +14452,7 @@ pub fn request_capability_access(
 
     Ok(CapabilityAccessRecord {
         effective_status: request.status,
+        projection_revision: 0,
         grant_state: CapabilityGrantState::NotGranted,
         request,
         resolution: None,
@@ -14609,7 +14560,6 @@ pub fn submit_browser_boundary(
     store
         .append_capability_invocation(&outcome.invocation)
         .map_err(event_store_error)?;
-
     Ok(outcome.invocation)
 }
 
@@ -15408,6 +15358,18 @@ pub fn export_operations_briefing_pdf_report(
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let export_dir = operations_briefing_report_export_dir(&app_data_dir, &directory_state);
     let report_pdf = render_operations_briefing_pdf_report(&run);
+    let report_file_name = operations_briefing_pdf_report_file_name(&run);
+    if approval_granted {
+        let store = state.event_store.lock().map_err(|_| lock_error())?;
+        prepare_pdf_artifact_before_write(
+            &store,
+            run.id,
+            format!("Operations Briefing {}", run.id),
+            vec![render_operations_briefing_report(&run)],
+            &report_pdf,
+            &export_dir.join(&report_file_name),
+        )?;
+    }
     let outcome = run_drive_write_boundary(
         DriveWriteRequest {
             access_mode,
@@ -15415,9 +15377,9 @@ pub fn export_operations_briefing_pdf_report(
             summary: format!("Export Operations Briefing PDF report {}", run.id),
             package_json: None,
             export_file: Some(DriveWriteExportFile {
-                file_name: operations_briefing_pdf_report_file_name(&run),
+                file_name: report_file_name,
                 content: String::new(),
-                content_base64: Some(general_purpose::STANDARD.encode(report_pdf)),
+                content_base64: Some(general_purpose::STANDARD.encode(&report_pdf)),
             }),
             approval_granted,
         },
@@ -15439,6 +15401,20 @@ pub fn export_operations_briefing_pdf_report(
     store
         .append_capability_invocation(&outcome.invocation)
         .map_err(event_store_error)?;
+    if outcome.invocation.status == CapabilityInvocationStatus::Succeeded {
+        register_completed_pdf_artifact(
+            &store,
+            run.id,
+            format!("Operations Briefing {}", run.id),
+            vec![render_operations_briefing_report(&run)],
+            &report_pdf,
+            outcome
+                .invocation
+                .evidence_ref
+                .as_deref()
+                .ok_or_else(|| "written PDF artifact path is unavailable".to_string())?,
+        )?;
+    }
 
     Ok(outcome.invocation)
 }
@@ -15580,29 +15556,26 @@ pub fn preview_work_package_import(
 mod tests {
     use super::{
         agent_app_update_tool_request, agent_terminal_read_command_from_target,
-        agent_tool_run_id_for_action, app_update_current_version,
-        apply_agent_local_completion_summary, apply_tool_invocation_to_agent_action,
-        authorize_agent_tool_execution, block_agent_run_after_action_resolution,
-        execute_agent_tool_with_executor, finish_agent_run_after_resumed_tool, is_newer_version,
-        is_windows_installer_asset, load_agent_skill_catalog,
-        record_completed_agent_tool_execution, release_asset_is_trusted, release_installable_asset,
+        agent_tool_run_id_for_action, apply_agent_local_completion_summary,
+        apply_tool_invocation_to_agent_action, authorize_agent_tool_execution,
+        block_agent_run_after_action_resolution, execute_agent_tool_with_executor,
+        finish_agent_run_after_resumed_tool, load_agent_skill_catalog,
+        record_completed_agent_tool_execution,
         run_agent_chat_with_clients_and_api_keys_and_computer_use,
         run_authorized_agent_tool_execution,
         run_queued_agent_chat_with_clients_and_api_keys_and_computer_use,
-        run_with_agent_run_lease_heartbeat, silent_update_install_command,
-        update_status_from_release, update_status_from_releases, AgentToolAuthorization,
-        BrowserBrowseAgentToolExecutor, ComputerControlAgentToolExecutor,
-        ComputerScreenshotAgentToolExecutor, FileReadAgentToolExecutor,
-        FileSystemMutationAgentToolExecutor, FileWriteAgentToolExecutor, GithubRelease,
-        GithubReleaseAsset, NetworkSearchAgentToolExecutor, TerminalReadAgentToolExecutor,
+        run_with_agent_run_lease_heartbeat, AgentToolAuthorization, BrowserBrowseAgentToolExecutor,
+        ComputerControlAgentToolExecutor, ComputerScreenshotAgentToolExecutor,
+        FileReadAgentToolExecutor, FileSystemMutationAgentToolExecutor, FileWriteAgentToolExecutor,
+        NetworkSearchAgentToolExecutor, TerminalReadAgentToolExecutor,
     };
     use crate::commands::{
         agent_chat_api_key_candidates_from_sources, agent_chat_api_key_from_sources,
         agent_chat_with_dispatch_and_tool_followup, agent_chat_with_transport,
-        apply_memory_candidate_update_if_current, computer_screenshot_evidence_base_dir,
-        computer_tool_strategy_for_command, create_generated_skill_with_store,
-        deepseek_telemetry_with_pricing, dispatch_agent_action_proposals,
-        dispatch_agent_app_update_action_with_executor,
+        apply_memory_candidate_update_if_current, block_subagent_mutating_actions,
+        computer_screenshot_evidence_base_dir, computer_tool_strategy_for_command,
+        create_generated_skill_with_store, deepseek_telemetry_with_pricing,
+        dispatch_agent_action_proposals, dispatch_agent_app_update_action_with_executor,
         dispatch_agent_browser_open_action_with_opener,
         dispatch_agent_browser_open_tool_with_executor,
         dispatch_agent_browser_open_tool_with_store_mutex, dispatch_agent_office_create_action,
@@ -15622,16 +15595,16 @@ mod tests {
         operations_briefing_template_seed_dir, operations_briefing_token_cache_context,
         propose_memory_update_candidate_from_feedback_in_store,
         record_agent_action_permission_requests, record_memory_maintenance_review_action_in_store,
-        resume_agent_chat_action_with_clients,
+        register_completed_office_artifact, resume_agent_chat_action_with_clients,
         resume_agent_chat_action_with_clients_and_computer_use, run_agent_chat_with_clients,
         run_memory_background_maintenance_in_store,
         run_memory_background_maintenance_with_model_in_store,
         run_next_queued_agent_chat_with_clients_and_api_keys,
         should_require_computer_control_unlock, thinking_level_context_label,
-        block_subagent_mutating_actions, validated_subagent_plan, AgentChatActionProposal,
-        AgentChatReadiness, AgentChatRequest, AgentChatResponse, AgentChatRuntimeContext,
-        AgentSubtaskPlanItem, BrowserUrlOpenOutcome, BrowserUrlOpener,
-        ComputerControlUnlockState, GeneratedSkillRequest, COMPUTER_CONTROL_UNLOCK_TTL_MINUTES,
+        validated_subagent_plan, AgentChatActionProposal, AgentChatReadiness, AgentChatRequest,
+        AgentChatResponse, AgentChatRuntimeContext, AgentSubtaskPlanItem, BrowserUrlOpenOutcome,
+        BrowserUrlOpener, ComputerControlUnlockState, GeneratedSkillRequest,
+        COMPUTER_CONTROL_UNLOCK_TTL_MINUTES,
     };
     use crate::kernel::agent_run::{
         AgentRunCancelRequest, AgentRunExecutionContext, AgentRunQueuedGuidance,
@@ -15668,9 +15641,9 @@ mod tests {
         ThinkingLevel,
     };
     use crate::kernel::office::{
-        build_office_artifact, OfficeApp, OfficeArtifactClient, OfficeCreateResult,
-        OfficeCreateSpec, OfficeOpenClient, OfficeOpenResult, OfficeUpdateClient,
-        OfficeUpdateResult, OfficeUpdateSpec,
+        build_office_artifact, LocalOfficeArtifactClient, OfficeApp, OfficeArtifactClient,
+        OfficeCreateResult, OfficeCreateSpec, OfficeOpenClient, OfficeOpenResult,
+        OfficeUpdateClient, OfficeUpdateResult, OfficeUpdateSpec,
     };
     use crate::kernel::policy::{CapabilityKind, PolicyDecision};
     use crate::kernel::skill::{
@@ -15694,17 +15667,6 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration as StdDuration;
     use uuid::Uuid;
-
-    #[test]
-    fn app_update_version_compare_accepts_newer_release_tags() {
-        assert!(is_newer_version("v0.1.2", "0.1.1"));
-        assert!(is_newer_version("0.2.1", "0.1.9"));
-        assert!(is_newer_version("v0.1.0-rc.3", "v0.1.0-rc.1"));
-        assert!(is_newer_version("v0.1.0", "v0.1.0-rc.3"));
-        assert!(!is_newer_version("v0.1.0-rc.3", "v0.1.0"));
-        assert!(!is_newer_version("v0.1.0", "0.1.0"));
-        assert!(!is_newer_version("v0.0.9", "0.1.0"));
-    }
 
     #[test]
     fn agent_chat_prompt_keeps_internal_receipts_out_of_ordinary_replies() {
@@ -16202,6 +16164,111 @@ mod tests {
             .list_active_agent_run_resource_claims()
             .expect("resource claims load")
             .is_empty());
+    }
+
+    #[test]
+    fn office_create_rejects_same_filename_from_a_different_approved_directory() {
+        struct PathDriftClient;
+        impl OfficeArtifactClient for PathDriftClient {
+            fn write_office_artifact(
+                &self,
+                spec: &OfficeCreateSpec,
+            ) -> Result<OfficeCreateResult, String> {
+                Ok(OfficeCreateResult {
+                    path: "other/verified.docx".to_string(),
+                    bytes: build_office_artifact(spec)?.len() as u64,
+                    app: spec.app,
+                    artifact_kind: "word_document".to_string(),
+                })
+            }
+
+            fn verify_written_artifact_path(
+                &self,
+                _spec: &OfficeCreateSpec,
+                _result: &OfficeCreateResult,
+            ) -> Result<(), String> {
+                Err("office.create executor reported a different approved path".to_string())
+            }
+        }
+        let store = EventStore::open_memory().unwrap();
+        let mut action = AgentChatActionProposal {
+            action_type: "office_create".to_string(),
+            title: Some("Verified report".to_string()),
+            reason: Some("Path binding".to_string()),
+            risk: Some("high".to_string()),
+            requires_confirmation: false,
+            target: Some("approved/verified.docx".to_string()),
+            target_location: None,
+            destination: None,
+            preferred_browser: None,
+            content: Some("Visible body".to_string()),
+            capability: Some(CapabilityKind::FileWrite),
+            policy_decision: Some(PolicyDecision::Allow),
+            execution_state: "proposed".to_string(),
+            dispatch_note: None,
+            permission_request_id: None,
+            capability_invocation_id: None,
+            workflow_run_id: None,
+            blocked_reason: None,
+        };
+        let invocation = dispatch_agent_office_create_tool_with_executor(
+            &store,
+            AccessMode::FullAccess,
+            &mut action,
+            None,
+            &PathDriftClient,
+        )
+        .unwrap();
+        assert_eq!(invocation.status, ToolExecutionStatus::Failed);
+        assert!(invocation
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("different approved path")));
+    }
+
+    #[test]
+    #[ignore = "requires installed Microsoft Word and pdftoppm"]
+    fn approved_office_write_persists_actual_preview_and_completed_delivery_across_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("artifact-e2e.sqlite3");
+        let workspace = temp.path().join("workspace");
+        let client =
+            LocalOfficeArtifactClient::new_with_desktop_dir(workspace, 8 * 1024 * 1024, None);
+        let spec = OfficeCreateSpec {
+            app: OfficeApp::Word,
+            path: "delivery/actual.docx".to_string(),
+            title: "Actual delivery".to_string(),
+            body: "This page must be visibly rendered before completion.".to_string(),
+            rows: Vec::new(),
+            slides: Vec::new(),
+        };
+        let result = client.write_office_artifact(&spec).expect("approved write");
+        let request_id = Uuid::new_v4();
+        let artifact_id = {
+            let store = EventStore::open(&db).expect("store opens");
+            register_completed_office_artifact(&store, request_id, true, &spec, &result)
+                .expect("actual render delivery registers");
+            let delivery = store.list_artifact_deliveries(10).unwrap().remove(0);
+            assert_eq!(
+                delivery.phase,
+                crate::kernel::artifacts::ArtifactPhase::Completed
+            );
+            assert!(delivery.preview_available);
+            assert!(delivery.rendered_page_count > 0);
+            assert!(store
+                .artifact_visual_preview_page(delivery.id, 0)
+                .unwrap()
+                .starts_with(b"\x89PNG\r\n\x1a\n"));
+            delivery.id
+        };
+        let reopened = EventStore::open(&db).expect("store reopens");
+        let delivery = reopened.list_artifact_deliveries(10).unwrap().remove(0);
+        assert_eq!(delivery.id, artifact_id);
+        assert_eq!(
+            delivery.phase,
+            crate::kernel::artifacts::ArtifactPhase::Completed
+        );
+        assert!(delivery.preview_available);
     }
 
     #[test]
@@ -18649,226 +18716,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn app_update_status_selects_newer_prerelease_installer_from_release_list() {
-        let releases = vec![
-            GithubRelease {
-                tag_name: "v0.1.0-rc.3".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.1.0-rc.3"
-                    .to_string(),
-                assets: vec![GithubReleaseAsset {
-                    name: "DS Agent_0.1.0_x64-setup.exe".to_string(),
-                    browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.1.0-rc.3/DS.Agent_0.1.0_x64-setup.exe"
-                            .to_string(),
-                }],
-            },
-            GithubRelease {
-                tag_name: "v0.1.0-rc.1".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.1.0-rc.1"
-                    .to_string(),
-                assets: vec![GithubReleaseAsset {
-                    name: "DS Agent_0.1.0_x64-setup.exe".to_string(),
-                    browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.1.0-rc.1/DS.Agent_0.1.0_x64-setup.exe"
-                            .to_string(),
-                }],
-            },
-        ];
-
-        let status = update_status_from_releases(releases, "v0.1.0-rc.1");
-
-        assert!(status.update_available);
-        assert_eq!(status.current_version, "v0.1.0-rc.1");
-        assert_eq!(status.latest_version.as_deref(), Some("0.1.0-rc.3"));
-        assert_eq!(
-            status.asset_name.as_deref(),
-            Some("DS Agent_0.1.0_x64-setup.exe")
-        );
-    }
-
-    #[test]
-    fn app_update_status_keeps_current_prerelease_quiet_from_release_list() {
-        let releases = vec![GithubRelease {
-            tag_name: "v0.1.0-rc.3".to_string(),
-            html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.1.0-rc.3"
-                .to_string(),
-            assets: vec![GithubReleaseAsset {
-                name: "DS Agent_0.1.0_x64-setup.exe".to_string(),
-                browser_download_url:
-                    "https://github.com/Lee-take/dsagent/releases/download/v0.1.0-rc.3/DS.Agent_0.1.0_x64-setup.exe"
-                        .to_string(),
-            }],
-        }];
-
-        let status = update_status_from_releases(releases, "v0.1.0-rc.3");
-
-        assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.1.0-rc.3");
-        assert_eq!(status.latest_version.as_deref(), Some("0.1.0-rc.3"));
-        assert!(status.asset_name.is_none());
-    }
-
-    #[test]
-    fn app_update_status_keeps_current_formal_release_quiet_from_release_list() {
-        let releases = vec![
-            GithubRelease {
-                tag_name: "v0.3.0".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.3.0"
-                    .to_string(),
-                assets: vec![GithubReleaseAsset {
-                    name: "DS Agent_0.3.0_x64-setup.exe".to_string(),
-                    browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.3.0/DS.Agent_0.3.0_x64-setup.exe"
-                            .to_string(),
-                }],
-            },
-            GithubRelease {
-                tag_name: "v0.1.0".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.1.0"
-                    .to_string(),
-                assets: vec![GithubReleaseAsset {
-                    name: "DS Agent_0.1.0_x64-setup.exe".to_string(),
-                    browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.1.0/DS.Agent_0.1.0_x64-setup.exe"
-                            .to_string(),
-                }],
-            },
-        ];
-
-        let status = update_status_from_releases(releases, app_update_current_version());
-
-        assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.4.1");
-        assert_eq!(status.latest_version.as_deref(), Some("0.3.0"));
-        assert!(status.asset_name.is_none());
-    }
-
-    #[test]
-    fn app_update_status_selects_v012_installer_for_v011_client() {
-        let releases = vec![
-            GithubRelease {
-                tag_name: "v0.1.2".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.1.2"
-                    .to_string(),
-                assets: vec![GithubReleaseAsset {
-                    name: "DS.Agent_0.1.2_x64-setup.exe".to_string(),
-                    browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.1.2/DS.Agent_0.1.2_x64-setup.exe"
-                            .to_string(),
-                }],
-            },
-            GithubRelease {
-                tag_name: "v0.1.1".to_string(),
-                html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.1.1"
-                    .to_string(),
-                assets: vec![GithubReleaseAsset {
-                    name: "DS.Agent_0.1.1_x64-setup.exe".to_string(),
-                    browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v0.1.1/DS.Agent_0.1.1_x64-setup.exe"
-                            .to_string(),
-                }],
-            },
-        ];
-
-        let status = update_status_from_releases(releases, "v0.1.1");
-
-        assert!(status.update_available);
-        assert_eq!(status.current_version, "v0.1.1");
-        assert_eq!(status.latest_version.as_deref(), Some("0.1.2"));
-        assert_eq!(
-            status.asset_name.as_deref(),
-            Some("DS.Agent_0.1.2_x64-setup.exe")
-        );
-        assert_eq!(
-            status.release_url.as_deref(),
-            Some("https://github.com/Lee-take/dsagent/releases/tag/v0.1.2")
-        );
-    }
-
-    #[test]
-    fn app_update_asset_filter_accepts_windows_installers_only() {
-        assert!(is_windows_installer_asset("DS Agent_0.1.2_x64-setup.exe"));
-        assert!(is_windows_installer_asset("DS-Agent-0.1.2.msi"));
-        assert!(!is_windows_installer_asset("Source code.zip"));
-        assert!(!is_windows_installer_asset("DS-Agent-0.1.2-debug.exe"));
-        assert!(!is_windows_installer_asset("DS-Agent-0.1.2-symbols.exe"));
-    }
-
-    #[test]
-    fn app_update_asset_trust_accepts_canonical_and_legacy_release_urls() {
-        assert!(release_asset_is_trusted(
-            "https://github.com/Lee-take/dsagent/releases/download/v0.1.2/DS.Agent_0.1.2_x64-setup.exe"
-        ));
-        assert!(release_asset_is_trusted(
-            "https://github.com/Lee-take/deepseek-agent-os/releases/download/v0.1.2/DS.Agent_0.1.2_x64-setup.exe"
-        ));
-        assert!(!release_asset_is_trusted(
-            "https://github.com/SomeoneElse/dsagent/releases/download/v0.1.2/DS.Agent_0.1.2_x64-setup.exe"
-        ));
-    }
-
-    #[test]
-    fn app_update_status_hides_source_only_newer_release() {
-        let release = GithubRelease {
-            tag_name: "v9.9.9".to_string(),
-            html_url: "https://github.com/Lee-take/dsagent/releases/tag/v9.9.9".to_string(),
-            assets: vec![GithubReleaseAsset {
-                name: "source.zip".to_string(),
-                browser_download_url:
-                    "https://github.com/Lee-take/dsagent/releases/download/v9.9.9/source.zip"
-                        .to_string(),
-            }],
-        };
-
-        let status = update_status_from_release(release);
-        assert!(!status.update_available);
-        assert_eq!(
-            status.message.as_deref(),
-            Some("latest release has no Windows installer asset")
-        );
-    }
-
-    #[test]
-    fn app_update_selects_trusted_windows_installer_asset() {
-        let release = GithubRelease {
-            tag_name: "v9.9.9".to_string(),
-            html_url: "https://github.com/Lee-take/dsagent/releases/tag/v9.9.9".to_string(),
-            assets: vec![
-                GithubReleaseAsset {
-                    name: "source.zip".to_string(),
-                    browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v9.9.9/source.zip"
-                            .to_string(),
-                },
-                GithubReleaseAsset {
-                    name: "DS Agent_9.9.9_x64-setup.exe".to_string(),
-                    browser_download_url:
-                        "https://github.com/Lee-take/dsagent/releases/download/v9.9.9/DS.Agent.exe"
-                            .to_string(),
-                },
-            ],
-        };
-
-        let asset = release_installable_asset(&release).expect("installer asset");
-        assert_eq!(asset.name, "DS Agent_9.9.9_x64-setup.exe");
-    }
-
-    #[test]
-    fn app_update_silent_installer_command_uses_nsis_s_arg() {
-        let command = silent_update_install_command(std::path::Path::new(
-            r"C:\Users\tester\AppData\Local\Temp\ds-agent-updates\DS.Agent_0.1.0_rc7_x64-setup.exe",
-        ));
-
-        assert_eq!(
-            command.program,
-            std::path::PathBuf::from(
-                r"C:\Users\tester\AppData\Local\Temp\ds-agent-updates\DS.Agent_0.1.0_rc7_x64-setup.exe",
-            )
-        );
-        assert_eq!(command.args, vec!["/S"]);
-    }
-
     struct RecordingDeepSeekTransport {
         response_text: String,
         requests: Mutex<Vec<DeepSeekChatCompletionRequest>>,
@@ -19224,6 +19071,18 @@ mod tests {
                 artifact_kind: "test_office_artifact".to_string(),
             })
         }
+
+        fn verify_written_artifact_path(
+            &self,
+            spec: &OfficeCreateSpec,
+            result: &OfficeCreateResult,
+        ) -> Result<(), String> {
+            if result.path == spec.path {
+                Ok(())
+            } else {
+                Err("test Office path changed".to_string())
+            }
+        }
     }
 
     impl OfficeUpdateClient for StoreLockCheckingOfficeClient<'_> {
@@ -19243,6 +19102,18 @@ mod tests {
                 artifact_kind: "test_office_artifact".to_string(),
                 summary: "updated existing Office artifact".to_string(),
             })
+        }
+
+        fn verify_updated_artifact_path(
+            &self,
+            spec: &OfficeUpdateSpec,
+            result: &OfficeUpdateResult,
+        ) -> Result<(), String> {
+            if result.path == spec.path {
+                Ok(())
+            } else {
+                Err("test Office update path changed".to_string())
+            }
         }
     }
 
@@ -19282,6 +19153,17 @@ mod tests {
                 app: spec.app,
                 artifact_kind: "test_office_artifact".to_string(),
             })
+        }
+        fn verify_written_artifact_path(
+            &self,
+            spec: &OfficeCreateSpec,
+            result: &OfficeCreateResult,
+        ) -> Result<(), String> {
+            if result.path == spec.path {
+                Ok(())
+            } else {
+                Err("test Office path changed".to_string())
+            }
         }
     }
 
@@ -19324,6 +19206,18 @@ mod tests {
                 artifact_kind: "test_office_artifact".to_string(),
                 summary: "updated existing office artifact".to_string(),
             })
+        }
+
+        fn verify_updated_artifact_path(
+            &self,
+            spec: &OfficeUpdateSpec,
+            result: &OfficeUpdateResult,
+        ) -> Result<(), String> {
+            if result.path == spec.path {
+                Ok(())
+            } else {
+                Err("test Office update path changed".to_string())
+            }
         }
     }
 
@@ -19997,8 +19891,12 @@ mod tests {
             .filter(|record| record.parent_run_id == Some(parent.id))
             .collect::<Vec<_>>();
         assert_eq!(children.len(), 2);
-        assert!(children.iter().all(|record| record.status == AgentRunStatus::Queued));
-        assert!(children.iter().all(|record| record.conversation_id == parent.conversation_id));
+        assert!(children
+            .iter()
+            .all(|record| record.status == AgentRunStatus::Queued));
+        assert!(children
+            .iter()
+            .all(|record| record.conversation_id == parent.conversation_id));
     }
 
     #[test]
@@ -20019,8 +19917,12 @@ mod tests {
         .expect("child is valid");
         {
             let event_store = store.lock().expect("store lock");
-            event_store.append_agent_run_start(&parent).expect("parent appends");
-            event_store.append_agent_run_start(&child).expect("child appends");
+            event_store
+                .append_agent_run_start(&parent)
+                .expect("parent appends");
+            event_store
+                .append_agent_run_start(&child)
+                .expect("child appends");
         }
         let transport = RecordingDeepSeekTransport::new(
             r#"{
@@ -20058,9 +19960,17 @@ mod tests {
         .expect("child run exists");
 
         assert_eq!(outcome.record.status, AgentRunStatus::Failed);
-        assert!(outcome.record.finish_error.as_deref().unwrap().contains("parent Agent"));
+        assert!(outcome
+            .record
+            .finish_error
+            .as_deref()
+            .unwrap()
+            .contains("parent Agent"));
         assert!(file_write_client.recorded_calls().is_empty());
-        assert_eq!(outcome.response.proposed_actions[0].execution_state, "blocked");
+        assert_eq!(
+            outcome.response.proposed_actions[0].execution_state,
+            "blocked"
+        );
     }
 
     #[test]
@@ -22042,8 +21952,14 @@ mod tests {
         assert_eq!(reply.subagent_plan[0].key, "policy");
 
         let invalid = validated_subagent_plan(&[
-            AgentSubtaskPlanItem { key: "same".to_string(), prompt: "A".to_string() },
-            AgentSubtaskPlanItem { key: "SAME".to_string(), prompt: "B".to_string() },
+            AgentSubtaskPlanItem {
+                key: "same".to_string(),
+                prompt: "A".to_string(),
+            },
+            AgentSubtaskPlanItem {
+                key: "SAME".to_string(),
+                prompt: "B".to_string(),
+            },
         ]);
         assert!(invalid.is_empty());
 
@@ -22069,7 +21985,10 @@ mod tests {
             blocked_reason: None,
         }];
         block_subagent_mutating_actions(&mut blocked_response);
-        assert_eq!(blocked_response.proposed_actions[0].execution_state, "blocked");
+        assert_eq!(
+            blocked_response.proposed_actions[0].execution_state,
+            "blocked"
+        );
         assert!(blocked_response.proposed_actions[0]
             .blocked_reason
             .as_deref()
