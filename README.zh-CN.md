@@ -16,13 +16,35 @@
   <a href="LICENSE">Apache-2.0</a>
 </p>
 
-DS Agent 是专门为 DeepSeek 优化的本地 Agent Harness。它让 DeepSeek
-支持的工作拥有持久记忆、定时执行、可验证的电脑控制、并行 Subagent 和可复用技能，
-同时让关键动作始终受到权限、证据、审计、验证和恢复机制保护。
+<p align="center">由 <strong>Lee take</strong> 创建并维护。</p>
+
+DS Agent 是一款面向日常工作的 DeepSeek-first 本地 Windows Agent。你只需在聊天中说明
+想要的结果，它就能整理办公材料、开展带来源的研究、处理本地文件、运行持久自动任务，
+并在你授权后操作桌面应用；整个过程保留可见步骤、证据、权限、验证和恢复机制。
+
+在底层，DS Agent 是专门为 DeepSeek 优化的本地 Agent Harness。Harness 为模型驱动的
+工作提供持久、受权限约束且可验证的本地执行边界。
 
 DS Agent 源于一个很实际的需求：越来越多同事开始在日常工作中使用 DeepSeek，但很难
 找到一个专门围绕 DeepSeek 大模型优化，同时具备强大本地自动化和可信执行边界的
 Agent。
+
+<p align="center">
+  <img src="docs/assets/ds-agent-office-workflow.png" alt="DS Agent v1.0.0 真实运行：把会议纪要整理成团队执行清单，六个验证步骤全部完成" />
+</p>
+
+<p align="center"><em>真实的本地 v1.0.0 运行：会议纪要被整理成可直接发送的执行清单，全部运行步骤可见并已完成。</em></p>
+
+## 现在可以完成什么
+
+- **把办公输入转成行动。** 将会议纪要、需求或零散材料整理为结构化清单、计划、报告和
+  交接材料。
+- **生成有证据的简报。** 阅读你选定的本地文件或公开网页来源，保留来源链接，形成可
+  审阅的总结。
+- **让重复工作持续运行。** 创建一次性、每天、每周或每月自动任务，并保存计划、有限
+  重试和恢复状态。
+- **在受控条件下操作电脑。** 只有经过明确权限、执行前后观察和结果验证，DS Agent 才会
+  操作受支持的本地应用。
 
 ## 一个 Kernel，模块化能力
 
@@ -128,10 +150,13 @@ command 与 React UI 保持薄层，业务状态由 Kernel 和持久投影统一
 ## 快速开始
 
 1. 下载 [Windows x64 安装包](https://github.com/Lee-take/dsagent/releases/download/v1.0.0/DS.Agent_1.0.0_x64-setup.exe)。
-2. 让 DS Agent 进程能够读取 `DEEPSEEK_API_KEY`。
+2. 让 DS Agent 进程能够读取你自己的有效 `DEEPSEEK_API_KEY`。
 3. 首次运行时选择一个本地工作目录。
 4. 在聊天中描述你希望完成的结果；只有任务确实需要时，DS Agent 才会请求额外权限或
    前置条件。
+
+用户自行提供有效的 DeepSeek API Key 是必备前提。DS Agent 不内置共享 Key，也不会
+绕过 DeepSeek 的访问条件；实际使用仍须遵守 DeepSeek 的服务条款和账号规则。
 
 v1.0.0 安装包目前尚未签名，Windows 可能显示“未知发布者”提示。安装前请阅读
 [安装指南](docs/INSTALLATION.md)。

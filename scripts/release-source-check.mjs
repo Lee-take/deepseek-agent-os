@@ -43,6 +43,8 @@ const generatedDirectorySegments = new Set(["node_modules", "dist", "target"]);
 const allowedSourceBinaryFiles = new Set([
   "apps/desktop/public/ds-agent-mark.png",
   "apps/desktop/src-tauri/icons/icon.ico",
+  "docs/assets/ds-agent-office-workflow.png",
+  "docs/assets/ds-agent-social-preview.png",
 ]);
 const requiredDocs = [
   "README.md",

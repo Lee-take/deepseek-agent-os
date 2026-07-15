@@ -16,14 +16,38 @@
   <a href="LICENSE">Apache-2.0</a>
 </p>
 
-DS Agent is a local Agent Harness optimized for DeepSeek. It gives
-DeepSeek-backed work durable memory, scheduled execution, verified desktop
-control, parallel Subagents, and reusable Skills—while keeping critical actions
-governed by permissions, evidence, audit, verification, and recovery.
+<p align="center">Created and maintained by <strong>Lee take</strong>.</p>
+
+DS Agent is a DeepSeek-first local Windows agent for everyday work. Describe the
+result you need in chat: it can organize office material, research with sources,
+work with local files, run durable automations, and control desktop apps when you
+approve—while keeping steps, evidence, permissions, verification, and recovery
+visible.
+
+Under the hood, DS Agent is a local Agent Harness optimized for DeepSeek. The
+Harness gives model-backed work a durable, permissioned, and verifiable
+execution boundary on the local machine.
 
 DS Agent began from a practical need: more colleagues were using DeepSeek in
 daily work, yet it was difficult to find an Agent specifically optimized for
 DeepSeek with strong local automation and a trustworthy execution boundary.
+
+<p align="center">
+  <img src="docs/assets/ds-agent-office-workflow.png" alt="A real DS Agent v1.0.0 run turning meeting notes into a team execution checklist, with six completed verification steps" />
+</p>
+
+<p align="center"><em>A real local v1.0.0 run: meeting notes become a ready-to-send execution checklist, with every run step visible and completed.</em></p>
+
+## What you can do today
+
+- **Turn office input into action.** Convert meeting notes, requirements, or
+  rough material into structured checklists, plans, reports, and handoffs.
+- **Build evidence-backed briefings.** Read selected local files or public web
+  sources, preserve source links, and produce reviewable summaries.
+- **Keep recurring work running.** Create one-time, daily, weekly, or monthly
+  automations with persisted schedules, bounded retries, and recovery state.
+- **Use the desktop with control.** Let DS Agent operate supported local apps
+  only through explicit permissions, pre/post observation, and verification.
 
 ## One Kernel, modular capabilities
 
@@ -145,10 +169,14 @@ remain thin; the Kernel and persistent projections own business state.
 ## Quick start
 
 1. Download the [Windows x64 installer](https://github.com/Lee-take/dsagent/releases/download/v1.0.0/DS.Agent_1.0.0_x64-setup.exe).
-2. Make `DEEPSEEK_API_KEY` available to the DS Agent process.
+2. Make your own valid `DEEPSEEK_API_KEY` available to the DS Agent process.
 3. Choose one local workspace on first run.
 4. Describe the result you want in chat. DS Agent requests additional
    permissions or prerequisites only when the task needs them.
+
+A user-supplied DeepSeek API key is a required prerequisite. DS Agent does not
+bundle a shared key or bypass DeepSeek access requirements; use remains subject
+to DeepSeek's terms and account policies.
 
 The v1.0.0 installer is currently unsigned, so Windows may display an
 unknown-publisher warning. Read the [installation guide](docs/INSTALLATION.md)
