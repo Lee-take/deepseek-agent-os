@@ -49,6 +49,21 @@ test("settings panel exposes only the ordinary user configuration items", () => 
   );
 });
 
+test("settings panel shows the creator and maintainer attribution", () => {
+  const appSource = readFileSync(appSourceUrl, "utf8");
+  const i18nSource = readFileSync(i18nSourceUrl, "utf8");
+  const styles = readFileSync(stylesSourceUrl, "utf8");
+
+  assert.match(appSource, /className="product-attribution"/);
+  assert.match(appSource, /copy\.settingsPanel\.attribution/);
+  assert.match(i18nSource, /attribution:\s*"DS Agent 由 Lee take 创建并维护。"/);
+  assert.match(
+    i18nSource,
+    /attribution:\s*"DS Agent is created and maintained by Lee take\."/,
+  );
+  assert.match(styles, /\.product-attribution\s*\{/);
+});
+
 test("model selector uses ordinary model type language and concise options", () => {
   const i18nSource = readFileSync(i18nSourceUrl, "utf8");
 

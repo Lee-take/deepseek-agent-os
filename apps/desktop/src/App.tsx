@@ -1131,6 +1131,19 @@ export function App() {
     () => skillRecords.filter((record) => record.package_kind === "skill"),
     [skillRecords],
   );
+  const agentActionPermissionRequestIds = useMemo(() => {
+    const requestIds = new Set<string>();
+    for (const conversation of agentConversations) {
+      for (const message of conversation.messages) {
+        for (const action of message.proposed_actions ?? []) {
+          if (action.permission_request_id) {
+            requestIds.add(action.permission_request_id);
+          }
+        }
+      }
+    }
+    return requestIds;
+  }, [agentConversations]);
   const feedbackReviewItems = useMemo(() => {
     const memoriesById = new Map(memoryRecords.map((memory) => [memory.id, memory]));
     const feedbackByMemory = selectedMemoryFeedbackRecords.reduce(
@@ -4424,12 +4437,12 @@ export function App() {
     }
   };
 
-  const resumeAgentAction = async (
+  const resolveAndResumeAgentActionGroup = async (
     messageId: string,
-    actionIndex: number,
-    action: AgentChatActionProposal,
+    actionEntries: Array<{ actionIndex: number; action: AgentChatActionProposal }>,
+    approved: boolean,
   ) => {
-    const actionKey = `${messageId}:${actionIndex}`;
+    const actionKey = `${messageId}:approval-group`;
     setAgentActionPending(actionKey);
     setAgentChatError("");
 
@@ -4440,124 +4453,70 @@ export function App() {
     }
 
     try {
-      const updatedAction = await invoke<AgentChatActionProposal>("resume_agent_chat_action", {
-        accessMode: state.access_mode,
-        largeModelProvider: state.large_model_provider,
-        networkSearchSourceModel: state.network_search_source_model || null,
-        action,
-      });
-      updateActiveAgentMessages((currentMessages) =>
-        currentMessages.map((message) => {
-          if (message.id !== messageId || !message.proposed_actions) {
-            return message;
-          }
-          return {
-            ...message,
-            proposed_actions: message.proposed_actions.map((currentAction, index) =>
-              index === actionIndex ? updatedAction : currentAction,
-            ),
-          };
-        }),
-      );
-      await Promise.all([refreshCapabilityState(), refreshOperationsBriefingRuns()]);
-    } catch (error) {
-      setAgentChatError(String(error) || copy.chatWorkbench.resumeActionFailed);
-    } finally {
-      setAgentActionPending(null);
-    }
-  };
-
-  const approveAndResumeAgentAction = async (
-    messageId: string,
-    actionIndex: number,
-    action: AgentChatActionProposal,
-  ) => {
-    const actionKey = `${messageId}:${actionIndex}`;
-    setAgentActionPending(actionKey);
-    setAgentChatError("");
-
-    if (!hasDesktopRuntime()) {
-      setAgentChatError(copy.chatWorkbench.desktopRuntimeMissing);
-      setAgentActionPending(null);
-      return;
-    }
-
-    try {
-      if (action.permission_request_id) {
+      for (const { action } of actionEntries) {
+        if (!action.permission_request_id) {
+          continue;
+        }
+        const approvalRecord = capabilityRecords.find(
+          (record) => record.request.id === action.permission_request_id,
+        );
+        if (approvalRecord?.effective_status !== "pending_approval") {
+          continue;
+        }
         setResolutionPending(action.permission_request_id);
         await invoke("resolve_capability_access_request", {
           requestId: action.permission_request_id,
-          approved: true,
-          note: copy.chatWorkbench.confirmAndRun,
+          approved,
+          note: approved
+            ? copy.chatWorkbench.confirmAndRun
+            : copy.chatWorkbench.taskApprovalRejected,
         });
       }
 
-      const updatedAction = await invoke<AgentChatActionProposal>("resume_agent_chat_action", {
-        accessMode: state.access_mode,
-        largeModelProvider: state.large_model_provider,
-        networkSearchSourceModel: state.network_search_source_model || null,
-        action,
-      });
-      updateActiveAgentMessages((currentMessages) =>
-        currentMessages.map((message) => {
-          if (message.id !== messageId || !message.proposed_actions) {
-            return message;
-          }
-          return {
-            ...message,
-            proposed_actions: message.proposed_actions.map((currentAction, index) =>
-              index === actionIndex ? updatedAction : currentAction,
-            ),
-          };
-        }),
-      );
+      for (const { actionIndex, action } of actionEntries) {
+        const approvalRecord = action.permission_request_id
+          ? capabilityRecords.find(
+              (record) => record.request.id === action.permission_request_id,
+            )
+          : null;
+        const updatedAction: AgentChatActionProposal =
+          !approved && approvalRecord?.effective_status !== "pending_approval"
+            ? {
+                ...action,
+                execution_state: "blocked",
+                blocked_reason: copy.chatWorkbench.taskApprovalRejected,
+                dispatch_note: copy.chatWorkbench.taskApprovalRejected,
+              }
+            : await invoke<AgentChatActionProposal>("resume_agent_chat_action", {
+                accessMode: state.access_mode,
+                largeModelProvider: state.large_model_provider,
+                networkSearchSourceModel: state.network_search_source_model || null,
+                action,
+              });
+        updateActiveAgentMessages((currentMessages) =>
+          currentMessages.map((message) => {
+            if (message.id !== messageId || !message.proposed_actions) {
+              return message;
+            }
+            return {
+              ...message,
+              proposed_actions: message.proposed_actions.map((currentAction, index) =>
+                index === actionIndex ? updatedAction : currentAction,
+              ),
+            };
+          }),
+        );
+      }
       await Promise.all([refreshCapabilityState(), refreshOperationsBriefingRuns()]);
     } catch (error) {
+      await Promise.all([refreshCapabilityState(), refreshOperationsBriefingRuns()]).catch(
+        () => null,
+      );
       setAgentChatError(String(error) || copy.chatWorkbench.resumeActionFailed);
     } finally {
       setResolutionPending(null);
       setAgentActionPending(null);
     }
-  };
-
-  const resolveVisibleToolApproval = async (requestId: string, approved: boolean) => {
-    let matchingAction:
-      | { messageId: string; actionIndex: number; action: AgentChatActionProposal }
-      | undefined;
-
-    for (const message of agentMessages) {
-      const actionIndex =
-        message.proposed_actions?.findIndex(
-          (action) => action.permission_request_id === requestId,
-        ) ?? -1;
-      if (actionIndex >= 0 && message.proposed_actions) {
-        matchingAction = {
-          messageId: message.id,
-          actionIndex,
-          action: message.proposed_actions[actionIndex],
-        };
-        break;
-      }
-    }
-
-    if (approved && matchingAction) {
-      await approveAndResumeAgentAction(
-        matchingAction.messageId,
-        matchingAction.actionIndex,
-        matchingAction.action,
-      );
-      return;
-    }
-
-    const resolved = await resolveCapabilityAccess(requestId, approved);
-    if (!resolved || !matchingAction) {
-      return;
-    }
-    await resumeAgentAction(
-      matchingAction.messageId,
-      matchingAction.actionIndex,
-      matchingAction.action,
-    );
   };
 
   const sendAgentMessage = async (event: FormEvent<HTMLFormElement>) => {
@@ -4730,28 +4689,11 @@ export function App() {
     }
   };
 
-  const pendingCapabilityRecords = capabilityRecords.filter(
-    (record) => record.effective_status === "pending_approval",
-  );
-  useEffect(() => {
-    if (pendingCapabilityRecords.length === 0 || typeof window === "undefined") {
-      return;
-    }
-    window.requestAnimationFrame(() => {
-      const chatThread = chatThreadRef.current;
-      chatThread?.scrollTo({
-        top: chatThread.scrollHeight,
-        behavior: "smooth",
-      });
-    });
-  }, [pendingCapabilityRecords.length]);
   const latestOperationsBriefingRun = operationsBriefingRuns[0];
   const latestRunFailed = latestOperationsBriefingRun?.status === "failed";
   const latestRunReady = latestOperationsBriefingRun?.status === "draft_ready";
   const latestOperationsRunNeedsApproval =
     latestOperationsBriefingRun?.status === "pending_approval";
-  const latestRunNeedsApproval =
-    latestOperationsRunNeedsApproval || pendingCapabilityRecords.length > 0;
   const latestAgentMessage = latestAssistantMessage(agentMessages);
   const latestAgentRunError = userFacingAgentRunError(latestAgentMessage, {
     requestFailed: copy.chatWorkbench.deepSeekRequestFailed,
@@ -4761,6 +4703,9 @@ export function App() {
     ? latestAgentMessage
     : undefined;
   const latestAgentActions = latestAgentEnvelopeMessage?.proposed_actions ?? [];
+  const latestRunNeedsApproval =
+    latestOperationsRunNeedsApproval ||
+    latestAgentActions.some((action) => action.execution_state === "needs_confirmation");
   const latestAgentMissingPrerequisites =
     latestAgentEnvelopeMessage?.missing_prerequisites ?? [];
   const latestUserMessageWithAttachments = [...agentMessages]
@@ -5348,6 +5293,7 @@ export function App() {
                     <p className="package-error">{deepSeekBalanceError}</p>
                   ) : null}
                 </div>
+                <p className="product-attribution">{copy.settingsPanel.attribution}</p>
               </section>
             </div>
           </details>
@@ -5963,6 +5909,36 @@ export function App() {
                     message.role === "assistant"
                       ? (message.proposed_actions ?? []).filter(shouldShowAgentActionInChat)
                       : [];
+                  const messageApprovalActions = (message.proposed_actions ?? [])
+                    .map((action, actionIndex) => ({ action, actionIndex }))
+                    .filter(({ action }) => action.execution_state === "needs_confirmation");
+                  const messageApprovalRecords = messageApprovalActions.map(({ action }) =>
+                    action.permission_request_id
+                      ? capabilityRecords.find(
+                          (record) => record.request.id === action.permission_request_id,
+                        )
+                      : null,
+                  );
+                  const taskApprovalReady =
+                    messageApprovalActions.length > 0 &&
+                    messageApprovalActions.every(({ action }, index) => {
+                      if (!action.permission_request_id) {
+                        return true;
+                      }
+                      const record = messageApprovalRecords[index];
+                      return (
+                        record?.effective_status === "pending_approval" ||
+                        (record?.effective_status === "approved" &&
+                          (record.grant_state === "reusable" ||
+                            record.grant_state === "one_shot_available"))
+                      );
+                    });
+                  const taskApprovalHasPending = messageApprovalActions.some(
+                    ({ action }, index) =>
+                      !action.permission_request_id ||
+                      messageApprovalRecords[index]?.effective_status === "pending_approval",
+                  );
+                  const taskApprovalKey = `${message.id}:approval-group`;
 
                   return (
                   <article className={`chat-message ${message.role}`} key={message.id}>
@@ -6027,25 +6003,6 @@ export function App() {
                           <ul>
                             {visibleProposedActions.map((action) => {
                               const actionIndex = message.proposed_actions?.indexOf(action) ?? -1;
-                              const actionKey = `${message.id}:${actionIndex}`;
-                              const approvalRecord = action.permission_request_id
-                                ? capabilityRecords.find(
-                                    (record) => record.request.id === action.permission_request_id,
-                                  )
-                                : null;
-                              const canResumeAction =
-                                action.execution_state === "needs_confirmation" &&
-                                approvalRecord?.effective_status === "approved" &&
-                                (approvalRecord.grant_state === "reusable" ||
-                                  approvalRecord.grant_state === "one_shot_available");
-                              const canApproveAndResumeAction =
-                                action.execution_state === "needs_confirmation" &&
-                                ((action.permission_request_id !== null &&
-                                  approvalRecord?.effective_status === "pending_approval") ||
-                                  action.permission_request_id === null);
-                              const actionButtonDisabled =
-                                agentActionPending !== null ||
-                                resolutionPending !== null;
                               const actionDetail = userFacingAgentActionDetail(action);
                               return (
                                 <li key={`${message.id}-action-${actionIndex}`}>
@@ -6057,43 +6014,61 @@ export function App() {
                                     {action.target ? ` · ${action.target}` : ""}
                                   </p>
                                   {actionDetail ? <small>{actionDetail}</small> : null}
-                                  {canApproveAndResumeAction ? (
-                                    <button
-                                      className="agent-action-resume"
-                                      type="button"
-                                      disabled={actionButtonDisabled}
-                                      onClick={() =>
-                                        void approveAndResumeAgentAction(
-                                          message.id,
-                                          actionIndex,
-                                          action,
-                                        )
-                                      }
-                                    >
-                                      <Check size={13} aria-hidden="true" />
-                                      {agentActionPending === actionKey
-                                        ? copy.chatWorkbench.confirmingAction
-                                        : copy.chatWorkbench.confirmAndRun}
-                                    </button>
-                                  ) : canResumeAction ? (
-                                    <button
-                                      className="agent-action-resume"
-                                      type="button"
-                                      disabled={actionButtonDisabled}
-                                      onClick={() =>
-                                        void resumeAgentAction(message.id, actionIndex, action)
-                                      }
-                                    >
-                                      <Play size={13} aria-hidden="true" />
-                                      {agentActionPending === actionKey
-                                        ? copy.chatWorkbench.resumingAction
-                                        : copy.chatWorkbench.resumeAction}
-                                    </button>
-                                  ) : null}
                                 </li>
                               );
                             })}
                           </ul>
+                          {taskApprovalReady ? (
+                            <div className="agent-action-approval">
+                              <p>
+                                {copy.chatWorkbench.approvalSummary(
+                                  messageApprovalActions.length,
+                                )}
+                              </p>
+                              <div className="agent-action-approval-buttons">
+                                <button
+                                  className="agent-action-resume"
+                                  type="button"
+                                  disabled={
+                                    agentActionPending !== null || resolutionPending !== null
+                                  }
+                                  onClick={() =>
+                                    void resolveAndResumeAgentActionGroup(
+                                      message.id,
+                                      messageApprovalActions,
+                                      true,
+                                    )
+                                  }
+                                >
+                                  <Check size={13} aria-hidden="true" />
+                                  {agentActionPending === taskApprovalKey
+                                    ? copy.chatWorkbench.confirmingAction
+                                    : taskApprovalHasPending
+                                      ? copy.chatWorkbench.confirmAndRun
+                                      : copy.chatWorkbench.resumeAction}
+                                </button>
+                                {taskApprovalHasPending ? (
+                                  <button
+                                    className="agent-action-reject"
+                                    type="button"
+                                    disabled={
+                                      agentActionPending !== null || resolutionPending !== null
+                                    }
+                                    onClick={() =>
+                                      void resolveAndResumeAgentActionGroup(
+                                        message.id,
+                                        messageApprovalActions,
+                                        false,
+                                      )
+                                    }
+                                  >
+                                    <X size={13} aria-hidden="true" />
+                                    {copy.capabilities.reject}
+                                  </button>
+                                ) : null}
+                              </div>
+                            </div>
+                          ) : null}
                         </div>
                       ) : null}
                       {message.role === "assistant" && message.memory_candidates?.length ? (
@@ -6124,70 +6099,6 @@ export function App() {
                       <p>{agentChatPendingStatus}</p>
                     </div>
                   </article>
-                ) : null}
-                {pendingCapabilityRecords.length > 0 ? (
-                  <section
-                    className="chat-approval-queue"
-                    aria-label={copy.capabilities.pendingTitle}
-                  >
-                    <div className="chat-avatar" aria-hidden="true">
-                      <ShieldCheck size={16} />
-                    </div>
-                    <div className="approval-queue chat-approval-card">
-                      <div className="queue-heading">
-                        <strong>{copy.capabilities.pendingTitle}</strong>
-                        <span>{pendingCapabilityRecords.length}</span>
-                      </div>
-                      <div className="approval-list">
-                        {pendingCapabilityRecords.map((record) => (
-                          <article className="approval-row" key={record.request.id}>
-                            <div>
-                              <strong>{copy.capabilityOptions[record.request.capability]}</strong>
-                              <p>
-                                {copy.riskOptions[record.request.risk_level]} ·{" "}
-                                {copy.accessOptions[record.request.access_mode]}
-                              </p>
-                              {record.request.exact_tool ? (
-                                <p className="approval-preview">
-                                  {record.request.exact_tool.preview}
-                                </p>
-                              ) : null}
-                            </div>
-                            <div className="approval-actions">
-                              <button
-                                type="button"
-                                aria-label={copy.capabilities.approve}
-                                onClick={() =>
-                                  void resolveVisibleToolApproval(record.request.id, true)
-                                }
-                                disabled={
-                                  resolutionPending !== null || capabilityPending !== null
-                                }
-                              >
-                                <Check size={14} aria-hidden="true" />
-                                {resolutionPending === record.request.id
-                                  ? copy.capabilities.resolving
-                                  : copy.chatWorkbench.confirmAndRun}
-                              </button>
-                              <button
-                                type="button"
-                                aria-label={copy.capabilities.reject}
-                                onClick={() =>
-                                  void resolveVisibleToolApproval(record.request.id, false)
-                                }
-                                disabled={
-                                  resolutionPending !== null || capabilityPending !== null
-                                }
-                              >
-                                <X size={14} aria-hidden="true" />
-                                {copy.capabilities.reject}
-                              </button>
-                            </div>
-                          </article>
-                        ))}
-                      </div>
-                    </div>
-                  </section>
                 ) : null}
               </div>
 
@@ -8273,9 +8184,18 @@ export function App() {
               <div className="capability-grid">
                 {capabilityCatalog.map((capability) => {
                   const Icon = capabilityFamilyIcon(capability.family);
-                  const latestRecord = capabilityRecords.find(
-                    (record) => record.request.capability === capability.capability,
+                  const latestPendingRecord = capabilityRecords.find(
+                    (record) =>
+                      record.request.capability === capability.capability &&
+                      record.effective_status === "pending_approval" &&
+                      record.request.exact_tool === null &&
+                      !agentActionPermissionRequestIds.has(record.request.id),
                   );
+                  const latestRecord =
+                    latestPendingRecord ??
+                    capabilityRecords.find(
+                      (record) => record.request.capability === capability.capability,
+                    );
 
                   return (
                     <article className="capability-card" key={capability.capability}>
@@ -8305,16 +8225,43 @@ export function App() {
                           </span>
                         ) : null}
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => void requestCapabilityAccess(capability.capability)}
-                        disabled={capabilityPending !== null || resolutionPending !== null}
-                      >
-                        <MousePointerClick size={14} aria-hidden="true" />
-                        {capabilityPending === capability.capability
-                          ? copy.capabilities.requesting
-                          : copy.capabilities.request}
-                      </button>
+                      {latestPendingRecord ? (
+                        <div className="capability-card-approval">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void resolveCapabilityAccess(latestPendingRecord.request.id, true)
+                            }
+                            disabled={capabilityPending !== null || resolutionPending !== null}
+                          >
+                            <Check size={14} aria-hidden="true" />
+                            {resolutionPending === latestPendingRecord.request.id
+                              ? copy.capabilities.resolving
+                              : copy.capabilities.approve}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void resolveCapabilityAccess(latestPendingRecord.request.id, false)
+                            }
+                            disabled={capabilityPending !== null || resolutionPending !== null}
+                          >
+                            <X size={14} aria-hidden="true" />
+                            {copy.capabilities.reject}
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => void requestCapabilityAccess(capability.capability)}
+                          disabled={capabilityPending !== null || resolutionPending !== null}
+                        >
+                          <MousePointerClick size={14} aria-hidden="true" />
+                          {capabilityPending === capability.capability
+                            ? copy.capabilities.requesting
+                            : copy.capabilities.request}
+                        </button>
+                      )}
                     </article>
                   );
                 })}

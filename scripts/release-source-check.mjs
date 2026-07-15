@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-const expectedVersion = "1.0.0";
+const expectedVersion = "1.0.1";
 const maxSourceFileBytes = 2 * 1024 * 1024;
 const binaryReleaseExtensions = new Set([
   ".appimage",
@@ -50,6 +50,7 @@ const requiredDocs = [
   "README.md",
   "README.zh-CN.md",
   "docs/INSTALLATION.md",
+  "docs/RELEASE_NOTES_v1.0.1.md",
   "docs/RELEASE_NOTES_v1.0.0.md",
   "docs/DS_AGENT_V1_COMPLETION_AUDIT.md",
   "docs/RELEASE_NOTES_v0.9.0.md",
@@ -79,6 +80,7 @@ const publicReleaseCopyFiles = [
   "apps/desktop/package.json",
   "docs/INSTALLATION.md",
   "docs/OPEN_SOURCE_RELEASE.md",
+  "docs/RELEASE_NOTES_v1.0.1.md",
   "docs/RELEASE_NOTES_v1.0.0.md",
   "docs/DS_AGENT_V1_COMPLETION_AUDIT.md",
   "docs/RELEASE_NOTES_v0.9.0.md",
@@ -435,9 +437,11 @@ const failures = [];
 const checks = [];
 
 checkJsonField("package.json", "version", expectedVersion);
+checkJsonField("package.json", "author", "Lee take");
 checkJsonField("package.json", "license", "Apache-2.0");
 checkJsonField("package.json", "packageManager", expectedPackageManager);
 checkJsonField("apps/desktop/package.json", "version", expectedVersion);
+checkJsonField("apps/desktop/package.json", "author", "Lee take");
 checkJsonField("apps/desktop/package.json", "license", "Apache-2.0");
 checkJsonField("apps/desktop/src-tauri/tauri.conf.json", "version", expectedVersion);
 checkJsonField("apps/desktop/src-tauri/tauri.conf.json", "productName", "DS Agent");
@@ -448,6 +452,12 @@ checkJsonField(
   "ai.deepseek-agent-os.desktop",
 );
 checkJsonField("apps/desktop/src-tauri/tauri.conf.json", "bundle.active", false);
+checkJsonField("apps/desktop/src-tauri/tauri.conf.json", "bundle.publisher", "Lee take");
+checkJsonField(
+  "apps/desktop/src-tauri/tauri.conf.json",
+  "bundle.copyright",
+  "Copyright © 2026 Lee take",
+);
 checkJsonField(
   "apps/desktop/src-tauri/tauri.windows.conf.json",
   "build.beforeBuildCommand",
@@ -702,7 +712,7 @@ function checkRequiredDocs() {
   for (const [phrase, label] of [
     ["One Kernel. Modular capabilities. Verifiable execution.", "English README product promise"],
     ["DS Agent is a local Agent Harness optimized for DeepSeek", "English README DeepSeek-first positioning"],
-    ["v1.0.0 stable", "English README formal stable status"],
+    ["v1.0.1 stable", "English README formal stable status"],
     ["The key difference is that Memory, Automation, Computer Use, parallel Subagents, and Skills are not isolated plugins", "English README unified Kernel thesis"],
     ["contract-first modular Harness architecture", "English README modular architecture"],
     ["Five core capabilities, one engineering philosophy", "English README five-capability framing"],
@@ -714,7 +724,7 @@ function checkRequiredDocs() {
     ["goal → done-when contract → context → plan → permission → execution → evidence → verification → recovery", "English README Loop Engineering contract"],
     ["DeepSeek and DS Agent boundary", "English README model boundary"],
     ["Why Rust", "English README Rust rationale"],
-    ["Production Microsoft/Google account registration and live external-write authority remain disabled in v1.0.0", "English README connector authority boundary"],
+    ["Production Microsoft/Google account registration and live external-write authority remain disabled in v1.0.1", "English README connector authority boundary"],
     ["README.zh-CN.md", "English README language switch"],
     ["Search aliases: DS Agent, DSAgent, dsagent, DeepSeek Agent OS.", "English README searchable aliases"],
   ]) {
@@ -723,7 +733,7 @@ function checkRequiredDocs() {
   for (const [phrase, label] of [
     ["一个 Kernel，模块化能力，统一可信执行。", "Chinese README product promise"],
     ["DS Agent 是专门为 DeepSeek 优化的本地 Agent Harness", "Chinese README DeepSeek-first positioning"],
-    ["v1.0.0 正式稳定版", "Chinese README formal stable status"],
+    ["v1.0.1 正式稳定版", "Chinese README formal stable status"],
     ["真正的差异点是：记忆、自动化执行、Computer Use、Subagent 并行协作和技能", "Chinese README unified Kernel thesis"],
     ["契约优先的模块化 Harness 架构", "Chinese README modular architecture"],
     ["五项核心能力，一套工程理念", "Chinese README five-capability framing"],
@@ -735,7 +745,7 @@ function checkRequiredDocs() {
     ["目标 → 完成条件 → 上下文 → 规划 → 权限 → 执行 → 证据 → 验证 → 恢复", "Chinese README Loop Engineering contract"],
     ["DeepSeek 与 DS Agent 的工作边界", "Chinese README model boundary"],
     ["为什么使用 Rust", "Chinese README Rust rationale"],
-    ["v1.0.0 仍未开放生产 Microsoft/Google 账号注册和真实外部写入权限", "Chinese README connector authority boundary"],
+    ["v1.0.1 仍未开放生产 Microsoft/Google 账号注册和真实外部写入权限", "Chinese README connector authority boundary"],
     ["README.md", "Chinese README language switch"],
     ["中文搜索别名：DS Agent、DSAgent、dsagent、DeepSeek Agent OS。", "Chinese README searchable aliases"],
   ]) {
@@ -1583,14 +1593,38 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludes(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v1.0.0"',
-    "app updater current release tag v1.0.0",
+    'APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/1.0.1"',
+    "app updater User-Agent v1.0.1",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/kernel/app_update.rs",
+    readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v1.0.1"',
+    "app updater current release tag v1.0.1",
   );
   checkTextDoesNotInclude(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
     'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.9.0"',
     "app updater current release tag must not regress to v0.9.0",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v1.0.1.md",
+    readText("docs/RELEASE_NOTES_v1.0.1.md"),
+    "Package, desktop, Tauri and Cargo metadata are `1.0.1`, and the updater identity is `v1.0.1`.",
+    "v1.0.1 stable release notes updater identity",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v1.0.1.md",
+    readText("docs/RELEASE_NOTES_v1.0.1.md"),
+    "one Confirm and run / Reject decision pair",
+    "v1.0.1 task-bound grouped approval fix",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v1.0.1.md",
+    readText("docs/RELEASE_NOTES_v1.0.1.md"),
+    "The release artifact was built and inspected without launching the installer or changing the installed DS Agent application or its data.",
+    "v1.0.1 release validation boundary",
   );
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v1.0.0.md",
@@ -2039,7 +2073,8 @@ function checkChatFirstCenterWorkbenchUi() {
     "copy.chatWorkbench.networkSearchTitle",
     "copy.chatWorkbench.title",
     "copy.chatWorkbench.composerPlaceholder",
-    "className=\"chat-approval-queue\"",
+    "className=\"agent-action-approval\"",
+    "resolveAndResumeAgentActionGroup",
   ]) {
     checkTextIncludes(appPath, app, snippet, `chat-first center workbench app snippet: ${snippet}`);
   }

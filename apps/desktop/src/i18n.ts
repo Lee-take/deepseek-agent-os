@@ -112,6 +112,7 @@ type TranslationSet = {
     balanceNotQueried: string;
     balanceFailed: string;
     balanceEmpty: string;
+    attribution: string;
   };
   controls: {
     modelRoute: string;
@@ -271,6 +272,8 @@ type TranslationSet = {
     workspaceBody: string;
     networkSearchTitle: string;
     networkSearchBody: string;
+    approvalSummary: (count: number) => string;
+    taskApprovalRejected: string;
     confirmAndRun: string;
     confirmingAction: string;
     resumeAction: string;
@@ -995,6 +998,7 @@ export const translations: Record<Language, TranslationSet> = {
       balanceNotQueried: "尚未读取余额",
       balanceFailed: "DeepSeek 余额读取失败。",
       balanceEmpty: "DeepSeek 未返回余额明细。",
+      attribution: "DS Agent 由 Lee take 创建并维护。",
     },
     controls: {
       modelRoute: "模型类型",
@@ -1300,6 +1304,9 @@ export const translations: Record<Language, TranslationSet> = {
       workspaceBody: "请选择一个工作目录。DS Agent 会在里面自动创建和维护项目结构。",
       networkSearchTitle: "配置网络搜索",
       networkSearchBody: "这条指令看起来需要网络信息。请选择搜索来源模型后继续；需要密钥的搜索源会走对应提供商配置。",
+      approvalSummary: (count) =>
+        `本次任务需要确认以下 ${count} 项动作；一次确认后将按顺序执行，也可以拒绝整个任务。`,
+      taskApprovalRejected: "用户拒绝了本次任务的待授权动作。",
       confirmAndRun: "确认并执行",
       confirmingAction: "执行中",
       resumeAction: "继续执行",
@@ -2149,6 +2156,7 @@ export const translations: Record<Language, TranslationSet> = {
       balanceNotQueried: "Balance not read yet",
       balanceFailed: "DeepSeek balance query failed.",
       balanceEmpty: "DeepSeek returned no balance details.",
+      attribution: "DS Agent is created and maintained by Lee take.",
     },
     controls: {
       modelRoute: "Model type",
@@ -2454,6 +2462,9 @@ export const translations: Record<Language, TranslationSet> = {
       workspaceBody: "Choose one workspace. DS Agent will create and maintain the project structure inside it.",
       networkSearchTitle: "Configure Network Search",
       networkSearchBody: "This instruction appears to need web information. Choose a search source model to continue; key-backed search sources use their provider configuration.",
+      approvalSummary: (count) =>
+        `This task needs approval for the ${count} action${count === 1 ? "" : "s"} below. One confirmation runs them in order, or you can reject the whole task.`,
+      taskApprovalRejected: "The user rejected the actions awaiting approval for this task.",
       confirmAndRun: "Confirm and run",
       confirmingAction: "Running",
       resumeAction: "Continue",

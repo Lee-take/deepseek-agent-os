@@ -1132,6 +1132,31 @@ h1 {
   opacity: 0.58;
 }
 
+.agent-action-approval {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.agent-action-approval > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.agent-action-approval-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agent-action-reject {
+  min-height: 30px;
+  font-size: 12px;
+}
+
 .agent-action-state.needs_confirmation {
   border-color: color-mix(in srgb, #d9b35f 58%, var(--border));
   color: #d9b35f;
@@ -1728,6 +1753,13 @@ h1 {
   font-size: 12px;
   line-height: 1.4;
   resize: vertical;
+}
+
+.product-attribution {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .api-key-input-row {
@@ -3282,38 +3314,17 @@ dd {
   justify-self: start;
 }
 
+.capability-card-approval {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .approval-queue {
   display: grid;
   gap: 8px;
   border-top: 1px solid var(--border);
   padding-top: 10px;
-}
-
-.chat-approval-queue {
-  display: grid;
-  grid-template-columns: 32px minmax(0, 1fr);
-  gap: 10px;
-  align-items: start;
-  justify-self: center;
-  width: min(100%, var(--chat-content-rail-width));
-  min-width: 0;
-  scroll-margin-block: 16px;
-}
-
-.chat-approval-card {
-  border: 1px solid var(--border-active);
-  border-radius: 8px;
-  background: var(--surface-bg);
-  padding: 12px;
-}
-
-.chat-approval-card .approval-row {
-  display: grid;
-  gap: 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--surface-control) 74%, transparent);
-  padding: 10px;
 }
 
 .queue-heading {
@@ -3641,8 +3652,7 @@ dd {
     padding-right: 0;
   }
 
-  .chat-message,
-  .chat-approval-queue {
+  .chat-message {
     grid-template-columns: minmax(0, 1fr);
   }
 

@@ -9,13 +9,13 @@ project does not depend on the maintainer's local directories.
 The published Windows release provides a normal NSIS setup executable:
 
 ```text
-DS.Agent_1.0.0_x64-setup.exe
+DS.Agent_1.0.1_x64-setup.exe
 ```
 
-Version `1.0.0` is the current published stable release. Earlier commits, tags,
+Version `1.0.1` is the current published stable release. Earlier commits, tags,
 Releases, and assets remain immutable. The installer is unsigned, so Windows
 may show an unknown-publisher warning. Verify its SHA-256 against the value in
-`docs/RELEASE_NOTES_v1.0.0.md` before running it. The installer
+`docs/RELEASE_NOTES_v1.0.1.md` before running it. The installer
 embeds the Microsoft WebView2 bootstrapper and runs it silently when the target
 machine needs the WebView2 runtime; users do not need Node.js, pnpm, Rust, or a
 source checkout to run the installed app.

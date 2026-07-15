@@ -43,7 +43,10 @@ const durableWorker = app.slice(durableWorkerStart, durableWorkerEnd);
 assert.match(durableWorker, /refreshSkillRecords\(\)/);
 
 const sendAgentPromptStart = app.indexOf("const sendAgentPrompt");
-const sendAgentPromptEnd = app.indexOf("const resumeAgentAction", sendAgentPromptStart);
+const sendAgentPromptEnd = app.indexOf(
+  "const resolveAndResumeAgentActionGroup",
+  sendAgentPromptStart,
+);
 const sendAgentPrompt = app.slice(sendAgentPromptStart, sendAgentPromptEnd);
 assert.match(sendAgentPrompt, /refreshSkillRecords\(\)/);
 

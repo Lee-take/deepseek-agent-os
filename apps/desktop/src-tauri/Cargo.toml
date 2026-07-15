@@ -1,9 +1,10 @@
 [package]
 name = "deepseek-agent-os-desktop"
-version = "1.0.0"
+version = "1.0.1"
 description = "Local-first DeepSeek AI work platform"
 edition = "2021"
 license = "Apache-2.0"
+authors = ["Lee take"]
 
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
