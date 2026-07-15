@@ -47,6 +47,7 @@ const allowedSourceBinaryFiles = new Set([
 const requiredDocs = [
   "README.md",
   "docs/INSTALLATION.md",
+  "docs/RELEASE_NOTES_v0.8.0.md",
   "docs/RELEASE_NOTES_v0.8.0-rc.1.md",
   "docs/RELEASE_NOTES_v0.5.0.md",
   "docs/RELEASE_NOTES_v0.4.1.md",
@@ -71,6 +72,7 @@ const publicReleaseCopyFiles = [
   "apps/desktop/package.json",
   "docs/INSTALLATION.md",
   "docs/OPEN_SOURCE_RELEASE.md",
+  "docs/RELEASE_NOTES_v0.8.0.md",
   "docs/RELEASE_NOTES_v0.8.0-rc.1.md",
   "docs/RELEASE_NOTES_v0.5.0.md",
   "docs/RELEASE_NOTES_v0.4.1.md",
@@ -718,8 +720,12 @@ function checkRequiredDocs() {
       "README.md searchable DSAgent aliases",
     ],
     [
-      "Latest prerelease: [DS Agent v0.8.0-rc.1]",
-      "README.md latest prerelease link",
+      "Latest stable: [DS Agent v0.8.0]",
+      "README.md latest stable v0.8.0 link",
+    ],
+    [
+      "Historical prerelease: [DS Agent v0.8.0-rc.1]",
+      "README.md historical v0.8.0-rc.1 link",
     ],
     [
       "Background Agent runs keep the composer usable while work is queued, claimed, executed, cancelled, and audited.",
@@ -744,6 +750,18 @@ function checkRequiredDocs() {
   ]) {
     checkTextIncludesCollapsed("README.md", readme, phrase, label);
   }
+  checkTextDoesNotInclude(
+    "README.md",
+    readme,
+    "Latest prerelease: [DS Agent v0.8.0-rc.1]",
+    "README current release status must not regress to v0.8.0-rc.1",
+  );
+  checkTextDoesNotInclude(
+    "docs/INSTALLATION.md",
+    readText("docs/INSTALLATION.md"),
+    "The current stable release remains `v0.5.0`",
+    "installation current stable status must not regress to v0.5.0",
+  );
 
   for (const phrase of [
     "BrowserSubmit boundary v1, NetworkSearch source adapter v1, FileRead v1",
@@ -1757,20 +1775,26 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludes(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.8.0"',
+    "app updater current release tag v0.8.0",
+  );
+  checkTextDoesNotInclude(
+    "apps/desktop/src-tauri/src/kernel/app_update.rs",
+    readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
     'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.8.0-rc.1"',
-    "app updater current release tag v0.8.0-rc.1",
+    "app updater current release tag must not regress to v0.8.0-rc.1",
   );
   checkTextIncludesCollapsed(
-    "docs/RELEASE_NOTES_v0.8.0-rc.1.md",
-    readText("docs/RELEASE_NOTES_v0.8.0-rc.1.md"),
-    "Bumps the package, desktop, Tauri and Cargo metadata to `0.8.0`, while the updater identity is `v0.8.0-rc.1`, so installed Windows clients can detect and test this release candidate as newer than `v0.5.0`.",
-    "v0.8.0-rc.1 release notes updater version bump",
+    "docs/RELEASE_NOTES_v0.8.0.md",
+    readText("docs/RELEASE_NOTES_v0.8.0.md"),
+    "Package, desktop, Tauri and Cargo metadata remain `0.8.0`, and the updater identity is `v0.8.0`.",
+    "v0.8.0 stable release notes updater identity",
   );
   checkTextIncludesCollapsed(
-    "docs/RELEASE_NOTES_v0.8.0-rc.1.md",
-    readText("docs/RELEASE_NOTES_v0.8.0-rc.1.md"),
+    "docs/RELEASE_NOTES_v0.8.0.md",
+    readText("docs/RELEASE_NOTES_v0.8.0.md"),
     "Durable Verified Computer Use",
-    "v0.8.0-rc.1 release notes computer use positioning",
+    "v0.8.0 stable release notes computer use positioning",
   );
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.5.0.md",
