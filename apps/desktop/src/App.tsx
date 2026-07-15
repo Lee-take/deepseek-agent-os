@@ -75,6 +75,12 @@ import {
   shouldExposePluginsSidebarEntry,
 } from "./settingsPanel";
 import { translations } from "./i18n";
+import {
+  blockedParentsWithTerminalChildren,
+  expertBudgetLabel,
+  expertTeamCanSynthesize,
+  readyExpertAttempts,
+} from "./expert-team";
 import type {
   AccessMode,
   AgentChatActionProposal,
@@ -83,6 +89,7 @@ import type {
   AgentContextReceipt,
   AgentRunRecord,
   AgentRunWorkerResult,
+  AgentSoulProfileUpdateReceipt,
   AgentToolContract,
   AgentSoulProfileState,
   AppUpdateDownloadResult,
@@ -424,6 +431,7 @@ type AgentConversationMessage = {
   proposed_actions?: AgentChatActionProposal[];
   missing_prerequisites?: AgentChatMissingPrerequisite[];
   memory_candidates?: MemoryCandidate[];
+  soul_profile_update?: AgentSoulProfileUpdateReceipt | null;
   run_error?: string;
   created_at: string;
 };
@@ -1418,6 +1426,13 @@ export function App() {
   const applySoulProfileState = (profileState: AgentSoulProfileState) => {
     setSoulProfileState(profileState);
     setSoulProfileDraft(profileState.content);
+    const soulProfileBootstrap = agentSoulProfileBootstrapFromState(profileState) || null;
+    setAgentConversations((currentConversations) =>
+      currentConversations.map((conversation) => ({
+        ...conversation,
+        soul_profile_bootstrap: soulProfileBootstrap,
+      })),
+    );
   };
 
   const loadSoulProfileStateForBootstrap = async (): Promise<AgentSoulProfileState> => {
@@ -1431,6 +1446,16 @@ export function App() {
     } catch {
       return soulProfileState;
     }
+  };
+
+  const refreshSoulProfileAfterAgentResponse = async (response: AgentChatResponse) => {
+    if (
+      response.soul_profile_update?.status !== "applied" &&
+      response.soul_profile_update?.status !== "unchanged"
+    ) {
+      return;
+    }
+    await loadSoulProfileStateForBootstrap();
   };
 
   useEffect(() => {
@@ -2585,32 +2610,38 @@ export function App() {
       backgroundAgentWorkerBusyRef.current = true;
       try {
         const currentRuns = await refreshAgentRunRecords();
-        const recoverableParents = currentRuns.filter(
-          (record) =>
-            record.role === "parent" &&
-            record.status === "blocked" &&
-            currentRuns.some((child) => child.parent_run_id === record.id) &&
-            currentRuns
-              .filter((child) => child.parent_run_id === record.id)
-              .every((child) =>
-                ["completed", "failed", "cancelled"].includes(child.status),
-              ),
-        );
+        const recoverableParents = blockedParentsWithTerminalChildren(currentRuns);
         if (recoverableParents.length > 0) {
+          const queuedRetries = (
+            await Promise.all(
+              recoverableParents.map((parent) =>
+                invoke<AgentRunRecord[]>("queue_expert_team_retries", {
+                  parentRunId: parent.id,
+                }),
+              ),
+            )
+          ).flat();
+          queuedRetries.forEach(upsertAgentRunRecord);
+          if (queuedRetries.length > 0) {
+            await refreshAgentRunRecords();
+            return;
+          }
           const queuedParents = await Promise.all(
             recoverableParents.map((parent) =>
-              invoke<AgentRunRecord>("queue_parent_agent_synthesis", {
-                parentRunId: parent.id,
-              }),
+              expertTeamCanSynthesize(currentRuns, parent.id)
+                ? invoke<AgentRunRecord>("queue_parent_agent_synthesis", {
+                    parentRunId: parent.id,
+                  })
+                : Promise.resolve(null),
             ),
           );
-          queuedParents.forEach(upsertAgentRunRecord);
-          await refreshAgentRunRecords();
-          return;
+          queuedParents.forEach((record) => record && upsertAgentRunRecord(record));
+          if (queuedParents.some(Boolean)) {
+            await refreshAgentRunRecords();
+            return;
+          }
         }
-        const queuedSubagents = currentRuns
-          .filter((record) => record.role === "subagent" && record.status === "queued")
-          .slice(0, 3);
+        const queuedSubagents = readyExpertAttempts(currentRuns);
         if (queuedSubagents.length > 0) {
           const subagentResults = await Promise.all(
             queuedSubagents.map((record, index) =>
@@ -2648,11 +2679,21 @@ export function App() {
                   ["completed", "failed", "cancelled"].includes(child.status),
                 )
               ) {
-                const queuedParent = await invoke<AgentRunRecord>(
-                  "queue_parent_agent_synthesis",
+                const queuedRetries = await invoke<AgentRunRecord[]>(
+                  "queue_expert_team_retries",
                   { parentRunId: parent.id },
                 );
-                upsertAgentRunRecord(queuedParent);
+                queuedRetries.forEach(upsertAgentRunRecord);
+                if (
+                  queuedRetries.length === 0 &&
+                  expertTeamCanSynthesize(finishedRuns, parent.id)
+                ) {
+                  const queuedParent = await invoke<AgentRunRecord>(
+                    "queue_parent_agent_synthesis",
+                    { parentRunId: parent.id },
+                  );
+                  upsertAgentRunRecord(queuedParent);
+                }
               }
             }),
           );
@@ -2686,6 +2727,7 @@ export function App() {
           await refreshAgentRunRecords();
           return;
         }
+        await refreshSoulProfileAfterAgentResponse(workerResult.response);
         const assistantMessage: AgentConversationMessage = {
           id: workerResult.response.id,
           role: "assistant",
@@ -2695,6 +2737,7 @@ export function App() {
           proposed_actions: workerResult.response.proposed_actions,
           missing_prerequisites: workerResult.response.missing_prerequisites,
           memory_candidates: workerResult.response.memory_candidates,
+          soul_profile_update: workerResult.response.soul_profile_update,
           created_at: workerResult.response.created_at,
         };
         setAgentConversations((currentConversations) => {
@@ -4095,20 +4138,19 @@ export function App() {
       (conversation) => conversation.id === activeAgentConversationId,
     );
     let capturedSoulProfileBootstrap = activeConversation?.soul_profile_bootstrap || "";
-    if (!capturedSoulProfileBootstrap && priorMessages.length === 0) {
+    if (priorMessages.length === 0) {
       capturedSoulProfileBootstrap = agentSoulProfileBootstrapFromState(
         await loadSoulProfileStateForBootstrap(),
       );
     }
-    if (
-      capturedSoulProfileBootstrap &&
-      priorMessages.length === 0 &&
-      !activeConversation?.soul_profile_bootstrap
-    ) {
+    if (priorMessages.length === 0) {
       setAgentConversations((currentConversations) =>
         currentConversations.map((conversation) =>
           conversation.id === activeAgentConversationId
-            ? { ...conversation, soul_profile_bootstrap: capturedSoulProfileBootstrap }
+            ? {
+                ...conversation,
+                soul_profile_bootstrap: capturedSoulProfileBootstrap || null,
+              }
             : conversation,
         ),
       );
@@ -4229,6 +4271,7 @@ export function App() {
       if (runToken !== agentChatRunTokenRef.current || agentStopRequestedRef.current) {
         return;
       }
+      await refreshSoulProfileAfterAgentResponse(response);
       if (contextPacket.compressed) {
         setAgentConversations((currentConversations) =>
           currentConversations.map((conversation) =>
@@ -4250,6 +4293,7 @@ export function App() {
             proposed_actions: response.proposed_actions,
             missing_prerequisites: response.missing_prerequisites,
             memory_candidates: response.memory_candidates,
+            soul_profile_update: response.soul_profile_update,
             created_at: response.created_at,
           },
         ], displayPrompt);
@@ -4740,9 +4784,10 @@ export function App() {
     (action) =>
       action.execution_state === "proposed" || action.execution_state === "waiting_prerequisite",
   );
-  const recentAgentRunRecords = [...agentRunRecords]
+  const recentAgentRunRecords = agentRunRecords
+    .filter((record) => record.role === "parent")
     .sort((left, right) => new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime())
-    .slice(0, 5);
+    .slice(0, 3);
   const recentToolInvocations = [...toolInvocations]
     .sort(
       (left, right) =>
@@ -7497,41 +7542,95 @@ export function App() {
                     </span>
                   </div>
                   <div className="sidebar-record-list">
-                    {recentAgentRunRecords.map((record) => (
-                      <article
-                        className={`sidebar-record-row${record.role === "subagent" ? " subagent-run-row" : ""}`}
-                        key={record.id}
-                      >
-                        <div>
-                          <span>{formatTaskDate(record.updated_at, language)}</span>
-                          {record.role === "subagent" ? (
-                            <span>
-                              {language === "zh" ? "并行子任务" : "Parallel subtask"}
-                              {record.subtask_key ? ` · ${record.subtask_key}` : ""}
+                    {recentAgentRunRecords.map((record) => {
+                      const expertAttempts = agentRunRecords
+                        .filter((child) => child.parent_run_id === record.id)
+                        .sort(
+                          (left, right) =>
+                            (left.expert_contract?.attempt ?? 0) -
+                            (right.expert_contract?.attempt ?? 0),
+                        );
+                      return (
+                        <section className="expert-team-run" key={record.id}>
+                          <article className="sidebar-record-row parent-run-row">
+                            <div>
+                              <span>{formatTaskDate(record.updated_at, language)}</span>
+                              <strong>{record.prompt}</strong>
+                              <small>
+                                {copy.runStatus.runStepsLabel(record.steps.length)}
+                                {" / "}
+                                {copy.runStatus.runArtifactsLabel(record.artifacts.length)}
+                                {record.recovery_count > 0
+                                  ? ` / ${copy.runStatus.recoveryLabel(record.recovery_count)}`
+                                  : ""}
+                                {record.expert_merge_receipt
+                                  ? language === "zh"
+                                    ? " / 已通过审查合并"
+                                    : " / reviewed merge ready"
+                                  : ""}
+                              </small>
+                              {record.status_reason ? <small>{record.status_reason}</small> : null}
+                            </div>
+                            <span className={`access-status ${record.status}`}>
+                              {copy.runStatus.agentRunStatus[record.status]}
                             </span>
+                          </article>
+                          {expertAttempts.length > 0 ? (
+                            <div className="expert-attempt-list">
+                              {expertAttempts.map((attempt) => {
+                                const budget = expertBudgetLabel(attempt);
+                                const role = attempt.expert_contract?.role;
+                                const roleLabel = role
+                                  ? language === "zh"
+                                    ? {
+                                        research: "调研",
+                                        analysis: "分析",
+                                        production: "制作",
+                                        review: "审查",
+                                      }[role]
+                                    : role
+                                  : language === "zh"
+                                    ? "子任务"
+                                    : "subtask";
+                                return (
+                                  <article className="sidebar-record-row expert-attempt-row" key={attempt.id}>
+                                    <div>
+                                      <span>
+                                        {roleLabel}
+                                        {attempt.expert_contract
+                                          ? ` · #${attempt.expert_contract.attempt}`
+                                          : ""}
+                                        {attempt.subtask_key ? ` · ${attempt.subtask_key}` : ""}
+                                      </span>
+                                      <strong>{attempt.prompt}</strong>
+                                      {budget ? (
+                                        <small>
+                                          {language === "zh" ? "令牌" : "tokens"} {budget.tokens}
+                                          {` / ${language === "zh" ? "工具" : "tools"} ${budget.tools}`}
+                                          {` / ${language === "zh" ? "证据" : "evidence"} ${budget.evidence}`}
+                                          {` / ${language === "zh" ? "冲突" : "conflicts"} ${budget.conflicts}`}
+                                          {` / ${language === "zh" ? "闸门" : "gates"} ${budget.gatesPassed}/${budget.gatesTotal}`}
+                                        </small>
+                                      ) : null}
+                                      {attempt.expert_result?.review ? (
+                                        <small>
+                                          {language === "zh" ? "审查" : "review"}: {attempt.expert_result.review.decision}
+                                          {` · ${attempt.expert_result.review.target_revision.slice(0, 10)}`}
+                                        </small>
+                                      ) : null}
+                                      {attempt.finish_error ? <small>{attempt.finish_error}</small> : null}
+                                    </div>
+                                    <span className={`access-status ${attempt.status}`}>
+                                      {copy.runStatus.agentRunStatus[attempt.status]}
+                                    </span>
+                                  </article>
+                                );
+                              })}
+                            </div>
                           ) : null}
-                          <strong>{record.prompt}</strong>
-                          <small>
-                            {copy.runStatus.runStepsLabel(record.steps.length)}
-                            {" / "}
-                            {copy.runStatus.runArtifactsLabel(record.artifacts.length)}
-                            {record.worker_id
-                              ? ` / ${copy.runStatus.workerLabel(record.worker_id)}`
-                              : ""}
-                            {record.recovery_count > 0
-                              ? ` / ${copy.runStatus.recoveryLabel(record.recovery_count)}`
-                              : ""}
-                          </small>
-                          {record.recovery_reason && record.recovery_reason !== record.status_reason ? (
-                            <small>{record.recovery_reason}</small>
-                          ) : null}
-                          {record.status_reason ? <small>{record.status_reason}</small> : null}
-                        </div>
-                        <span className={`access-status ${record.status}`}>
-                          {copy.runStatus.agentRunStatus[record.status]}
-                        </span>
-                      </article>
-                    ))}
+                        </section>
+                      );
+                    })}
                   </div>
                 </>
               ) : null}

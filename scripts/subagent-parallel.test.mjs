@@ -13,8 +13,8 @@ const runSource = await readFile(
 );
 
 test("runs at most three queued Subagents concurrently without adding their replies to chat", () => {
-  assert.match(appSource, /filter\(\(record\) => record\.role === "subagent" && record\.status === "queued"\)/);
-  assert.match(appSource, /\.slice\(0, 3\)/);
+  assert.match(appSource, /readyExpertAttempts\(currentRuns\)/);
+  assert.match(appSource, /queue_expert_team_retries/);
   assert.match(appSource, /Promise\.all\([\s\S]*queuedSubagents\.map/);
   assert.match(appSource, /desktop-subagent-worker-\$\{index \+ 1\}/);
   assert.doesNotMatch(
@@ -26,14 +26,14 @@ test("runs at most three queued Subagents concurrently without adding their repl
 test("queues one parent synthesis after all Subagents terminate", () => {
   assert.match(appSource, /queue_parent_agent_synthesis/);
   assert.match(appSource, /\["completed", "failed", "cancelled"\]\.includes\(child\.status\)/);
-  assert.match(commandSource, /All Subagents reached terminal state; parent synthesis is queued\./);
+  assert.match(commandSource, /All latest Expert Team attempts passed their gates/);
   assert.match(commandSource, /do not claim failed work succeeded/i);
 });
 
 test("enforces bounded one-level read-only Subagent execution", () => {
   assert.match(runSource, /AGENT_RUN_MAX_PARALLEL_SUBAGENTS: usize = 3/);
   assert.match(commandSource, /Background Subagents are read-only/);
-  assert.match(commandSource, /"file_read" \| "network_search" \| "browser_browse"/);
+  assert.match(commandSource, /ExpertCapability::FileRead/);
   assert.doesNotMatch(
     commandSource.match(/fn block_subagent_mutating_actions[\s\S]*?\n\}/)?.[0] ?? "",
     /browser_open/,

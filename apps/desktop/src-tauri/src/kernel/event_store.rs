@@ -63,6 +63,10 @@ use crate::kernel::connectors::{
     ConnectorRecoverySyncCapability, ConnectorSecret,
 };
 use crate::kernel::deepseek::DeepSeekChatTelemetry;
+use crate::kernel::expert_team::{
+    parent_input_revision, resources_conflict, validate_team_plan, ExpertAttemptResult,
+    ExpertMergeReceipt, ExpertTeamPlanItem, EXPERT_TEAM_MAX_TOTAL_ATTEMPTS,
+};
 use crate::kernel::models::{
     AccessMode, KernelEvent, MemoryCandidate, MemoryCandidateMergePreview, MemoryCandidateRecord,
     MemoryCandidateReplacePreview, MemoryCandidateResolution, MemoryCandidateSource,
@@ -82,6 +86,7 @@ use crate::kernel::skill::{
     SkillUninstallRecord, SkillUpdateCheckRecord, SkillUpdateCheckStatus, SkillUpdateFailureRecord,
     SkillUpdateRecord, SkillUpdateState,
 };
+use crate::kernel::soul::AgentSoulProfileUpdateAudit;
 use crate::kernel::tool_runtime::{
     prepare_tool_execution, tool_approval_preview, tool_request_fingerprint, ToolEvidence,
     ToolExecutionStatus, ToolInvocationRecord, ToolVerificationResult,
@@ -113,6 +118,8 @@ pub const AGENT_RUN_ARTIFACT_RECORDED_EVENT: &str = "agent_run.artifact_recorded
 pub const AGENT_RUN_TRANSITIONED_EVENT: &str = "agent_run.transitioned";
 pub const AGENT_RUN_RESOURCE_CLAIMED_EVENT: &str = "agent_run.resource_claimed";
 pub const AGENT_RUN_RESOURCE_RELEASED_EVENT: &str = "agent_run.resource_released";
+pub const EXPERT_ATTEMPT_RESULT_RECORDED_EVENT: &str = "expert_team.attempt_result_recorded";
+pub const EXPERT_MERGE_RECORDED_EVENT: &str = "expert_team.merge_recorded";
 pub const DEEPSEEK_CHAT_TELEMETRY_RECORDED_EVENT: &str = "deepseek_chat.telemetry_recorded";
 pub const MEMORY_CANDIDATE_PROPOSED_EVENT: &str = "memory_candidate.proposed";
 pub const MEMORY_CANDIDATE_RESOLVED_EVENT: &str = "memory_candidate.resolved";
@@ -132,6 +139,7 @@ pub const SKILL_INSTALLED_EVENT: &str = "skill.installed";
 pub const SKILL_TRUST_RESET_EVENT: &str = "skill.trust_reset";
 pub const SKILL_UNINSTALLED_EVENT: &str = "skill.uninstalled";
 pub const SKILL_UPDATED_EVENT: &str = "skill.updated";
+pub const SOUL_PROFILE_UPDATED_EVENT: &str = "soul_profile.updated";
 pub const SKILL_UPDATE_CHECKED_EVENT: &str = "skill.update_checked";
 pub const SKILL_UPDATE_FAILED_EVENT: &str = "skill.update_failed";
 pub const TASK_RECORD_CREATED_EVENT: &str = "task_record.created";
@@ -169,6 +177,76 @@ pub enum EventStoreError {
 }
 
 pub type EventStoreResult<T> = Result<T, EventStoreError>;
+
+fn expert_attempt_ready(record: &AgentRunRecord, records: &[AgentRunRecord]) -> bool {
+    let Some(contract) = record.expert_contract.as_ref() else {
+        return true;
+    };
+    let Some(parent) = records
+        .iter()
+        .find(|candidate| candidate.id == contract.parent_run_id)
+    else {
+        return false;
+    };
+    if parent_input_revision(&parent.prompt) != contract.parent_input_revision {
+        return false;
+    }
+    let team_records = records
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .expert_contract
+                .as_ref()
+                .is_some_and(|candidate_contract| candidate_contract.team_id == contract.team_id)
+        })
+        .collect::<Vec<_>>();
+    if team_records
+        .iter()
+        .filter(|candidate| candidate.status == AgentRunStatus::Running)
+        .count()
+        >= AGENT_RUN_MAX_PARALLEL_SUBAGENTS
+    {
+        return false;
+    }
+    for dependency_key in &contract.depends_on {
+        let latest = team_records
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .expert_contract
+                    .as_ref()
+                    .is_some_and(|candidate_contract| {
+                        candidate_contract.key.eq_ignore_ascii_case(dependency_key)
+                    })
+            })
+            .max_by_key(|candidate| {
+                candidate
+                    .expert_contract
+                    .as_ref()
+                    .map(|candidate_contract| candidate_contract.attempt)
+                    .unwrap_or(0)
+            });
+        if latest.is_none_or(|dependency| {
+            dependency.status != AgentRunStatus::Completed
+                || dependency
+                    .expert_result
+                    .as_ref()
+                    .is_none_or(|result| !result.passed())
+        }) {
+            return false;
+        }
+    }
+    !team_records.iter().any(|candidate| {
+        candidate.id != record.id
+            && candidate.status == AgentRunStatus::Running
+            && candidate
+                .expert_contract
+                .as_ref()
+                .is_some_and(|candidate_contract| {
+                    resources_conflict(&contract.resources, &candidate_contract.resources)
+                })
+    })
+}
 
 fn ensure_sqlite_column(
     connection: &Connection,
@@ -9992,10 +10070,26 @@ impl EventStore {
                 .iter()
                 .filter(|record| record.parent_run_id == Some(parent_id))
                 .count();
-            if sibling_count >= AGENT_RUN_MAX_PARALLEL_SUBAGENTS {
+            let sibling_limit = if start.expert_contract.is_some() {
+                EXPERT_TEAM_MAX_TOTAL_ATTEMPTS
+            } else {
+                AGENT_RUN_MAX_PARALLEL_SUBAGENTS
+            };
+            if sibling_count >= sibling_limit {
                 return Err(EventStoreError::InvalidState(format!(
-                    "a parent run may create at most {AGENT_RUN_MAX_PARALLEL_SUBAGENTS} subagents"
+                    "a parent run may create at most {sibling_limit} child attempts"
                 )));
+            }
+            if let Some(contract) = &start.expert_contract {
+                if contract.parent_run_id != parent_id
+                    || contract.key != start.subtask_key.clone().unwrap_or_default()
+                    || contract.parent_input_revision != parent_input_revision(&parent.prompt)
+                {
+                    return Err(EventStoreError::InvalidState(
+                        "expert attempt contract does not match its immutable parent input"
+                            .to_string(),
+                    ));
+                }
             }
         } else if start.parent_run_id.is_some() || start.subtask_key.is_some() {
             return Err(EventStoreError::InvalidState(
@@ -10079,6 +10173,215 @@ impl EventStore {
             .collect())
     }
 
+    pub fn append_expert_team_runs(
+        &self,
+        parent_run_id: Uuid,
+        items: Vec<ExpertTeamPlanItem>,
+    ) -> EventStoreResult<Vec<AgentRunRecord>> {
+        let records = self.list_agent_run_records()?;
+        let parent = records
+            .iter()
+            .find(|record| record.id == parent_run_id)
+            .ok_or_else(|| EventStoreError::NotFound(format!("agent run {parent_run_id}")))?;
+        if parent.role != AgentRunRole::Parent || parent.parent_run_id.is_some() {
+            return Err(EventStoreError::InvalidState(
+                "only a parent run may create an expert team".to_string(),
+            ));
+        }
+        if !matches!(
+            parent.status,
+            AgentRunStatus::Queued | AgentRunStatus::Running
+        ) {
+            return Err(EventStoreError::InvalidState(format!(
+                "parent run cannot create an expert team from status {:?}",
+                parent.status
+            )));
+        }
+        if records
+            .iter()
+            .any(|record| record.parent_run_id == Some(parent_run_id))
+        {
+            return Err(EventStoreError::InvalidState(
+                "parent run already has a child plan".to_string(),
+            ));
+        }
+        let contracts = validate_team_plan(parent_run_id, &parent.prompt, &items)
+            .map_err(EventStoreError::InvalidState)?;
+        let starts = contracts
+            .into_iter()
+            .map(|contract| {
+                AgentRunStart::queued_expert(
+                    parent_run_id,
+                    parent.conversation_id.clone(),
+                    contract,
+                )
+                .map_err(EventStoreError::InvalidState)
+            })
+            .collect::<EventStoreResult<Vec<_>>>()?;
+        let events = starts
+            .iter()
+            .map(|start| KernelEvent::new(AGENT_RUN_STARTED_EVENT, start).map_err(Into::into))
+            .collect::<EventStoreResult<Vec<_>>>()?;
+        let transaction = self.conn.unchecked_transaction()?;
+        for event in &events {
+            Self::insert_kernel_event(&transaction, event)?;
+        }
+        transaction.commit()?;
+        let child_ids = starts
+            .iter()
+            .map(|start| start.id)
+            .collect::<std::collections::HashSet<_>>();
+        Ok(self
+            .list_agent_run_records()?
+            .into_iter()
+            .filter(|record| child_ids.contains(&record.id))
+            .collect())
+    }
+
+    pub fn append_expert_retry(
+        &self,
+        parent_run_id: Uuid,
+        key: &str,
+    ) -> EventStoreResult<AgentRunRecord> {
+        let records = self.list_agent_run_records()?;
+        let parent = records
+            .iter()
+            .find(|record| record.id == parent_run_id)
+            .ok_or_else(|| EventStoreError::NotFound(format!("agent run {parent_run_id}")))?;
+        let mut attempts = records
+            .iter()
+            .filter(|record| record.parent_run_id == Some(parent_run_id))
+            .filter(|record| {
+                record
+                    .expert_contract
+                    .as_ref()
+                    .is_some_and(|contract| contract.key.eq_ignore_ascii_case(key))
+            })
+            .collect::<Vec<_>>();
+        attempts.sort_by_key(|record| {
+            record
+                .expert_contract
+                .as_ref()
+                .map(|contract| contract.attempt)
+                .unwrap_or(0)
+        });
+        let latest = attempts.last().copied().ok_or_else(|| {
+            EventStoreError::NotFound(format!("expert attempt {parent_run_id}/{key}"))
+        })?;
+        let mut contract = latest.expert_contract.clone().ok_or_else(|| {
+            EventStoreError::InvalidState("expert retry requires a contract".to_string())
+        })?;
+        if !matches!(
+            latest.status,
+            AgentRunStatus::Failed | AgentRunStatus::Cancelled
+        ) {
+            return Err(EventStoreError::InvalidState(
+                "only a failed or cancelled latest expert attempt may retry".to_string(),
+            ));
+        }
+        if latest
+            .expert_result
+            .as_ref()
+            .is_some_and(|result| !result.retry_eligible)
+            || contract.attempt >= contract.retry_policy.max_attempts
+        {
+            return Err(EventStoreError::InvalidState(
+                "expert retry policy is exhausted or the effect state is unsafe".to_string(),
+            ));
+        }
+        if records
+            .iter()
+            .filter(|record| record.parent_run_id == Some(parent_run_id))
+            .count()
+            >= EXPERT_TEAM_MAX_TOTAL_ATTEMPTS
+        {
+            return Err(EventStoreError::InvalidState(
+                "expert team total attempt budget is exhausted".to_string(),
+            ));
+        }
+        contract.attempt = contract.attempt.saturating_add(1);
+        contract.previous_attempt_run_id = Some(latest.id);
+        if let Some(substitute_role) = contract.retry_policy.substitute_role {
+            contract.role = substitute_role;
+        }
+        contract.prompt = format!(
+            "Retry attempt {} for the same bounded expert assignment. Preserve uncertainty and correct the previous failure without expanding capability scope.\n\nOriginal assignment:\n{}\n\nPrevious failure:\n{}",
+            contract.attempt,
+            contract.prompt,
+            latest
+                .finish_error
+                .as_deref()
+                .unwrap_or("The previous attempt did not pass its deterministic quality gate.")
+        )
+        .chars()
+        .take(4_000)
+        .collect();
+        if contract.parent_input_revision != parent_input_revision(&parent.prompt) {
+            return Err(EventStoreError::InvalidState(
+                "expert retry parent input revision is stale".to_string(),
+            ));
+        }
+        let start =
+            AgentRunStart::queued_expert(parent_run_id, parent.conversation_id.clone(), contract)
+                .map_err(EventStoreError::InvalidState)?;
+        self.append_agent_run_start(&start)?;
+        self.list_agent_run_records()?
+            .into_iter()
+            .find(|record| record.id == start.id)
+            .ok_or_else(|| EventStoreError::NotFound(format!("agent run {}", start.id)))
+    }
+
+    pub fn append_due_expert_retries(
+        &self,
+        parent_run_id: Uuid,
+    ) -> EventStoreResult<Vec<AgentRunRecord>> {
+        let records = self.list_agent_run_records()?;
+        let mut latest_by_key = std::collections::HashMap::<String, &AgentRunRecord>::new();
+        for record in records
+            .iter()
+            .filter(|record| record.parent_run_id == Some(parent_run_id))
+            .filter(|record| record.expert_contract.is_some())
+        {
+            let contract = record.expert_contract.as_ref().expect("checked above");
+            latest_by_key
+                .entry(contract.key.to_ascii_lowercase())
+                .and_modify(|current| {
+                    if contract.attempt
+                        > current
+                            .expert_contract
+                            .as_ref()
+                            .map(|current| current.attempt)
+                            .unwrap_or(0)
+                    {
+                        *current = record;
+                    }
+                })
+                .or_insert(record);
+        }
+        let mut keys = latest_by_key
+            .into_values()
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    AgentRunStatus::Failed | AgentRunStatus::Cancelled
+                )
+            })
+            .filter_map(|record| {
+                let contract = record.expert_contract.as_ref()?;
+                let eligible = record
+                    .expert_result
+                    .as_ref()
+                    .map(|result| result.retry_eligible)
+                    .unwrap_or(contract.attempt < contract.retry_policy.max_attempts);
+                eligible.then_some(contract.key.clone())
+            })
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.into_iter()
+            .map(|key| self.append_expert_retry(parent_run_id, &key))
+            .collect()
+    }
+
     pub fn request_agent_run_tree_cancel(
         &self,
         parent_run_id: Uuid,
@@ -10135,11 +10438,13 @@ impl EventStore {
         lease_seconds: i64,
     ) -> EventStoreResult<Option<AgentRunRecord>> {
         self.recover_expired_agent_runs(Utc::now())?;
-        let Some(next_run) = self
-            .list_agent_run_records()?
-            .into_iter()
+        let records = self.list_agent_run_records()?;
+        let Some(next_run) = records
+            .iter()
             .filter(|record| record.status == AgentRunStatus::Queued)
+            .filter(|record| expert_attempt_ready(record, &records))
             .min_by_key(|record| record.started_at)
+            .cloned()
         else {
             return Ok(None);
         };
@@ -10157,15 +10462,22 @@ impl EventStore {
         lease_seconds: i64,
     ) -> EventStoreResult<AgentRunRecord> {
         self.recover_expired_agent_runs(Utc::now())?;
-        let target = self
-            .list_agent_run_records()?
-            .into_iter()
+        let records = self.list_agent_run_records()?;
+        let target = records
+            .iter()
             .find(|record| record.id == run_id)
+            .cloned()
             .ok_or_else(|| EventStoreError::InvalidState("agent run does not exist".to_string()))?;
         if target.status != AgentRunStatus::Queued || target.cancel_requested {
             return Err(EventStoreError::InvalidState(format!(
                 "agent run {} cannot be claimed from status {:?}",
                 target.id, target.status
+            )));
+        }
+        if !expert_attempt_ready(&target, &records) {
+            return Err(EventStoreError::InvalidState(format!(
+                "expert attempt {} is waiting for dependencies or a resource lease",
+                target.id
             )));
         }
 
@@ -10180,6 +10492,14 @@ impl EventStore {
 
     pub fn append_agent_run_claim(&self, claim: &AgentRunClaim) -> EventStoreResult<()> {
         self.ensure_agent_run_exists(claim.run_id)?;
+        let records = self.list_agent_run_records()?;
+        if let Some(record) = records.iter().find(|record| record.id == claim.run_id) {
+            if record.status == AgentRunStatus::Queued && !expert_attempt_ready(record, &records) {
+                return Err(EventStoreError::InvalidState(
+                    "expert attempt is not ready for a claim".to_string(),
+                ));
+            }
+        }
         let event = KernelEvent::new(AGENT_RUN_CLAIMED_EVENT, claim)?;
         self.append(&event)
     }
@@ -10797,7 +11117,124 @@ impl EventStore {
             .collect()
     }
 
+    pub fn append_expert_attempt_result(
+        &self,
+        result: &ExpertAttemptResult,
+    ) -> EventStoreResult<()> {
+        let records = self.list_agent_run_records()?;
+        let record = records
+            .iter()
+            .find(|record| record.id == result.run_id)
+            .ok_or_else(|| EventStoreError::NotFound(format!("agent run {}", result.run_id)))?;
+        let contract = record.expert_contract.as_ref().ok_or_else(|| {
+            EventStoreError::InvalidState("expert result requires an expert attempt".to_string())
+        })?;
+        if result.parent_run_id != contract.parent_run_id
+            || result.key != contract.key
+            || result.role != contract.role
+            || result.attempt != contract.attempt
+            || result.parent_input_revision != contract.parent_input_revision
+        {
+            return Err(EventStoreError::InvalidState(
+                "expert result does not match its immutable attempt contract".to_string(),
+            ));
+        }
+        if self
+            .list_expert_attempt_results()?
+            .iter()
+            .any(|existing| existing.run_id == result.run_id)
+        {
+            return Err(EventStoreError::InvalidState(
+                "expert attempt result is immutable and already recorded".to_string(),
+            ));
+        }
+        let event = KernelEvent::new(EXPERT_ATTEMPT_RESULT_RECORDED_EVENT, result)?;
+        self.append(&event)
+    }
+
+    pub fn list_expert_attempt_results(&self) -> EventStoreResult<Vec<ExpertAttemptResult>> {
+        self.list_by_type(EXPERT_ATTEMPT_RESULT_RECORDED_EVENT, 1000)?
+            .into_iter()
+            .map(|event| serde_json::from_str(&event.payload_json).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn append_expert_merge_receipt(
+        &self,
+        receipt: &ExpertMergeReceipt,
+    ) -> EventStoreResult<()> {
+        let records = self.list_agent_run_records()?;
+        let parent = records
+            .iter()
+            .find(|record| record.id == receipt.parent_run_id)
+            .ok_or_else(|| {
+                EventStoreError::NotFound(format!("agent run {}", receipt.parent_run_id))
+            })?;
+        if parent.role != AgentRunRole::Parent
+            || parent_input_revision(&parent.prompt) != receipt.parent_input_revision
+        {
+            return Err(EventStoreError::InvalidState(
+                "expert merge parent revision is stale".to_string(),
+            ));
+        }
+        let production = records
+            .iter()
+            .find(|record| record.id == receipt.production_run_id)
+            .and_then(|record| record.expert_result.as_ref())
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "expert merge production result is missing".to_string(),
+                )
+            })?;
+        let review = records
+            .iter()
+            .find(|record| record.id == receipt.review_run_id)
+            .and_then(|record| record.expert_result.as_ref())
+            .ok_or_else(|| {
+                EventStoreError::InvalidState("expert merge review result is missing".to_string())
+            })?;
+        let review_accepted = review.review.as_ref().is_some_and(|verdict| {
+            verdict.decision == crate::kernel::expert_team::ExpertReviewDecision::Accept
+                && verdict.target_revision == production.output_revision
+        });
+        if !production.passed()
+            || !review.passed()
+            || production.output_revision != receipt.production_revision
+            || !review_accepted
+        {
+            return Err(EventStoreError::InvalidState(
+                "expert merge requires a passed production revision and an exact accepted review"
+                    .to_string(),
+            ));
+        }
+        if self.list_expert_merge_receipts()?.iter().any(|existing| {
+            existing.parent_run_id == receipt.parent_run_id
+                && existing.parent_input_revision == receipt.parent_input_revision
+        }) {
+            return Err(EventStoreError::InvalidState(
+                "expert parent revision already has a merge receipt".to_string(),
+            ));
+        }
+        let event = KernelEvent::new(EXPERT_MERGE_RECORDED_EVENT, receipt)?;
+        self.append(&event)
+    }
+
+    pub fn list_expert_merge_receipts(&self) -> EventStoreResult<Vec<ExpertMergeReceipt>> {
+        self.list_by_type(EXPERT_MERGE_RECORDED_EVENT, 500)?
+            .into_iter()
+            .map(|event| serde_json::from_str(&event.payload_json).map_err(Into::into))
+            .collect()
+    }
+
     pub fn list_agent_run_records(&self) -> EventStoreResult<Vec<AgentRunRecord>> {
+        let mut expert_result_by_run_id = std::collections::HashMap::new();
+        for result in self.list_expert_attempt_results()? {
+            expert_result_by_run_id.insert(result.run_id, result);
+        }
+        let mut expert_merge_by_parent_id = std::collections::HashMap::new();
+        for receipt in self.list_expert_merge_receipts()? {
+            expert_merge_by_parent_id.insert(receipt.parent_run_id, receipt);
+        }
         let mut applied_by_guidance_id =
             std::collections::HashMap::<Uuid, AgentRunGuidanceApplied>::new();
         for applied in self.list_agent_run_guidance_applications()? {
@@ -10954,6 +11391,8 @@ impl EventStore {
                 let latest_finish = finish_by_run_id.remove(&start.id);
                 let steps = steps_by_run_id.remove(&start.id).unwrap_or_default();
                 let artifacts = artifacts_by_run_id.remove(&start.id).unwrap_or_default();
+                let expert_result = expert_result_by_run_id.remove(&start.id);
+                let expert_merge_receipt = expert_merge_by_parent_id.remove(&start.id);
                 let mut updated_at = start.started_at;
                 let latest_claim_at = latest_claim.as_ref().map(|claim| claim.claimed_at);
                 let latest_recovery_at = latest_recovery
@@ -11103,6 +11542,9 @@ impl EventStore {
                     role: start.role,
                     parent_run_id: start.parent_run_id,
                     subtask_key: start.subtask_key,
+                    expert_contract: start.expert_contract,
+                    expert_result,
+                    expert_merge_receipt,
                     status,
                     worker_id,
                     lease_expires_at,
@@ -12305,6 +12747,21 @@ impl EventStore {
     ) -> EventStoreResult<()> {
         let event = KernelEvent::new(AGENT_CONTEXT_RECEIPT_RECORDED_EVENT, receipt)?;
         self.append(&event)
+    }
+
+    pub fn append_soul_profile_update(
+        &self,
+        audit: &AgentSoulProfileUpdateAudit,
+    ) -> EventStoreResult<()> {
+        let event = KernelEvent::new(SOUL_PROFILE_UPDATED_EVENT, audit)?;
+        self.append(&event)
+    }
+
+    pub fn list_soul_profile_updates(&self) -> EventStoreResult<Vec<AgentSoulProfileUpdateAudit>> {
+        self.list_by_type(SOUL_PROFILE_UPDATED_EVENT, 100)?
+            .into_iter()
+            .map(|event| serde_json::from_str(&event.payload_json).map_err(Into::into))
+            .collect()
     }
 
     pub fn list_agent_context_receipts(&self) -> EventStoreResult<Vec<AgentContextReceipt>> {
@@ -14016,6 +14473,12 @@ mod tests {
         ConnectorAccount, ConnectorCapability, ConnectorCredentialHandle, ConnectorEvidenceRef,
         ConnectorHealth, ConnectorInvocation, ConnectorInvocationStatus,
     };
+    use crate::kernel::expert_team::{
+        ExpertAttemptResult, ExpertAttemptUsage, ExpertBudget, ExpertCapability,
+        ExpertExternalEffectState, ExpertMergeReceipt, ExpertOutputContract, ExpertQualityGate,
+        ExpertResourceAccess, ExpertResourceRequirement, ExpertRetryPolicy, ExpertReviewDecision,
+        ExpertReviewVerdict, ExpertRole, ExpertTeamPlanItem,
+    };
 
     #[test]
     fn connector_account_and_idempotent_invocation_survive_restart() {
@@ -14447,6 +14910,280 @@ mod tests {
         assert!(cancelled.iter().all(
             |record| record.cancel_reason.as_deref() == Some("User cancelled the parent task.")
         ));
+    }
+
+    fn expert_plan_item(
+        key: &str,
+        role: ExpertRole,
+        depends_on: &[&str],
+        max_attempts: u8,
+    ) -> ExpertTeamPlanItem {
+        let production = role == ExpertRole::Production;
+        ExpertTeamPlanItem {
+            key: key.to_string(),
+            role,
+            prompt: format!("Complete {key} with explicit evidence."),
+            depends_on: depends_on.iter().map(|value| value.to_string()).collect(),
+            capabilities: if production {
+                vec![
+                    ExpertCapability::FileRead,
+                    ExpertCapability::ManagedStagingWrite,
+                ]
+            } else {
+                vec![ExpertCapability::FileRead]
+            },
+            resources: if production {
+                vec![ExpertResourceRequirement {
+                    key: "draft".to_string(),
+                    access: ExpertResourceAccess::Write,
+                }]
+            } else {
+                vec![ExpertResourceRequirement {
+                    key: "evidence".to_string(),
+                    access: ExpertResourceAccess::Read,
+                }]
+            },
+            budget: ExpertBudget::default(),
+            output_contract: ExpertOutputContract::default(),
+            retry_policy: ExpertRetryPolicy {
+                max_attempts,
+                substitute_role: None,
+            },
+        }
+    }
+
+    fn expert_result(
+        record: &crate::kernel::agent_run::AgentRunRecord,
+        passed: bool,
+    ) -> ExpertAttemptResult {
+        let contract = record.expert_contract.as_ref().expect("expert contract");
+        ExpertAttemptResult {
+            id: Uuid::new_v4(),
+            run_id: record.id,
+            parent_run_id: contract.parent_run_id,
+            key: contract.key.clone(),
+            role: contract.role,
+            attempt: contract.attempt,
+            parent_input_revision: contract.parent_input_revision.clone(),
+            output_revision: format!("revision-{}-{}", contract.key, contract.attempt),
+            summary: format!("{} result", contract.key),
+            claims: Vec::new(),
+            evidence: Vec::new(),
+            unresolved_conflicts: Vec::new(),
+            missing_evidence: Vec::new(),
+            usage: ExpertAttemptUsage {
+                elapsed_ms: 100,
+                tool_calls: 1,
+                tokens: 200,
+                output_bytes: 100,
+                staged_bytes: 0,
+            },
+            quality_gates: vec![ExpertQualityGate {
+                code: "fake_executor".to_string(),
+                passed,
+                detail: "deterministic fake executor gate".to_string(),
+            }],
+            staging: None,
+            review: None,
+            external_effect_state: ExpertExternalEffectState::VerifiedReadOnly,
+            retry_eligible: !passed && contract.attempt < contract.retry_policy.max_attempts,
+            recorded_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn expert_attempt_dependencies_results_and_retry_lineage_survive_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("expert-team.sqlite3");
+        let parent_id;
+        let failed_run_id;
+        let retry_run_id;
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            let parent = AgentRunStart::new(
+                "expert-conversation".to_string(),
+                "Research and analyze a source-backed decision.".to_string(),
+                0,
+            )
+            .expect("parent valid");
+            parent_id = parent.id;
+            store
+                .append_agent_run_start(&parent)
+                .expect("parent appends");
+            let children = store
+                .append_expert_team_runs(
+                    parent.id,
+                    vec![
+                        expert_plan_item("research", ExpertRole::Research, &[], 2),
+                        expert_plan_item("analysis", ExpertRole::Analysis, &["research"], 1),
+                    ],
+                )
+                .expect("expert plan appends atomically");
+            assert_eq!(children.len(), 2);
+            let research = store
+                .claim_next_agent_run("expert-worker-1".to_string(), 60)
+                .expect("claim works")
+                .expect("research is ready");
+            assert_eq!(research.expert_contract.as_ref().unwrap().key, "research");
+            failed_run_id = research.id;
+            let failed = expert_result(&research, false);
+            store
+                .append_expert_attempt_result(&failed)
+                .expect("failed result persists");
+            store
+                .append_agent_run_finish(
+                    &AgentRunFinish::new(
+                        research.id,
+                        AgentRunStatus::Failed,
+                        None,
+                        Some("fake gate failed".to_string()),
+                    )
+                    .expect("finish valid"),
+                )
+                .expect("failure persists");
+            let retries = store
+                .append_due_expert_retries(parent.id)
+                .expect("retry queues");
+            assert_eq!(retries.len(), 1);
+            let retry = &retries[0];
+            retry_run_id = retry.id;
+            let retry_contract = retry.expert_contract.as_ref().unwrap();
+            assert_eq!(retry_contract.attempt, 2);
+            assert_eq!(retry_contract.previous_attempt_run_id, Some(failed_run_id));
+
+            let claimed_retry = store
+                .claim_next_agent_run("expert-worker-2".to_string(), 60)
+                .expect("retry claim works")
+                .expect("retry is ready before dependent analysis");
+            assert_eq!(claimed_retry.id, retry_run_id);
+            let passed = expert_result(&claimed_retry, true);
+            store
+                .append_expert_attempt_result(&passed)
+                .expect("retry result persists");
+            store
+                .append_agent_run_finish(
+                    &AgentRunFinish::completed(claimed_retry.id, "research passed".to_string())
+                        .expect("finish valid"),
+                )
+                .expect("retry completion persists");
+            let analysis = store
+                .claim_next_agent_run("expert-worker-3".to_string(), 60)
+                .expect("dependent claim works")
+                .expect("analysis becomes ready");
+            assert_eq!(analysis.expert_contract.as_ref().unwrap().key, "analysis");
+        }
+        let store = EventStore::open(&path).expect("store reopens");
+        let records = store.list_agent_run_records().expect("records project");
+        let children = records
+            .iter()
+            .filter(|record| record.parent_run_id == Some(parent_id))
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 3);
+        assert!(children
+            .iter()
+            .find(|record| record.id == failed_run_id)
+            .unwrap()
+            .expert_result
+            .is_some());
+        assert_eq!(
+            children
+                .iter()
+                .find(|record| record.id == retry_run_id)
+                .unwrap()
+                .expert_contract
+                .as_ref()
+                .unwrap()
+                .previous_attempt_run_id,
+            Some(failed_run_id)
+        );
+    }
+
+    #[test]
+    fn expert_merge_receipt_is_exact_revision_bound_and_idempotent() {
+        let store = EventStore::open_memory().expect("store opens");
+        let parent = AgentRunStart::new(
+            "expert-merge-conversation".to_string(),
+            "Produce and review one controlled draft.".to_string(),
+            0,
+        )
+        .expect("parent valid");
+        store
+            .append_agent_run_start(&parent)
+            .expect("parent appends");
+        let children = store
+            .append_expert_team_runs(
+                parent.id,
+                vec![
+                    expert_plan_item("draft", ExpertRole::Production, &[], 1),
+                    expert_plan_item("review", ExpertRole::Review, &["draft"], 1),
+                ],
+            )
+            .expect("team appends");
+        let production = children
+            .iter()
+            .find(|record| record.expert_contract.as_ref().unwrap().role == ExpertRole::Production)
+            .unwrap();
+        let review = children
+            .iter()
+            .find(|record| record.expert_contract.as_ref().unwrap().role == ExpertRole::Review)
+            .unwrap();
+        let mut production_result = expert_result(production, true);
+        production_result.output_revision = "production-revision".to_string();
+        store
+            .append_expert_attempt_result(&production_result)
+            .expect("production result persists");
+        store
+            .append_agent_run_finish(
+                &AgentRunFinish::completed(production.id, "draft ready".to_string())
+                    .expect("finish valid"),
+            )
+            .expect("production completes");
+        let mut review_result = expert_result(review, true);
+        review_result.review = Some(ExpertReviewVerdict {
+            target_revision: production_result.output_revision.clone(),
+            decision: ExpertReviewDecision::Accept,
+            findings: vec!["Exact revision is acceptable.".to_string()],
+        });
+        store
+            .append_expert_attempt_result(&review_result)
+            .expect("review result persists");
+        store
+            .append_agent_run_finish(
+                &AgentRunFinish::completed(review.id, "review accepted".to_string())
+                    .expect("finish valid"),
+            )
+            .expect("review completes");
+
+        let mut receipt = ExpertMergeReceipt {
+            id: Uuid::new_v4(),
+            parent_run_id: parent.id,
+            parent_input_revision: crate::kernel::expert_team::parent_input_revision(
+                &parent.prompt,
+            ),
+            production_run_id: production.id,
+            production_revision: "stale-revision".to_string(),
+            review_run_id: review.id,
+            merged_at: Utc::now(),
+        };
+        assert!(matches!(
+            store.append_expert_merge_receipt(&receipt),
+            Err(EventStoreError::InvalidState(_))
+        ));
+        receipt.production_revision = production_result.output_revision;
+        store
+            .append_expert_merge_receipt(&receipt)
+            .expect("exact merge receipt persists");
+        assert!(matches!(
+            store.append_expert_merge_receipt(&receipt),
+            Err(EventStoreError::InvalidState(_))
+        ));
+        let parent_record = store
+            .list_agent_run_records()
+            .expect("records project")
+            .into_iter()
+            .find(|record| record.id == parent.id)
+            .unwrap();
+        assert_eq!(parent_record.expert_merge_receipt, Some(receipt));
     }
 
     #[test]

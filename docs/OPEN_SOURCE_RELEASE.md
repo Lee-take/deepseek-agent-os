@@ -100,8 +100,8 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
   exports or packaged assets do not enter generated source archives.
 - `.env.example` documents local DeepSeek and optional local bridge environment
   variables without storing secret values.
-- `docs/RELEASE_NOTES_v0.8.0.md` is the current release note source. Historical
-  release notes, including `v0.8.0-rc.1`, remain unchanged.
+- `docs/RELEASE_NOTES_v0.9.0.md` is the current release note source. Historical
+  release notes, including `v0.8.0` and `v0.8.0-rc.1`, remain unchanged.
 
 Maintainer handoff notes, decision logs, and `docs/superpowers/` planning files
 are local-only continuation material. They are useful for project handoff on the

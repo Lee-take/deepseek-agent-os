@@ -70,9 +70,123 @@ export type AgentRunStatus =
 
 export type AgentRunRole = "parent" | "subagent";
 
+export type ExpertRole = "research" | "analysis" | "production" | "review";
+
+export type ExpertCapability =
+  | "file_read"
+  | "network_search"
+  | "browser_browse"
+  | "managed_staging_write";
+
+export type ExpertResourceRequirement = {
+  key: string;
+  access: "read" | "write";
+};
+
+export type ExpertBudget = {
+  max_elapsed_ms: number;
+  max_tool_calls: number;
+  max_tokens: number;
+  max_output_bytes: number;
+  max_staged_bytes: number;
+};
+
+export type ExpertOutputContract = {
+  min_evidence_sources: number;
+  require_claims: boolean;
+  require_staged_output: boolean;
+  require_review: boolean;
+  fail_on_unresolved_conflict: boolean;
+};
+
+export type ExpertRetryPolicy = {
+  max_attempts: number;
+  substitute_role: ExpertRole | null;
+};
+
 export type AgentSubtaskPlanItem = {
   key: string;
+  role: ExpertRole;
   prompt: string;
+  depends_on: string[];
+  capabilities: ExpertCapability[];
+  resources: ExpertResourceRequirement[];
+  budget: ExpertBudget;
+  output_contract: ExpertOutputContract;
+  retry_policy: ExpertRetryPolicy;
+};
+
+export type ExpertAttemptContract = AgentSubtaskPlanItem & {
+  team_id: string;
+  parent_run_id: string;
+  parent_input_revision: string;
+  attempt: number;
+  previous_attempt_run_id: string | null;
+};
+
+export type ExpertQualityGate = {
+  code: string;
+  passed: boolean;
+  detail: string;
+};
+
+export type ExpertAttemptResult = {
+  id: string;
+  run_id: string;
+  parent_run_id: string;
+  key: string;
+  role: ExpertRole;
+  attempt: number;
+  parent_input_revision: string;
+  output_revision: string;
+  summary: string;
+  claims: Array<{
+    key: string;
+    statement: string;
+    stance: "supports" | "contradicts" | "uncertain";
+    evidence_refs: string[];
+  }>;
+  evidence: Array<{
+    id: string;
+    kind: string;
+    reference: string;
+    summary: string;
+    verified: boolean;
+  }>;
+  unresolved_conflicts: string[];
+  missing_evidence: string[];
+  usage: {
+    elapsed_ms: number;
+    tool_calls: number;
+    tokens: number;
+    output_bytes: number;
+    staged_bytes: number;
+  };
+  quality_gates: ExpertQualityGate[];
+  staging: {
+    relative_path: string;
+    absolute_path: string;
+    sha256: string;
+    bytes: number;
+  } | null;
+  review: {
+    target_revision: string;
+    decision: "accept" | "reject" | "needs_revision";
+    findings: string[];
+  } | null;
+  external_effect_state: "none" | "verified_read_only" | "managed_staging_only" | "uncertain";
+  retry_eligible: boolean;
+  recorded_at: string;
+};
+
+export type ExpertMergeReceipt = {
+  id: string;
+  parent_run_id: string;
+  parent_input_revision: string;
+  production_run_id: string;
+  production_revision: string;
+  review_run_id: string;
+  merged_at: string;
 };
 
 export type AgentRunStepStatus = "pending" | "running" | "completed" | "failed";
@@ -114,6 +228,9 @@ export type AgentRunRecord = {
   role: AgentRunRole;
   parent_run_id: string | null;
   subtask_key: string | null;
+  expert_contract: ExpertAttemptContract | null;
+  expert_result: ExpertAttemptResult | null;
+  expert_merge_receipt: ExpertMergeReceipt | null;
   status: AgentRunStatus;
   worker_id: string | null;
   lease_expires_at: string | null;
@@ -532,6 +649,15 @@ export type DeepSeekChatCacheState = {
   entries: number;
 };
 
+export type AgentSoulProfileUpdateReceipt = {
+  update_id: string;
+  status: "applied" | "unchanged" | "blocked";
+  summary: string;
+  changed_fields: string[];
+  undo_available: boolean;
+  applied_at: string;
+};
+
 export type DeepSeekUserBalanceInfo = {
   currency: string;
   total_balance: string;
@@ -552,7 +678,9 @@ export type AgentChatResponse = {
   proposed_actions: AgentChatActionProposal[];
   missing_prerequisites: AgentChatMissingPrerequisite[];
   memory_candidates: MemoryCandidate[];
+  soul_profile_update: AgentSoulProfileUpdateReceipt | null;
   subagent_plan: AgentSubtaskPlanItem[];
+  expert_output?: unknown;
   model: string;
   cache_status: DeepSeekChatCacheStatus;
   elapsed_ms: number;

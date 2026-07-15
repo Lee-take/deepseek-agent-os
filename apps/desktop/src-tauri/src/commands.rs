@@ -82,6 +82,12 @@ use crate::kernel::deepseek_pricing::{
     DeepSeekPricingState,
 };
 use crate::kernel::event_store::{EventStore, EventStoreError, EventStoreResult};
+use crate::kernel::expert_team::{
+    deduplicate_evidence, parent_input_revision, sha256_text, stage_expert_output,
+    unresolved_claim_conflicts, verify_staging_manifest, ExpertAttemptResult, ExpertAttemptUsage,
+    ExpertCapability, ExpertEvidenceRef, ExpertExternalEffectState, ExpertMergeReceipt,
+    ExpertOutput, ExpertQualityGate, ExpertReviewDecision, ExpertRole, ExpertTeamPlanItem,
+};
 use crate::kernel::local_directory::{
     load_local_directory_state, local_directory_readiness_from_state,
     save_local_directory_settings as persist_local_directory_settings,
@@ -135,6 +141,9 @@ use crate::kernel::skill::{
 use crate::kernel::skill_source::{
     build_repository_skill_installation, fetch_repository_skill_installation,
     fetch_repository_snapshot, SkillRepositorySource,
+};
+use crate::kernel::soul::{
+    AgentSoulProfileUpdateAudit, AgentSoulProfileUpdateProposal, AgentSoulProfileUpdateReceipt,
 };
 use crate::kernel::tool_runtime::{
     builtin_tool_catalog, prepare_tool_execution, tool_approval_preview, tool_request_fingerprint,
@@ -254,7 +263,7 @@ const AGENT_TOOL_LOOP_MAX_ROUNDS: usize = 4;
 const AGENT_RUN_GUIDANCE_MAX_ITEMS_PER_ROUND: usize = 8;
 const AGENT_RUN_GUIDANCE_PROMPT_CHAR_LIMIT: usize = 12_000;
 const AGENT_SKILL_CATALOG_MAX_ITEMS: usize = 24;
-const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user from agent_actions, missing_prerequisites, required_confirmations, artifact_targets, memory_candidates, and subagent_plan. Use subagent_plan only when the request contains two or three concrete, independently useful read-only research or analysis subtasks that benefit from parallel work. Each item requires a short unique key and a self-contained prompt. Never create nested subagents, mutating subtasks, desktop-control subtasks, or more than three items. Leave subagent_plan empty for simple or dependent work. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
+const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user from agent_actions, missing_prerequisites, required_confirmations, artifact_targets, memory_candidates, soul_profile_update, subagent_plan, and expert_output. Soul is the durable cross-conversation identity and collaboration profile, not an ordinary memory candidate. Whenever the current user message explicitly defines, changes, or confirms any Soul setting, soul_profile_update must contain fields, clear_fields, current_message_evidence, and optional confirmation_context. This includes short confirmations such as yes when the immediately preceding context proposed a Soul setting. current_message_evidence must be an exact non-empty excerpt of the current user message; confirmation_context, when needed, must be an exact excerpt of the supplied conversation context. Use only the allowed Soul field names supplied by DS Agent. Keep identity roles exact: preferred_name is the user's own name, address_as is how DS Agent addresses the user, user_calls_ds_agent is the user's name for DS Agent, and ds_agent_should_refer_to_itself_as is DS Agent's self-reference. Never put DS Agent's name into preferred_name. Do not propose Soul updates for guesses, third-party statements, transient one-turn instructions, or sensitive values. Do not tell the user the setting was saved; DS Agent appends a persistence receipt only after the update is validated and written. For a complex task that materially benefits from specialists, subagent_plan may contain 2-4 unique roles chosen from research, analysis, production, review. Every item requires key, role, prompt, depends_on, capabilities, resources, budget, output_contract, and retry_policy. Use an acyclic flow: research and analysis may run in parallel when independent; production depends on relevant evidence/analysis; review depends on production. Only production may request managed_staging_write and a logical write resource. A child never writes an approved destination. Review cannot mutate staged output and must bind its decision to the exact production revision. Never create nested subagents or desktop-control subtasks. Leave subagent_plan empty for simple work. When executing an expert attempt, return expert_output with summary, evidence-linked claims, optional staged_content/staged_relative_path for production, and an exact-revision review verdict for review; never return another subagent_plan. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
 const AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT: usize = 1200;
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
@@ -292,9 +301,12 @@ struct AgentChatRuntimeContext {
     network_search_note: String,
     network_search_source_model: Option<NetworkSearchSourceModel>,
     soul_profile: Option<AgentSoulProfileContext>,
+    soul_profile_root: Option<PathBuf>,
     memory_context: AgentMemoryRuntimeContext,
     skill_catalog: Vec<AgentSkillCatalogItem>,
     desktop_dir: Option<PathBuf>,
+    expert_staging_root: Option<PathBuf>,
+    expert_capabilities: Option<Vec<ExpertCapability>>,
 }
 
 impl Default for AgentChatRuntimeContext {
@@ -309,9 +321,12 @@ impl Default for AgentChatRuntimeContext {
                 .to_string(),
             network_search_source_model: None,
             soul_profile: None,
+            soul_profile_root: None,
             memory_context: AgentMemoryRuntimeContext::default(),
             skill_catalog: Vec::new(),
             desktop_dir: None,
+            expert_staging_root: None,
+            expert_capabilities: None,
         }
     }
 }
@@ -440,7 +455,13 @@ pub struct AgentChatResponse {
     pub proposed_actions: Vec<AgentChatActionProposal>,
     pub missing_prerequisites: Vec<AgentChatMissingPrerequisite>,
     pub memory_candidates: Vec<MemoryCandidate>,
+    #[serde(default)]
+    pub soul_profile_update: Option<AgentSoulProfileUpdateReceipt>,
+    #[serde(skip)]
+    soul_profile_update_proposal: Option<AgentSoulProfileUpdateProposal>,
     pub subagent_plan: Vec<AgentSubtaskPlanItem>,
+    #[serde(default)]
+    pub expert_output: Option<ExpertOutput>,
     pub model: String,
     pub cache_status: DeepSeekChatCacheStatus,
     pub elapsed_ms: u128,
@@ -457,44 +478,37 @@ pub struct AgentRunWorkerResult {
     pub response: AgentChatResponse,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AgentSubtaskPlanItem {
-    pub key: String,
-    pub prompt: String,
-}
+pub type AgentSubtaskPlanItem = ExpertTeamPlanItem;
 
 fn validated_subagent_plan(items: &[AgentSubtaskPlanItem]) -> Vec<AgentSubtaskPlanItem> {
-    if items.len() < 2 || items.len() > crate::kernel::agent_run::AGENT_RUN_MAX_PARALLEL_SUBAGENTS {
-        return Vec::new();
-    }
-    let mut keys = std::collections::HashSet::new();
-    let mut validated = Vec::with_capacity(items.len());
-    for item in items {
-        let key = item.key.trim();
-        let prompt = item.prompt.trim();
-        if key.is_empty()
-            || key.chars().count() > 64
-            || prompt.is_empty()
-            || prompt.chars().count() > 4_000
-            || !keys.insert(key.to_ascii_lowercase())
-        {
-            return Vec::new();
-        }
-        validated.push(AgentSubtaskPlanItem {
-            key: key.to_string(),
-            prompt: prompt.to_string(),
-        });
-    }
-    validated
+    crate::kernel::expert_team::validate_team_plan(Uuid::new_v4(), "model proposal", items)
+        .is_ok()
+        .then(|| items.to_vec())
+        .unwrap_or_default()
 }
 
-fn block_subagent_mutating_actions(response: &mut AgentChatResponse) {
+fn block_subagent_mutating_actions(
+    response: &mut AgentChatResponse,
+    allowed_capabilities: Option<&[ExpertCapability]>,
+) {
     for action in &mut response.proposed_actions {
-        if !matches!(
-            action.action_type.as_str(),
-            "file_read" | "network_search" | "browser_browse"
-        ) {
-            let reason = "Background Subagents are read-only; the parent Agent must mediate mutating or foreground actions.".to_string();
+        let capability = match action.action_type.as_str() {
+            "file_read" => Some(ExpertCapability::FileRead),
+            "network_search" => Some(ExpertCapability::NetworkSearch),
+            "browser_browse" => Some(ExpertCapability::BrowserBrowse),
+            _ => None,
+        };
+        if capability.is_none()
+            || allowed_capabilities.is_some_and(|allowed| {
+                capability.is_none_or(|capability| !allowed.contains(&capability))
+            })
+        {
+            let reason = if capability.is_none() {
+                "Background Subagents are read-only; the parent Agent must mediate mutating or foreground actions."
+            } else {
+                "Expert action is outside the immutable capability scope; the parent Agent must mediate it."
+            }
+            .to_string();
             action.execution_state = "blocked".to_string();
             action.blocked_reason = Some(reason.clone());
             action.dispatch_note = Some(reason);
@@ -660,7 +674,11 @@ struct AgentModelEnvelope {
     #[serde(default)]
     memory_candidates: Vec<AgentChatMemoryCandidateProposal>,
     #[serde(default)]
+    soul_profile_update: Option<AgentSoulProfileUpdateProposal>,
+    #[serde(default)]
     subagent_plan: Vec<AgentSubtaskPlanItem>,
+    #[serde(default)]
+    expert_output: Option<ExpertOutput>,
 }
 
 fn deserialize_agent_reply_to_user<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -4641,6 +4659,12 @@ fn agent_chat_response_from_telemetry(
         .as_ref()
         .map(|envelope| validated_subagent_plan(&envelope.subagent_plan))
         .unwrap_or_default();
+    let expert_output = parsed_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.expert_output.clone());
+    let soul_profile_update_proposal = parsed_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.soul_profile_update.clone());
 
     AgentChatResponse {
         id: Uuid::new_v4(),
@@ -4650,7 +4674,10 @@ fn agent_chat_response_from_telemetry(
         proposed_actions,
         missing_prerequisites,
         memory_candidates,
+        soul_profile_update: None,
+        soul_profile_update_proposal,
         subagent_plan,
+        expert_output,
         model: telemetry.model.clone(),
         cache_status: telemetry.cache_status,
         elapsed_ms: telemetry.elapsed_ms,
@@ -5492,6 +5519,7 @@ fn build_agent_chat_protocol_user_prompt(
     request: &AgentChatRequest,
     runtime_context: &AgentChatRuntimeContext,
 ) -> String {
+    let current_soul_user_message = agent_soul_current_user_message(&request.prompt);
     let source_model = runtime_context
         .network_search_source_model
         .map(|model| serialize_agent_chat_context_value(&model))
@@ -5528,6 +5556,8 @@ fn build_agent_chat_protocol_user_prompt(
 	         - completion_advice: when a result is complete or partially complete, end with at most one short next-better suggestion grounded in the task. Keep it secondary and do not imply extra work already ran.\n\
 	         - Return exactly one structured agent envelope as JSON.\n\
 	         - Required JSON fields: protocol_version, reply_to_user, agent_actions, missing_prerequisites.\n\
+	         - Soul update contract: when the current user message defines, changes, or confirms a durable identity, naming, response-default, workflow, writing, confirmation, privacy, initiative, or relationship setting, return soul_profile_update with fields, clear_fields, current_message_evidence, and optional confirmation_context. Allowed fields are preferred_name, address_as, language_preferences, default_response_tone, default_response_length, formatting_preferences, initiative_level, user_calls_ds_agent, ds_agent_should_refer_to_itself_as, relationship_boundary, workflow_preferences, writing_preferences, confirmation_preferences, and privacy_preferences. preferred_name is the user's own name; address_as is how DS Agent addresses the user; user_calls_ds_agent is the user's name for DS Agent; ds_agent_should_refer_to_itself_as is DS Agent's self-reference. Never put DS Agent's name into preferred_name. Soul updates are applied immediately after local validation and are not memory_candidates.\n\
+	         - Soul evidence contract: current_message_evidence must be an exact excerpt of Current user message for Soul authorization below. Use confirmation_context only for a short confirmation of a prior Soul proposal, and copy it exactly from Full user message. Never claim the update was persisted in reply_to_user; DS Agent adds the saved or blocked receipt.\n\
          - Supported agent_actions action_type values are app_update_check, app_update_download, app_update_install, browser_open, browser_browse, computer_control, computer_screenshot, file_read, file_write, file_create, file_update, file_delete, file_rename, directory_create, directory_rename, directory_delete, create_report, office_create, office_update, office_open, network_search, operations_briefing, skill_activate, skill_install, skill_create, skill_uninstall, terminal_read, workspace_setup, deepseek_key_setup, and search_setup.\n\
          - For DS Agent self-update requests, use app_update_check first. Propose app_update_download only when verified release status reports an update. Propose app_update_install only with target set to the exact installer_path returned by the verified download tool. Download and install require local approval; install is critical and can never be self-approved by the model.\n\
          - Do not use run_shell. For opening a website in the user's browser, use action_type browser_open with target set to the exact http:// or https:// URL. For reading or inspecting a web page as evidence, use browser_browse. If the user asked to log in, open the site only and ask the user to enter credentials manually.\n\
@@ -5545,7 +5575,8 @@ fn build_agent_chat_protocol_user_prompt(
          - reply_to_user must describe the intended plan, not local completion. Do not say a file was created, opened, edited, or saved until DS Agent returns execution evidence.\n\
          - Write reply_to_user for an ordinary user in the same language as the user. Lead with the useful conclusion or next step, use short natural sentences, and omit internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, and English verification receipts unless the user explicitly asks for technical details.\n\
          - DS Agent will validate schema, permissions, risk, workspace paths, and confirmations before executing any action.\n\n\
-         {runtime_memory_section}\
+	         {runtime_memory_section}\
+	         Current user message for Soul authorization:\n{current_soul_user_message}\n\
          Full user message:\n{user_prompt}",
         model_route = serialize_agent_chat_context_value(&request.model_route),
         thinking_level = serialize_agent_chat_context_value(&request.thinking_level),
@@ -5554,8 +5585,18 @@ fn build_agent_chat_protocol_user_prompt(
         workspace_note = runtime_context.workspace_note.as_str(),
         network_search_ready = runtime_context.network_search_ready.as_str(),
         network_search_note = runtime_context.network_search_note.as_str(),
+        current_soul_user_message = current_soul_user_message,
         user_prompt = request.prompt
     )
+}
+
+fn agent_soul_current_user_message(prompt: &str) -> &str {
+    const CURRENT_USER_MARKER: &str = "\n\nCurrent user message:\n";
+    prompt
+        .rsplit_once(CURRENT_USER_MARKER)
+        .map(|(_, current)| current.trim())
+        .filter(|current| !current.is_empty())
+        .unwrap_or_else(|| prompt.trim())
 }
 
 fn serialize_agent_chat_context_value<T: Serialize>(value: &T) -> String {
@@ -5617,6 +5658,470 @@ fn save_agent_soul_profile_content(
         true,
         content.to_string(),
     ))
+}
+
+fn apply_agent_soul_profile_update(
+    store: &EventStore,
+    app_data_dir: &Path,
+    proposal: &AgentSoulProfileUpdateProposal,
+    current_user_message: &str,
+    full_prompt: &str,
+    source_run_id: Option<Uuid>,
+) -> Result<AgentSoulProfileUpdateReceipt, String> {
+    validate_agent_soul_profile_update(proposal, current_user_message, full_prompt)?;
+    let soul_path = agent_soul_profile_path(app_data_dir);
+    let soul_existed = soul_path.exists();
+    let previous_content = if soul_existed {
+        fs::read_to_string(&soul_path).map_err(event_store_error)?
+    } else {
+        AGENT_SOUL_PROFILE_TEMPLATE.to_string()
+    };
+    let previous_fields = parse_agent_soul_profile_fields(&previous_content);
+    let mut updates = proposal.fields.clone();
+    for field in &proposal.clear_fields {
+        updates.insert(field.clone(), String::new());
+    }
+    repair_agent_soul_cross_role_name(&previous_fields, &mut updates);
+
+    let mut updated_content = previous_content.clone();
+    for (field, value) in &updates {
+        updated_content = upsert_agent_soul_profile_field(&updated_content, field, value)?;
+    }
+    if updated_content.len() > AGENT_SOUL_PROFILE_MAX_BYTES {
+        return Err(format!(
+            "updated soul profile must be {} bytes or less",
+            AGENT_SOUL_PROFILE_MAX_BYTES
+        ));
+    }
+    let updated_fields = parse_agent_soul_profile_fields(&updated_content);
+    let changed_fields = updates
+        .keys()
+        .filter(|field| previous_fields.get(field.as_str()) != updated_fields.get(field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let is_cjk = current_user_message.chars().any(agent_memory_is_cjk);
+
+    if changed_fields.is_empty() {
+        return Ok(AgentSoulProfileUpdateReceipt {
+            update_id: Uuid::new_v4(),
+            status: "unchanged".to_string(),
+            summary: agent_soul_profile_update_summary(
+                "unchanged",
+                &updated_fields,
+                updates.keys(),
+                is_cjk,
+            ),
+            changed_fields,
+            undo_available: false,
+            applied_at: Utc::now(),
+        });
+    }
+
+    save_agent_soul_profile_content(app_data_dir, &updated_content)?;
+    let audit = AgentSoulProfileUpdateAudit::new(
+        source_run_id,
+        current_user_message,
+        previous_content.clone(),
+        updated_content,
+        changed_fields.clone(),
+    );
+    if let Err(error) = store.append_soul_profile_update(&audit) {
+        let rollback = if soul_existed {
+            fs::write(&soul_path, &previous_content).map_err(event_store_error)
+        } else if soul_path.exists() {
+            fs::remove_file(&soul_path).map_err(event_store_error)
+        } else {
+            Ok(())
+        };
+        return match rollback {
+            Ok(()) => Err(format!(
+                "soul profile audit failed and the file update was rolled back: {error}"
+            )),
+            Err(rollback_error) => Err(format!(
+                "soul profile audit failed: {error}; rollback also failed: {rollback_error}"
+            )),
+        };
+    }
+
+    Ok(AgentSoulProfileUpdateReceipt {
+        update_id: audit.id,
+        status: "applied".to_string(),
+        summary: agent_soul_profile_update_summary(
+            "applied",
+            &updated_fields,
+            changed_fields.iter(),
+            is_cjk,
+        ),
+        changed_fields,
+        undo_available: true,
+        applied_at: audit.applied_at,
+    })
+}
+
+fn finalize_agent_soul_profile_update(
+    store: &EventStore,
+    app_data_dir: Option<&Path>,
+    current_user_message: &str,
+    full_prompt: &str,
+    source_run_id: Option<Uuid>,
+    writes_allowed: bool,
+    response: &mut AgentChatResponse,
+) {
+    let Some(proposal) = response.soul_profile_update_proposal.take() else {
+        return;
+    };
+    let is_cjk = current_user_message.chars().any(agent_memory_is_cjk);
+    let receipt = if !writes_allowed {
+        blocked_agent_soul_profile_update_receipt(is_cjk, "read_only")
+    } else if let Some(app_data_dir) = app_data_dir {
+        apply_agent_soul_profile_update(
+            store,
+            app_data_dir,
+            &proposal,
+            current_user_message,
+            full_prompt,
+            source_run_id,
+        )
+        .unwrap_or_else(|_| blocked_agent_soul_profile_update_receipt(is_cjk, "validation"))
+    } else {
+        blocked_agent_soul_profile_update_receipt(is_cjk, "storage")
+    };
+    if response.content.trim().is_empty() {
+        response.content = receipt.summary.clone();
+    } else {
+        response.content.push_str("\n\n");
+        response.content.push_str(&receipt.summary);
+    }
+    response.soul_profile_update = Some(receipt);
+}
+
+fn blocked_agent_soul_profile_update_receipt(
+    is_cjk: bool,
+    reason: &str,
+) -> AgentSoulProfileUpdateReceipt {
+    let summary = if is_cjk {
+        match reason {
+            "read_only" => "本次只读专家对话不能修改全局 Soul；设置未写入。",
+            "storage" => "当前无法访问 Soul 存储位置；设置未写入。",
+            _ => "这项设置未通过 Soul 的证据或安全校验，因此没有写入。",
+        }
+    } else {
+        match reason {
+            "read_only" => {
+                "This read-only expert conversation cannot change global Soul; nothing was saved."
+            }
+            "storage" => "Soul storage is unavailable, so the setting was not saved.",
+            _ => {
+                "The setting did not pass Soul evidence or safety validation, so it was not saved."
+            }
+        }
+    };
+    AgentSoulProfileUpdateReceipt {
+        update_id: Uuid::new_v4(),
+        status: "blocked".to_string(),
+        summary: summary.to_string(),
+        changed_fields: Vec::new(),
+        undo_available: false,
+        applied_at: Utc::now(),
+    }
+}
+
+fn validate_agent_soul_profile_update(
+    proposal: &AgentSoulProfileUpdateProposal,
+    current_user_message: &str,
+    full_prompt: &str,
+) -> Result<(), String> {
+    let evidence = proposal.current_message_evidence.trim();
+    if evidence.is_empty()
+        || evidence.chars().count() > 500
+        || !current_user_message.contains(evidence)
+    {
+        return Err("soul update evidence is not bound to the current user message".to_string());
+    }
+    if let Some(context) = proposal.confirmation_context.as_deref() {
+        let context = context.trim();
+        let latest_assistant_line = agent_soul_latest_prior_role_line(full_prompt)
+            .filter(|(role, _)| *role == "assistant")
+            .map(|(_, content)| content);
+        if context.is_empty()
+            || context.chars().count() > 1_000
+            || !full_prompt.contains(context)
+            || !latest_assistant_line
+                .map(|line| line.contains(context))
+                .unwrap_or(false)
+        {
+            return Err(
+                "soul update confirmation context is not bound to the conversation".to_string(),
+            );
+        }
+    }
+    if proposal.fields.is_empty() && proposal.clear_fields.is_empty() {
+        return Err("soul update must change or clear at least one field".to_string());
+    }
+    if proposal.fields.len() + proposal.clear_fields.len() > 14 {
+        return Err("soul update contains too many fields".to_string());
+    }
+    for (field, value) in &proposal.fields {
+        validate_agent_soul_profile_field_name(field)?;
+        if value.trim().is_empty() {
+            return Err(format!(
+                "soul field {field} must use clear_fields when removing a value"
+            ));
+        }
+        if value.chars().count() > 240
+            || value.chars().any(char::is_control)
+            || agent_soul_profile_value_looks_sensitive(value)
+        {
+            return Err(format!("soul field {field} contains a disallowed value"));
+        }
+    }
+    let mut cleared = std::collections::BTreeSet::new();
+    for field in &proposal.clear_fields {
+        validate_agent_soul_profile_field_name(field)?;
+        if !cleared.insert(field.as_str()) {
+            return Err(format!("soul field {field} is cleared more than once"));
+        }
+        if proposal.fields.contains_key(field) {
+            return Err(format!(
+                "soul field {field} cannot be set and cleared together"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn agent_soul_latest_prior_role_line(full_prompt: &str) -> Option<(&str, &str)> {
+    let prior_context = full_prompt
+        .split_once("\n\nCurrent user message:\n")
+        .map(|(prior, _)| prior)
+        .unwrap_or(full_prompt);
+    prior_context
+        .lines()
+        .filter_map(agent_soul_role_line)
+        .last()
+}
+
+fn agent_soul_role_line(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim();
+    let role_line = trimmed
+        .split_once(". ")
+        .filter(|(sequence, _)| sequence.chars().all(|character| character.is_ascii_digit()))
+        .map(|(_, role_line)| role_line)
+        .unwrap_or(trimmed);
+    let (role, content) = role_line.split_once(':')?;
+    let role = role.trim();
+    if role.eq_ignore_ascii_case("assistant") {
+        Some(("assistant", content.trim()))
+    } else if role.eq_ignore_ascii_case("user") {
+        Some(("user", content.trim()))
+    } else {
+        None
+    }
+}
+
+fn validate_agent_soul_profile_field_name(field: &str) -> Result<(), String> {
+    if agent_soul_profile_allowed_key(field) {
+        Ok(())
+    } else {
+        Err(format!("unknown soul profile field: {field}"))
+    }
+}
+
+fn repair_agent_soul_cross_role_name(
+    current_fields: &std::collections::BTreeMap<String, String>,
+    updates: &mut std::collections::BTreeMap<String, String>,
+) {
+    let agent_names = [
+        updates.get("user_calls_ds_agent"),
+        updates.get("ds_agent_should_refer_to_itself_as"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|name| name.trim())
+    .filter(|name| !name.is_empty())
+    .collect::<Vec<_>>();
+    if agent_names.is_empty() {
+        return;
+    }
+    let proposed_preferred_conflicts = updates
+        .get("preferred_name")
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(|name| agent_names.iter().any(|agent_name| *agent_name == name))
+        .unwrap_or(false);
+    let current_preferred_conflicts = updates.contains_key("address_as")
+        && current_fields
+            .get("preferred_name")
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(|name| agent_names.iter().any(|agent_name| *agent_name == name))
+            .unwrap_or(false);
+    if proposed_preferred_conflicts || current_preferred_conflicts {
+        updates.insert("preferred_name".to_string(), String::new());
+    }
+}
+
+fn upsert_agent_soul_profile_field(
+    content: &str,
+    field: &str,
+    value: &str,
+) -> Result<String, String> {
+    let target_section = agent_soul_profile_section_for_key(field)
+        .ok_or_else(|| format!("unknown soul profile field: {field}"))?;
+    let had_trailing_newline = content.ends_with('\n');
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut section = String::new();
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            section = heading.trim().to_ascii_lowercase();
+            continue;
+        }
+        if section == target_section {
+            let Some(item) = trimmed.strip_prefix("- ") else {
+                continue;
+            };
+            let Some((key, _)) = item.split_once(':') else {
+                continue;
+            };
+            if key.trim().eq_ignore_ascii_case(field) {
+                *line = format!("- {field}:{value}");
+                return Ok(join_agent_soul_profile_lines(lines, had_trailing_newline));
+            }
+        }
+    }
+
+    let heading = format!("## {}", agent_soul_profile_section_heading(target_section));
+    let Some(section_start) = lines
+        .iter()
+        .position(|line| line.trim().eq_ignore_ascii_case(&heading))
+    else {
+        return Err(format!("soul profile section {target_section} is missing"));
+    };
+    let mut insert_at = lines
+        .iter()
+        .enumerate()
+        .skip(section_start + 1)
+        .find(|(_, line)| line.trim().starts_with("## "))
+        .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+    while insert_at > section_start + 1 && lines[insert_at - 1].trim().is_empty() {
+        insert_at -= 1;
+    }
+    lines.insert(insert_at, format!("- {field}:{value}"));
+    Ok(join_agent_soul_profile_lines(lines, had_trailing_newline))
+}
+
+fn join_agent_soul_profile_lines(lines: Vec<String>, trailing_newline: bool) -> String {
+    let mut content = lines.join("\n");
+    if trailing_newline {
+        content.push('\n');
+    }
+    content
+}
+
+fn agent_soul_profile_section_for_key(key: &str) -> Option<&'static str> {
+    match key {
+        "preferred_name"
+        | "address_as"
+        | "language_preferences"
+        | "default_response_tone"
+        | "default_response_length"
+        | "formatting_preferences"
+        | "initiative_level" => Some("user"),
+        "user_calls_ds_agent" | "ds_agent_should_refer_to_itself_as" | "relationship_boundary" => {
+            Some("ds agent")
+        }
+        "workflow_preferences"
+        | "writing_preferences"
+        | "confirmation_preferences"
+        | "privacy_preferences" => Some("stable preferences"),
+        _ => None,
+    }
+}
+
+fn agent_soul_profile_section_heading(section: &str) -> &'static str {
+    match section {
+        "user" => "User",
+        "ds agent" => "DS Agent",
+        "stable preferences" => "Stable Preferences",
+        _ => "Stable Preferences",
+    }
+}
+
+fn agent_soul_profile_update_summary<'a>(
+    status: &str,
+    fields: &std::collections::BTreeMap<String, String>,
+    changed_fields: impl Iterator<Item = &'a String>,
+    is_cjk: bool,
+) -> String {
+    let details = changed_fields
+        .map(|field| {
+            let label = agent_soul_profile_field_label(field, is_cjk);
+            fields
+                .get(field)
+                .map(|value| format!("{label}={value}"))
+                .unwrap_or_else(|| {
+                    if is_cjk {
+                        format!("已清除{label}")
+                    } else {
+                        format!("cleared {label}")
+                    }
+                })
+        })
+        .collect::<Vec<_>>()
+        .join(if is_cjk { "；" } else { "; " });
+    if is_cjk {
+        if status == "applied" {
+            format!("已写入 Soul，并会在任何新对话中生效：{details}。")
+        } else {
+            format!("Soul 已确认，现有设置已经会在任何新对话中生效：{details}。")
+        }
+    } else if status == "applied" {
+        format!("Saved to Soul for every new conversation: {details}.")
+    } else {
+        format!("Soul confirmed; the existing settings already apply to every new conversation: {details}.")
+    }
+}
+
+fn agent_soul_profile_field_label(field: &str, is_cjk: bool) -> &'static str {
+    if is_cjk {
+        match field {
+            "preferred_name" => "你的姓名",
+            "address_as" => "对你的称呼",
+            "language_preferences" => "默认语言",
+            "default_response_tone" => "默认语气",
+            "default_response_length" => "默认回复长度",
+            "formatting_preferences" => "格式偏好",
+            "initiative_level" => "主动程度",
+            "user_calls_ds_agent" => "你对 DS Agent 的称呼",
+            "ds_agent_should_refer_to_itself_as" => "DS Agent 自称",
+            "relationship_boundary" => "关系边界",
+            "workflow_preferences" => "工作流偏好",
+            "writing_preferences" => "写作偏好",
+            "confirmation_preferences" => "确认偏好",
+            "privacy_preferences" => "隐私偏好",
+            _ => "Soul 设置",
+        }
+    } else {
+        match field {
+            "preferred_name" => "your name",
+            "address_as" => "how DS Agent addresses you",
+            "language_preferences" => "default language",
+            "default_response_tone" => "default tone",
+            "default_response_length" => "default response length",
+            "formatting_preferences" => "formatting preference",
+            "initiative_level" => "initiative level",
+            "user_calls_ds_agent" => "your name for DS Agent",
+            "ds_agent_should_refer_to_itself_as" => "DS Agent self-reference",
+            "relationship_boundary" => "relationship boundary",
+            "workflow_preferences" => "workflow preference",
+            "writing_preferences" => "writing preference",
+            "confirmation_preferences" => "confirmation preference",
+            "privacy_preferences" => "privacy preference",
+            _ => "Soul setting",
+        }
+    }
 }
 
 fn agent_soul_profile_state_from_content(exists: bool, content: String) -> AgentSoulProfileState {
@@ -5782,9 +6287,21 @@ fn agent_soul_profile_allowed_key(key: &str) -> bool {
 
 fn agent_soul_profile_value_looks_sensitive(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
-    ["secret", "password", "api key", "token", "private key"]
-        .iter()
-        .any(|marker| normalized.contains(marker))
+    [
+        "secret",
+        "password",
+        "api key",
+        "token",
+        "private key",
+        "密码",
+        "口令",
+        "密钥",
+        "令牌",
+        "身份证",
+        "银行卡",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn build_agent_soul_profile_prompt(profile: Option<&AgentSoulProfileContext>) -> String {
@@ -7764,7 +8281,10 @@ fn agent_chat_with_dispatch_and_tool_followup(
         |response| {
             mark_agent_workspace_actions_waiting_if_needed(&runtime_context, response);
             if runtime_context.subagent_read_only {
-                block_subagent_mutating_actions(response);
+                block_subagent_mutating_actions(
+                    response,
+                    runtime_context.expert_capabilities.as_deref(),
+                );
             }
             dispatch_agent_action_proposals_with_desktop_dir(
                 store,
@@ -8015,6 +8535,8 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
     computer_use_client: &(impl ComputerScreenshotClient + ComputerControlClient),
 ) -> Result<AgentChatResponse, String> {
     let mut request = request;
+    let soul_authorization_message = agent_soul_current_user_message(&request.prompt).to_string();
+    let soul_confirmation_prompt = request.prompt.clone();
     let (memory_context, initial_guidance, skill_catalog) = {
         let store = store.lock().map_err(|_| lock_error())?;
         (
@@ -8052,7 +8574,10 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
         |response| {
             mark_agent_workspace_actions_waiting_if_needed(&runtime_context, response);
             if runtime_context.subagent_read_only {
-                block_subagent_mutating_actions(response);
+                block_subagent_mutating_actions(
+                    response,
+                    runtime_context.expert_capabilities.as_deref(),
+                );
             }
             if let Some(run_id) = runtime_context.active_run_id {
                 if agent_run_cancel_requested(store, run_id)? {
@@ -8111,6 +8636,15 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
 
     {
         let store = store.lock().map_err(|_| lock_error())?;
+        finalize_agent_soul_profile_update(
+            &store,
+            runtime_context.soul_profile_root.as_deref(),
+            &soul_authorization_message,
+            &soul_confirmation_prompt,
+            runtime_context.active_run_id,
+            !runtime_context.subagent_read_only && runtime_context.expert_capabilities.is_none(),
+            &mut response,
+        );
         let memory_candidate_gate = apply_agent_memory_candidate_gate(&store, &mut response)?;
         record_agent_memory_candidates(&store, &response)?;
         record_agent_context_receipts(
@@ -8388,15 +8922,21 @@ fn run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
         return Ok(None);
     };
     let run_id = claimed.id;
-    let prompt = execution_prompt
+    let base_prompt = execution_prompt
         .map(|prompt| prompt.trim().to_string())
         .filter(|prompt| !prompt.is_empty())
         .or_else(|| claimed.execution_prompt.clone())
         .unwrap_or_else(|| claimed.prompt.clone());
+    let prompt = expert_attempt_execution_prompt(store, &claimed, &base_prompt)?;
     let mut runtime_context = runtime_context;
     runtime_context.active_run_id = Some(run_id);
     runtime_context.subagent_read_only =
         claimed.role == crate::kernel::agent_run::AgentRunRole::Subagent;
+    runtime_context.expert_capabilities = claimed
+        .expert_contract
+        .as_ref()
+        .map(|contract| contract.capabilities.clone());
+    let expert_staging_root = runtime_context.expert_staging_root.clone();
 
     record_agent_run_worker_step(
         store,
@@ -8471,14 +9011,7 @@ fn run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
                 {
                     let store = store.lock().map_err(|_| lock_error())?;
                     store
-                        .append_subagent_runs(
-                            run_id,
-                            response
-                                .subagent_plan
-                                .iter()
-                                .map(|item| (item.key.clone(), item.prompt.clone()))
-                                .collect(),
-                        )
+                        .append_expert_team_runs(run_id, response.subagent_plan.clone())
                         .map_err(event_store_error)?;
                 }
                 transition_agent_run_from_worker(
@@ -8488,6 +9021,44 @@ fn run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
                     "Parent run is waiting for its parallel Subagents to finish.".to_string(),
                     None,
                 )?
+            } else if claimed.expert_contract.is_some() {
+                let result = build_expert_attempt_result(
+                    store,
+                    &claimed,
+                    &response,
+                    expert_staging_root.as_deref(),
+                )?;
+                let passed = result.passed();
+                {
+                    let store = store.lock().map_err(|_| lock_error())?;
+                    store
+                        .append_expert_attempt_result(&result)
+                        .map_err(event_store_error)?;
+                }
+                if passed {
+                    finish_agent_run_from_worker(
+                        store,
+                        run_id,
+                        AgentRunStatus::Completed,
+                        Some(result.summary.clone()),
+                        None,
+                    )?
+                } else {
+                    let failed_gates = result
+                        .quality_gates
+                        .iter()
+                        .filter(|gate| !gate.passed)
+                        .map(|gate| gate.code.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    finish_agent_run_from_worker(
+                        store,
+                        run_id,
+                        AgentRunStatus::Failed,
+                        None,
+                        Some(format!("Expert quality gates failed: {failed_gates}")),
+                    )?
+                }
             } else if claimed.role == crate::kernel::agent_run::AgentRunRole::Subagent
                 && response.proposed_actions.iter().any(|action| {
                     action.execution_state == "blocked"
@@ -8557,6 +9128,373 @@ fn agent_run_has_subagents(store: &Mutex<EventStore>, parent_run_id: Uuid) -> Re
         .map_err(event_store_error)?
         .iter()
         .any(|record| record.parent_run_id == Some(parent_run_id)))
+}
+
+fn expert_attempt_execution_prompt(
+    store: &Mutex<EventStore>,
+    claimed: &AgentRunRecord,
+    base_prompt: &str,
+) -> Result<String, String> {
+    let Some(contract) = claimed.expert_contract.as_ref() else {
+        return Ok(base_prompt.to_string());
+    };
+    let records = store
+        .lock()
+        .map_err(|_| lock_error())?
+        .list_agent_run_records()
+        .map_err(event_store_error)?;
+    let dependencies = contract
+        .depends_on
+        .iter()
+        .map(|dependency_key| {
+            let latest = records
+                .iter()
+                .filter(|record| record.parent_run_id == Some(contract.parent_run_id))
+                .filter(|record| {
+                    record.expert_contract.as_ref().is_some_and(|candidate| {
+                        candidate.key.eq_ignore_ascii_case(dependency_key)
+                    })
+                })
+                .max_by_key(|record| {
+                    record
+                        .expert_contract
+                        .as_ref()
+                        .map(|candidate| candidate.attempt)
+                        .unwrap_or(0)
+                })
+                .ok_or_else(|| format!("expert dependency `{dependency_key}` is missing"))?;
+            let result = latest.expert_result.as_ref().ok_or_else(|| {
+                format!("expert dependency `{dependency_key}` has no durable result")
+            })?;
+            if latest.status != AgentRunStatus::Completed || !result.passed() {
+                return Err(format!(
+                    "expert dependency `{dependency_key}` did not pass its quality gate"
+                ));
+            }
+            let claims = result
+                .claims
+                .iter()
+                .take(8)
+                .map(|claim| {
+                    format!(
+                        "    claim={} stance={:?} statement={}",
+                        claim.key,
+                        claim.stance,
+                        compact_tool_evidence_excerpt(&claim.statement)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let evidence = result
+                .evidence
+                .iter()
+                .filter(|evidence| evidence.verified)
+                .take(8)
+                .map(|evidence| {
+                    format!(
+                        "    evidence={} kind={} reference={} summary={}",
+                        evidence.id,
+                        evidence.kind,
+                        compact_tool_evidence_excerpt(&evidence.reference),
+                        compact_tool_evidence_excerpt(&evidence.summary)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!(
+                "- key={} role={:?} attempt={} revision={}\n  summary={}\n  evidence={} conflicts={} missing={}\n  claims:\n{}\n  verified evidence:\n{}",
+                dependency_key,
+                result.role,
+                result.attempt,
+                result.output_revision,
+                result.summary,
+                result.evidence.len(),
+                result.unresolved_conflicts.len(),
+                result.missing_evidence.len(),
+                if claims.is_empty() { "    (none)" } else { claims.as_str() },
+                if evidence.is_empty() {
+                    "    (none)"
+                } else {
+                    evidence.as_str()
+                }
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .join("\n");
+    Ok(format!(
+        "You are the {:?} expert in one bounded DS Agent Expert Team. This is attempt {} for key `{}`. Do not create another team or subagent plan. Stay inside capabilities {:?}. Child actions are read-only; production content may only be returned as expert_output.staged_content for DS Agent to write into managed run-scoped staging. Review cannot mutate content and must bind its verdict to the exact dependency revision. Preserve contradictions, missing evidence, and uncertainty. Return structured expert_output with summary and evidence-linked claims; production must include staged_content and a safe relative filename; review must include target_revision, decision, and findings.\n\nImmutable budgets: elapsed_ms<={} tool_calls<={} tokens<={} output_bytes<={} staged_bytes<={}.\nParent input revision: {}.\n\nAssignment:\n{}\n\nPassed dependency results:\n{}",
+        contract.role,
+        contract.attempt,
+        contract.key,
+        contract.capabilities,
+        contract.budget.max_elapsed_ms,
+        contract.budget.max_tool_calls,
+        contract.budget.max_tokens,
+        contract.budget.max_output_bytes,
+        contract.budget.max_staged_bytes,
+        contract.parent_input_revision,
+        base_prompt,
+        if dependencies.is_empty() {
+            "(none)"
+        } else {
+            dependencies.as_str()
+        }
+    ))
+}
+
+fn build_expert_attempt_result(
+    store: &Mutex<EventStore>,
+    claimed: &AgentRunRecord,
+    response: &AgentChatResponse,
+    staging_base: Option<&Path>,
+) -> Result<ExpertAttemptResult, String> {
+    let contract = claimed
+        .expert_contract
+        .as_ref()
+        .ok_or_else(|| "expert result requires an immutable attempt contract".to_string())?;
+    let output = response.expert_output.clone().unwrap_or_default();
+    let claims = output
+        .claims
+        .iter()
+        .take(crate::kernel::expert_team::EXPERT_TEAM_MAX_CLAIMS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let (tool_invocations, records) = {
+        let store = store.lock().map_err(|_| lock_error())?;
+        (
+            store
+                .list_tool_invocations()
+                .map_err(event_store_error)?
+                .into_iter()
+                .filter(|invocation| invocation.run_id == Some(claimed.id))
+                .collect::<Vec<_>>(),
+            store.list_agent_run_records().map_err(event_store_error)?,
+        )
+    };
+    let evidence = deduplicate_evidence(
+        tool_invocations
+            .iter()
+            .flat_map(|invocation| {
+                invocation
+                    .evidence
+                    .iter()
+                    .map(move |evidence| ExpertEvidenceRef {
+                        id: String::new(),
+                        kind: evidence.kind.clone(),
+                        reference: evidence.reference.clone(),
+                        summary: evidence.summary.clone(),
+                        verified: invocation.status == ToolExecutionStatus::Succeeded
+                            && invocation.verification.passed,
+                    })
+            })
+            .collect(),
+    );
+    let evidence_ids = evidence
+        .iter()
+        .flat_map(|item| [item.id.as_str(), item.reference.as_str()])
+        .collect::<std::collections::HashSet<_>>();
+    let mut missing_evidence = Vec::new();
+    for claim in &claims {
+        if claim.evidence_refs.is_empty() {
+            missing_evidence.push(format!("claim `{}` has no evidence reference", claim.key));
+        } else {
+            for reference in &claim.evidence_refs {
+                if !evidence_ids.contains(reference.trim()) {
+                    missing_evidence.push(format!(
+                        "claim `{}` references unknown evidence `{}`",
+                        claim.key, reference
+                    ));
+                }
+            }
+        }
+    }
+    missing_evidence.sort();
+    missing_evidence.dedup();
+    let unresolved_conflicts = unresolved_claim_conflicts(&claims);
+
+    let serialized_output = serde_json::to_string(&output).map_err(event_store_error)?;
+    let output_bytes = u64::try_from(response.content.len() + serialized_output.len())
+        .map_err(|_| "expert output byte count overflow".to_string())?;
+    let mut staging = None;
+    let mut staging_error = None;
+    if contract.role == ExpertRole::Production {
+        match (
+            staging_base,
+            output.staged_content.as_deref(),
+            output.staged_relative_path.as_deref().or(Some("draft.md")),
+        ) {
+            (Some(base), Some(content), Some(relative_path)) => {
+                match stage_expert_output(base, contract, relative_path, content) {
+                    Ok(manifest) => staging = Some(manifest),
+                    Err(error) => staging_error = Some(error),
+                }
+            }
+            _ => staging_error = Some("production expert returned no staged content".to_string()),
+        }
+    }
+    let staged_bytes = staging.as_ref().map(|manifest| manifest.bytes).unwrap_or(0);
+    let tokens = response.total_tokens.unwrap_or_else(|| {
+        response
+            .prompt_tokens
+            .unwrap_or(0)
+            .saturating_add(response.completion_tokens.unwrap_or(0))
+    });
+    let usage = ExpertAttemptUsage {
+        elapsed_ms: u64::try_from(response.elapsed_ms).unwrap_or(u64::MAX),
+        tool_calls: u32::try_from(tool_invocations.len()).unwrap_or(u32::MAX),
+        tokens,
+        output_bytes,
+        staged_bytes,
+    };
+    let verified_sources = evidence.iter().filter(|item| item.verified).count();
+    let mut quality_gates = vec![
+        ExpertQualityGate {
+            code: "output_present".to_string(),
+            passed: !response.content.trim().is_empty() || !output.summary.trim().is_empty(),
+            detail: "expert returned a non-empty summary or response".to_string(),
+        },
+        ExpertQualityGate {
+            code: "capability_scope".to_string(),
+            passed: response
+                .proposed_actions
+                .iter()
+                .all(|action| action.execution_state != "blocked"),
+            detail: "all expert actions remained inside the immutable capability scope".to_string(),
+        },
+        ExpertQualityGate {
+            code: "elapsed_budget".to_string(),
+            passed: usage.elapsed_ms <= contract.budget.max_elapsed_ms,
+            detail: format!(
+                "elapsed {} / {} ms",
+                usage.elapsed_ms, contract.budget.max_elapsed_ms
+            ),
+        },
+        ExpertQualityGate {
+            code: "tool_budget".to_string(),
+            passed: usage.tool_calls <= contract.budget.max_tool_calls,
+            detail: format!(
+                "tool calls {} / {}",
+                usage.tool_calls, contract.budget.max_tool_calls
+            ),
+        },
+        ExpertQualityGate {
+            code: "token_budget".to_string(),
+            passed: usage.tokens <= contract.budget.max_tokens,
+            detail: format!("tokens {} / {}", usage.tokens, contract.budget.max_tokens),
+        },
+        ExpertQualityGate {
+            code: "output_budget".to_string(),
+            passed: usage.output_bytes <= contract.budget.max_output_bytes,
+            detail: format!(
+                "output bytes {} / {}",
+                usage.output_bytes, contract.budget.max_output_bytes
+            ),
+        },
+        ExpertQualityGate {
+            code: "claims".to_string(),
+            passed: !contract.output_contract.require_claims || !claims.is_empty(),
+            detail: format!("{} structured claims", claims.len()),
+        },
+        ExpertQualityGate {
+            code: "evidence".to_string(),
+            passed: verified_sources >= contract.output_contract.min_evidence_sources
+                && missing_evidence.is_empty(),
+            detail: format!(
+                "{} verified sources; {} missing claim links",
+                verified_sources,
+                missing_evidence.len()
+            ),
+        },
+        ExpertQualityGate {
+            code: "conflicts".to_string(),
+            passed: !contract.output_contract.fail_on_unresolved_conflict
+                || unresolved_conflicts.is_empty(),
+            detail: format!("{} unresolved conflicts", unresolved_conflicts.len()),
+        },
+    ];
+    if contract.output_contract.require_staged_output {
+        quality_gates.push(ExpertQualityGate {
+            code: "managed_staging".to_string(),
+            passed: staging.is_some() && staging_error.is_none(),
+            detail: staging_error
+                .unwrap_or_else(|| format!("{} staged bytes recorded", staged_bytes)),
+        });
+    }
+    if contract.output_contract.require_review {
+        let latest_production = records
+            .iter()
+            .filter(|record| record.parent_run_id == Some(contract.parent_run_id))
+            .filter(|record| {
+                record
+                    .expert_contract
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.role == ExpertRole::Production)
+            })
+            .filter_map(|record| {
+                record
+                    .expert_contract
+                    .as_ref()
+                    .zip(record.expert_result.as_ref())
+                    .map(|(candidate, result)| (candidate.attempt, result))
+            })
+            .max_by_key(|(attempt, _)| *attempt)
+            .map(|(_, result)| result);
+        let exact_review = output.review.as_ref().is_some_and(|review| {
+            latest_production.is_some_and(|production| {
+                review.target_revision == production.output_revision
+                    && review.decision == ExpertReviewDecision::Accept
+            })
+        });
+        quality_gates.push(ExpertQualityGate {
+            code: "exact_revision_review".to_string(),
+            passed: exact_review,
+            detail: if exact_review {
+                "review accepted the exact current production revision".to_string()
+            } else {
+                "review did not accept the exact current production revision".to_string()
+            },
+        });
+    }
+    let output_revision = staging
+        .as_ref()
+        .map(|manifest| manifest.sha256.clone())
+        .unwrap_or_else(|| sha256_text(&format!("{}\n{}", response.content, serialized_output)));
+    let passed = quality_gates.iter().all(|gate| gate.passed);
+    let external_effect_state = if staging.is_some() {
+        ExpertExternalEffectState::ManagedStagingOnly
+    } else if tool_invocations.is_empty() {
+        ExpertExternalEffectState::None
+    } else {
+        ExpertExternalEffectState::VerifiedReadOnly
+    };
+    Ok(ExpertAttemptResult {
+        id: Uuid::new_v4(),
+        run_id: claimed.id,
+        parent_run_id: contract.parent_run_id,
+        key: contract.key.clone(),
+        role: contract.role,
+        attempt: contract.attempt,
+        parent_input_revision: contract.parent_input_revision.clone(),
+        output_revision,
+        summary: if output.summary.trim().is_empty() {
+            response.content.clone()
+        } else {
+            output.summary
+        },
+        claims,
+        evidence,
+        unresolved_conflicts,
+        missing_evidence,
+        usage,
+        quality_gates,
+        staging,
+        review: output.review,
+        external_effect_state,
+        retry_eligible: !passed
+            && contract.attempt < contract.retry_policy.max_attempts
+            && external_effect_state != ExpertExternalEffectState::Uncertain,
+        recorded_at: Utc::now(),
+    })
 }
 
 fn run_with_agent_run_lease_heartbeat<T>(
@@ -9274,6 +10212,10 @@ fn merge_agent_chat_followup_response(
     followup_response
         .memory_candidates
         .splice(0..0, initial_response.memory_candidates);
+    if followup_response.soul_profile_update_proposal.is_none() {
+        followup_response.soul_profile_update_proposal =
+            initial_response.soul_profile_update_proposal.take();
+    }
     followup_response
 }
 
@@ -10962,7 +11904,10 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                     proposed_actions: vec![action.clone()],
                     missing_prerequisites: Vec::new(),
                     memory_candidates: Vec::new(),
+                    soul_profile_update: None,
+                    soul_profile_update_proposal: None,
                     subagent_plan: Vec::new(),
+                    expert_output: None,
                     model: response.model.clone(),
                     cache_status: response.cache_status,
                     elapsed_ms: response.elapsed_ms,
@@ -11037,7 +11982,10 @@ fn resume_agent_chat_action_with_clients_and_computer_use(
         proposed_actions: vec![action],
         missing_prerequisites: Vec::new(),
         memory_candidates: Vec::new(),
+        soul_profile_update: None,
+        soul_profile_update_proposal: None,
         subagent_plan: Vec::new(),
+        expert_output: None,
         model: "local-ds-agent-dispatch".to_string(),
         cache_status: DeepSeekChatCacheStatus::Miss,
         elapsed_ms: 0,
@@ -12535,9 +13483,12 @@ fn agent_chat_runtime_context(
         network_search_note: network_status.note,
         network_search_source_model: tool_strategy.network_search_source_model,
         soul_profile,
+        soul_profile_root: app_data_dir,
         memory_context: AgentMemoryRuntimeContext::default(),
         skill_catalog: Vec::new(),
         desktop_dir: app.path().desktop_dir().ok(),
+        expert_staging_root: None,
+        expert_capabilities: None,
     }
 }
 
@@ -12906,7 +13857,7 @@ pub async fn run_next_queued_agent_chat_worker(
             .ok()
             .and_then(|app_data_dir| load_deepseek_pricing_state(app_data_dir).ok())
             .map(|pricing_state| pricing_state.settings);
-        let runtime_context = agent_chat_runtime_context(
+        let mut runtime_context = agent_chat_runtime_context(
             &app,
             large_model_provider,
             network_search_source_model,
@@ -12914,6 +13865,7 @@ pub async fn run_next_queued_agent_chat_worker(
         );
         let transport = HttpDeepSeekChatCompletionTransport::new()?;
         let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+        runtime_context.expert_staging_root = Some(app_data_dir.join("expert-team-staging"));
         let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
         let desktop_dir = runtime_context.desktop_dir.clone();
         let file_client = LocalFileContentClient::new(512 * 1024);
@@ -13752,18 +14704,90 @@ pub fn enqueue_subagent_run_records(
 ) -> Result<Vec<AgentRunRecord>, String> {
     let store = state.event_store.lock().map_err(|_| lock_error())?;
     store
-        .append_subagent_runs(
-            parent_run_id,
-            subtasks
-                .into_iter()
-                .map(|subtask| (subtask.key, subtask.prompt))
-                .collect(),
-        )
+        .append_expert_team_runs(parent_run_id, subtasks)
         .map_err(event_store_error)
 }
 
 #[tauri::command]
+pub fn queue_expert_team_retries(
+    parent_run_id: Uuid,
+    state: State<'_, AppState>,
+) -> Result<Vec<AgentRunRecord>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    let retries = store
+        .append_due_expert_retries(parent_run_id)
+        .map_err(event_store_error)?;
+    if retries.is_empty() {
+        let records = store.list_agent_run_records().map_err(event_store_error)?;
+        let mut latest_by_key = std::collections::HashMap::<String, &AgentRunRecord>::new();
+        for record in records
+            .iter()
+            .filter(|record| record.parent_run_id == Some(parent_run_id))
+            .filter(|record| record.expert_contract.is_some())
+        {
+            let contract = record.expert_contract.as_ref().expect("checked above");
+            latest_by_key
+                .entry(contract.key.to_ascii_lowercase())
+                .and_modify(|current| {
+                    if contract.attempt
+                        > current
+                            .expert_contract
+                            .as_ref()
+                            .map(|current| current.attempt)
+                            .unwrap_or(0)
+                    {
+                        *current = record;
+                    }
+                })
+                .or_insert(record);
+        }
+        let failed = latest_by_key
+            .into_values()
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    AgentRunStatus::Failed | AgentRunStatus::Cancelled
+                )
+            })
+            .filter(|record| {
+                record
+                    .expert_result
+                    .as_ref()
+                    .is_none_or(|result| !result.retry_eligible)
+            })
+            .map(|record| {
+                record
+                    .subtask_key
+                    .as_deref()
+                    .unwrap_or("expert")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        if !failed.is_empty() {
+            let reason = format!(
+                "Expert Team stopped with an exhausted or non-retryable partial failure: {}.",
+                failed.join(", ")
+            );
+            if records
+                .iter()
+                .find(|record| record.id == parent_run_id)
+                .is_some_and(|parent| parent.status_reason.as_deref() != Some(reason.as_str()))
+            {
+                let transition =
+                    AgentRunTransition::new(parent_run_id, AgentRunStatus::Blocked, reason, None)
+                        .map_err(event_store_error)?;
+                store
+                    .append_agent_run_transition(&transition)
+                    .map_err(event_store_error)?;
+            }
+        }
+    }
+    Ok(retries)
+}
+
+#[tauri::command]
 pub fn queue_parent_agent_synthesis(
+    app: AppHandle,
     parent_run_id: Uuid,
     state: State<'_, AppState>,
 ) -> Result<AgentRunRecord, String> {
@@ -13781,6 +14805,38 @@ pub fn queue_parent_agent_synthesis(
         .filter(|record| record.parent_run_id == Some(parent_run_id))
         .collect::<Vec<_>>();
     children.sort_by_key(|record| record.started_at);
+    let expert_team = children
+        .iter()
+        .any(|record| record.expert_contract.is_some());
+    if expert_team {
+        let mut latest_by_key = std::collections::HashMap::<String, &AgentRunRecord>::new();
+        for child in &children {
+            let Some(contract) = child.expert_contract.as_ref() else {
+                return Err("Expert Team cannot mix legacy and contracted child runs.".to_string());
+            };
+            latest_by_key
+                .entry(contract.key.to_ascii_lowercase())
+                .and_modify(|current| {
+                    if contract.attempt
+                        > current
+                            .expert_contract
+                            .as_ref()
+                            .map(|current| current.attempt)
+                            .unwrap_or(0)
+                    {
+                        *current = child;
+                    }
+                })
+                .or_insert(child);
+        }
+        children = latest_by_key.into_values().collect();
+        children.sort_by_key(|record| {
+            record
+                .expert_contract
+                .as_ref()
+                .map(|contract| (contract.role as u8, contract.key.clone()))
+        });
+    }
     if children.is_empty()
         || children.iter().any(|record| {
             !matches!(
@@ -13793,6 +14849,19 @@ pub fn queue_parent_agent_synthesis(
             "Parent synthesis requires every Subagent to reach a terminal state.".to_string(),
         );
     }
+    if expert_team
+        && children.iter().any(|record| {
+            record
+                .expert_result
+                .as_ref()
+                .is_none_or(|result| !result.passed())
+        })
+    {
+        return Err(
+            "Expert Team quality gate is blocked by a failed, missing, or partial latest attempt."
+                .to_string(),
+        );
+    }
     if parent.status == AgentRunStatus::Queued {
         return Ok(parent.clone());
     }
@@ -13803,24 +14872,176 @@ pub fn queue_parent_agent_synthesis(
         ));
     }
 
+    let mut staged_content_by_run_id = std::collections::HashMap::<Uuid, String>::new();
+    if expert_team {
+        let production = children.iter().find(|record| {
+            record
+                .expert_contract
+                .as_ref()
+                .is_some_and(|contract| contract.role == ExpertRole::Production)
+        });
+        let review = children.iter().find(|record| {
+            record
+                .expert_contract
+                .as_ref()
+                .is_some_and(|contract| contract.role == ExpertRole::Review)
+        });
+        if production.is_some() != review.is_some() {
+            return Err(
+                "Expert Team production requires an exact-revision review before merge."
+                    .to_string(),
+            );
+        }
+        if let (Some(production), Some(review)) = (production, review) {
+            let production_result = production
+                .expert_result
+                .as_ref()
+                .ok_or_else(|| "Expert production result is missing.".to_string())?;
+            let manifest = production_result
+                .staging
+                .as_ref()
+                .ok_or_else(|| "Expert production staging manifest is missing.".to_string())?;
+            let production_contract = production
+                .expert_contract
+                .as_ref()
+                .ok_or_else(|| "Expert production contract is missing.".to_string())?;
+            let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+            let staging_root = app_data_dir
+                .join("expert-team-staging")
+                .join(parent_run_id.to_string())
+                .join(format!(
+                    "{}-{}",
+                    production_contract.key, production_contract.attempt
+                ));
+            verify_staging_manifest(&staging_root, manifest)?;
+            let staged_content = std::fs::read_to_string(&manifest.absolute_path)
+                .map_err(|error| format!("Read verified expert staged output: {error}"))?;
+            let staged_content = if staged_content.chars().count() > 24_000 {
+                format!(
+                    "{}\n[DS Agent truncated staged content at 24,000 characters for parent synthesis.]",
+                    staged_content.chars().take(24_000).collect::<String>()
+                )
+            } else {
+                staged_content
+            };
+            staged_content_by_run_id.insert(production.id, staged_content);
+            let review_result = review
+                .expert_result
+                .as_ref()
+                .ok_or_else(|| "Expert review result is missing.".to_string())?;
+            let accepted = review_result.review.as_ref().is_some_and(|verdict| {
+                verdict.decision == ExpertReviewDecision::Accept
+                    && verdict.target_revision == production_result.output_revision
+            });
+            if !accepted {
+                return Err(
+                    "Expert review is not bound to the exact current production revision."
+                        .to_string(),
+                );
+            }
+            if parent.expert_merge_receipt.is_none() {
+                let receipt = ExpertMergeReceipt {
+                    id: Uuid::new_v4(),
+                    parent_run_id,
+                    parent_input_revision: parent_input_revision(&parent.prompt),
+                    production_run_id: production.id,
+                    production_revision: production_result.output_revision.clone(),
+                    review_run_id: review.id,
+                    merged_at: Utc::now(),
+                };
+                store
+                    .append_expert_merge_receipt(&receipt)
+                    .map_err(event_store_error)?;
+            }
+        }
+    }
+
     let child_results = children
         .iter()
         .map(|child| {
+            let structured_detail = child
+                .expert_result
+                .as_ref()
+                .map(|result| {
+                    let claims = result
+                        .claims
+                        .iter()
+                        .take(8)
+                        .map(|claim| {
+                            format!(
+                                "    claim={} stance={:?} statement={}",
+                                claim.key,
+                                claim.stance,
+                                compact_tool_evidence_excerpt(&claim.statement)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let sources = result
+                        .evidence
+                        .iter()
+                        .filter(|evidence| evidence.verified)
+                        .take(8)
+                        .map(|evidence| format!("    {}", evidence.reference))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "\n  claims:\n{}\n  verified sources:\n{}",
+                        if claims.is_empty() { "    (none)" } else { claims.as_str() },
+                        if sources.is_empty() {
+                            "    (none)"
+                        } else {
+                            sources.as_str()
+                        }
+                    )
+                })
+                .unwrap_or_default();
+            let staged_detail = staged_content_by_run_id
+                .get(&child.id)
+                .map(|content| format!("\n  reviewed staged draft:\n{content}"))
+                .unwrap_or_default();
             format!(
-                "- Subagent `{}` status={:?}\n  result: {}",
+                "- Expert `{}` role={:?} attempt={} status={:?}\n  result: {}\n  evidence={} conflicts={} gates={}{}{}",
                 child.subtask_key.as_deref().unwrap_or("subtask"),
+                child
+                    .expert_contract
+                    .as_ref()
+                    .map(|contract| contract.role)
+                    .unwrap_or(ExpertRole::Research),
+                child
+                    .expert_contract
+                    .as_ref()
+                    .map(|contract| contract.attempt)
+                    .unwrap_or(1),
                 child.status,
                 child
                     .finish_summary
                     .as_deref()
                     .or(child.finish_error.as_deref())
-                    .unwrap_or("No result was returned.")
+                    .unwrap_or("No result was returned."),
+                child
+                    .expert_result
+                    .as_ref()
+                    .map(|result| result.evidence.len())
+                    .unwrap_or(0),
+                child
+                    .expert_result
+                    .as_ref()
+                    .map(|result| result.unresolved_conflicts.len())
+                    .unwrap_or(0),
+                child
+                    .expert_result
+                    .as_ref()
+                    .map(|result| result.quality_gates.iter().filter(|gate| gate.passed).count())
+                    .unwrap_or(0),
+                structured_detail,
+                staged_detail
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
-        "You are resuming the single parent task after its bounded parallel Subagents finished. Synthesize one final user-facing answer for the original goal. Preserve failures or uncertainty; do not claim failed work succeeded. Do not create another subagent_plan.\n\nOriginal goal:\n{}\n\nSubagent results:\n{}",
+        "You are resuming the single parent task after its bounded Expert Team finished and DS Agent passed the deterministic merge gate. Synthesize one final user-facing answer for the original goal. Preserve uncertainty, evidence conflicts, and partial limits; do not claim failed work succeeded. Do not create another subagent_plan.\n\nOriginal goal:\n{}\n\nExpert results:\n{}",
         parent.prompt, child_results
     );
     let context =
@@ -13831,7 +15052,8 @@ pub fn queue_parent_agent_synthesis(
     let transition = AgentRunTransition::new(
         parent_run_id,
         AgentRunStatus::Queued,
-        "All Subagents reached terminal state; parent synthesis is queued.".to_string(),
+        "All latest Expert Team attempts passed their gates; parent synthesis is queued."
+            .to_string(),
         None,
     )
     .map_err(event_store_error)?;
@@ -16111,10 +17333,10 @@ mod tests {
         agent_app_update_tool_request, agent_terminal_read_command_from_target,
         agent_tool_run_id_for_action, apply_agent_local_completion_summary,
         apply_tool_invocation_to_agent_action, authorize_agent_tool_execution,
-        block_agent_run_after_action_resolution, durable_computer_use_tool_request,
-        execute_agent_tool_with_executor, finish_agent_run_after_resumed_tool,
-        load_agent_skill_catalog, record_completed_agent_tool_execution,
-        resolved_computer_use_screenshot,
+        block_agent_run_after_action_resolution, build_expert_attempt_result,
+        durable_computer_use_tool_request, execute_agent_tool_with_executor,
+        finish_agent_run_after_resumed_tool, load_agent_skill_catalog,
+        record_completed_agent_tool_execution, resolved_computer_use_screenshot,
         run_agent_chat_with_clients_and_api_keys_and_computer_use,
         run_authorized_agent_tool_execution,
         run_queued_agent_chat_with_clients_and_api_keys_and_computer_use,
@@ -16505,7 +17727,10 @@ mod tests {
             }],
             missing_prerequisites: Vec::new(),
             memory_candidates: Vec::new(),
+            soul_profile_update: None,
+            soul_profile_update_proposal: None,
             subagent_plan: Vec::new(),
+            expert_output: None,
             model: "deepseek-v4-pro".to_string(),
             cache_status: DeepSeekChatCacheStatus::Miss,
             elapsed_ms: 0,
@@ -20509,8 +21734,8 @@ mod tests {
                 "protocol_version": "ds-agent-envelope/v1",
                 "reply_to_user": "正在并行核对。",
                 "subagent_plan": [
-                    {"key":"source-a","prompt":"只读核对来源 A。"},
-                    {"key":"source-b","prompt":"只读核对来源 B。"}
+                    {"key":"source-a","role":"research","prompt":"只读核对来源 A。","capabilities":["file_read","network_search"],"resources":[]},
+                    {"key":"source-b","role":"analysis","prompt":"只读核对来源 B。","capabilities":["file_read"],"resources":[]}
                 ]
             }"#,
         );
@@ -22587,9 +23812,9 @@ mod tests {
             "protocol_version": "ds-agent-envelope-v1",
             "reply_to_user": "我会并行核对三组独立证据，再统一给出结论。",
             "subagent_plan": [
-                {"key": "policy", "prompt": "只读核对政策原文并返回出处。"},
-                {"key": "market", "prompt": "只读核对市场数据并返回出处。"},
-                {"key": "risk", "prompt": "只读分析风险并返回反证。"}
+                {"key": "policy", "role": "research", "prompt": "只读核对政策原文并返回出处。", "capabilities": ["file_read", "network_search"], "resources": []},
+                {"key": "market", "role": "analysis", "prompt": "只读核对市场数据并返回出处。", "capabilities": ["file_read"], "resources": []},
+                {"key": "risk", "role": "review", "prompt": "只读分析风险并返回反证。", "depends_on": ["market"], "capabilities": ["file_read"], "resources": []}
             ]
         });
         let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
@@ -22614,11 +23839,25 @@ mod tests {
         let invalid = validated_subagent_plan(&[
             AgentSubtaskPlanItem {
                 key: "same".to_string(),
+                role: crate::kernel::expert_team::ExpertRole::Research,
                 prompt: "A".to_string(),
+                depends_on: Vec::new(),
+                capabilities: vec![crate::kernel::expert_team::ExpertCapability::FileRead],
+                resources: Vec::new(),
+                budget: Default::default(),
+                output_contract: Default::default(),
+                retry_policy: Default::default(),
             },
             AgentSubtaskPlanItem {
                 key: "SAME".to_string(),
+                role: crate::kernel::expert_team::ExpertRole::Analysis,
                 prompt: "B".to_string(),
+                depends_on: Vec::new(),
+                capabilities: vec![crate::kernel::expert_team::ExpertCapability::FileRead],
+                resources: Vec::new(),
+                budget: Default::default(),
+                output_contract: Default::default(),
+                retry_policy: Default::default(),
             },
         ]);
         assert!(invalid.is_empty());
@@ -22644,7 +23883,7 @@ mod tests {
             workflow_run_id: None,
             blocked_reason: None,
         }];
-        block_subagent_mutating_actions(&mut blocked_response);
+        block_subagent_mutating_actions(&mut blocked_response, None);
         assert_eq!(
             blocked_response.proposed_actions[0].execution_state,
             "blocked"
@@ -22654,6 +23893,88 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("read-only"));
+    }
+
+    #[test]
+    fn expert_fake_executor_fails_closed_on_missing_evidence_links() {
+        let store = Mutex::new(EventStore::open_memory().expect("store opens"));
+        let parent = AgentRunStart::new(
+            "expert-fake-conversation".to_string(),
+            "Research and analyze a source-backed claim.".to_string(),
+            0,
+        )
+        .expect("parent valid");
+        store
+            .lock()
+            .expect("store lock")
+            .append_agent_run_start(&parent)
+            .expect("parent appends");
+        let items: Vec<AgentSubtaskPlanItem> = serde_json::from_value(serde_json::json!([
+            {
+                "key": "research",
+                "role": "research",
+                "prompt": "Research two sources.",
+                "capabilities": ["file_read", "network_search"],
+                "resources": [],
+                "retry_policy": {"max_attempts": 2}
+            },
+            {
+                "key": "analysis",
+                "role": "analysis",
+                "prompt": "Analyze the research.",
+                "depends_on": ["research"],
+                "capabilities": ["file_read"],
+                "resources": []
+            }
+        ]))
+        .expect("plan JSON valid");
+        let research = store
+            .lock()
+            .expect("store lock")
+            .append_expert_team_runs(parent.id, items)
+            .expect("team appends")
+            .into_iter()
+            .find(|record| record.expert_contract.as_ref().unwrap().key == "research")
+            .unwrap();
+        let transport = RecordingDeepSeekTransport::new(
+            serde_json::json!({
+                "protocol_version": "ds-agent-envelope/v1",
+                "reply_to_user": "Research complete.",
+                "expert_output": {
+                    "summary": "A claim without durable evidence.",
+                    "claims": [{
+                        "key": "claim-a",
+                        "statement": "The claim is true.",
+                        "stance": "supports",
+                        "evidence_refs": ["missing-source"]
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        let response = agent_chat_with_transport(
+            &transport,
+            &DeepSeekMemoryChatCompletionCache::default(),
+            "test-secret",
+            AgentChatRequest {
+                prompt: "Research the claim.".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskOnRisk,
+            },
+            None,
+        )
+        .expect("fake model response parses")
+        .0;
+        let result = build_expert_attempt_result(&store, &research, &response, None)
+            .expect("host result builds");
+        assert!(!result.passed());
+        assert_eq!(result.missing_evidence.len(), 1);
+        assert!(result
+            .quality_gates
+            .iter()
+            .any(|gate| gate.code == "evidence" && !gate.passed));
+        assert!(result.retry_eligible);
     }
 
     #[test]
@@ -24195,6 +25516,337 @@ schema_version: 1
     }
 
     #[test]
+    fn confirmed_chat_soul_update_repairs_cross_role_name_and_survives_reload() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = EventStore::open_memory().expect("store opens");
+        super::save_agent_soul_profile_content(
+            temp_dir.path(),
+            &super::AGENT_SOUL_PROFILE_TEMPLATE
+                .replace("- preferred_name:", "- preferred_name:劳斯莱斯.黑马"),
+        )
+        .expect("stale profile saves");
+        let proposal = super::AgentSoulProfileUpdateProposal {
+            fields: std::collections::BTreeMap::from([
+                ("preferred_name".to_string(), "劳斯莱斯.黑马".to_string()),
+                ("address_as".to_string(), "老大".to_string()),
+                (
+                    "user_calls_ds_agent".to_string(),
+                    "劳斯莱斯.黑马".to_string(),
+                ),
+                (
+                    "ds_agent_should_refer_to_itself_as".to_string(),
+                    "小劳".to_string(),
+                ),
+            ]),
+            clear_fields: Vec::new(),
+            current_message_evidence: "现在开始你叫劳斯莱斯.黑马,简称小劳，你可以叫我老大"
+                .to_string(),
+            confirmation_context: None,
+        };
+
+        let receipt = super::apply_agent_soul_profile_update(
+            &store,
+            temp_dir.path(),
+            &proposal,
+            "现在开始你叫劳斯莱斯.黑马,简称小劳，你可以叫我老大",
+            "Current user message:\n现在开始你叫劳斯莱斯.黑马,简称小劳，你可以叫我老大",
+            Some(Uuid::new_v4()),
+        )
+        .expect("confirmed Soul update applies");
+
+        assert_eq!(receipt.status, "applied");
+        assert!(receipt.summary.contains("老大"));
+        assert!(receipt.summary.contains("小劳"));
+        assert!(receipt.undo_available);
+        let reloaded = super::agent_soul_profile_state_from_app_data_dir(temp_dir.path())
+            .expect("updated Soul reloads");
+        let fields = super::parse_agent_soul_profile_fields(&reloaded.content);
+        assert_eq!(fields.get("address_as").map(String::as_str), Some("老大"));
+        assert_eq!(
+            fields.get("user_calls_ds_agent").map(String::as_str),
+            Some("劳斯莱斯.黑马")
+        );
+        assert_eq!(
+            fields
+                .get("ds_agent_should_refer_to_itself_as")
+                .map(String::as_str),
+            Some("小劳")
+        );
+        assert!(!fields.contains_key("preferred_name"));
+        assert_eq!(
+            store
+                .list_soul_profile_updates()
+                .expect("Soul audits list")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn confirmed_chat_soul_update_audit_survives_event_store_restart() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let event_path = temp_dir.path().join("events.db");
+        let proposal = super::AgentSoulProfileUpdateProposal {
+            fields: std::collections::BTreeMap::from([(
+                "address_as".to_string(),
+                "老大".to_string(),
+            )]),
+            clear_fields: Vec::new(),
+            current_message_evidence: "以后叫我老大".to_string(),
+            confirmation_context: None,
+        };
+        let update_id = {
+            let store = EventStore::open(&event_path).expect("store opens");
+            super::apply_agent_soul_profile_update(
+                &store,
+                temp_dir.path(),
+                &proposal,
+                "以后叫我老大",
+                "Current user message:\n以后叫我老大",
+                None,
+            )
+            .expect("Soul update applies")
+            .update_id
+        };
+
+        let reopened = EventStore::open(&event_path).expect("store reopens");
+        let audits = reopened
+            .list_soul_profile_updates()
+            .expect("Soul audits list after restart");
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].id, update_id);
+        assert_eq!(audits[0].changed_fields, vec!["address_as"]);
+        assert_ne!(
+            audits[0].previous_content_sha256,
+            audits[0].updated_content_sha256
+        );
+    }
+
+    #[test]
+    fn chat_soul_update_requires_current_message_evidence_before_writing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = EventStore::open_memory().expect("store opens");
+        let proposal = super::AgentSoulProfileUpdateProposal {
+            fields: std::collections::BTreeMap::from([(
+                "address_as".to_string(),
+                "老大".to_string(),
+            )]),
+            clear_fields: Vec::new(),
+            current_message_evidence: "以后叫我老大".to_string(),
+            confirmation_context: None,
+        };
+
+        let error = super::apply_agent_soul_profile_update(
+            &store,
+            temp_dir.path(),
+            &proposal,
+            "今天天气怎么样",
+            "Current user message:\n今天天气怎么样",
+            None,
+        )
+        .expect_err("unbound proposal is rejected");
+
+        assert!(error.contains("current user message"));
+        assert!(!temp_dir
+            .path()
+            .join(crate::kernel::local_directory::LOCAL_MEMORY_DIR_NAME)
+            .join(super::AGENT_SOUL_PROFILE_FILE_NAME)
+            .exists());
+        assert!(store
+            .list_soul_profile_updates()
+            .expect("Soul audits list")
+            .is_empty());
+    }
+
+    #[test]
+    fn soul_confirmation_context_must_be_bound_to_the_conversation() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = EventStore::open_memory().expect("store opens");
+        let proposal = super::AgentSoulProfileUpdateProposal {
+            fields: std::collections::BTreeMap::from([(
+                "default_response_tone".to_string(),
+                "简洁直接".to_string(),
+            )]),
+            clear_fields: Vec::new(),
+            current_message_evidence: "对，就按这个来".to_string(),
+            confirmation_context: Some("以后默认使用简洁直接的语气，对吗？".to_string()),
+        };
+
+        let error = super::apply_agent_soul_profile_update(
+            &store,
+            temp_dir.path(),
+            &proposal,
+            "对，就按这个来",
+            "Assistant asked about an unrelated setting.\nCurrent user message:\n对，就按这个来",
+            None,
+        )
+        .expect_err("unbound confirmation context is rejected");
+
+        assert!(error.contains("confirmation context"));
+    }
+
+    #[test]
+    fn short_chat_confirmation_applies_the_bound_soul_setting() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = EventStore::open_memory().expect("store opens");
+        let proposal = super::AgentSoulProfileUpdateProposal {
+            fields: std::collections::BTreeMap::from([(
+                "default_response_tone".to_string(),
+                "简洁直接".to_string(),
+            )]),
+            clear_fields: Vec::new(),
+            current_message_evidence: "对，就按这个来".to_string(),
+            confirmation_context: Some("以后默认使用简洁直接的语气，对吗？".to_string()),
+        };
+        let prompt = "Assistant: 以后默认使用简洁直接的语气，对吗？\n\nCurrent user message:\n对，就按这个来";
+
+        let receipt = super::apply_agent_soul_profile_update(
+            &store,
+            temp_dir.path(),
+            &proposal,
+            super::agent_soul_current_user_message(prompt),
+            prompt,
+            None,
+        )
+        .expect("bound short confirmation applies");
+
+        assert_eq!(receipt.status, "applied");
+        let reloaded = super::agent_soul_profile_state_from_app_data_dir(temp_dir.path())
+            .expect("updated Soul reloads");
+        assert_eq!(
+            super::parse_agent_soul_profile_fields(&reloaded.content)
+                .get("default_response_tone")
+                .map(String::as_str),
+            Some("简洁直接")
+        );
+    }
+
+    #[test]
+    fn chat_soul_update_rejects_unknown_and_sensitive_fields_without_writing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = EventStore::open_memory().expect("store opens");
+        let proposals = [
+            super::AgentSoulProfileUpdateProposal {
+                fields: std::collections::BTreeMap::from([(
+                    "favorite_password".to_string(),
+                    "blue".to_string(),
+                )]),
+                clear_fields: Vec::new(),
+                current_message_evidence: "记住这个设置".to_string(),
+                confirmation_context: None,
+            },
+            super::AgentSoulProfileUpdateProposal {
+                fields: std::collections::BTreeMap::from([(
+                    "workflow_preferences".to_string(),
+                    "我的密码是 hunter2".to_string(),
+                )]),
+                clear_fields: Vec::new(),
+                current_message_evidence: "记住这个设置".to_string(),
+                confirmation_context: None,
+            },
+        ];
+
+        for proposal in proposals {
+            super::apply_agent_soul_profile_update(
+                &store,
+                temp_dir.path(),
+                &proposal,
+                "记住这个设置",
+                "Current user message:\n记住这个设置",
+                None,
+            )
+            .expect_err("unsafe Soul proposal is rejected");
+        }
+
+        assert!(!temp_dir
+            .path()
+            .join(crate::kernel::local_directory::LOCAL_MEMORY_DIR_NAME)
+            .join(super::AGENT_SOUL_PROFILE_FILE_NAME)
+            .exists());
+        assert!(store
+            .list_soul_profile_updates()
+            .expect("Soul audits list")
+            .is_empty());
+    }
+
+    #[test]
+    fn agent_chat_persists_confirmed_soul_update_before_returning_receipt() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let user_message = "现在开始你叫劳斯莱斯.黑马，简称小劳，你可以叫我老大";
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope/v1",
+            "reply_to_user": "好的，老大。",
+            "agent_actions": [],
+            "missing_prerequisites": [],
+            "soul_profile_update": {
+                "fields": {
+                    "address_as": "老大",
+                    "user_calls_ds_agent": "劳斯莱斯.黑马",
+                    "ds_agent_should_refer_to_itself_as": "小劳"
+                },
+                "clear_fields": [],
+                "current_message_evidence": user_message
+            }
+        });
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let response = run_agent_chat_with_clients(
+            &store,
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: user_message.to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::FullAccess,
+            },
+            AgentChatRuntimeContext {
+                soul_profile_root: Some(temp_dir.path().to_path_buf()),
+                ..AgentChatRuntimeContext::default()
+            },
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("agent chat applies Soul update");
+
+        let receipt = response
+            .soul_profile_update
+            .as_ref()
+            .expect("Soul receipt is returned");
+        assert_eq!(receipt.status, "applied");
+        assert!(response.content.contains("已写入 Soul"));
+        let reloaded = super::agent_soul_profile_state_from_app_data_dir(temp_dir.path())
+            .expect("updated Soul reloads in a new conversation");
+        let fields = super::parse_agent_soul_profile_fields(&reloaded.content);
+        assert_eq!(fields.get("address_as").map(String::as_str), Some("老大"));
+        assert_eq!(
+            fields
+                .get("ds_agent_should_refer_to_itself_as")
+                .map(String::as_str),
+            Some("小劳")
+        );
+        assert_eq!(
+            store
+                .lock()
+                .expect("store locks")
+                .list_soul_profile_updates()
+                .expect("Soul audits list")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn agent_chat_protocol_prompt_includes_soul_profile_context() {
         let mut runtime_context = AgentChatRuntimeContext::default();
         runtime_context.soul_profile = Some(super::AgentSoulProfileContext {
@@ -24221,6 +25873,9 @@ schema_version: 1
         assert!(prompt.contains("user preferred address: 李总"));
         assert!(prompt.contains("user calls this app: 小 D"));
         assert!(prompt.contains("Profile limits: soul.md compact summary, raw file body omitted."));
+        assert!(prompt.contains("soul_profile_update"));
+        assert!(prompt.contains("current_message_evidence"));
+        assert!(prompt.contains("confirmation_context"));
     }
 
     #[test]
@@ -27245,9 +28900,12 @@ schema_version: 1
                 network_search_note: "network search ready".to_string(),
                 network_search_source_model: None,
                 soul_profile: None,
+                soul_profile_root: None,
                 memory_context: super::AgentMemoryRuntimeContext::default(),
                 skill_catalog: Vec::new(),
                 desktop_dir: None,
+                expert_staging_root: None,
+                expert_capabilities: None,
             },
             None,
             &file_client,

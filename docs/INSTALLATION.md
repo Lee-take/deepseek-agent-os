@@ -9,13 +9,13 @@ project does not depend on the maintainer's local directories.
 The Windows build produces a normal NSIS setup executable:
 
 ```text
-DS Agent_0.8.0_x64-setup.exe
+DS Agent_0.9.0_x64-setup.exe
 ```
 
-The `v0.8.0` stable release attaches this Windows installer. Existing `v0.5.0`
-and `v0.8.0-rc.1` installations can detect `v0.8.0` through the built-in
-updater; equal or newer installations are not offered a downgrade. The
-historical RC remains available as an immutable prerelease. The installer is
+The `v0.9.0` stable release attaches this Windows installer. Existing `v0.5.0`,
+`v0.8.0-rc.1` and `v0.8.0` installations can detect `v0.9.0` through the
+built-in updater; equal or newer installations are not offered a downgrade.
+The historical v0.8 stable release and RC remain immutable. The installer is
 unsigned, so Windows may show an unknown-publisher warning. The installer
 embeds the Microsoft WebView2 bootstrapper and runs it silently when the target
 machine needs the WebView2 runtime; users do not need Node.js, pnpm, Rust, or a

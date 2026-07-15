@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::kernel::expert_team::{ExpertAttemptContract, ExpertAttemptResult, ExpertMergeReceipt};
+
 pub const AGENT_RUN_GUIDANCE_MAX_CHARS: usize = 4_000;
 pub const AGENT_RUN_MAX_PARALLEL_SUBAGENTS: usize = 3;
 
@@ -39,6 +41,8 @@ pub struct AgentRunStart {
     pub parent_run_id: Option<Uuid>,
     #[serde(default)]
     pub subtask_key: Option<String>,
+    #[serde(default)]
+    pub expert_contract: Option<ExpertAttemptContract>,
     #[serde(default = "default_agent_run_initial_status")]
     pub initial_status: AgentRunStatus,
     pub started_at: DateTime<Utc>,
@@ -205,6 +209,12 @@ pub struct AgentRunRecord {
     pub role: AgentRunRole,
     pub parent_run_id: Option<Uuid>,
     pub subtask_key: Option<String>,
+    #[serde(default)]
+    pub expert_contract: Option<ExpertAttemptContract>,
+    #[serde(default)]
+    pub expert_result: Option<ExpertAttemptResult>,
+    #[serde(default)]
+    pub expert_merge_receipt: Option<ExpertMergeReceipt>,
     pub status: AgentRunStatus,
     pub worker_id: Option<String>,
     pub lease_expires_at: Option<DateTime<Utc>>,
@@ -250,6 +260,7 @@ impl AgentRunStart {
             role: AgentRunRole::Parent,
             parent_run_id: None,
             subtask_key: None,
+            expert_contract: None,
             initial_status: AgentRunStatus::Running,
             started_at: Utc::now(),
         })
@@ -278,6 +289,24 @@ impl AgentRunStart {
         start.role = AgentRunRole::Subagent;
         start.parent_run_id = Some(parent_run_id);
         start.subtask_key = Some(required_text(subtask_key, "subagent subtask key")?);
+        Ok(start)
+    }
+
+    pub fn queued_expert(
+        parent_run_id: Uuid,
+        conversation_id: String,
+        contract: ExpertAttemptContract,
+    ) -> Result<Self, String> {
+        if contract.parent_run_id != parent_run_id {
+            return Err("expert contract parent run id does not match its run".to_string());
+        }
+        let mut start = Self::queued_subagent(
+            parent_run_id,
+            conversation_id,
+            contract.key.clone(),
+            contract.prompt.clone(),
+        )?;
+        start.expert_contract = Some(contract);
         Ok(start)
     }
 }

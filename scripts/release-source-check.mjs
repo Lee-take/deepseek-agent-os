@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-const expectedVersion = "0.8.0";
+const expectedVersion = "0.9.0";
 const maxSourceFileBytes = 2 * 1024 * 1024;
 const binaryReleaseExtensions = new Set([
   ".appimage",
@@ -47,6 +47,7 @@ const allowedSourceBinaryFiles = new Set([
 const requiredDocs = [
   "README.md",
   "docs/INSTALLATION.md",
+  "docs/RELEASE_NOTES_v0.9.0.md",
   "docs/RELEASE_NOTES_v0.8.0.md",
   "docs/RELEASE_NOTES_v0.8.0-rc.1.md",
   "docs/RELEASE_NOTES_v0.5.0.md",
@@ -72,6 +73,7 @@ const publicReleaseCopyFiles = [
   "apps/desktop/package.json",
   "docs/INSTALLATION.md",
   "docs/OPEN_SOURCE_RELEASE.md",
+  "docs/RELEASE_NOTES_v0.9.0.md",
   "docs/RELEASE_NOTES_v0.8.0.md",
   "docs/RELEASE_NOTES_v0.8.0-rc.1.md",
   "docs/RELEASE_NOTES_v0.5.0.md",
@@ -720,8 +722,8 @@ function checkRequiredDocs() {
       "README.md searchable DSAgent aliases",
     ],
     [
-      "Latest stable: [DS Agent v0.8.0]",
-      "README.md latest stable v0.8.0 link",
+      "Latest stable: [DS Agent v0.9.0]",
+      "README.md latest stable v0.9.0 link",
     ],
     [
       "Historical prerelease: [DS Agent v0.8.0-rc.1]",
@@ -753,8 +755,8 @@ function checkRequiredDocs() {
   checkTextDoesNotInclude(
     "README.md",
     readme,
-    "Latest prerelease: [DS Agent v0.8.0-rc.1]",
-    "README current release status must not regress to v0.8.0-rc.1",
+    "Latest stable: [DS Agent v0.8.0]",
+    "README current release status must not regress to v0.8.0",
   );
   checkTextDoesNotInclude(
     "docs/INSTALLATION.md",
@@ -916,7 +918,7 @@ function checkRequiredDocs() {
   }
 
   for (const phrase of [
-    "The current 0.8.0 release candidate includes the permission loop",
+    "The current 0.9.0 stable release includes the permission loop",
     "Harness architecture v1",
     "runs through a stable Agent OS Kernel plus Workflow Packs",
     "uses permissioned tool boundaries, source-linked evidence, bounded workflow runs, selective context assembly, and token-efficient DeepSeek routing",
@@ -1775,26 +1777,32 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludes(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.8.0"',
-    "app updater current release tag v0.8.0",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.9.0"',
+    "app updater current release tag v0.9.0",
   );
   checkTextDoesNotInclude(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.8.0-rc.1"',
-    "app updater current release tag must not regress to v0.8.0-rc.1",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.8.0"',
+    "app updater current release tag must not regress to v0.8.0",
   );
   checkTextIncludesCollapsed(
-    "docs/RELEASE_NOTES_v0.8.0.md",
-    readText("docs/RELEASE_NOTES_v0.8.0.md"),
-    "Package, desktop, Tauri and Cargo metadata remain `0.8.0`, and the updater identity is `v0.8.0`.",
-    "v0.8.0 stable release notes updater identity",
+    "docs/RELEASE_NOTES_v0.9.0.md",
+    readText("docs/RELEASE_NOTES_v0.9.0.md"),
+    "Package, desktop, Tauri and Cargo metadata are `0.9.0`, and the updater identity is `v0.9.0`.",
+    "v0.9.0 stable release notes updater identity",
   );
   checkTextIncludesCollapsed(
-    "docs/RELEASE_NOTES_v0.8.0.md",
-    readText("docs/RELEASE_NOTES_v0.8.0.md"),
-    "Durable Verified Computer Use",
-    "v0.8.0 stable release notes computer use positioning",
+    "docs/RELEASE_NOTES_v0.9.0.md",
+    readText("docs/RELEASE_NOTES_v0.9.0.md"),
+    "Expert Team",
+    "v0.9.0 stable release notes expert team positioning",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v0.9.0.md",
+    readText("docs/RELEASE_NOTES_v0.9.0.md"),
+    "Soul",
+    "v0.9.0 stable release notes Soul positioning",
   );
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.5.0.md",

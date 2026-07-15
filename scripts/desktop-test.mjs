@@ -29,6 +29,7 @@ run([
 run(["node", "scripts/conversation-title.test.mjs"]);
 run(["node", "scripts/agent-chat-run-state.test.mjs"]);
 run(["node", "scripts/subagent-parallel.test.mjs"]);
+run(["node", "scripts/expert-team.test.mjs"]);
 run(["node", "scripts/automation-center.test.mjs"]);
 run(["node", "scripts/agent-attachments.test.mjs"]);
 run(["node", "scripts/agent-chat-pending.test.mjs"]);

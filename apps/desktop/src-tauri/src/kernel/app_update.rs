@@ -14,8 +14,8 @@ const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/dsagent/releases/download/";
 const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.8.0";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.8.0";
+const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.9.0";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.9.0";
 #[cfg(windows)]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -502,10 +502,10 @@ mod tests {
         assert!(!is_newer_version("v0.1.0", "0.1.0"));
         assert!(!is_newer_version("v0.0.9", "0.1.0"));
 
-        assert!(is_newer_version("v0.8.0", "v0.5.0"));
-        assert!(!is_newer_version("v0.8.0-rc.1", "v0.8.0"));
-        assert!(!is_newer_version("v0.8.0", "v0.8.0"));
-        assert!(!is_newer_version("v0.8.0", "v0.8.1"));
+        assert!(is_newer_version("v0.9.0", "v0.8.0"));
+        assert!(!is_newer_version("v0.8.0", "v0.9.0"));
+        assert!(!is_newer_version("v0.9.0", "v0.9.0"));
+        assert!(!is_newer_version("v0.9.0", "v0.9.1"));
     }
 
     #[test]
@@ -595,31 +595,30 @@ mod tests {
         let status = update_status_from_releases(releases, app_update_current_version());
 
         assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.8.0");
+        assert_eq!(status.current_version, "v0.9.0");
         assert_eq!(status.latest_version.as_deref(), Some("0.3.0"));
         assert!(status.asset_name.is_none());
     }
 
     #[test]
-    fn app_update_status_promotes_v050_to_v080_and_fails_closed_afterward() {
+    fn app_update_status_promotes_v080_to_v090_and_fails_closed_afterward() {
         let stable = GithubRelease {
+            tag_name: "v0.9.0".to_string(),
+            html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.9.0".to_string(),
+            assets: vec![GithubReleaseAsset {
+                name: "DS.Agent_0.9.0_x64-setup.exe".to_string(),
+                browser_download_url:
+                    "https://github.com/Lee-take/dsagent/releases/download/v0.9.0/DS.Agent_0.9.0_x64-setup.exe"
+                        .to_string(),
+            }],
+        };
+        let previous_stable = GithubRelease {
             tag_name: "v0.8.0".to_string(),
             html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.8.0".to_string(),
             assets: vec![GithubReleaseAsset {
                 name: "DS.Agent_0.8.0_x64-setup.exe".to_string(),
                 browser_download_url:
                     "https://github.com/Lee-take/dsagent/releases/download/v0.8.0/DS.Agent_0.8.0_x64-setup.exe"
-                        .to_string(),
-            }],
-        };
-        let candidate = GithubRelease {
-            tag_name: "v0.8.0-rc.1".to_string(),
-            html_url: "https://github.com/Lee-take/dsagent/releases/tag/v0.8.0-rc.1"
-                .to_string(),
-            assets: vec![GithubReleaseAsset {
-                name: "DS.Agent_0.8.0_x64-setup.exe".to_string(),
-                browser_download_url:
-                    "https://github.com/Lee-take/dsagent/releases/download/v0.8.0-rc.1/DS.Agent_0.8.0_x64-setup.exe"
                         .to_string(),
             }],
         };
@@ -633,24 +632,24 @@ mod tests {
                         .to_string(),
             }],
         };
-        let releases = vec![candidate, old_stable, stable];
+        let releases = vec![previous_stable, old_stable, stable];
 
-        let old_client = update_status_from_releases(releases.clone(), "v0.5.0");
+        let old_client = update_status_from_releases(releases.clone(), "v0.8.0");
         assert!(old_client.update_available);
-        assert_eq!(old_client.latest_version.as_deref(), Some("0.8.0"));
+        assert_eq!(old_client.latest_version.as_deref(), Some("0.9.0"));
         assert_eq!(
             old_client.asset_name.as_deref(),
-            Some("DS.Agent_0.8.0_x64-setup.exe")
+            Some("DS.Agent_0.9.0_x64-setup.exe")
         );
 
-        let stable_client = update_status_from_releases(releases.clone(), "v0.8.0");
+        let stable_client = update_status_from_releases(releases.clone(), "v0.9.0");
         assert!(!stable_client.update_available);
-        assert_eq!(stable_client.latest_version.as_deref(), Some("0.8.0"));
+        assert_eq!(stable_client.latest_version.as_deref(), Some("0.9.0"));
         assert!(stable_client.asset_name.is_none());
 
-        let newer_client = update_status_from_releases(releases, "v0.8.1");
+        let newer_client = update_status_from_releases(releases, "v0.9.1");
         assert!(!newer_client.update_available);
-        assert_eq!(newer_client.latest_version.as_deref(), Some("0.8.0"));
+        assert_eq!(newer_client.latest_version.as_deref(), Some("0.9.0"));
         assert!(newer_client.asset_name.is_none());
     }
 

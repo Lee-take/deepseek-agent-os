@@ -171,7 +171,18 @@ test("new conversations keep Soul bootstrap outside compressed chat history", ()
   assert.match(appSource, /soul_profile_bootstrap:\s*string \| null/);
   assert.match(appSource, /function buildAgentSoulBootstrapContextSection/);
   assert.match(appSource, /const loadSoulProfileStateForBootstrap = async/);
-  assert.match(appSource, /await loadSoulProfileStateForBootstrap\(\)/);
+  assert.match(
+    appSource,
+    /if \(priorMessages\.length === 0\) \{[\s\S]*?await loadSoulProfileStateForBootstrap\(\)/,
+  );
+  assert.match(appSource, /const refreshSoulProfileAfterAgentResponse = async/);
+  assert.match(appSource, /response\.soul_profile_update\?\.status !== "applied"/);
+  assert.match(appSource, /await refreshSoulProfileAfterAgentResponse\(response\)/);
+  assert.match(
+    appSource,
+    /currentConversations\.map\(\(conversation\) => \(\{[\s\S]*?soul_profile_bootstrap: soulProfileBootstrap/,
+  );
+  assert.match(appSource, /soul_profile_update: response\.soul_profile_update/);
   assert.match(
     appSource,
     /function buildAgentConversationContextPrompt\(\s*prompt: string,\s*messages: AgentConversationMessage\[\],\s*soulProfileBootstrap: string \| null = null,/,
