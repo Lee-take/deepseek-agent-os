@@ -10,6 +10,8 @@ import type {
 import { ConnectorHealthPanel } from "./ConnectorHealthPanel";
 import { ArtifactDeliveryPanel } from "./ArtifactDeliveryPanel";
 import { RecoveryCenter } from "./RecoveryCenter";
+import { TaskLifecyclePanel } from "./TaskLifecyclePanel";
+import { WorkspaceUndoPanel } from "./WorkspaceUndoPanel";
 
 type Props = {
   language: Language;
@@ -156,10 +158,14 @@ export function AutomationCenter({ language, onRunQueued }: Props) {
     }
   };
 
-  const resolveReview = async (itemId: string, accepted: boolean) => {
+  const resolveReview = async (item: ReviewQueueItem, accepted: boolean) => {
     setPending(true);
     try {
-      await invoke("resolve_automation_review_item", { itemId, accepted });
+      await invoke("resolve_automation_review_item", {
+        itemId: item.id,
+        actionRevision: item.action_revision,
+        accepted,
+      });
       await refresh();
     } catch (reason) {
       setError(String(reason));
@@ -280,8 +286,8 @@ export function AutomationCenter({ language, onRunQueued }: Props) {
               <span className={`access-status ${item.status}`}>{item.status}</span>
               {item.status === "pending_review" ? (
                 <>
-                  <button type="button" disabled={pending} onClick={() => void resolveReview(item.id, true)}>{zh ? "接受" : "Accept"}</button>
-                  <button type="button" disabled={pending} onClick={() => void resolveReview(item.id, false)}>{zh ? "拒绝" : "Reject"}</button>
+                  <button type="button" disabled={pending} onClick={() => void resolveReview(item, true)}>{zh ? "接受" : "Accept"}</button>
+                  <button type="button" disabled={pending} onClick={() => void resolveReview(item, false)}>{zh ? "拒绝" : "Reject"}</button>
                 </>
               ) : null}
             </article>
@@ -290,6 +296,8 @@ export function AutomationCenter({ language, onRunQueued }: Props) {
       </div>
       <ConnectorHealthPanel language={language} />
       <RecoveryCenter language={language} />
+      <WorkspaceUndoPanel language={language} />
+      <TaskLifecyclePanel language={language} />
       <ArtifactDeliveryPanel language={language} />
     </section>
   );

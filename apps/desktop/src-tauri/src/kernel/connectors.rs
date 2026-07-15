@@ -3,6 +3,8 @@
 pub mod catalog;
 pub mod contract;
 pub mod domain;
+pub mod draft;
+pub mod google;
 pub mod http;
 pub(crate) mod landing;
 #[cfg(windows)]
@@ -10,6 +12,7 @@ pub(crate) mod landing_windows;
 #[cfg(test)]
 mod lifecycle_tests;
 pub mod microsoft;
+pub mod mutation;
 pub mod oauth;
 pub mod provider;
 pub(crate) mod read_execution;
@@ -43,6 +46,8 @@ use crate::kernel::tool_runtime::{
     tool_request_fingerprint, ToolExecutionRequest, ToolExecutionStatus, ToolInvocationRecord,
     CONNECTOR_MUTATE_TOOL_ID,
 };
+
+use mutation::ConnectorMutationIntent;
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ConnectorCredentialHandle(String);
@@ -1068,6 +1073,10 @@ pub struct ConnectorMutationEnvelope {
     pub capability: ConnectorCapability,
     pub target_ref: String,
     pub preview_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<ConnectorMutationIntent>,
     pub idempotency_key: String,
     pub automation_run_id: Uuid,
     pub agent_run_id: Option<Uuid>,
@@ -1079,21 +1088,40 @@ impl ConnectorMutationEnvelope {
         let account_generation = self.account_generation.ok_or_else(|| {
             "legacy connector mutation has no frozen account generation".to_string()
         })?;
+        self.validate_intent_binding()?;
+        let mut input = serde_json::json!({
+            "provider_id": self.provider_id,
+            "account_id": self.account_id.to_string(),
+            "account_generation": account_generation,
+            "capability": self.capability.contract_name(),
+            "target_ref": self.target_ref,
+            "preview_hash": self.preview_hash,
+            "idempotency_key": self.idempotency_key,
+            "automation_run_id": self.automation_run_id.to_string(),
+        });
+        if let Some(intent_hash) = &self.intent_hash {
+            input["intent_hash"] = serde_json::Value::String(intent_hash.clone());
+        }
         Ok(ToolExecutionRequest {
             tool_id: CONNECTOR_MUTATE_TOOL_ID.to_string(),
-            input: serde_json::json!({
-                "provider_id": self.provider_id,
-                "account_id": self.account_id.to_string(),
-                "account_generation": account_generation,
-                "capability": self.capability.contract_name(),
-                "target_ref": self.target_ref,
-                "preview_hash": self.preview_hash,
-                "idempotency_key": self.idempotency_key,
-                "automation_run_id": self.automation_run_id.to_string(),
-            }),
+            input,
             access_mode: self.access_mode,
             run_id: self.agent_run_id,
         })
+    }
+
+    pub(crate) fn validate_intent_binding(&self) -> Result<(), String> {
+        match (&self.intent_hash, &self.intent) {
+            (None, None) => Ok(()),
+            (Some(expected), Some(intent))
+                if intent.capability() == self.capability
+                    && intent.target_ref() == self.target_ref
+                    && intent.hash().as_deref() == Ok(expected.as_str()) =>
+            {
+                Ok(())
+            }
+            _ => Err("connector mutation intent does not match its frozen envelope".to_string()),
+        }
     }
 }
 
@@ -1246,6 +1274,19 @@ impl ConnectorInvocation {
             .ok_or_else(|| "connector mutation capability is invalid".to_string())?;
         let target_ref = text("target_ref")?;
         let preview_hash = text("preview_hash")?;
+        let intent_hash = input
+            .get("intent_hash")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        if intent_hash.as_ref().is_some_and(|hash| {
+            hash.len() != 72
+                || !hash.starts_with("intent1:")
+                || !hash[8..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err("connector mutation intent hash is invalid".to_string());
+        }
         let idempotency_key = text("idempotency_key")?;
         let automation_run_id = Uuid::parse_str(&text("automation_run_id")?)
             .map_err(|_| "connector mutation automation run id is invalid".to_string())?;
@@ -1256,6 +1297,8 @@ impl ConnectorInvocation {
             capability,
             target_ref,
             preview_hash,
+            intent_hash,
+            intent: None,
             idempotency_key: idempotency_key.clone(),
             automation_run_id,
             agent_run_id: request.run_id,
@@ -1277,6 +1320,37 @@ impl ConnectorInvocation {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         })
+    }
+
+    pub fn bind_intent(mut self, intent: ConnectorMutationIntent) -> Result<Self, String> {
+        let mutation = self
+            .mutation
+            .as_mut()
+            .ok_or_else(|| "connector mutation envelope is missing".to_string())?;
+        let intent_hash = intent.hash()?;
+        if mutation.intent_hash.as_deref() != Some(intent_hash.as_str())
+            || intent.capability() != mutation.capability
+            || intent.target_ref() != mutation.target_ref
+        {
+            return Err(
+                "connector mutation intent does not match the exact tool request".to_string(),
+            );
+        }
+        mutation.intent = Some(intent);
+        mutation.validate_intent_binding()?;
+        Ok(self)
+    }
+
+    pub fn mutation_intent(&self) -> Result<&ConnectorMutationIntent, String> {
+        let mutation = self
+            .mutation
+            .as_ref()
+            .ok_or_else(|| "connector mutation envelope is missing".to_string())?;
+        mutation.validate_intent_binding()?;
+        mutation
+            .intent
+            .as_ref()
+            .ok_or_else(|| "connector mutation intent is unavailable".to_string())
     }
 }
 
@@ -1655,6 +1729,31 @@ pub fn validate_connector_invocation(
     }
     if capability.external_mutation() {
         return Err("external connector mutation requires exact tool approval".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_connector_mutation_invocation(
+    account: &ConnectorAccount,
+    provider: &dyn ConnectorProvider,
+    invocation: &ConnectorInvocation,
+) -> Result<(), String> {
+    if account.health != ConnectorHealth::Connected
+        || account.provider_id != provider.provider_id()
+        || invocation.account_id != account.id
+        || invocation.provider_id != provider.provider_id()
+        || !invocation.capability.external_mutation()
+        || invocation.status != ConnectorInvocationStatus::Running
+        || !account
+            .granted_capabilities
+            .contains(&invocation.capability)
+        || !provider.capabilities().contains(&invocation.capability)
+    {
+        return Err("connector mutation is not ready".to_string());
+    }
+    let intent = invocation.mutation_intent()?;
+    if intent.capability() != invocation.capability {
+        return Err("connector mutation intent capability changed".to_string());
     }
     Ok(())
 }

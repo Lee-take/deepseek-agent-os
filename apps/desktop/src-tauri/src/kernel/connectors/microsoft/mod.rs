@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -9,8 +10,13 @@ use zeroize::Zeroize;
 
 use super::domain::{CalendarAttendee, CalendarEvent, MailAddress, MailMessage, MailThread};
 use super::http::{
-    ConnectorAccessTokenResolver, ConnectorHttpAuthContext, ConnectorHttpFailure,
-    ConnectorHttpMethod, ConnectorHttpRequest, ConnectorHttpResponse, ConnectorHttpTransport,
+    ConnectorAccessTokenResolver, ConnectorHttpAuthContext, ConnectorHttpBody,
+    ConnectorHttpFailure, ConnectorHttpMethod, ConnectorHttpRequest, ConnectorHttpResponse,
+    ConnectorHttpTransport,
+};
+use super::mutation::{
+    build_rfc5322_message, CalendarMutationEvent, ConnectorMailDraftContent,
+    ConnectorMutationIntent,
 };
 use super::oauth::{
     validate_loopback_redirect_uri, ConnectorAuthorizationSession, ConnectorAuthorizationStatus,
@@ -27,8 +33,10 @@ use super::sync::{
     ConnectorSyncContinuation, ConnectorSyncPage, MailSyncProvider, MailSyncRequest,
 };
 use super::{
-    ConnectorAccount, ConnectorCapability, ConnectorCredentialStore, ConnectorHealth,
-    ConnectorProvider, ConnectorRuntime, ConnectorSecret,
+    ConnectorAccount, ConnectorCapability, ConnectorCredentialStore, ConnectorEvidenceRef,
+    ConnectorHealth, ConnectorInvocation, ConnectorMutationApplyOutcome, ConnectorMutationProvider,
+    ConnectorMutationReceipt, ConnectorMutationReconciler, ConnectorProvider,
+    ConnectorReconciliationOutcome, ConnectorRuntime, ConnectorSecret,
 };
 
 mod attachment;
@@ -41,12 +49,16 @@ pub const MICROSOFT_PROVIDER_ID: &str = "microsoft";
 pub const MICROSOFT_AUTHORITY: &str = "https://login.microsoftonline.com/organizations/oauth2/v2.0";
 pub const MICROSOFT_GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0/";
 const MAX_GRAPH_RESPONSE_BYTES: usize = 1024 * 1024;
-const MICROSOFT_READ_CAPABILITIES: &[ConnectorCapability] = &[
+const MICROSOFT_CAPABILITIES: &[ConnectorCapability] = &[
     ConnectorCapability::MailSearch,
     ConnectorCapability::MailReadThread,
     ConnectorCapability::MailSyncInbox,
+    ConnectorCapability::MailSendDraft,
     ConnectorCapability::CalendarListEvents,
     ConnectorCapability::CalendarSyncEvents,
+    ConnectorCapability::CalendarCreateEvent,
+    ConnectorCapability::CalendarUpdateEvent,
+    ConnectorCapability::CalendarCancelEvent,
 ];
 const ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
 const MICROSOFT_MAIL_DELTA_PATH: &str = "/v1.0/me/mailFolders/inbox/messages/delta";
@@ -382,7 +394,7 @@ impl<T: ConnectorHttpTransport> ConnectorProvider for MicrosoftGraphAdapter<T> {
     }
 
     fn capabilities(&self) -> &'static [ConnectorCapability] {
-        MICROSOFT_READ_CAPABILITIES
+        MICROSOFT_CAPABILITIES
     }
 }
 
@@ -601,7 +613,391 @@ impl<T: ConnectorHttpTransport> CalendarSyncProvider for MicrosoftGraphAdapter<T
     }
 }
 
+impl<T: ConnectorHttpTransport> ConnectorMutationProvider for MicrosoftGraphAdapter<T> {
+    fn apply_mutation(
+        &self,
+        account: &ConnectorAccount,
+        invocation: &ConnectorInvocation,
+    ) -> Result<ConnectorMutationApplyOutcome, String> {
+        super::validate_connector_mutation_invocation(account, self, invocation)?;
+        let intent = invocation.mutation_intent()?;
+        let outcome = match intent {
+            ConnectorMutationIntent::MailSendDraft {
+                draft_ref,
+                internet_message_id,
+                content,
+            } => {
+                if let Some(content) = content {
+                    return self.apply_direct_microsoft_send(
+                        account,
+                        invocation,
+                        internet_message_id,
+                        content,
+                    );
+                }
+                self.validate_mail_draft(account, draft_ref, internet_message_id)?;
+                let url = graph_resource_url(&["me", "messages", draft_ref, "send"])
+                    .map_err(provider_failure_message)?;
+                self.execute_mutation_http(
+                    account,
+                    mutation_request(ConnectorHttpMethod::Post, url, None),
+                    &[202],
+                )
+            }
+            ConnectorMutationIntent::CalendarCreateEvent {
+                calendar_ref,
+                event,
+            } => {
+                ensure_default_calendar(calendar_ref)?;
+                validate_microsoft_notification_semantics(event)?;
+                let intent_hash = invocation
+                    .mutation
+                    .as_ref()
+                    .and_then(|mutation| mutation.intent_hash.as_deref())
+                    .ok_or_else(|| "connector mutation intent hash is unavailable".to_string())?;
+                let body = microsoft_event_body(
+                    event,
+                    Some(&invocation.idempotency_key),
+                    Some(intent_hash),
+                );
+                let url =
+                    graph_resource_url(&["me", "events"]).map_err(provider_failure_message)?;
+                self.execute_mutation_http(
+                    account,
+                    mutation_request(ConnectorHttpMethod::Post, url, Some(body)),
+                    &[201],
+                )
+            }
+            ConnectorMutationIntent::CalendarUpdateEvent {
+                calendar_ref,
+                event_ref,
+                expected_etag,
+                event,
+            } => {
+                ensure_default_calendar(calendar_ref)?;
+                validate_microsoft_notification_semantics(event)?;
+                let intent_hash = invocation
+                    .mutation
+                    .as_ref()
+                    .and_then(|mutation| mutation.intent_hash.as_deref())
+                    .ok_or_else(|| "connector mutation intent hash is unavailable".to_string())?;
+                let url = graph_resource_url(&["me", "events", event_ref])
+                    .map_err(provider_failure_message)?;
+                let mut request = mutation_request(
+                    ConnectorHttpMethod::Patch,
+                    url,
+                    Some(microsoft_event_body(event, None, Some(intent_hash))),
+                );
+                request
+                    .headers
+                    .insert("If-Match".to_string(), expected_etag.clone());
+                self.execute_mutation_http(account, request, &[200])
+            }
+            ConnectorMutationIntent::CalendarCancelEvent {
+                calendar_ref,
+                event_ref,
+                expected_etag,
+            } => {
+                ensure_default_calendar(calendar_ref)?;
+                let url = graph_resource_url(&["me", "events", event_ref])
+                    .map_err(provider_failure_message)?;
+                let mut request = mutation_request(ConnectorHttpMethod::Delete, url, None);
+                request
+                    .headers
+                    .insert("If-Match".to_string(), expected_etag.clone());
+                self.execute_mutation_http(account, request, &[204])
+            }
+        };
+        match outcome {
+            MicrosoftMutationHttpOutcome::Applied(remote_ref) => {
+                Ok(ConnectorMutationApplyOutcome::Applied(
+                    microsoft_mutation_receipt(invocation, account, remote_ref, false)?,
+                ))
+            }
+            MicrosoftMutationHttpOutcome::KnownNotApplied(message) => Err(message),
+            MicrosoftMutationHttpOutcome::Uncertain => {
+                Ok(ConnectorMutationApplyOutcome::ReconciliationRequired)
+            }
+        }
+    }
+}
+
+impl<T: ConnectorHttpTransport> ConnectorMutationReconciler for MicrosoftGraphAdapter<T> {
+    fn reconcile_mutation(
+        &self,
+        account: &ConnectorAccount,
+        invocation: &ConnectorInvocation,
+    ) -> Result<ConnectorReconciliationOutcome, String> {
+        if account.health != ConnectorHealth::Connected
+            || account.provider_id != MICROSOFT_PROVIDER_ID
+            || invocation.account_id != account.id
+            || invocation.provider_id != MICROSOFT_PROVIDER_ID
+            || invocation.status != super::ConnectorInvocationStatus::ReconciliationRequired
+        {
+            return Err("connector reconciliation is not ready".to_string());
+        }
+        let intent = invocation.mutation_intent()?;
+        match intent {
+            ConnectorMutationIntent::MailSendDraft {
+                draft_ref,
+                internet_message_id,
+                ..
+            } => self.reconcile_mail_send(account, invocation, draft_ref, internet_message_id),
+            ConnectorMutationIntent::CalendarCreateEvent {
+                calendar_ref,
+                event: _,
+            } => {
+                ensure_default_calendar(calendar_ref)?;
+                self.reconcile_calendar_create(account, invocation)
+            }
+            ConnectorMutationIntent::CalendarUpdateEvent {
+                calendar_ref,
+                event_ref,
+                expected_etag,
+                event,
+            } => {
+                ensure_default_calendar(calendar_ref)?;
+                self.reconcile_calendar_update(account, invocation, event_ref, expected_etag, event)
+            }
+            ConnectorMutationIntent::CalendarCancelEvent {
+                calendar_ref,
+                event_ref,
+                expected_etag,
+            } => {
+                ensure_default_calendar(calendar_ref)?;
+                self.reconcile_calendar_cancel(account, invocation, event_ref, expected_etag)
+            }
+        }
+    }
+}
+
 impl<T: ConnectorHttpTransport> MicrosoftGraphAdapter<T> {
+    fn apply_direct_microsoft_send(
+        &self,
+        account: &ConnectorAccount,
+        invocation: &ConnectorInvocation,
+        internet_message_id: &str,
+        content: &ConnectorMailDraftContent,
+    ) -> Result<ConnectorMutationApplyOutcome, String> {
+        let mut mime = build_rfc5322_message(internet_message_id, content)?;
+        let encoded = general_purpose::STANDARD.encode(&mime);
+        mime.zeroize();
+        let url = graph_resource_url(&["me", "sendMail"]).map_err(provider_failure_message)?;
+        let request = ConnectorHttpRequest {
+            method: ConnectorHttpMethod::Post,
+            url: url.to_string(),
+            headers: BTreeMap::new(),
+            body: Some(
+                ConnectorHttpBody::text_plain(encoded)
+                    .map_err(|_| "Microsoft MIME payload is invalid".to_string())?,
+            ),
+            max_response_bytes: MAX_GRAPH_RESPONSE_BYTES,
+        };
+        match self.execute_mutation_http(account, request, &[202]) {
+            MicrosoftMutationHttpOutcome::Applied(remote_ref) => {
+                Ok(ConnectorMutationApplyOutcome::Applied(
+                    microsoft_mutation_receipt(invocation, account, remote_ref, false)?,
+                ))
+            }
+            MicrosoftMutationHttpOutcome::KnownNotApplied(message) => Err(message),
+            MicrosoftMutationHttpOutcome::Uncertain => {
+                Ok(ConnectorMutationApplyOutcome::ReconciliationRequired)
+            }
+        }
+    }
+
+    fn validate_mail_draft(
+        &self,
+        account: &ConnectorAccount,
+        draft_ref: &str,
+        internet_message_id: &str,
+    ) -> Result<(), String> {
+        let mut url =
+            graph_resource_url(&["me", "messages", draft_ref]).map_err(provider_failure_message)?;
+        url.query_pairs_mut()
+            .append_pair("$select", "id,isDraft,internetMessageId");
+        let draft: GraphMutationMessage = self
+            .execute_json(account, get_request(url), None)
+            .map_err(provider_failure_message)?;
+        if draft.id != draft_ref
+            || draft.is_draft != Some(true)
+            || draft.internet_message_id.as_deref() != Some(internet_message_id)
+        {
+            return Err("Microsoft mail draft changed after review".to_string());
+        }
+        Ok(())
+    }
+
+    fn reconcile_mail_send(
+        &self,
+        account: &ConnectorAccount,
+        invocation: &ConnectorInvocation,
+        draft_ref: &str,
+        internet_message_id: &str,
+    ) -> Result<ConnectorReconciliationOutcome, String> {
+        let mut url = graph_resource_url(&["me", "messages"]).map_err(provider_failure_message)?;
+        url.query_pairs_mut()
+            .append_pair(
+                "$filter",
+                &format!(
+                    "internetMessageId eq '{}'",
+                    internet_message_id.replace('\'', "''")
+                ),
+            )
+            .append_pair("$select", "id,isDraft,internetMessageId")
+            .append_pair("$top", "2");
+        let matches: GraphCollection<GraphMutationMessage> = self
+            .execute_json(account, get_request(url), None)
+            .map_err(provider_failure_message)?;
+        let sent = matches
+            .value
+            .into_iter()
+            .filter(|message| message.is_draft == Some(false))
+            .collect::<Vec<_>>();
+        if sent.len() == 1 {
+            return Ok(ConnectorReconciliationOutcome::Applied(
+                microsoft_mutation_receipt(invocation, account, sent[0].id.clone(), true)?,
+            ));
+        }
+        if sent.len() > 1 {
+            return Ok(ConnectorReconciliationOutcome::StillUncertain);
+        }
+        if invocation.mutation_intent()?.mail_content().is_some() {
+            return Ok(ConnectorReconciliationOutcome::StillUncertain);
+        }
+        match self.validate_mail_draft(account, draft_ref, internet_message_id) {
+            Ok(()) => Ok(ConnectorReconciliationOutcome::KnownNotApplied),
+            Err(_) => Ok(ConnectorReconciliationOutcome::StillUncertain),
+        }
+    }
+
+    fn reconcile_calendar_create(
+        &self,
+        account: &ConnectorAccount,
+        invocation: &ConnectorInvocation,
+    ) -> Result<ConnectorReconciliationOutcome, String> {
+        let mut url = graph_resource_url(&["me", "events"]).map_err(provider_failure_message)?;
+        url.query_pairs_mut()
+            .append_pair(
+                "$filter",
+                &format!(
+                    "transactionId eq '{}'",
+                    invocation.idempotency_key.replace('\'', "''")
+                ),
+            )
+            .append_pair("$select", "id,transactionId")
+            .append_pair("$top", "2");
+        let events: GraphCollection<GraphMutationEvent> = self
+            .execute_json(account, get_request(url), None)
+            .map_err(provider_failure_message)?;
+        if events.value.len() == 1
+            && events.value[0].transaction_id.as_deref()
+                == Some(invocation.idempotency_key.as_str())
+        {
+            return Ok(ConnectorReconciliationOutcome::Applied(
+                microsoft_mutation_receipt(invocation, account, events.value[0].id.clone(), true)?,
+            ));
+        }
+        if events.value.is_empty() {
+            Ok(ConnectorReconciliationOutcome::KnownNotApplied)
+        } else {
+            Ok(ConnectorReconciliationOutcome::StillUncertain)
+        }
+    }
+
+    fn reconcile_calendar_update(
+        &self,
+        account: &ConnectorAccount,
+        invocation: &ConnectorInvocation,
+        event_ref: &str,
+        expected_etag: &str,
+        event: &CalendarMutationEvent,
+    ) -> Result<ConnectorReconciliationOutcome, String> {
+        let url =
+            graph_resource_url(&["me", "events", event_ref]).map_err(provider_failure_message)?;
+        let remote: GraphMutationEvent = self
+            .execute_json(account, get_request(url), None)
+            .map_err(provider_failure_message)?;
+        if remote.id != event_ref {
+            return Ok(ConnectorReconciliationOutcome::StillUncertain);
+        }
+        if remote.etag.as_deref() == Some(expected_etag) {
+            return Ok(ConnectorReconciliationOutcome::KnownNotApplied);
+        }
+        if microsoft_event_matches(&remote, event) {
+            Ok(ConnectorReconciliationOutcome::Applied(
+                microsoft_mutation_receipt(invocation, account, event_ref.to_string(), true)?,
+            ))
+        } else {
+            Ok(ConnectorReconciliationOutcome::StillUncertain)
+        }
+    }
+
+    fn reconcile_calendar_cancel(
+        &self,
+        account: &ConnectorAccount,
+        invocation: &ConnectorInvocation,
+        event_ref: &str,
+        expected_etag: &str,
+    ) -> Result<ConnectorReconciliationOutcome, String> {
+        let url =
+            graph_resource_url(&["me", "events", event_ref]).map_err(provider_failure_message)?;
+        match self.execute_json::<GraphMutationEvent>(account, get_request(url), None) {
+            Err(ConnectorProviderFailure::RemoteNotFound) => {
+                Ok(ConnectorReconciliationOutcome::Applied(
+                    microsoft_mutation_receipt(invocation, account, event_ref.to_string(), true)?,
+                ))
+            }
+            Ok(event) if event.etag.as_deref() == Some(expected_etag) => {
+                Ok(ConnectorReconciliationOutcome::KnownNotApplied)
+            }
+            Ok(_) => Ok(ConnectorReconciliationOutcome::StillUncertain),
+            Err(failure) => Err(provider_failure_message(failure)),
+        }
+    }
+
+    fn execute_mutation_http(
+        &self,
+        account: &ConnectorAccount,
+        request: ConnectorHttpRequest,
+        successful_statuses: &[u16],
+    ) -> MicrosoftMutationHttpOutcome {
+        let response = match self
+            .transport
+            .execute(ConnectorHttpAuthContext::for_account(account), request)
+        {
+            Ok(response) => response,
+            Err(
+                ConnectorHttpFailure::Timeout
+                | ConnectorHttpFailure::Network
+                | ConnectorHttpFailure::ResponseTooLarge,
+            ) => return MicrosoftMutationHttpOutcome::Uncertain,
+            Err(
+                ConnectorHttpFailure::BeforeSend
+                | ConnectorHttpFailure::CredentialUnavailable
+                | ConnectorHttpFailure::InvalidRequest,
+            ) => {
+                return MicrosoftMutationHttpOutcome::KnownNotApplied(
+                    "Microsoft mutation did not start".to_string(),
+                )
+            }
+        };
+        if successful_statuses.contains(&response.status) {
+            let remote_ref = serde_json::from_slice::<GraphMutationIdentity>(&response.body)
+                .ok()
+                .and_then(|identity| non_empty(identity.id))
+                .unwrap_or_else(|| "microsoft:accepted".to_string());
+            return MicrosoftMutationHttpOutcome::Applied(remote_ref);
+        }
+        if response.status == 429 || response.status >= 500 {
+            MicrosoftMutationHttpOutcome::Uncertain
+        } else {
+            MicrosoftMutationHttpOutcome::KnownNotApplied(
+                "Microsoft rejected the exact mutation".to_string(),
+            )
+        }
+    }
+
     pub(crate) fn attachment_metadata(
         &self,
         account: &ConnectorAccount,
@@ -715,6 +1111,152 @@ fn graph_url(path: &str) -> ConnectorProviderResult<reqwest::Url> {
     reqwest::Url::parse(MICROSOFT_GRAPH_BASE)
         .and_then(|base| base.join(path))
         .map_err(|_| ConnectorProviderFailure::InvalidResponse)
+}
+
+fn graph_resource_url(segments: &[&str]) -> ConnectorProviderResult<reqwest::Url> {
+    let mut url = reqwest::Url::parse(MICROSOFT_GRAPH_BASE)
+        .map_err(|_| ConnectorProviderFailure::InvalidResponse)?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| ConnectorProviderFailure::InvalidResponse)?;
+        path.pop_if_empty();
+        for segment in segments {
+            if segment.trim().is_empty() || segment.len() > 1024 || segment.contains(['\r', '\n']) {
+                return Err(ConnectorProviderFailure::InvalidResponse);
+            }
+            path.push(segment);
+        }
+    }
+    Ok(url)
+}
+
+fn mutation_request(
+    method: ConnectorHttpMethod,
+    url: reqwest::Url,
+    body: Option<serde_json::Value>,
+) -> ConnectorHttpRequest {
+    ConnectorHttpRequest {
+        method,
+        url: url.to_string(),
+        headers: BTreeMap::new(),
+        body: body
+            .map(ConnectorHttpBody::json_owned)
+            .transpose()
+            .expect("bounded static connector JSON body serializes"),
+        max_response_bytes: MAX_GRAPH_RESPONSE_BYTES,
+    }
+}
+
+fn microsoft_event_body(
+    event: &CalendarMutationEvent,
+    transaction_id: Option<&str>,
+    intent_hash: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "subject": event.title,
+        "body": {
+            "contentType": "text",
+            "content": event.description.clone().unwrap_or_default(),
+        },
+        "location": { "displayName": event.location.clone().unwrap_or_default() },
+        "start": {
+            "dateTime": event.starts_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "timeZone": "UTC",
+        },
+        "end": {
+            "dateTime": event.ends_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "timeZone": "UTC",
+        },
+        "attendees": event.attendees.iter().map(|attendee| serde_json::json!({
+            "emailAddress": {
+                "address": attendee.address,
+                "name": attendee.display_name.clone().unwrap_or_default(),
+            },
+            "type": "required",
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(transaction_id) = transaction_id {
+        body["transactionId"] = serde_json::Value::String(transaction_id.to_string());
+    }
+    if let Some(intent_hash) = intent_hash {
+        body["singleValueExtendedProperties"] = serde_json::json!([{
+            "id": "String {00020329-0000-0000-C000-000000000046} Name DSAgentIntentHash",
+            "value": intent_hash,
+        }]);
+    }
+    body
+}
+
+fn validate_microsoft_notification_semantics(event: &CalendarMutationEvent) -> Result<(), String> {
+    if !event.notify_attendees && !event.attendees.is_empty() {
+        return Err(
+            "Microsoft calendar cannot suppress attendee effects for this reviewed event"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_default_calendar(calendar_ref: &str) -> Result<(), String> {
+    if calendar_ref == "microsoft:default-calendar" {
+        Ok(())
+    } else {
+        Err("Microsoft calendar reference is unsupported".to_string())
+    }
+}
+
+fn microsoft_event_matches(remote: &GraphMutationEvent, expected: &CalendarMutationEvent) -> bool {
+    let Some(start) = remote
+        .start
+        .as_ref()
+        .and_then(|value| parse_graph_datetime(value).ok())
+    else {
+        return false;
+    };
+    let Some(end) = remote
+        .end
+        .as_ref()
+        .and_then(|value| parse_graph_datetime(value).ok())
+    else {
+        return false;
+    };
+    remote.subject.as_deref() == Some(expected.title.as_str())
+        && start == expected.starts_at
+        && end == expected.ends_at
+}
+
+fn microsoft_mutation_receipt(
+    invocation: &ConnectorInvocation,
+    account: &ConnectorAccount,
+    remote_ref: String,
+    reconciled: bool,
+) -> Result<ConnectorMutationReceipt, String> {
+    ConnectorMutationReceipt::applied(
+        invocation,
+        ConnectorEvidenceRef {
+            provider_id: MICROSOFT_PROVIDER_ID.to_string(),
+            account_id: account.id,
+            remote_object_ref: remote_ref,
+            retrieved_at: Utc::now(),
+            bounded_summary: Some(if reconciled {
+                "Microsoft external result was verified by read-only reconciliation.".to_string()
+            } else {
+                "Microsoft accepted the exact approved mutation.".to_string()
+            }),
+        },
+        reconciled,
+    )
+}
+
+fn provider_failure_message(failure: ConnectorProviderFailure) -> String {
+    failure.to_string()
+}
+
+enum MicrosoftMutationHttpOutcome {
+    Applied(String),
+    KnownNotApplied(String),
+    Uncertain,
 }
 
 fn get_request(url: reqwest::Url) -> ConnectorHttpRequest {
@@ -943,10 +1485,14 @@ fn microsoft_scopes_for(capability: ConnectorCapability) -> Option<&'static [&'s
         | ConnectorCapability::MailReadThread
         | ConnectorCapability::MailReadAttachment
         | ConnectorCapability::MailSyncInbox => Some(&["Mail.Read"]),
-        ConnectorCapability::CalendarListEvents | ConnectorCapability::CalendarSyncEvents => {
-            Some(&["Calendars.Read"])
-        }
-        _ => None,
+        ConnectorCapability::MailCreateDraft => Some(&["Mail.ReadWrite"]),
+        ConnectorCapability::MailSendDraft => Some(&["Mail.ReadWrite", "Mail.Send"]),
+        ConnectorCapability::CalendarListEvents
+        | ConnectorCapability::CalendarSyncEvents
+        | ConnectorCapability::CalendarFindFreeTime => Some(&["Calendars.Read"]),
+        ConnectorCapability::CalendarCreateEvent
+        | ConnectorCapability::CalendarUpdateEvent
+        | ConnectorCapability::CalendarCancelEvent => Some(&["Calendars.ReadWrite"]),
     }
 }
 
@@ -1126,6 +1672,20 @@ struct GraphMessage {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct GraphMutationMessage {
+    id: String,
+    is_draft: Option<bool>,
+    internet_message_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GraphMutationIdentity {
+    #[serde(default)]
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GraphRecipient {
     email_address: GraphEmailAddress,
 }
@@ -1147,6 +1707,18 @@ struct GraphEvent {
     attendees: Vec<GraphAttendee>,
     online_meeting: Option<GraphOnlineMeeting>,
     recurrence: Option<GraphRecurrence>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphMutationEvent {
+    id: String,
+    #[serde(rename = "@odata.etag")]
+    etag: Option<String>,
+    transaction_id: Option<String>,
+    subject: Option<String>,
+    start: Option<GraphDateTime>,
+    end: Option<GraphDateTime>,
 }
 
 #[derive(Deserialize)]
@@ -1196,15 +1768,20 @@ mod tests {
     use super::*;
     use crate::kernel::connectors::contract::{
         validate_calendar_read_contract, validate_calendar_sync_contract,
-        validate_mail_read_contract, validate_mail_sync_contract, validate_provider_contract,
+        validate_mail_read_contract, validate_mail_sync_contract, validate_mutation_contract,
+        validate_provider_contract,
     };
     use crate::kernel::connectors::http::{
         json_response, ConnectorHttpResponse, ScriptedConnectorHttpTransport,
     };
     use crate::kernel::connectors::oauth::begin_authorization;
     use crate::kernel::connectors::sync::ConnectorSyncState;
-    use crate::kernel::connectors::{ConnectorCredentialHandle, FakeConnectorCredentialStore};
+    use crate::kernel::connectors::{
+        ConnectorCredentialHandle, ConnectorInvocationStatus, ConnectorMutationEnvelope,
+        FakeConnectorCredentialStore,
+    };
     use crate::kernel::event_store::EventStore;
+    use crate::kernel::models::AccessMode;
 
     struct OfflineExchange;
 
@@ -1228,10 +1805,69 @@ mod tests {
             display_name: "Microsoft test account".to_string(),
             tenant_ref: Some("tenant:test".to_string()),
             credential_handle: ConnectorCredentialHandle::new(),
-            granted_capabilities: MICROSOFT_READ_CAPABILITIES.to_vec(),
+            granted_capabilities: {
+                let mut capabilities = MICROSOFT_CAPABILITIES.to_vec();
+                capabilities.push(ConnectorCapability::MailReadAttachment);
+                capabilities
+            },
             health: ConnectorHealth::Connected,
             connected_at: now,
             updated_at: now,
+        }
+    }
+
+    fn mutation_invocation(
+        account: &ConnectorAccount,
+        intent: ConnectorMutationIntent,
+        idempotency_key: &str,
+    ) -> ConnectorInvocation {
+        let intent_hash = intent.hash().unwrap();
+        let target_ref = intent.target_ref().to_string();
+        let automation_run_id = Uuid::new_v4();
+        ConnectorInvocation {
+            id: Uuid::new_v4(),
+            provider_id: MICROSOFT_PROVIDER_ID.to_string(),
+            account_id: account.id,
+            account_generation: Some(0),
+            capability: intent.capability(),
+            automation_run_id: Some(automation_run_id),
+            tool_invocation_id: Some(Uuid::new_v4()),
+            request_fingerprint: format!("sha256:{}", Uuid::new_v4()),
+            idempotency_key: idempotency_key.to_string(),
+            mutation: Some(ConnectorMutationEnvelope {
+                provider_id: MICROSOFT_PROVIDER_ID.to_string(),
+                account_id: account.id,
+                account_generation: Some(0),
+                capability: intent.capability(),
+                target_ref,
+                preview_hash: "sha256:reviewed-provider-preview".to_string(),
+                intent_hash: Some(intent_hash),
+                intent: Some(intent),
+                idempotency_key: idempotency_key.to_string(),
+                automation_run_id,
+                agent_run_id: None,
+                access_mode: AccessMode::FullAccess,
+            }),
+            status: ConnectorInvocationStatus::Running,
+            evidence: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn reviewed_calendar_event() -> CalendarMutationEvent {
+        let starts_at = DateTime::parse_from_rfc3339("2026-07-15T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        CalendarMutationEvent {
+            title: "Reviewed Microsoft event".to_string(),
+            description: Some("Exact reviewed description".to_string()),
+            location: Some("Room A".to_string()),
+            starts_at,
+            ends_at: starts_at + Duration::hours(1),
+            timezone: "UTC".to_string(),
+            attendees: Vec::new(),
+            notify_attendees: false,
         }
     }
 
@@ -1557,14 +2193,18 @@ mod tests {
                 .is_err()
         );
 
-        assert!(begin_authorization(
+        let write_session = begin_authorization(
             &mut credentials,
             &provider,
             vec![ConnectorCapability::MailSendDraft],
             "http://127.0.0.1:43821/callback".to_string(),
             Utc::now(),
         )
-        .is_err());
+        .expect("explicit mail send scope is supported");
+        assert_eq!(
+            write_session.requested_scopes,
+            vec!["Mail.ReadWrite", "Mail.Send", "User.Read", "offline_access"]
+        );
     }
 
     #[test]
@@ -1590,6 +2230,51 @@ mod tests {
                 mail_delta_page(None, Some(mail_delta), false),
             )),
             Ok(json_response(200, calendar_delta_page(calendar_delta))),
+            Ok(json_response(
+                200,
+                json!({
+                    "id": "draft-1",
+                    "isDraft": true,
+                    "internetMessageId": "<reviewed@example.com>"
+                }),
+            )),
+            Ok(json_response(202, json!({}))),
+            Ok(json_response(
+                200,
+                json!({
+                    "value": [{
+                        "id": "sent-message-1",
+                        "isDraft": false,
+                        "internetMessageId": "<reviewed@example.com>"
+                    }]
+                }),
+            )),
+            Ok(json_response(201, json!({"id": "created-event-1"}))),
+            Ok(json_response(
+                200,
+                json!({
+                    "value": [{
+                        "id": "created-event-1",
+                        "transactionId": "microsoft:create:once"
+                    }]
+                }),
+            )),
+            Ok(json_response(200, json!({"id": "updated-event-1"}))),
+            Ok(json_response(
+                200,
+                json!({
+                    "id": "event-update-1",
+                    "@odata.etag": "etag-after",
+                    "subject": "Reviewed Microsoft event",
+                    "start": {"dateTime": "2026-07-15T10:00:00", "timeZone": "UTC"},
+                    "end": {"dateTime": "2026-07-15T11:00:00", "timeZone": "UTC"}
+                }),
+            )),
+            Ok(json_response(204, json!({}))),
+            Ok(json_response(
+                404,
+                json!({"error": {"code": "ErrorItemNotFound"}}),
+            )),
         ]));
         let adapter = MicrosoftGraphAdapter::new(Arc::clone(&transport));
         let account = account();
@@ -1623,10 +2308,72 @@ mod tests {
             CalendarSyncRequest::new(starts_at, starts_at + Duration::days(1), 10).unwrap();
         validate_calendar_sync_contract(&adapter, &account, &calendar_sync, &mut coverage)
             .expect("typed calendar sync contract passes");
+        let mail_send = mutation_invocation(
+            &account,
+            ConnectorMutationIntent::MailSendDraft {
+                draft_ref: "draft-1".to_string(),
+                internet_message_id: "<reviewed@example.com>".to_string(),
+                content: None,
+            },
+            "microsoft:mail:once",
+        );
+        validate_mutation_contract(&adapter, &adapter, &account, &mail_send, &mut coverage)
+            .expect("Microsoft mail mutation contract passes");
+        let calendar_create = mutation_invocation(
+            &account,
+            ConnectorMutationIntent::CalendarCreateEvent {
+                calendar_ref: "microsoft:default-calendar".to_string(),
+                event: reviewed_calendar_event(),
+            },
+            "microsoft:create:once",
+        );
+        validate_mutation_contract(
+            &adapter,
+            &adapter,
+            &account,
+            &calendar_create,
+            &mut coverage,
+        )
+        .expect("Microsoft calendar create contract passes");
+        let calendar_update = mutation_invocation(
+            &account,
+            ConnectorMutationIntent::CalendarUpdateEvent {
+                calendar_ref: "microsoft:default-calendar".to_string(),
+                event_ref: "event-update-1".to_string(),
+                expected_etag: "etag-before".to_string(),
+                event: reviewed_calendar_event(),
+            },
+            "microsoft:update:once",
+        );
+        validate_mutation_contract(
+            &adapter,
+            &adapter,
+            &account,
+            &calendar_update,
+            &mut coverage,
+        )
+        .expect("Microsoft calendar update contract passes");
+        let calendar_cancel = mutation_invocation(
+            &account,
+            ConnectorMutationIntent::CalendarCancelEvent {
+                calendar_ref: "microsoft:default-calendar".to_string(),
+                event_ref: "event-cancel-1".to_string(),
+                expected_etag: "etag-cancel".to_string(),
+            },
+            "microsoft:cancel:once",
+        );
+        validate_mutation_contract(
+            &adapter,
+            &adapter,
+            &account,
+            &calendar_cancel,
+            &mut coverage,
+        )
+        .expect("Microsoft calendar cancel contract passes");
         coverage.finish().expect("all capabilities are covered");
         let requests = transport.take_requests();
         let auth_contexts = transport.take_auth_contexts();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 15);
         assert_eq!(auth_contexts.len(), requests.len());
         assert!(auth_contexts.iter().all(|auth| {
             auth.account_id() == account.id
@@ -1639,10 +2386,132 @@ mod tests {
                 .as_deref()
                 == Some("graph.microsoft.com")
         }));
-        assert!(requests.iter().all(|request| request.body.is_none()));
+        assert!(requests
+            .iter()
+            .filter(|request| request.method == ConnectorHttpMethod::Get)
+            .all(|request| request.body.is_none()));
         assert!(requests
             .iter()
             .all(|request| request.max_response_bytes == MAX_GRAPH_RESPONSE_BYTES));
+    }
+
+    #[test]
+    fn microsoft_mail_timeout_reconciles_read_only_without_replaying_send() {
+        let transport = Arc::new(ScriptedConnectorHttpTransport::new(vec![
+            Ok(json_response(
+                200,
+                json!({
+                    "id": "draft-timeout",
+                    "isDraft": true,
+                    "internetMessageId": "<timeout@example.com>"
+                }),
+            )),
+            Err(ConnectorHttpFailure::Timeout),
+            Ok(json_response(
+                200,
+                json!({
+                    "value": [{
+                        "id": "sent-after-timeout",
+                        "isDraft": false,
+                        "internetMessageId": "<timeout@example.com>"
+                    }]
+                }),
+            )),
+        ]));
+        let adapter = MicrosoftGraphAdapter::new(Arc::clone(&transport));
+        let account = account();
+        let mut invocation = mutation_invocation(
+            &account,
+            ConnectorMutationIntent::MailSendDraft {
+                draft_ref: "draft-timeout".to_string(),
+                internet_message_id: "<timeout@example.com>".to_string(),
+                content: None,
+            },
+            "microsoft:timeout:send:once",
+        );
+        assert_eq!(
+            adapter.apply_mutation(&account, &invocation).unwrap(),
+            ConnectorMutationApplyOutcome::ReconciliationRequired
+        );
+        invocation.status = ConnectorInvocationStatus::ReconciliationRequired;
+        assert!(matches!(
+            adapter.reconcile_mutation(&account, &invocation).unwrap(),
+            ConnectorReconciliationOutcome::Applied(_)
+        ));
+        let requests = transport.take_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == ConnectorHttpMethod::Post)
+                .count(),
+            1
+        );
+        assert_eq!(requests.len(), 3);
+    }
+
+    #[test]
+    fn microsoft_direct_mail_timeout_sends_once_then_reconciles_read_only() {
+        let transport = Arc::new(ScriptedConnectorHttpTransport::new(vec![
+            Err(ConnectorHttpFailure::Timeout),
+            Ok(json_response(
+                200,
+                json!({
+                    "value": [{
+                        "id": "sent-direct-timeout",
+                        "isDraft": false,
+                        "internetMessageId": "<direct-timeout@example.com>"
+                    }]
+                }),
+            )),
+        ]));
+        let adapter = MicrosoftGraphAdapter::new(Arc::clone(&transport));
+        let account = account();
+        let mut invocation = mutation_invocation(
+            &account,
+            ConnectorMutationIntent::MailSendDraft {
+                draft_ref: "local-draft-direct".to_string(),
+                internet_message_id: "<direct-timeout@example.com>".to_string(),
+                content: Some(ConnectorMailDraftContent {
+                    to: vec![MailAddress {
+                        display_name: Some("Receiver".to_string()),
+                        address: "receiver@example.com".to_string(),
+                    }],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Reviewed local draft".to_string(),
+                    body_text: "Exact reviewed body".to_string(),
+                    in_reply_to: None,
+                    thread_ref: None,
+                }),
+            },
+            "microsoft:direct-timeout:send:once",
+        );
+        assert_eq!(
+            adapter.apply_mutation(&account, &invocation).unwrap(),
+            ConnectorMutationApplyOutcome::ReconciliationRequired
+        );
+        invocation.status = ConnectorInvocationStatus::ReconciliationRequired;
+        assert!(matches!(
+            adapter.reconcile_mutation(&account, &invocation).unwrap(),
+            ConnectorReconciliationOutcome::Applied(_)
+        ));
+        let requests = transport.take_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, ConnectorHttpMethod::Post);
+        assert!(requests[0].url.ends_with("/v1.0/me/sendMail"));
+        let body = requests[0].body.as_ref().unwrap();
+        assert_eq!(body.content_type(), "text/plain");
+        let decoded = general_purpose::STANDARD.decode(body.bytes()).unwrap();
+        let decoded = String::from_utf8(decoded).unwrap();
+        assert!(decoded.contains("Message-ID: <direct-timeout@example.com>"));
+        assert!(decoded.contains("Exact reviewed body"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == ConnectorHttpMethod::Post)
+                .count(),
+            1
+        );
     }
 
     #[test]

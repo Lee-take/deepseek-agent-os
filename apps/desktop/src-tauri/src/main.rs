@@ -4,8 +4,11 @@ mod app_update_commands;
 mod artifact_commands;
 mod automation_commands;
 mod commands;
+mod connected_work_commands;
 mod connector_commands;
 mod kernel;
+mod lifecycle_commands;
+mod workspace_undo_commands;
 
 use app_update_commands::{check_app_update, download_app_update, install_app_update};
 use artifact_commands::{
@@ -65,6 +68,10 @@ use commands::{
     update_memory_candidate_conflict, update_memory_record, verify_skill_source,
     write_drive_boundary, write_file_boundary, AppState,
 };
+use connected_work_commands::{
+    approve_and_run_connected_work_review, list_connected_work_reviews,
+    reject_connected_work_review, request_connected_work_approval,
+};
 use connector_commands::{
     disconnect_connector_account, get_connector_authorization_review,
     inspect_connector_external_result, list_connector_account_summaries,
@@ -80,8 +87,11 @@ use connector_commands::{
 use connector_commands::{
     reconcile_pending_connector_disconnects, recover_pending_connector_authorizations,
 };
+use kernel::app_update::recover_app_update_state;
 use kernel::event_store::EventStore;
+use lifecycle_commands::list_task_lifecycle;
 use tauri::{image::Image, Manager};
+use workspace_undo_commands::{list_workspace_undo_items, undo_workspace_mutation};
 
 const APP_ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
 #[cfg(windows)]
@@ -258,7 +268,14 @@ fn main() {
                 WindowsSingleInstanceGuard::acquire(&app_data_dir)
                     .map_err(std::io::Error::other)?,
             );
+            recover_app_update_state().map_err(std::io::Error::other)?;
             let event_store = EventStore::open(app_data_dir.join("kernel-events.sqlite3"))?;
+            event_store
+                .reconcile_completed_connected_work_projections(chrono::Utc::now())
+                .map_err(std::io::Error::other)?;
+            event_store
+                .reconcile_interrupted_foreground_connected_work_preparations(chrono::Utc::now())
+                .map_err(std::io::Error::other)?;
             ensure_system_skill_builder(&event_store).map_err(|error| {
                 std::io::Error::other(format!("system Skill setup failed: {error}"))
             })?;
@@ -308,9 +325,16 @@ fn main() {
             run_next_queued_agent_chat_worker,
             resume_agent_chat_action,
             list_agent_run_records,
+            list_task_lifecycle,
+            list_workspace_undo_items,
+            undo_workspace_mutation,
             list_automation_definitions,
             list_automation_runs,
             list_automation_review_items,
+            list_connected_work_reviews,
+            request_connected_work_approval,
+            reject_connected_work_review,
+            approve_and_run_connected_work_review,
             list_artifact_deliveries,
             get_artifact_visual_preview,
             list_connector_account_summaries,
@@ -493,6 +517,12 @@ mod tests {
     #[test]
     fn startup_resets_recovery_claims_before_spawning_workers() {
         let source = include_str!("main.rs");
+        let completed_projection = source
+            .find("reconcile_completed_connected_work_projections")
+            .expect("completed connected-work projections remain repaired at startup");
+        let foreground_preparation = source
+            .find("reconcile_interrupted_foreground_connected_work_preparations")
+            .expect("interrupted foreground preparation remains repaired at startup");
         let revocation = source
             .find("reset_abandoned_connector_revocation_claims")
             .expect("revocation reset remains wired");
@@ -518,6 +548,8 @@ mod tests {
             .find("            spawn_connector_read_worker(state.clone());")
             .expect("read worker remains wired");
 
+        assert!(completed_projection < foreground_preparation);
+        assert!(foreground_preparation < revocation);
         assert!(revocation < reconciliation);
         assert!(reconciliation < sync);
         assert!(sync < read);

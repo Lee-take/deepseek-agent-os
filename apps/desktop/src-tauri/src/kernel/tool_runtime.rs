@@ -372,6 +372,11 @@ pub fn builtin_tool_catalog() -> Vec<ToolContract> {
                     field("capability", ToolValueType::String, "Normalized capability."),
                     field("target_ref", ToolValueType::String, "Normalized remote target."),
                     field("preview_hash", ToolValueType::String, "Frozen preview hash."),
+                    field(
+                        "intent_hash",
+                        ToolValueType::String,
+                        "Hash of private typed provider input.",
+                    ),
                     field("idempotency_key", ToolValueType::String, "One-side-effect key."),
                     field("automation_run_id", ToolValueType::String, "Owning automation run."),
                 ],
@@ -1265,26 +1270,30 @@ pub fn builtin_tool_catalog() -> Vec<ToolContract> {
         },
         ToolContract {
             id: APP_UPDATE_DOWNLOAD_TOOL_ID.to_string(),
-            version: "1.0.0".to_string(),
+            version: "2.0.0".to_string(),
             title: "Download a DS Agent update".to_string(),
-            description: "Download the trusted Windows installer into the isolated update directory."
-                .to_string(),
+            description:
+                "Stream a trusted Windows installer into receipt-bound managed storage."
+                    .to_string(),
             capability: CapabilityKind::AppUpdateDownload,
             risk_level: RiskLevel::High,
-            executor_id: "builtin.app_update.download.v1".to_string(),
+            executor_id: "builtin.app_update.download.v2".to_string(),
             input_schema: empty_object_schema(),
             output_schema: object_schema(
                 vec![
                     field("latest_version", ToolValueType::String, "Downloaded version."),
                     field("asset_name", ToolValueType::String, "Trusted release asset name."),
-                    field("installer_path", ToolValueType::String, "Verified local installer path."),
+                    field("download_receipt", ToolValueType::String, "Opaque one-shot download receipt."),
+                    field("sha256", ToolValueType::String, "Streamed installer SHA-256."),
+                    field("byte_size", ToolValueType::Number, "Bounded streamed byte count."),
                 ],
-                &["latest_version", "asset_name", "installer_path"],
+                &["latest_version", "asset_name", "download_receipt", "sha256", "byte_size"],
             ),
             constraints: ToolConstraints {
                 allowed_network_hosts: vec![
                     "api.github.com".to_string(),
                     "github.com".to_string(),
+                    "release-assets.githubusercontent.com".to_string(),
                 ],
                 path_scope: ToolPathScope::AppUpdateDirectory,
                 mutates_machine_state: false,
@@ -1297,9 +1306,10 @@ pub fn builtin_tool_catalog() -> Vec<ToolContract> {
                 }),
             },
             verification: ToolVerificationContract {
-                recipe_id: "app_update.downloaded_installer.v1".to_string(),
-                description: "Require a trusted installer asset inside the isolated update directory."
-                    .to_string(),
+                recipe_id: "app_update.downloaded_installer.v2".to_string(),
+                description:
+                    "Require bounded streaming, managed atomic landing, hash and file identity."
+                        .to_string(),
                 required_evidence_kinds: vec!["downloaded_installer".to_string()],
             },
             recovery_hint: "Retry the download; do not install assets that fail source or path validation."
@@ -1307,34 +1317,32 @@ pub fn builtin_tool_catalog() -> Vec<ToolContract> {
         },
         ToolContract {
             id: APP_UPDATE_INSTALL_TOOL_ID.to_string(),
-            version: "1.0.0".to_string(),
+            version: "2.0.0".to_string(),
             title: "Install a DS Agent update".to_string(),
             description: "Schedule a verified installer and restart DS Agent after approval."
                 .to_string(),
             capability: CapabilityKind::AppUpdateInstall,
             risk_level: RiskLevel::Critical,
-            executor_id: "builtin.app_update.install.v1".to_string(),
+            executor_id: "builtin.app_update.install.v2".to_string(),
             input_schema: object_schema(
                 vec![field(
-                    "installer_path",
+                    "download_receipt",
                     ToolValueType::String,
-                    "Installer path returned by app_update.download.",
+                    "Opaque one-shot receipt returned by app_update.download.",
                 )],
-                &["installer_path"],
+                &["download_receipt"],
             ),
             output_schema: object_schema(
-                vec![
-                    field("installer_path", ToolValueType::String, "Scheduled installer path."),
-                    field("restart_scheduled", ToolValueType::Boolean, "Whether restart is scheduled."),
-                ],
-                &["installer_path", "restart_scheduled"],
+                vec![field("restart_scheduled", ToolValueType::Boolean, "Whether restart is scheduled.")],
+                &["restart_scheduled"],
             ),
             constraints: ToolConstraints {
                 allowed_network_hosts: Vec::new(),
                 path_scope: ToolPathScope::AppUpdateDirectory,
                 mutates_machine_state: true,
-                protected_path_policy: "execute only an installer previously verified in the app update directory"
-                    .to_string(),
+                protected_path_policy:
+                    "consume one exact receipt and revalidate managed identity, size and hash"
+                        .to_string(),
                 resource: Some(ToolResourceRequirement {
                     key: "app_update://installer".to_string(),
                     access: ToolResourceAccess::Write,
@@ -2024,7 +2032,7 @@ mod tests {
         assert!(install
             .input_schema
             .required
-            .contains(&"installer_path".to_string()));
+            .contains(&"download_receipt".to_string()));
     }
 
     #[test]
@@ -2682,15 +2690,17 @@ mod tests {
             .expect("app update install contract");
 
         assert!(validate_tool_input(&install, &json!({})).is_err());
-        assert!(validate_tool_input(&install, &json!({"installer_path": 42})).is_err());
+        assert!(validate_tool_input(&install, &json!({"download_receipt": 42})).is_err());
         assert!(validate_tool_input(
             &install,
-            &json!({"installer_path": "C:/Temp/update.exe", "approve": true})
+            &json!({"download_receipt": "dsur1.123456781234123412341234567890ab.3", "approve": true})
         )
         .is_err());
-        assert!(
-            validate_tool_input(&install, &json!({"installer_path": "C:/Temp/update.exe"})).is_ok()
-        );
+        assert!(validate_tool_input(
+            &install,
+            &json!({"download_receipt": "dsur1.123456781234123412341234567890ab.3"})
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2711,7 +2721,7 @@ mod tests {
         .expect("download plan");
         let install = prepare_tool_execution(&ToolExecutionRequest {
             tool_id: APP_UPDATE_INSTALL_TOOL_ID.to_string(),
-            input: json!({"installer_path": "C:/Temp/update.exe"}),
+            input: json!({"download_receipt": "dsur1.123456781234123412341234567890ab.3"}),
             access_mode: AccessMode::FullAccess,
             run_id: None,
         })

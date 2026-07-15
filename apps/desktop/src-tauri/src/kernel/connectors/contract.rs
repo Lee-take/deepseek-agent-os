@@ -177,8 +177,10 @@ pub fn validate_mutation_contract(
         return Err("provider mutation contract returned an uncertain first result".to_string());
     };
     validate_mutation_receipt(&applied, provider.provider_id(), account, invocation, false)?;
+    let mut reconciliation_invocation = invocation.clone();
+    reconciliation_invocation.status = super::ConnectorInvocationStatus::ReconciliationRequired;
     let ConnectorReconciliationOutcome::Applied(reconciled) = reconciler
-        .reconcile_mutation(account, invocation)
+        .reconcile_mutation(account, &reconciliation_invocation)
         .map_err(|_| "provider failed the read-only reconciliation contract".to_string())?
     else {
         return Err("provider could not reconcile its applied contract fixture".to_string());
@@ -361,6 +363,8 @@ mod tests {
                 capability,
                 target_ref: format!("contract-target:{}", capability.contract_name()),
                 preview_hash: "sha256:contract-preview".to_string(),
+                intent_hash: None,
+                intent: None,
                 idempotency_key,
                 automation_run_id,
                 agent_run_id: None,

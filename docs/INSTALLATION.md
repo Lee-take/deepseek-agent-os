@@ -6,17 +6,16 @@ project does not depend on the maintainer's local directories.
 
 ## Windows Installer
 
-The Windows build produces a normal NSIS setup executable:
+The published Windows release provides a normal NSIS setup executable:
 
 ```text
-DS Agent_0.9.0_x64-setup.exe
+DS.Agent_1.0.0_x64-setup.exe
 ```
 
-The `v0.9.0` stable release attaches this Windows installer. Existing `v0.5.0`,
-`v0.8.0-rc.1` and `v0.8.0` installations can detect `v0.9.0` through the
-built-in updater; equal or newer installations are not offered a downgrade.
-The historical v0.8 stable release and RC remain immutable. The installer is
-unsigned, so Windows may show an unknown-publisher warning. The installer
+Version `1.0.0` is the current published stable release. Earlier commits, tags,
+Releases, and assets remain immutable. The installer is unsigned, so Windows
+may show an unknown-publisher warning. Verify its SHA-256 against the value in
+`docs/RELEASE_NOTES_v1.0.0.md` before running it. The installer
 embeds the Microsoft WebView2 bootstrapper and runs it silently when the target
 machine needs the WebView2 runtime; users do not need Node.js, pnpm, Rust, or a
 source checkout to run the installed app.
@@ -256,14 +255,14 @@ before using the local bridge for screen inspection, computer control, and
 source-linked web search. In this preview, start and stop the bridge service
 yourself; DS Agent does not launch or manage the bridge service in this preview.
 
-## Current Deferred Connectors
+## Current Connector Boundary
 
-Email read, draft, and send tools are approval and audit surfaces in this
-version. They record permission decisions but do not read, draft, or send real
-mail yet.
-
-Local folder read and work-package export use local folders and local export
-packages in this version. Cloud-drive connectors are deferred.
+Microsoft/Google-shaped mail and calendar flows are implemented and validated
+offline with adversarial fake providers. Production account registration and
+live-provider execution remain disabled. The release therefore does not use a
+real account, read live mail/calendar data, send mail, or create, modify, or
+cancel real calendar events unless those separate boundaries are deliberately
+enabled and authorized in a future release.
 
 ## Troubleshooting
 

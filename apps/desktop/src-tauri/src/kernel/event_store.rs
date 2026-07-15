@@ -2,8 +2,12 @@
 
 mod artifact;
 mod computer_use;
+mod connector_draft;
 mod read_execution;
 mod revocation;
+mod workspace_undo;
+
+pub use connector_draft::ConnectedWorkReviewView;
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +33,10 @@ use crate::kernel::automation::{
 use crate::kernel::capability::{CapabilityInvocation, CapabilityInvocationStatus};
 use crate::kernel::connectors::catalog::ConnectorSyncHealthSnapshot;
 use crate::kernel::connectors::domain::{CalendarEvent, MailMessage};
+use crate::kernel::connectors::draft::{
+    ConnectorCalendarProposal, ConnectorCalendarProposalStatus, ConnectorMailDraft,
+    ConnectorMailDraftStatus,
+};
 use crate::kernel::connectors::landing::{
     connector_attachment_landing_fingerprint, connector_attachment_workspace_binding,
     ConnectorAttachmentCleanupCandidate, ConnectorAttachmentDownloadPermit,
@@ -1607,8 +1615,10 @@ impl EventStore {
         )?;
         artifact::migrate(self)?;
         computer_use::migrate(self)?;
+        connector_draft::migrate(self)?;
         revocation::migrate(self)?;
         read_execution::migrate(self)?;
+        workspace_undo::migrate(self)?;
         ensure_sqlite_column(
             &self.conn,
             "connector_sync_streams",
@@ -2802,11 +2812,14 @@ impl EventStore {
     pub fn edit_review_queue_item(
         &self,
         id: Uuid,
+        action_revision: &str,
         title: String,
         preview_fingerprint: Option<String>,
         changed_at: DateTime<Utc>,
     ) -> EventStoreResult<ReviewQueueItem> {
         let mut item = self.review_queue_item(id)?;
+        item.validate_action_revision(action_revision)
+            .map_err(EventStoreError::InvalidState)?;
         let previous_revision = item.revision;
         let resolution = self.review_tool_approval_invalidation(&item, "Review preview changed")?;
         item.edit(title, preview_fingerprint, changed_at)
@@ -2818,10 +2831,13 @@ impl EventStore {
     pub fn resolve_review_queue_item(
         &self,
         id: Uuid,
+        action_revision: &str,
         accepted: bool,
         changed_at: DateTime<Utc>,
     ) -> EventStoreResult<ReviewQueueItem> {
         let mut item = self.review_queue_item(id)?;
+        item.validate_action_revision(action_revision)
+            .map_err(EventStoreError::InvalidState)?;
         let previous_revision = item.revision;
         let resolution = (!accepted)
             .then(|| self.review_tool_approval_invalidation(&item, "Review item rejected"))
@@ -4902,6 +4918,11 @@ impl EventStore {
                 "connector mutation account generation projection is inconsistent".to_string(),
             ));
         }
+        if let Some(mutation) = invocation.mutation.as_ref() {
+            mutation
+                .validate_intent_binding()
+                .map_err(EventStoreError::InvalidState)?;
+        }
         let account_generation = invocation
             .account_generation
             .map(|generation| {
@@ -6743,6 +6764,36 @@ impl EventStore {
         id: Uuid,
         changed_at: DateTime<Utc>,
     ) -> EventStoreResult<ConnectorInvocation> {
+        self.start_connector_invocation(id, None, changed_at)
+    }
+
+    pub(crate) fn resolve_and_start_connector_invocation(
+        &self,
+        id: Uuid,
+        note: String,
+        expected_request_revision: u64,
+        expected_preview_revision: u32,
+        expected_preview_hash: String,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorInvocation> {
+        self.start_connector_invocation(
+            id,
+            Some((
+                note,
+                expected_request_revision,
+                expected_preview_revision,
+                expected_preview_hash,
+            )),
+            changed_at,
+        )
+    }
+
+    fn start_connector_invocation(
+        &self,
+        id: Uuid,
+        exact_approval: Option<(String, u64, u32, String)>,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<ConnectorInvocation> {
         let mut invocation = self.connector_invocation(id)?;
         if invocation.status != ConnectorInvocationStatus::PendingApproval {
             return Err(EventStoreError::InvalidState(
@@ -6794,15 +6845,73 @@ impl EventStore {
         let approval_request_id = tool_record.approval_request_id.ok_or_else(|| {
             EventStoreError::InvalidState("connector approval request is missing".to_string())
         })?;
-        let approved = self
-            .list_capability_access_records()?
-            .into_iter()
-            .any(|record| {
-                record.request.id == approval_request_id
-                    && record.request.capability == CapabilityKind::ConnectorWrite
-                    && record.effective_status == CapabilityAccessStatus::Approved
-                    && record.grant_state == CapabilityGrantState::OneShotAvailable
+        let exact_local_draft_approval_required = invocation
+            .mutation
+            .as_ref()
+            .and_then(|mutation| mutation.intent.as_ref())
+            .and_then(|intent| intent.mail_content())
+            .is_some();
+        let approval_record = self.capability_access_record_by_id(approval_request_id)?;
+        let resolution = if let Some((
+            note,
+            expected_request_revision,
+            expected_preview_revision,
+            expected_preview_hash,
+        )) = exact_approval
+        {
+            if approval_record.request.capability != CapabilityKind::ConnectorWrite
+                || approval_record.effective_status != CapabilityAccessStatus::PendingApproval
+                || approval_record.resolution.is_some()
+                || approval_record.projection_revision != expected_request_revision
+            {
+                return Err(EventStoreError::InvalidState(
+                    "connector mutation approval is stale or unavailable".to_string(),
+                ));
+            }
+            let scope = approval_record.request.exact_tool.as_ref().ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "connector mutation approval has no exact preview evidence".to_string(),
+                )
+            })?;
+            if scope.tool_id != crate::kernel::tool_runtime::CONNECTOR_MUTATE_TOOL_ID
+                || scope.request_fingerprint != invocation.request_fingerprint
+                || scope.preview_revision != expected_preview_revision
+                || scope.preview_hash != expected_preview_hash
+            {
+                return Err(EventStoreError::InvalidState(
+                    "connector mutation approval preview changed".to_string(),
+                ));
+            }
+            Some(
+                PermissionResolution::new_exact(
+                    approval_request_id,
+                    true,
+                    note,
+                    expected_request_revision,
+                    scope,
+                )
+                .map_err(EventStoreError::InvalidState)?,
+            )
+        } else {
+            None
+        };
+        let approved = resolution.is_some() || {
+            let record = &approval_record;
+            let exact_scope_valid = record.request.exact_tool.as_ref().is_some_and(|scope| {
+                scope.tool_id == crate::kernel::tool_runtime::CONNECTOR_MUTATE_TOOL_ID
+                    && scope.request_fingerprint == invocation.request_fingerprint
+                    && record.resolution.as_ref().is_some_and(|resolution| {
+                        resolution.exact_preview_revision == Some(scope.preview_revision)
+                            && resolution.exact_preview_hash.as_deref()
+                                == Some(scope.preview_hash.as_str())
+                    })
             });
+            record.request.id == approval_request_id
+                && record.request.capability == CapabilityKind::ConnectorWrite
+                && record.effective_status == CapabilityAccessStatus::Approved
+                && record.grant_state == CapabilityGrantState::OneShotAvailable
+                && (!exact_local_draft_approval_required || exact_scope_valid)
+        };
         if !approved {
             return Err(EventStoreError::InvalidState(
                 "exact connector approval is not available".to_string(),
@@ -6831,8 +6940,15 @@ impl EventStore {
         tool_record.finished_at = None;
         invocation.status = ConnectorInvocationStatus::Running;
         invocation.updated_at = changed_at;
+        let resolution_event = resolution
+            .as_ref()
+            .map(|resolution| KernelEvent::new(PERMISSION_RESOLUTION_RECORDED_EVENT, resolution))
+            .transpose()?;
         let tool_event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, &tool_record)?;
-        let transaction = self.conn.unchecked_transaction()?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if let Some(event) = &resolution_event {
+            Self::insert_kernel_event(&transaction, event)?;
+        }
         transaction.execute(
             r#"INSERT INTO connector_approval_consumptions
                (request_id, connector_invocation_id, consumed_at)
@@ -7449,6 +7565,199 @@ impl EventStore {
         Ok(invocation)
     }
 
+    fn consume_completed_connected_work_projection(
+        transaction: &Transaction<'_>,
+        invocation: &ConnectorInvocation,
+        changed_at: DateTime<Utc>,
+    ) -> EventStoreResult<bool> {
+        if invocation.status != ConnectorInvocationStatus::Succeeded {
+            return Err(EventStoreError::InvalidState(
+                "only a successful connector invocation can consume connected work".to_string(),
+            ));
+        }
+        let invocation_id = invocation.id.to_string();
+        let draft_id = transaction
+            .query_row(
+                r#"SELECT draft_id FROM connector_mail_draft_reviews
+                   WHERE connector_invocation_id = ?1"#,
+                params![invocation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let proposal_id = transaction
+            .query_row(
+                r#"SELECT proposal_id FROM connector_calendar_proposal_reviews
+                   WHERE connector_invocation_id = ?1"#,
+                params![invocation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if draft_id.is_some() && proposal_id.is_some() {
+            return Err(EventStoreError::InvalidState(
+                "connector invocation is bound to multiple connected-work projections".to_string(),
+            ));
+        }
+
+        if let Some(draft_id) = draft_id {
+            let (draft_json, projected_status, projected_revision) = transaction.query_row(
+                r#"SELECT draft_json, status, revision FROM connector_mail_drafts
+                   WHERE id = ?1"#,
+                params![draft_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?;
+            let mut draft: ConnectorMailDraft = serde_json::from_str(&draft_json)?;
+            draft.validate().map_err(EventStoreError::InvalidState)?;
+            if projected_status != serde_json::to_string(&draft.status)?
+                || projected_revision
+                    != i64::try_from(draft.revision).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector mail draft revision is too large".to_string(),
+                        )
+                    })?
+            {
+                return Err(EventStoreError::InvalidState(
+                    "connector mail draft projection changed before completion".to_string(),
+                ));
+            }
+            if draft.status == ConnectorMailDraftStatus::Consumed
+                && draft.consumed_by_invocation_id == Some(invocation.id)
+            {
+                return Ok(false);
+            }
+            let expected_target = format!("local-draft:{}", draft.id);
+            if invocation.provider_id != draft.provider_id
+                || invocation.account_id != draft.account_id
+                || invocation.account_generation != Some(draft.account_generation)
+                || invocation
+                    .mutation_intent()
+                    .ok()
+                    .map(|intent| intent.target_ref())
+                    != Some(expected_target.as_str())
+            {
+                return Err(EventStoreError::InvalidState(
+                    "connector mail draft does not match the successful invocation".to_string(),
+                ));
+            }
+            let previous_revision = draft.revision;
+            draft
+                .consume(invocation.id, changed_at)
+                .map_err(EventStoreError::InvalidState)?;
+            let changed = transaction.execute(
+                r#"UPDATE connector_mail_drafts
+                   SET draft_json = ?2, status = ?3, revision = ?4,
+                       consumed_by_invocation_id = ?5, updated_at = ?6
+                   WHERE id = ?1 AND status = ?7 AND revision = ?8"#,
+                params![
+                    draft.id.to_string(),
+                    serde_json::to_string(&draft)?,
+                    serde_json::to_string(&draft.status)?,
+                    i64::try_from(draft.revision).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector mail draft revision is too large".to_string(),
+                        )
+                    })?,
+                    invocation.id.to_string(),
+                    changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    serde_json::to_string(&ConnectorMailDraftStatus::Frozen)?,
+                    i64::try_from(previous_revision).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector mail draft revision is too large".to_string(),
+                        )
+                    })?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(EventStoreError::InvalidState(
+                    "connector mail draft consumption raced".to_string(),
+                ));
+            }
+            return Ok(true);
+        }
+
+        if let Some(proposal_id) = proposal_id {
+            let (proposal_json, projected_status, projected_revision) = transaction.query_row(
+                r#"SELECT proposal_json, status, revision FROM connector_calendar_proposals
+                   WHERE id = ?1"#,
+                params![proposal_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?;
+            let mut proposal: ConnectorCalendarProposal = serde_json::from_str(&proposal_json)?;
+            proposal.validate().map_err(EventStoreError::InvalidState)?;
+            if projected_status != serde_json::to_string(&proposal.status)?
+                || projected_revision
+                    != i64::try_from(proposal.revision).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector calendar proposal revision is too large".to_string(),
+                        )
+                    })?
+            {
+                return Err(EventStoreError::InvalidState(
+                    "connector calendar proposal projection changed before completion".to_string(),
+                ));
+            }
+            if proposal.status == ConnectorCalendarProposalStatus::Consumed
+                && proposal.consumed_by_invocation_id == Some(invocation.id)
+            {
+                return Ok(false);
+            }
+            if invocation.provider_id != proposal.provider_id
+                || invocation.account_id != proposal.account_id
+                || invocation.account_generation != Some(proposal.account_generation)
+                || invocation.mutation_intent().ok() != Some(&proposal.intent)
+            {
+                return Err(EventStoreError::InvalidState(
+                    "connector calendar proposal does not match the successful invocation"
+                        .to_string(),
+                ));
+            }
+            let previous_revision = proposal.revision;
+            proposal
+                .consume(invocation.id, changed_at)
+                .map_err(EventStoreError::InvalidState)?;
+            let changed = transaction.execute(
+                r#"UPDATE connector_calendar_proposals
+                   SET proposal_json = ?2, status = ?3, revision = ?4, updated_at = ?5
+                   WHERE id = ?1 AND status = ?6 AND revision = ?7"#,
+                params![
+                    proposal.id.to_string(),
+                    serde_json::to_string(&proposal)?,
+                    serde_json::to_string(&proposal.status)?,
+                    i64::try_from(proposal.revision).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector calendar proposal revision is too large".to_string(),
+                        )
+                    })?,
+                    changed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    serde_json::to_string(&ConnectorCalendarProposalStatus::Frozen)?,
+                    i64::try_from(previous_revision).map_err(|_| {
+                        EventStoreError::InvalidState(
+                            "connector calendar proposal revision is too large".to_string(),
+                        )
+                    })?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(EventStoreError::InvalidState(
+                    "connector calendar proposal consumption raced".to_string(),
+                ));
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn complete_connector_invocation_internal(
         &self,
         id: Uuid,
@@ -7699,6 +8008,7 @@ impl EventStore {
                 ));
             }
         }
+        Self::consume_completed_connected_work_projection(&transaction, &invocation, changed_at)?;
         transaction.commit()?;
         Ok(invocation)
     }
@@ -13399,6 +13709,50 @@ impl EventStore {
         Ok(resolution)
     }
 
+    pub fn resolve_connector_mutation_access_request(
+        &self,
+        request_id: Uuid,
+        approved: bool,
+        note: String,
+        expected_request_revision: u64,
+        expected_preview_revision: u32,
+        expected_preview_hash: &str,
+    ) -> EventStoreResult<PermissionResolution> {
+        let record = self.capability_access_record_by_id(request_id)?;
+        if record.request.capability != CapabilityKind::ConnectorWrite
+            || record.effective_status != CapabilityAccessStatus::PendingApproval
+            || record.resolution.is_some()
+            || record.projection_revision != expected_request_revision
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector mutation approval is stale or unavailable".to_string(),
+            ));
+        }
+        let scope = record.request.exact_tool.as_ref().ok_or_else(|| {
+            EventStoreError::InvalidState(
+                "connector mutation approval has no exact preview evidence".to_string(),
+            )
+        })?;
+        if scope.tool_id != crate::kernel::tool_runtime::CONNECTOR_MUTATE_TOOL_ID
+            || scope.preview_revision != expected_preview_revision
+            || scope.preview_hash != expected_preview_hash
+        {
+            return Err(EventStoreError::InvalidState(
+                "connector mutation approval preview changed".to_string(),
+            ));
+        }
+        let resolution = PermissionResolution::new_exact(
+            request_id,
+            approved,
+            note,
+            expected_request_revision,
+            scope,
+        )
+        .map_err(EventStoreError::InvalidState)?;
+        self.append_permission_resolution(&resolution)?;
+        Ok(resolution)
+    }
+
     #[cfg(test)]
     fn resolve_connector_attachment_access_request(
         &self,
@@ -14255,9 +14609,11 @@ mod tests {
             store
                 .upsert_review_queue_item(&item)
                 .expect("item persists");
+            let stale_action_revision = item.action_revision();
             let edited = store
                 .edit_review_queue_item(
                     item.id,
+                    &stale_action_revision,
                     "Edited draft".to_string(),
                     Some("sha256:preview-b".to_string()),
                     Utc::now(),
@@ -14266,6 +14622,9 @@ mod tests {
             assert_eq!(edited.status, ReviewQueueItemStatus::PendingReview);
             assert!(edited.tool_invocation_id.is_none());
             assert_eq!(edited.revision, 2);
+            assert!(store
+                .resolve_review_queue_item(item.id, &stale_action_revision, false, Utc::now(),)
+                .is_err());
             let access = store
                 .list_capability_access_records()
                 .expect("access records load");
@@ -14284,8 +14643,9 @@ mod tests {
             store
                 .upsert_review_queue_item(&edited)
                 .expect("new approval persists");
+            let exact_action_revision = edited.action_revision();
             store
-                .resolve_review_queue_item(item.id, false, Utc::now())
+                .resolve_review_queue_item(item.id, &exact_action_revision, false, Utc::now())
                 .expect("review rejects");
             assert!(store.upsert_review_queue_item(&item).is_err());
         }
@@ -18899,6 +19259,24 @@ mod tests {
                       status TEXT NOT NULL,
                       updated_at TEXT NOT NULL
                     );
+                    CREATE TABLE connector_calendar_proposals (
+                      id TEXT PRIMARY KEY NOT NULL,
+                      provider_id TEXT NOT NULL,
+                      account_id TEXT NOT NULL,
+                      account_generation INTEGER NOT NULL,
+                      proposal_json TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      revision INTEGER NOT NULL,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE connector_calendar_proposal_reviews (
+                      proposal_id TEXT PRIMARY KEY NOT NULL,
+                      automation_run_id TEXT NOT NULL UNIQUE,
+                      agent_run_id TEXT NOT NULL,
+                      review_item_id TEXT NOT NULL UNIQUE,
+                      created_at TEXT NOT NULL
+                    );
                     "#,
                 )
                 .expect("legacy schema builds");
@@ -18942,6 +19320,16 @@ mod tests {
                 ("connector_invocations", "reconciliation_attempt_count"),
                 ("connector_invocations", "reconciliation_quarantine_code"),
                 ("connector_invocations", "reconciliation_quarantined_at"),
+                (
+                    "connector_calendar_proposal_reviews",
+                    "proposal_action_revision",
+                ),
+                ("connector_calendar_proposal_reviews", "access_request_id"),
+                ("connector_calendar_proposal_reviews", "tool_invocation_id"),
+                (
+                    "connector_calendar_proposal_reviews",
+                    "connector_invocation_id",
+                ),
             ] {
                 let present = store
                     .conn
@@ -18955,6 +19343,16 @@ mod tests {
                     .any(|candidate| candidate == column);
                 assert!(present, "missing migrated column {table}.{column}");
             }
+            let workspace_undo_table: i64 = store
+                .conn
+                .query_row(
+                    r#"SELECT COUNT(*) FROM sqlite_master
+                       WHERE type = 'table' AND name = 'workspace_mutation_checkpoints'"#,
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("workspace undo migration table query succeeds");
+            assert_eq!(workspace_undo_table, 1);
         }
     }
 

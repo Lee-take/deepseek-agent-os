@@ -1,6 +1,7 @@
 use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -63,11 +64,20 @@ pub struct AutomationDefinition {
 
 impl AutomationDefinition {
     pub fn once(goal: String, timezone: String, run_at: DateTime<Utc>) -> Result<Self, String> {
+        Self::once_with_id(Uuid::new_v4(), goal, timezone, run_at, Utc::now())
+    }
+
+    pub(crate) fn once_with_id(
+        id: Uuid,
+        goal: String,
+        timezone: String,
+        run_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, String> {
         let goal = required_text(goal, "automation goal")?;
         let timezone = required_text(timezone, "automation timezone")?;
-        let now = Utc::now();
         Ok(Self {
-            id: Uuid::new_v4(),
+            id,
             revision: 0,
             goal,
             timezone,
@@ -148,7 +158,62 @@ pub struct ReviewQueueItem {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReviewQueueItemView {
+    pub id: Uuid,
+    pub automation_run_id: Uuid,
+    pub agent_run_id: Option<Uuid>,
+    pub tool_invocation_id: Option<Uuid>,
+    pub status: ReviewQueueItemStatus,
+    pub preview_fingerprint: Option<String>,
+    pub revision: u32,
+    pub action_revision: String,
+    pub title: String,
+    pub evidence_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 impl ReviewQueueItem {
+    pub fn action_revision(&self) -> String {
+        let canonical = serde_json::to_vec(&(
+            "ds-agent.review-action.v1",
+            self.id,
+            self.automation_run_id,
+            self.agent_run_id,
+            self.tool_invocation_id,
+            self.status,
+            self.preview_fingerprint.as_deref(),
+            self.revision,
+        ))
+        .expect("review action fields are serializable");
+        format!("review1:{}", hex::encode(Sha256::digest(canonical)))
+    }
+
+    pub fn public_view(&self) -> ReviewQueueItemView {
+        ReviewQueueItemView {
+            id: self.id,
+            automation_run_id: self.automation_run_id,
+            agent_run_id: self.agent_run_id,
+            tool_invocation_id: self.tool_invocation_id,
+            status: self.status,
+            preview_fingerprint: self.preview_fingerprint.clone(),
+            revision: self.revision,
+            action_revision: self.action_revision(),
+            title: self.title.clone(),
+            evidence_ref: self.evidence_ref.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+
+    pub fn validate_action_revision(&self, value: &str) -> Result<(), String> {
+        if value != self.action_revision() {
+            return Err("review action is stale or does not match this exact revision".to_string());
+        }
+        Ok(())
+    }
+
     pub fn edit(
         &mut self,
         title: String,

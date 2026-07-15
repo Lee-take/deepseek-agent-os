@@ -5,6 +5,7 @@ use super::provider::{CalendarConnectorProvider, MailConnectorProvider};
 use super::reconciliation::{ConnectorReconcilerRegistry, EmptyConnectorReconcilerRegistry};
 use super::revocation::{ConnectorRevocationProvider, ConnectorRevocationRegistry};
 use super::sync::{CalendarSyncProvider, MailSyncProvider};
+use super::{ConnectorCapability, ConnectorMutationProvider};
 
 pub(crate) trait ConnectorOAuthRegistry: Send + Sync {
     fn provider(&self, provider_key: &str) -> Option<&dyn ConnectorOAuthProvider>;
@@ -25,6 +26,20 @@ pub(crate) trait ConnectorSyncRegistry: Send + Sync {
 
     fn execution_enabled(&self) -> bool {
         false
+    }
+}
+
+pub(crate) trait ConnectorMutationRegistry: Send + Sync {
+    fn provider(&self, provider_key: &str) -> Option<&dyn ConnectorMutationProvider>;
+
+    fn execution_enabled(&self) -> bool {
+        false
+    }
+
+    fn supports(&self, provider_key: &str, capability: ConnectorCapability) -> bool {
+        self.provider(provider_key).is_some_and(|provider| {
+            provider.provider_id() == provider_key && provider.capabilities().contains(&capability)
+        })
     }
 }
 
@@ -64,6 +79,15 @@ impl ConnectorSyncRegistry for EmptyConnectorSyncRegistry {
 }
 
 #[derive(Default)]
+struct EmptyConnectorMutationRegistry;
+
+impl ConnectorMutationRegistry for EmptyConnectorMutationRegistry {
+    fn provider(&self, _provider_key: &str) -> Option<&dyn ConnectorMutationProvider> {
+        None
+    }
+}
+
+#[derive(Default)]
 struct EmptyConnectorRevocationRegistry;
 
 impl ConnectorRevocationRegistry for EmptyConnectorRevocationRegistry {
@@ -76,6 +100,7 @@ pub(crate) struct ConnectorRuntimeRegistries {
     oauth: Arc<dyn ConnectorOAuthRegistry>,
     reads: Arc<dyn ConnectorReadRegistry>,
     syncs: Arc<dyn ConnectorSyncRegistry>,
+    mutations: Arc<dyn ConnectorMutationRegistry>,
     reconcilers: Arc<dyn ConnectorReconcilerRegistry>,
     revocations: Arc<dyn ConnectorRevocationRegistry>,
 }
@@ -86,6 +111,7 @@ impl ConnectorRuntimeRegistries {
             oauth: Arc::new(EmptyConnectorOAuthRegistry),
             reads: Arc::new(EmptyConnectorReadRegistry),
             syncs: Arc::new(EmptyConnectorSyncRegistry),
+            mutations: Arc::new(EmptyConnectorMutationRegistry),
             reconcilers: Arc::new(EmptyConnectorReconcilerRegistry),
             revocations: Arc::new(EmptyConnectorRevocationRegistry),
         }
@@ -107,6 +133,10 @@ impl ConnectorRuntimeRegistries {
         Arc::clone(&self.oauth)
     }
 
+    pub(crate) fn mutations(&self) -> Arc<dyn ConnectorMutationRegistry> {
+        Arc::clone(&self.mutations)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_reconciler_for_test(
         reconcilers: Arc<dyn ConnectorReconcilerRegistry>,
@@ -115,6 +145,7 @@ impl ConnectorRuntimeRegistries {
             oauth: Arc::new(EmptyConnectorOAuthRegistry),
             reads: Arc::new(EmptyConnectorReadRegistry),
             syncs: Arc::new(EmptyConnectorSyncRegistry),
+            mutations: Arc::new(EmptyConnectorMutationRegistry),
             reconcilers,
             revocations: Arc::new(EmptyConnectorRevocationRegistry),
         }
@@ -126,6 +157,7 @@ impl ConnectorRuntimeRegistries {
             oauth,
             reads: Arc::new(EmptyConnectorReadRegistry),
             syncs: Arc::new(EmptyConnectorSyncRegistry),
+            mutations: Arc::new(EmptyConnectorMutationRegistry),
             reconcilers: Arc::new(EmptyConnectorReconcilerRegistry),
             revocations: Arc::new(EmptyConnectorRevocationRegistry),
         }
@@ -137,6 +169,7 @@ impl ConnectorRuntimeRegistries {
             oauth: Arc::new(EmptyConnectorOAuthRegistry),
             reads: Arc::new(EmptyConnectorReadRegistry),
             syncs,
+            mutations: Arc::new(EmptyConnectorMutationRegistry),
             reconcilers: Arc::new(EmptyConnectorReconcilerRegistry),
             revocations: Arc::new(EmptyConnectorRevocationRegistry),
         }
@@ -148,6 +181,19 @@ impl ConnectorRuntimeRegistries {
             oauth: Arc::new(EmptyConnectorOAuthRegistry),
             reads,
             syncs: Arc::new(EmptyConnectorSyncRegistry),
+            mutations: Arc::new(EmptyConnectorMutationRegistry),
+            reconcilers: Arc::new(EmptyConnectorReconcilerRegistry),
+            revocations: Arc::new(EmptyConnectorRevocationRegistry),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_mutation_for_test(mutations: Arc<dyn ConnectorMutationRegistry>) -> Self {
+        Self {
+            oauth: Arc::new(EmptyConnectorOAuthRegistry),
+            reads: Arc::new(EmptyConnectorReadRegistry),
+            syncs: Arc::new(EmptyConnectorSyncRegistry),
+            mutations,
             reconcilers: Arc::new(EmptyConnectorReconcilerRegistry),
             revocations: Arc::new(EmptyConnectorRevocationRegistry),
         }
@@ -170,6 +216,9 @@ mod tests {
         assert!(registries.syncs.mail_provider("microsoft").is_none());
         assert!(registries.syncs.calendar_provider("google").is_none());
         assert!(!registries.syncs.execution_enabled());
+        assert!(registries.mutations.provider("microsoft").is_none());
+        assert!(registries.mutations.provider("google").is_none());
+        assert!(!registries.mutations.execution_enabled());
         assert!(registries.reconcilers.reconciler("microsoft").is_none());
         assert!(registries.revocations.provider("google").is_none());
     }

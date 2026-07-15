@@ -9,17 +9,80 @@ use zeroize::Zeroize;
 use super::{ConnectorAccount, ConnectorCredentialHandle, ConnectorSecret};
 
 const MAX_CONNECTOR_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_CONNECTOR_HTTP_REQUEST_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorHttpMethod {
     Get,
+    Post,
+    Patch,
+    Delete,
+}
+
+pub struct ConnectorHttpBody {
+    content_type: &'static str,
+    bytes: Vec<u8>,
+}
+
+impl ConnectorHttpBody {
+    pub fn json(value: &Value) -> Result<Self, ConnectorHttpFailure> {
+        let bytes = serde_json::to_vec(value).map_err(|_| ConnectorHttpFailure::InvalidRequest)?;
+        Self::new("application/json", bytes)
+    }
+
+    pub fn text_plain(value: String) -> Result<Self, ConnectorHttpFailure> {
+        Self::new("text/plain", value.into_bytes())
+    }
+
+    pub fn json_owned(mut value: Value) -> Result<Self, ConnectorHttpFailure> {
+        let result = serde_json::to_vec(&value)
+            .map_err(|_| ConnectorHttpFailure::InvalidRequest)
+            .and_then(|bytes| Self::new("application/json", bytes));
+        zeroize_json_value(&mut value);
+        result
+    }
+
+    fn new(content_type: &'static str, mut bytes: Vec<u8>) -> Result<Self, ConnectorHttpFailure> {
+        if bytes.len() > MAX_CONNECTOR_HTTP_REQUEST_BYTES {
+            bytes.zeroize();
+            return Err(ConnectorHttpFailure::InvalidRequest);
+        }
+        Ok(Self {
+            content_type,
+            bytes,
+        })
+    }
+
+    pub fn content_type(&self) -> &'static str {
+        self.content_type
+    }
+
+    #[cfg(test)]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn zeroize_json_value(value: &mut Value) {
+    match value {
+        Value::String(value) => value.zeroize(),
+        Value::Array(values) => values.iter_mut().for_each(zeroize_json_value),
+        Value::Object(values) => values.values_mut().for_each(zeroize_json_value),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+impl Drop for ConnectorHttpBody {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
 }
 
 pub struct ConnectorHttpRequest {
     pub method: ConnectorHttpMethod,
     pub url: String,
     pub headers: BTreeMap<String, String>,
-    pub body: Option<Value>,
+    pub body: Option<ConnectorHttpBody>,
     pub max_response_bytes: usize,
 }
 
@@ -107,6 +170,7 @@ impl<T: ConnectorHttpTransport + ?Sized> ConnectorHttpTransport for std::sync::A
     }
 }
 
+#[derive(Clone, Copy)]
 struct ConnectorHttpOrigin {
     scheme: &'static str,
     host: &'static str,
@@ -116,25 +180,44 @@ struct ConnectorHttpOrigin {
 pub struct ReqwestConnectorHttpTransport<R> {
     client: reqwest::blocking::Client,
     access_tokens: R,
-    origin: ConnectorHttpOrigin,
+    origins: Vec<ConnectorHttpOrigin>,
 }
 
 impl<R: ConnectorAccessTokenResolver> ReqwestConnectorHttpTransport<R> {
     pub fn new_microsoft(access_tokens: R) -> Result<Self, ConnectorHttpFailure> {
         Self::build(
             access_tokens,
-            ConnectorHttpOrigin {
+            vec![ConnectorHttpOrigin {
                 scheme: "https",
                 host: "graph.microsoft.com",
                 port: None,
-            },
+            }],
+            true,
+        )
+    }
+
+    pub fn new_google(access_tokens: R) -> Result<Self, ConnectorHttpFailure> {
+        Self::build(
+            access_tokens,
+            vec![
+                ConnectorHttpOrigin {
+                    scheme: "https",
+                    host: "gmail.googleapis.com",
+                    port: None,
+                },
+                ConnectorHttpOrigin {
+                    scheme: "https",
+                    host: "www.googleapis.com",
+                    port: None,
+                },
+            ],
             true,
         )
     }
 
     fn build(
         access_tokens: R,
-        origin: ConnectorHttpOrigin,
+        origins: Vec<ConnectorHttpOrigin>,
         https_only: bool,
     ) -> Result<Self, ConnectorHttpFailure> {
         let client = reqwest::blocking::Client::builder()
@@ -149,7 +232,7 @@ impl<R: ConnectorAccessTokenResolver> ReqwestConnectorHttpTransport<R> {
         Ok(Self {
             client,
             access_tokens,
-            origin,
+            origins,
         })
     }
 
@@ -157,11 +240,11 @@ impl<R: ConnectorAccessTokenResolver> ReqwestConnectorHttpTransport<R> {
     fn new_test_http(access_tokens: R, port: u16) -> Result<Self, ConnectorHttpFailure> {
         Self::build(
             access_tokens,
-            ConnectorHttpOrigin {
+            vec![ConnectorHttpOrigin {
                 scheme: "http",
                 host: "127.0.0.1",
                 port: Some(port),
-            },
+            }],
             false,
         )
     }
@@ -170,8 +253,11 @@ impl<R: ConnectorAccessTokenResolver> ReqwestConnectorHttpTransport<R> {
         &self,
         request: &ConnectorHttpRequest,
     ) -> Result<reqwest::Url, ConnectorHttpFailure> {
-        if request.method != ConnectorHttpMethod::Get
-            || request.body.is_some()
+        let body_allowed = matches!(
+            request.method,
+            ConnectorHttpMethod::Post | ConnectorHttpMethod::Patch
+        );
+        if (request.body.is_some() && !body_allowed)
             || request.max_response_bytes == 0
             || request.max_response_bytes > MAX_CONNECTOR_HTTP_RESPONSE_BYTES
         {
@@ -179,14 +265,14 @@ impl<R: ConnectorAccessTokenResolver> ReqwestConnectorHttpTransport<R> {
         }
         let url =
             reqwest::Url::parse(&request.url).map_err(|_| ConnectorHttpFailure::InvalidRequest)?;
-        let expected_port = self.origin.port;
-        let valid_origin = url.scheme() == self.origin.scheme
-            && url.host_str() == Some(self.origin.host)
-            && match expected_port {
-                Some(port) => url.port() == Some(port),
-                None => url.port().is_none(),
-            }
-            && url.username().is_empty()
+        let valid_origin = self.origins.iter().any(|origin| {
+            url.scheme() == origin.scheme
+                && url.host_str() == Some(origin.host)
+                && match origin.port {
+                    Some(port) => url.port() == Some(port),
+                    None => url.port().is_none(),
+                }
+        }) && url.username().is_empty()
             && url.password().is_none()
             && url.fragment().is_none();
         if !valid_origin {
@@ -195,7 +281,7 @@ impl<R: ConnectorAccessTokenResolver> ReqwestConnectorHttpTransport<R> {
         for (name, value) in &request.headers {
             if !matches!(
                 name.to_ascii_lowercase().as_str(),
-                "accept" | "consistencylevel" | "prefer"
+                "accept" | "consistencylevel" | "prefer" | "if-match"
             ) || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
                 || reqwest::header::HeaderValue::from_str(value).is_err()
             {
@@ -214,9 +300,20 @@ impl<R: ConnectorAccessTokenResolver> ConnectorHttpTransport for ReqwestConnecto
     ) -> Result<ConnectorHttpResponse, ConnectorHttpFailure> {
         let url = self.validate_request(&request)?;
         let access_token = self.access_tokens.resolve(&auth)?;
-        let mut builder = self.client.get(url).bearer_auth(access_token.expose());
+        let mut builder = match request.method {
+            ConnectorHttpMethod::Get => self.client.get(url),
+            ConnectorHttpMethod::Post => self.client.post(url),
+            ConnectorHttpMethod::Patch => self.client.patch(url),
+            ConnectorHttpMethod::Delete => self.client.delete(url),
+        }
+        .bearer_auth(access_token.expose());
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
+        }
+        if let Some(body) = &request.body {
+            builder = builder
+                .header(reqwest::header::CONTENT_TYPE, body.content_type())
+                .body(body.bytes.clone());
         }
         let mut response = builder.send().map_err(|error| {
             if error.is_timeout() {

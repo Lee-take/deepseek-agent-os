@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
+use crate::connected_work_commands::{
+    dispatch_connected_work_agent_action, is_connected_work_agent_action,
+};
 #[cfg(windows)]
 use crate::kernel::connectors::{ConnectorRuntime, WindowsConnectorCredentialStore};
 
@@ -24,8 +27,7 @@ use crate::kernel::agent_run::{
 };
 use crate::kernel::app_update::{
     check_update as check_app_update, download_update as download_app_update,
-    schedule_install as schedule_app_update_install, validate_downloaded_update_installer_path,
-    APP_UPDATE_RELEASES_API_URL,
+    schedule_install as schedule_app_update_install, APP_UPDATE_RELEASES_API_URL,
 };
 use crate::kernel::artifact_render::render_artifact_file;
 use crate::kernel::artifacts::{
@@ -66,7 +68,7 @@ use crate::kernel::computer_use_session::{
 };
 use crate::kernel::connectors::reconciliation::ConnectorReconcilerRegistry;
 use crate::kernel::connectors::runtime_registry::{
-    ConnectorOAuthRegistry, ConnectorRuntimeRegistries,
+    ConnectorMutationRegistry, ConnectorOAuthRegistry, ConnectorRuntimeRegistries,
 };
 use crate::kernel::deepseek::{
     build_deepseek_chat_completion_request, current_deepseek_credential_status,
@@ -175,6 +177,7 @@ use crate::kernel::workflow::{
     OperationsBriefingRunStatus, OperationsBriefingTemplateSeedRequest,
     OPERATIONS_BRIEFING_WORKFLOW_ID,
 };
+use crate::kernel::workspace_undo::execute_checkpointed_mutation;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -193,6 +196,9 @@ impl AppState {
     ) -> Result<Self, String> {
         event_store
             .recover_computer_use_steps_after_restart(Utc::now())
+            .map_err(event_store_error)?;
+        event_store
+            .recover_workspace_mutation_checkpoints(Utc::now())
             .map_err(event_store_error)?;
         Ok(Self {
             event_store: Arc::new(Mutex::new(event_store)),
@@ -224,6 +230,17 @@ impl AppState {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_connector_mutation_registry_for_test(
+        mut self,
+        mutations: Arc<dyn ConnectorMutationRegistry>,
+    ) -> Self {
+        self.connector_registries = Arc::new(ConnectorRuntimeRegistries::with_mutation_for_test(
+            mutations,
+        ));
+        self
+    }
+
     pub(crate) fn event_store(&self) -> Arc<Mutex<EventStore>> {
         Arc::clone(&self.event_store)
     }
@@ -246,6 +263,10 @@ impl AppState {
 
     pub(crate) fn connector_oauth_providers(&self) -> Arc<dyn ConnectorOAuthRegistry> {
         self.connector_registries.oauth()
+    }
+
+    pub(crate) fn connector_mutations(&self) -> Arc<dyn ConnectorMutationRegistry> {
+        self.connector_registries.mutations()
     }
 
     #[cfg(windows)]
@@ -1882,8 +1903,14 @@ impl AgentToolExecutor for SkillActivateAgentToolExecutor {
     }
 }
 
+enum WorkspaceCheckpointStore<'a> {
+    Direct(&'a EventStore),
+    Shared(&'a Mutex<EventStore>),
+}
+
 struct FileSystemMutationAgentToolExecutor<'a, T: FileSystemMutationClient + ?Sized> {
     client: &'a T,
+    checkpoint_store: WorkspaceCheckpointStore<'a>,
 }
 
 impl<T: FileSystemMutationClient + ?Sized> AgentToolExecutor
@@ -1909,7 +1936,29 @@ impl<T: FileSystemMutationClient + ?Sized> AgentToolExecutor
             .as_str()
             .ok_or_else(|| "filesystem.mutate requires a string summary".to_string())?;
 
-        let result = self.client.mutate(operation, path, destination, content)?;
+        let result = match self.checkpoint_store {
+            WorkspaceCheckpointStore::Direct(store) => execute_checkpointed_mutation(
+                store,
+                plan,
+                self.client,
+                operation,
+                path,
+                destination,
+                content,
+            )?,
+            WorkspaceCheckpointStore::Shared(store) => {
+                let store = store.lock().map_err(|_| lock_error())?;
+                execute_checkpointed_mutation(
+                    &store,
+                    plan,
+                    self.client,
+                    operation,
+                    path,
+                    destination,
+                    content,
+                )?
+            }
+        };
         verify_filesystem_mutation_postcondition(operation, path, destination, content, &result)?;
         let evidence_reference = destination.unwrap_or(path).to_string();
         let output = serde_json::json!({
@@ -2876,17 +2925,17 @@ fn agent_app_update_tool_request(
         "app_update_check" => (APP_UPDATE_CHECK_TOOL_ID, serde_json::json!({})),
         "app_update_download" => (APP_UPDATE_DOWNLOAD_TOOL_ID, serde_json::json!({})),
         "app_update_install" => {
-            let installer_path = action
+            let download_receipt = action
                 .target
                 .as_deref()
                 .map(str::trim)
                 .filter(|target| !target.is_empty())
                 .ok_or_else(|| {
-                    "app_update_install requires the verified installer path in target".to_string()
+                    "app_update_install requires the opaque download receipt in target".to_string()
                 })?;
             (
                 APP_UPDATE_INSTALL_TOOL_ID,
-                serde_json::json!({"installer_path": installer_path}),
+                serde_json::json!({"download_receipt": download_receipt}),
             )
         }
         action_type => return Err(format!("unsupported app update action `{action_type}`")),
@@ -4011,7 +4060,10 @@ fn dispatch_agent_filesystem_mutation_tool_with_executor(
     client: &impl FileSystemMutationClient,
 ) -> Result<ToolInvocationRecord, String> {
     let request = agent_filesystem_mutation_tool_request(action, access_mode, run_id)?;
-    let executor = FileSystemMutationAgentToolExecutor { client };
+    let executor = FileSystemMutationAgentToolExecutor {
+        client,
+        checkpoint_store: WorkspaceCheckpointStore::Direct(store),
+    };
     let invocation = execute_agent_tool_with_executor(store, request, &executor)?;
     apply_tool_invocation_to_agent_action(action, &invocation);
     Ok(invocation)
@@ -4032,7 +4084,10 @@ fn dispatch_agent_filesystem_mutation_tool_with_store_mutex(
     let invocation = match authorization {
         AgentToolAuthorization::Finished(invocation) => invocation,
         AgentToolAuthorization::Ready(authorized) => {
-            let executor = FileSystemMutationAgentToolExecutor { client };
+            let executor = FileSystemMutationAgentToolExecutor {
+                client,
+                checkpoint_store: WorkspaceCheckpointStore::Shared(store_mutex),
+            };
             let invocation = run_authorized_agent_tool_execution(authorized, &executor);
             let store = store_mutex.lock().map_err(|_| lock_error())?;
             record_completed_agent_tool_execution(&store, &invocation)?;
@@ -4263,13 +4318,13 @@ fn apply_tool_invocation_to_agent_action(
     action.dispatch_note = Some(tool_invocation_dispatch_note(invocation));
 
     if action.action_type == "app_update_download" {
-        if let Some(installer_path) = invocation
+        if let Some(download_receipt) = invocation
             .output
             .as_ref()
-            .and_then(|output| output.get("installer_path"))
+            .and_then(|output| output.get("download_receipt"))
             .and_then(serde_json::Value::as_str)
         {
-            action.target = Some(installer_path.to_string());
+            action.target = Some(download_receipt.to_string());
         }
     }
     if matches!(
@@ -4965,7 +5020,8 @@ fn normalize_agent_action_proposal(
         agent_action_policy_decision(access_mode, &action.action_type, capability)
     });
     let risk_requires_confirmation = action_risk_requires_confirmation(action.risk.as_deref())
-        && !is_agent_filesystem_mutation_action(&action.action_type);
+        && !is_agent_filesystem_mutation_action(&action.action_type)
+        && !is_connected_work_agent_action(&action.action_type);
 
     action.execution_state = if !is_supported_agent_action_type(&action.action_type) {
         action.blocked_reason = Some(unsupported_agent_action_reason(&action.action_type));
@@ -4998,6 +5054,9 @@ fn normalize_agent_action_type(action_type: &str) -> String {
 }
 
 fn normalize_agent_action_alias(action: &mut AgentChatActionProposal) {
+    if normalize_connected_work_action_alias(action) {
+        return;
+    }
     if normalize_agent_app_update_alias(action) {
         return;
     }
@@ -5070,6 +5129,33 @@ fn normalize_agent_action_alias(action: &mut AgentChatActionProposal) {
             action.requires_confirmation = false;
         }
     }
+}
+
+fn normalize_connected_work_action_alias(action: &mut AgentChatActionProposal) -> bool {
+    let action_type = match action.action_type.as_str() {
+        "connected_mail_review"
+        | "email_draft"
+        | "email_send"
+        | "send_email"
+        | "mail_send"
+        | "mail_send_draft"
+        | "compose_email" => "connected_mail_review",
+        "connected_calendar_review"
+        | "calendar_change"
+        | "calendar_create"
+        | "calendar_update"
+        | "calendar_cancel"
+        | "create_calendar_event"
+        | "update_calendar_event"
+        | "cancel_calendar_event" => "connected_calendar_review",
+        _ => return false,
+    };
+    action.action_type = action_type.to_string();
+    action.risk = Some("medium".to_string());
+    // This action only creates a local review. The exact external mutation has
+    // its own content-bound approval and cannot be executed by this dispatch.
+    action.requires_confirmation = false;
+    true
 }
 
 fn normalize_agent_skill_lifecycle_alias(action: &mut AgentChatActionProposal) -> bool {
@@ -5478,6 +5564,8 @@ fn is_supported_agent_action_type(action_type: &str) -> bool {
             | "browser_browse"
             | "computer_control"
             | "computer_screenshot"
+            | "connected_mail_review"
+            | "connected_calendar_review"
             | "create_report"
             | "deepseek_key_setup"
             | "file_read"
@@ -5558,11 +5646,12 @@ fn build_agent_chat_protocol_user_prompt(
 	         - Required JSON fields: protocol_version, reply_to_user, agent_actions, missing_prerequisites.\n\
 	         - Soul update contract: when the current user message defines, changes, or confirms a durable identity, naming, response-default, workflow, writing, confirmation, privacy, initiative, or relationship setting, return soul_profile_update with fields, clear_fields, current_message_evidence, and optional confirmation_context. Allowed fields are preferred_name, address_as, language_preferences, default_response_tone, default_response_length, formatting_preferences, initiative_level, user_calls_ds_agent, ds_agent_should_refer_to_itself_as, relationship_boundary, workflow_preferences, writing_preferences, confirmation_preferences, and privacy_preferences. preferred_name is the user's own name; address_as is how DS Agent addresses the user; user_calls_ds_agent is the user's name for DS Agent; ds_agent_should_refer_to_itself_as is DS Agent's self-reference. Never put DS Agent's name into preferred_name. Soul updates are applied immediately after local validation and are not memory_candidates.\n\
 	         - Soul evidence contract: current_message_evidence must be an exact excerpt of Current user message for Soul authorization below. Use confirmation_context only for a short confirmation of a prior Soul proposal, and copy it exactly from Full user message. Never claim the update was persisted in reply_to_user; DS Agent adds the saved or blocked receipt.\n\
-         - Supported agent_actions action_type values are app_update_check, app_update_download, app_update_install, browser_open, browser_browse, computer_control, computer_screenshot, file_read, file_write, file_create, file_update, file_delete, file_rename, directory_create, directory_rename, directory_delete, create_report, office_create, office_update, office_open, network_search, operations_briefing, skill_activate, skill_install, skill_create, skill_uninstall, terminal_read, workspace_setup, deepseek_key_setup, and search_setup.\n\
-         - For DS Agent self-update requests, use app_update_check first. Propose app_update_download only when verified release status reports an update. Propose app_update_install only with target set to the exact installer_path returned by the verified download tool. Download and install require local approval; install is critical and can never be self-approved by the model.\n\
+         - Supported agent_actions action_type values are app_update_check, app_update_download, app_update_install, browser_open, browser_browse, computer_control, computer_screenshot, connected_mail_review, connected_calendar_review, file_read, file_write, file_create, file_update, file_delete, file_rename, directory_create, directory_rename, directory_delete, create_report, office_create, office_update, office_open, network_search, operations_briefing, skill_activate, skill_install, skill_create, skill_uninstall, terminal_read, workspace_setup, deepseek_key_setup, and search_setup.\n\
+         - For DS Agent self-update requests, use app_update_check first. Propose app_update_download only when verified release status reports an update. Propose app_update_install only with target set to the exact opaque download_receipt returned by the verified download tool. Never request or expose an installer path. Download and install require local approval; install is critical and can never be self-approved by the model.\n\
          - Do not use run_shell. For opening a website in the user's browser, use action_type browser_open with target set to the exact http:// or https:// URL. For reading or inspecting a web page as evidence, use browser_browse. If the user asked to log in, open the site only and ask the user to enter credentials manually.\n\
          - For local directory listing requests, use exactly one terminal_read action with target set to the exact local folder path. DS Agent will run a bounded non-recursive directory listing without executing arbitrary shell. Do not add a second action to read terminal output.\n\
          - For Windows local filesystem create, update, delete, or rename requests, use file_create, file_update, file_delete, file_rename, directory_create, directory_rename, or directory_delete with exact absolute local paths. Use content for file_create and file_update. Use destination for file_rename and directory_rename. Do not use run_shell for Windows file or directory mutation.\n\
+         - For a request to send an email through a connected account, use connected_mail_review. Put one exact JSON object in content with to, cc, bcc, subject, body_text, in_reply_to, and thread_ref; each recipient has display_name and address. For a request to create, update, or cancel a connected calendar event, use connected_calendar_review and put one exact JSON object in content using kind=calendar_create_event|calendar_update_event|calendar_cancel_event and the required calendar_ref, event_ref, expected_etag, and event fields. Use target only when the user explicitly selected an account, and set it to that account's human display name, never a provider ID, account ID, or credential reference. These actions only prepare a private local review, so requires_confirmation=false. Never claim the email was sent or the calendar was changed; the user must inspect the exact content and separately approve the external change in DS Agent.\n\
          - browser_open may include preferred_browser=chrome only when the user explicitly asks for Chrome. DS Agent will fall back to the system default browser if Chrome is unavailable.\n\
          - For Word, Excel, and PowerPoint creation requests, prefer the built-in Office control plugin path: use action_type office_create and let DS Agent generate a real .docx, .xlsx, or .pptx before using desktop UI control. If the user asks for the Desktop, set target_location=\"desktop\" and target to the file name or desktop-relative path. If the user asks for the DS Agent workspace, set target_location=\"workspace\" or omit it. Do not infer or hide the location: express the user's location intent in target_location. Set content to either plain body text or JSON with app=word|excel|powerpoint, title, body, rows, slides, and optional target_location. Use office_create for tasks like creating a Word document containing requested text, creating a simple Excel workbook, or creating a PowerPoint deck. For updating an existing Office file, use action_type office_update with target set to the existing file and content as plain body text or JSON with app=word|excel|powerpoint, body, rows, and slides. DS Agent can append Word paragraphs, Excel rows, and PowerPoint slides deterministically. If the user asks to open the created or existing Office file, add a separate office_open action with the same target and target_location; DS Agent will prefer the matching Microsoft Office app and fall back to the system default app if it is unavailable.\n\
          - For desktop UI automation, use computer_screenshot to inspect the current desktop before planning screen-dependent clicks. Use computer_control only for one validated structured input action at a time. Set target to the app or window, set risk=critical, set requires_confirmation=true, and set content to exactly one of: click:x,y[,button], move:x,y, type:text, press:key, hotkey:key+key, or scroll:delta[,axis]. For multi-step desktop tasks such as editing an already open Word document, do not claim completion until DS Agent has actually completed the required local actions.\n\
@@ -9982,12 +10071,18 @@ fn agent_action_user_summary(action: &AgentChatActionProposal) -> String {
     match action.action_type.as_str() {
         "app_update_check" => agent_app_update_check_user_summary(action),
         "app_update_download" => target
-            .map(|path| format!("更新安装包已下载到：{path}。"))
+            .map(|_| "更新安装包已下载并绑定安全回执。".to_string())
             .unwrap_or_else(|| "更新安装包已下载并验证。".to_string()),
         "app_update_install" => "更新安装程序已启动。完成后 DS Agent 会重新打开。".to_string(),
         "browser_open" => target
             .map(|url| format!("已打开：{url}。"))
             .unwrap_or_else(|| "已打开你指定的网页。".to_string()),
+        "connected_mail_review" => {
+            "邮件草稿已准备好，正在等待你核对内容并进行最终批准；尚未发送。".to_string()
+        }
+        "connected_calendar_review" => {
+            "日历变更已准备好，正在等待你核对内容并进行最终批准；尚未修改日历。".to_string()
+        }
         "skill_install" => agent_skill_install_user_summary(action),
         "skill_create" => agent_skill_create_user_summary(action),
         "skill_uninstall" => agent_skill_uninstall_user_summary(action),
@@ -10844,6 +10939,7 @@ fn dispatch_agent_action_proposals_with_desktop_dir_and_computer_use(
         return Ok(());
     }
     mark_office_open_actions_waiting_for_pending_create(response);
+    let response_id = response.id;
 
     for action in &mut response.proposed_actions {
         if action.execution_state == "blocked" {
@@ -10854,6 +10950,12 @@ fn dispatch_agent_action_proposals_with_desktop_dir_and_computer_use(
             action.execution_state.as_str(),
             "waiting_prerequisite" | "succeeded" | "failed"
         ) {
+            continue;
+        }
+
+        if is_connected_work_agent_action(&action.action_type) {
+            let source_run_id = agent_tool_run_id_for_action(store, action)?.or(Some(response_id));
+            dispatch_connected_work_agent_action(store, action, source_run_id)?;
             continue;
         }
 
@@ -11475,6 +11577,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
         return Ok(());
     }
     mark_office_open_actions_waiting_for_pending_create(response);
+    let response_id = response.id;
 
     for action in &mut response.proposed_actions {
         if action.execution_state == "blocked" {
@@ -11485,6 +11588,16 @@ fn dispatch_agent_action_proposals_with_store_mutex(
             action.execution_state.as_str(),
             "waiting_prerequisite" | "succeeded" | "failed"
         ) {
+            continue;
+        }
+
+        if is_connected_work_agent_action(&action.action_type) {
+            let store = store_mutex.lock().map_err(|_| lock_error())?;
+            dispatch_connected_work_agent_action(
+                &store,
+                action,
+                active_run_id.or(Some(response_id)),
+            )?;
             continue;
         }
 
@@ -13527,33 +13640,34 @@ impl AgentToolExecutor for BuiltinAgentToolExecutor {
             }
             APP_UPDATE_DOWNLOAD_TOOL_ID => {
                 let result = download_app_update()?;
-                let verified_path =
-                    validate_downloaded_update_installer_path(&result.installer_path)?;
                 Ok(ToolExecutionOutput {
                     output: serde_json::to_value(&result).map_err(event_store_error)?,
                     evidence: vec![ToolEvidence {
                         kind: "downloaded_installer".to_string(),
-                        reference: verified_path.display().to_string(),
-                        summary: "Installer source, filename, and isolated update path were verified."
-                            .to_string(),
+                        reference: result.download_receipt.clone(),
+                        summary: format!(
+                            "Installer was streamed into managed storage with SHA-256 {} and {} bytes.",
+                            result.sha256, result.byte_size
+                        ),
                     }],
                     verification: ToolVerificationResult::passed(
-                        "downloaded installer is a trusted Windows asset inside the update directory",
+                        "downloaded installer is bound to an opaque hash and file-identity receipt",
                     ),
                 })
             }
             APP_UPDATE_INSTALL_TOOL_ID => {
-                let installer_path = plan.request.input["installer_path"]
+                let download_receipt = plan.request.input["download_receipt"]
                     .as_str()
-                    .ok_or_else(|| "app update install requires installer_path".to_string())?;
-                let result = schedule_app_update_install(installer_path)?;
+                    .ok_or_else(|| "app update install requires download_receipt".to_string())?;
+                let result = schedule_app_update_install(download_receipt)?;
                 Ok(ToolExecutionOutput {
                     output: serde_json::to_value(&result).map_err(event_store_error)?,
                     evidence: vec![ToolEvidence {
                         kind: "install_schedule".to_string(),
-                        reference: result.installer_path.clone(),
-                        summary: "Verified installer launch and DS Agent restart were scheduled."
-                            .to_string(),
+                        reference: download_receipt.to_string(),
+                        summary:
+                            "Receipt-bound installer launch and DS Agent restart were scheduled."
+                                .to_string(),
                     }],
                     verification: ToolVerificationResult::passed(
                         "verified installer and restart handoff were scheduled successfully",
@@ -13684,7 +13798,10 @@ pub fn execute_agent_tool(
         run_authorized_agent_tool_execution(authorized, &executor)
     } else if authorized.plan.contract.id == FILESYSTEM_MUTATE_TOOL_ID {
         let client = LocalFileSystemMutationClient;
-        let executor = FileSystemMutationAgentToolExecutor { client: &client };
+        let executor = FileSystemMutationAgentToolExecutor {
+            client: &client,
+            checkpoint_store: WorkspaceCheckpointStore::Shared(&state.event_store),
+        };
         run_authorized_agent_tool_execution(authorized, &executor)
     } else if authorized.plan.contract.id == TERMINAL_READ_TOOL_ID {
         let executor = TerminalReadAgentToolExecutor {
@@ -17343,7 +17460,7 @@ mod tests {
         run_with_agent_run_lease_heartbeat, AgentToolAuthorization, BrowserBrowseAgentToolExecutor,
         ComputerControlAgentToolExecutor, ComputerScreenshotAgentToolExecutor,
         FileReadAgentToolExecutor, FileSystemMutationAgentToolExecutor, FileWriteAgentToolExecutor,
-        NetworkSearchAgentToolExecutor, TerminalReadAgentToolExecutor,
+        NetworkSearchAgentToolExecutor, TerminalReadAgentToolExecutor, WorkspaceCheckpointStore,
     };
     use crate::commands::{
         agent_chat_api_key_candidates_from_sources, agent_chat_api_key_from_sources,
@@ -17642,15 +17759,17 @@ mod tests {
                     output: json!({
                         "latest_version": "0.1.3",
                         "asset_name": "DS Agent_0.1.3_x64-setup.exe",
-                        "installer_path": "C:/Temp/ds-agent-updates/DS Agent_0.1.3_x64-setup.exe"
+                        "download_receipt": "dsur1.123456781234123412341234567890ab.3",
+                        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "byte_size": 1024
                     }),
                     evidence: vec![ToolEvidence {
                         kind: "downloaded_installer".to_string(),
-                        reference: "C:/Temp/ds-agent-updates/DS Agent_0.1.3_x64-setup.exe"
+                        reference: "dsur1.123456781234123412341234567890ab.3".to_string(),
+                        summary: "Trusted installer was downloaded with a bounded receipt."
                             .to_string(),
-                        summary: "Trusted installer was downloaded.".to_string(),
                     }],
-                    verification: ToolVerificationResult::passed("installer path verified"),
+                    verification: ToolVerificationResult::passed("installer receipt verified"),
                 }),
                 tool_id => Err(format!("fake executor does not support {tool_id}")),
             }
@@ -18529,7 +18648,10 @@ mod tests {
         .expect("run is valid");
         store.append_agent_run_start(&run).expect("run appends");
         let client = LocalFileSystemMutationClient;
-        let executor = FileSystemMutationAgentToolExecutor { client: &client };
+        let executor = FileSystemMutationAgentToolExecutor {
+            client: &client,
+            checkpoint_store: WorkspaceCheckpointStore::Direct(&store),
+        };
 
         let invocation = execute_agent_tool_with_executor(
             &store,
@@ -18561,6 +18683,20 @@ mod tests {
         );
         assert_eq!(invocation.evidence[0].kind, "filesystem_state");
         assert!(invocation.verification.passed);
+        let checkpoint = store
+            .workspace_mutation_checkpoint_for_invocation(invocation.id)
+            .expect("filesystem mutation checkpoint exists");
+        assert!(checkpoint.action_revision().is_some());
+        let lifecycle = store.task_lifecycle_snapshot().expect("lifecycle loads");
+        assert!(lifecycle.items.iter().any(|item| {
+            item.id == checkpoint.id
+                && item.source
+                    == crate::kernel::task_lifecycle::TaskLifecycleSource::WorkspaceCheckpoint
+        }));
+        assert!(!lifecycle.items.iter().any(|item| {
+            item.id == invocation.id
+                && item.source == crate::kernel::task_lifecycle::TaskLifecycleSource::ToolInvocation
+        }));
         assert!(record.steps.iter().any(|step| {
             step.label == FILESYSTEM_MUTATE_TOOL_ID && step.status == AgentRunStepStatus::Completed
         }));
@@ -18578,7 +18714,10 @@ mod tests {
         fs::write(&source, "source").expect("source writes");
         let destination = temp_dir.path().join(".git").join("config");
         let client = LocalFileSystemMutationClient;
-        let executor = FileSystemMutationAgentToolExecutor { client: &client };
+        let executor = FileSystemMutationAgentToolExecutor {
+            client: &client,
+            checkpoint_store: WorkspaceCheckpointStore::Direct(&store),
+        };
 
         let invocation = execute_agent_tool_with_executor(
             &store,
@@ -18644,7 +18783,10 @@ mod tests {
         assert!(!second_path.exists());
 
         let client = LocalFileSystemMutationClient;
-        let executor = FileSystemMutationAgentToolExecutor { client: &client };
+        let executor = FileSystemMutationAgentToolExecutor {
+            client: &client,
+            checkpoint_store: WorkspaceCheckpointStore::Direct(&store),
+        };
         let first = run_authorized_agent_tool_execution(first, &executor);
         record_completed_agent_tool_execution(&store, &first).expect("first mutation completes");
         assert_eq!(first.status, ToolExecutionStatus::Succeeded);
@@ -19852,6 +19994,7 @@ mod tests {
             writer,
             &FileSystemMutationAgentToolExecutor {
                 client: &mutation_client,
+                checkpoint_store: WorkspaceCheckpointStore::Direct(&store),
             },
         );
         record_completed_agent_tool_execution(&store, &writer).expect("writer completes");
@@ -25894,8 +26037,6 @@ schema_version: 1
             "terminal_write",
             "drive_read",
             "drive_write",
-            "email_draft",
-            "email_send",
             "work_package_export",
         ] {
             let action = normalize_agent_action_proposal(
@@ -25931,6 +26072,56 @@ schema_version: 1
                     .contains(&format!("unsupported action_type `{action_type}`")),
                 "{action_type}"
             );
+        }
+    }
+
+    #[test]
+    fn agent_chat_routes_email_and_calendar_requests_to_local_exact_review() {
+        let prompt = super::build_agent_chat_protocol_user_prompt(
+            &AgentChatRequest {
+                prompt: "给客户发邮件并创建一个会议。".to_string(),
+                model_route: ModelRoute::Auto,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskEveryStep,
+            },
+            &AgentChatRuntimeContext::default(),
+        );
+        assert!(prompt.contains("connected_mail_review"));
+        assert!(prompt.contains("connected_calendar_review"));
+        assert!(prompt.contains("only prepare a private local review"));
+        assert!(prompt.contains("Never claim the email was sent"));
+
+        for alias in ["email_send", "send_email", "calendar_create"] {
+            let action = normalize_agent_action_proposal(
+                AgentChatActionProposal {
+                    action_type: alias.to_string(),
+                    title: Some("准备连接账户变更".to_string()),
+                    reason: None,
+                    risk: Some("high".to_string()),
+                    requires_confirmation: true,
+                    target: None,
+                    target_location: None,
+                    destination: None,
+                    preferred_browser: None,
+                    content: Some("{}".to_string()),
+                    capability: None,
+                    policy_decision: None,
+                    execution_state: "proposed".to_string(),
+                    dispatch_note: None,
+                    permission_request_id: None,
+                    capability_invocation_id: None,
+                    workflow_run_id: None,
+                    blocked_reason: None,
+                },
+                AccessMode::AskEveryStep,
+            );
+            assert!(matches!(
+                action.action_type.as_str(),
+                "connected_mail_review" | "connected_calendar_review"
+            ));
+            assert_eq!(action.execution_state, "proposed");
+            assert_eq!(action.capability, None);
+            assert!(!action.requires_confirmation);
         }
     }
 

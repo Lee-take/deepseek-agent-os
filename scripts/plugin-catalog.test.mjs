@@ -3,11 +3,12 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [app, i18n, commands, skill] = await Promise.all([
+const [app, i18n, commands, skill, styles] = await Promise.all([
   readFile("apps/desktop/src/App.tsx", "utf8"),
   readFile("apps/desktop/src/i18n.ts", "utf8"),
   readFile("apps/desktop/src-tauri/src/commands.rs", "utf8"),
   readFile("apps/desktop/src-tauri/src/kernel/skill.rs", "utf8"),
+  readFile("apps/desktop/src/styles.css", "utf8"),
 ]);
 
 assert.match(app, /className="skill-catalog"/);
@@ -19,6 +20,15 @@ assert.doesNotMatch(app, /copy\.skills\.prepareExecution/);
 assert.match(app, /setLocalSkillEnabled\(/);
 assert.match(app, /uninstallLocalSkill\(/);
 assert.match(app, /copy\.skills\.scenarioTemplates/);
+assert.match(
+  app,
+  /<details className="sidebar-tool operations-tool ordinary-user-hidden">[\s\S]*?copy\.skills\.scenarioTemplates/,
+);
+assert.match(
+  app,
+  /<details className="sidebar-tool package-tool ordinary-user-hidden">[\s\S]*?copy\.package\.title/,
+);
+assert.match(styles, /\.ordinary-user-hidden\s*\{\s*display: none;/);
 assert.match(app, /run_skill_update_sweep/);
 
 const skillRefreshStart = app.indexOf("const refreshSkillRecords");

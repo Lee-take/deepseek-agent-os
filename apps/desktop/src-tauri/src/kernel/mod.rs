@@ -1,6 +1,7 @@
 pub mod agent_context;
 pub mod agent_run;
 pub mod app_update;
+mod app_update_receipt;
 pub mod artifact_render;
 pub mod artifacts;
 pub mod attachments;
@@ -26,7 +27,9 @@ pub mod sandbox;
 pub mod skill;
 pub mod skill_source;
 pub mod soul;
+pub mod task_lifecycle;
 pub mod tool_runtime;
 pub mod tool_strategy;
 pub mod work_package;
 pub mod workflow;
+pub mod workspace_undo;

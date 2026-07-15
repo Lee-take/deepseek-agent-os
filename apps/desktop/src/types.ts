@@ -305,10 +305,226 @@ export type ReviewQueueItem = {
   status: "pending_review" | "pending_approval" | "accepted" | "rejected";
   preview_fingerprint: string | null;
   revision: number;
+  action_revision: string;
   title: string;
   evidence_ref: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type ConnectedWorkMailAddress = {
+  display_name: string | null;
+  address: string;
+};
+
+export type ConnectedWorkMailContent = {
+  to: ConnectedWorkMailAddress[];
+  cc: ConnectedWorkMailAddress[];
+  bcc: ConnectedWorkMailAddress[];
+  subject: string;
+  body_text: string;
+  in_reply_to: string | null;
+  thread_ref: string | null;
+};
+
+export type ConnectedWorkCalendarEvent = {
+  title: string;
+  description: string | null;
+  location: string | null;
+  starts_at: string;
+  ends_at: string;
+  timezone: string;
+  attendees: ConnectedWorkMailAddress[];
+  notify_attendees: boolean;
+};
+
+export type ConnectedWorkCalendarIntent =
+  | {
+      kind: "calendar_create_event";
+      calendar_ref: string;
+      event: ConnectedWorkCalendarEvent;
+    }
+  | {
+      kind: "calendar_update_event";
+      calendar_ref: string;
+      event_ref: string;
+      expected_etag: string;
+      event: ConnectedWorkCalendarEvent;
+    }
+  | {
+      kind: "calendar_cancel_event";
+      calendar_ref: string;
+      event_ref: string;
+      expected_etag: string;
+    };
+
+export type ConnectedWorkInvocationStatus =
+  | "pending_approval"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "reconciliation_required";
+
+type ConnectedWorkReviewBase = {
+  review: ReviewQueueItem;
+  account_display_name: string;
+};
+
+export type ConnectedWorkReview =
+  | (ConnectedWorkReviewBase & {
+      kind: "mail";
+      draft: {
+        id: string;
+        provider_id: string;
+        account_id: string;
+        account_generation: number;
+        status: "editing" | "frozen" | "consumed";
+        revision: number;
+        action_revision: string;
+        recipient_count: number;
+        body_chars: number;
+        has_reply_reference: boolean;
+        created_at: string;
+        updated_at: string;
+      };
+      content: ConnectedWorkMailContent;
+      invocation_status: ConnectedWorkInvocationStatus;
+    })
+  | (ConnectedWorkReviewBase & {
+      kind: "calendar";
+      proposal: {
+        id: string;
+        provider_id: string;
+        account_id: string;
+        account_generation: number;
+        capability:
+          | "calendar_create_event"
+          | "calendar_update_event"
+          | "calendar_cancel_event";
+        status: "pending_review" | "frozen" | "consumed";
+        revision: number;
+        action_revision: string;
+        created_at: string;
+        updated_at: string;
+      };
+      intent: ConnectedWorkCalendarIntent;
+      invocation_status: ConnectedWorkInvocationStatus | null;
+    });
+
+export type ConnectedWorkExecution = {
+  review_id: string;
+  invocation_status: ConnectedWorkInvocationStatus;
+  effect_state: "known_applied" | "effect_unknown";
+  evidence_ref: string | null;
+};
+
+export type TaskLifecycleSource =
+  | "task_record"
+  | "agent_run"
+  | "expert_attempt"
+  | "automation_run"
+  | "review"
+  | "tool_invocation"
+  | "connector_invocation"
+  | "connector_recovery"
+  | "artifact"
+  | "computer_use"
+  | "workspace_checkpoint";
+
+export type TaskLifecyclePhase =
+  | "queued"
+  | "running"
+  | "waiting_prerequisite"
+  | "waiting_review"
+  | "waiting_approval"
+  | "needs_recovery"
+  | "effect_unknown"
+  | "repair_required"
+  | "blocked"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type TaskEffectState =
+  | "no_effect"
+  | "read_only"
+  | "local_reversible"
+  | "local_applied"
+  | "local_uncertain"
+  | "remote_known_not_applied"
+  | "remote_known_applied"
+  | "remote_uncertain"
+  | "compensation_required";
+
+export type TaskLifecycleAction = {
+  kind:
+    | "review_decision"
+    | "retry_local_cleanup"
+    | "resume_sync"
+    | "inspect_external_result"
+    | "undo_local_change";
+  action_revision: string;
+};
+
+export type TaskLifecycleItem = {
+  id: string;
+  parent_id: string | null;
+  source: TaskLifecycleSource;
+  phase: TaskLifecyclePhase;
+  effect_state: TaskEffectState;
+  title: string;
+  detail_code: string;
+  action: TaskLifecycleAction | null;
+  updated_at: string;
+};
+
+export type TaskLifecycleSnapshot = {
+  items: TaskLifecycleItem[];
+  generated_at: string;
+};
+
+export type WorkspaceMutationOperation =
+  | "create_file"
+  | "update_file"
+  | "delete_file"
+  | "rename_file"
+  | "create_directory"
+  | "rename_directory"
+  | "delete_directory";
+
+export type WorkspaceMutationCheckpointStatus =
+  | "intent"
+  | "prepared"
+  | "effect_started"
+  | "ready"
+  | "not_undoable"
+  | "undo_started"
+  | "undone"
+  | "failed"
+  | "repair_required";
+
+export type WorkspaceCheckpointEffectState =
+  | "no_effect"
+  | "known_applied"
+  | "effect_unknown";
+
+export type WorkspaceUndoView = {
+  id: string;
+  tool_invocation_id: string;
+  run_id: string | null;
+  operation: WorkspaceMutationOperation;
+  status: WorkspaceMutationCheckpointStatus;
+  effect_state: WorkspaceCheckpointEffectState;
+  undo_available: boolean;
+  action_revision: string | null;
+  title_code: string;
+  safe_error_code: string | null;
+  updated_at: string;
+};
+
+export type WorkspaceUndoResult = {
+  checkpoint: WorkspaceUndoView;
+  acceptance: "accepted" | "already_accepted";
 };
 
 export type ConnectorAccountSummary = {
@@ -603,11 +819,12 @@ export type AppUpdateStatus = {
 export type AppUpdateDownloadResult = {
   latest_version: string;
   asset_name: string;
-  installer_path: string;
+  download_receipt: string;
+  sha256: string;
+  byte_size: number;
 };
 
 export type AppUpdateInstallResult = {
-  installer_path: string;
   restart_scheduled: boolean;
 };
 

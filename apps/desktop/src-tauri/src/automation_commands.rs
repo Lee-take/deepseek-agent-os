@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::commands::AppState;
 use crate::kernel::automation::{
     next_scheduled_at, AutomationDefinition, AutomationDefinitionStatus, AutomationRun,
-    AutomationSchedule, ReviewQueueItem,
+    AutomationSchedule, ReviewQueueItemView,
 };
 
 fn store_error(error: impl std::fmt::Display) -> String {
@@ -35,12 +35,15 @@ pub fn list_automation_runs(state: State<'_, AppState>) -> Result<Vec<Automation
 #[tauri::command]
 pub fn list_automation_review_items(
     state: State<'_, AppState>,
-) -> Result<Vec<ReviewQueueItem>, String> {
+) -> Result<Vec<ReviewQueueItemView>, String> {
     let store = state.event_store();
     let store = store
         .lock()
         .map_err(|_| "event store lock failed".to_string())?;
-    store.list_review_queue_items().map_err(store_error)
+    store
+        .list_review_queue_items()
+        .map(|items| items.into_iter().map(|item| item.public_view()).collect())
+        .map_err(store_error)
 }
 
 #[tauri::command]
@@ -185,31 +188,41 @@ pub fn run_automation_now(
 #[tauri::command]
 pub fn edit_automation_review_item(
     item_id: Uuid,
+    action_revision: String,
     title: String,
     preview_fingerprint: Option<String>,
     state: State<'_, AppState>,
-) -> Result<ReviewQueueItem, String> {
+) -> Result<ReviewQueueItemView, String> {
     let store = state.event_store();
     let store = store
         .lock()
         .map_err(|_| "event store lock failed".to_string())?;
     store
-        .edit_review_queue_item(item_id, title, preview_fingerprint, Utc::now())
+        .edit_review_queue_item(
+            item_id,
+            &action_revision,
+            title,
+            preview_fingerprint,
+            Utc::now(),
+        )
+        .map(|item| item.public_view())
         .map_err(store_error)
 }
 
 #[tauri::command]
 pub fn resolve_automation_review_item(
     item_id: Uuid,
+    action_revision: String,
     accepted: bool,
     state: State<'_, AppState>,
-) -> Result<ReviewQueueItem, String> {
+) -> Result<ReviewQueueItemView, String> {
     let store = state.event_store();
     let store = store
         .lock()
         .map_err(|_| "event store lock failed".to_string())?;
     store
-        .resolve_review_queue_item(item_id, accepted, Utc::now())
+        .resolve_review_queue_item(item_id, &action_revision, accepted, Utc::now())
+        .map(|item| item.public_view())
         .map_err(store_error)
 }
 

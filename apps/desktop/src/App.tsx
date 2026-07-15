@@ -60,6 +60,7 @@ import {
 } from "./agentChatPending";
 import { summarizeAgentContextReceipt } from "./agentContextReceipt";
 import { AutomationCenter } from "./AutomationCenter";
+import { ConnectedWorkReviewPanel } from "./ConnectedWorkReviewPanel";
 import {
   conversationAttachmentMetadata,
   formatAgentPromptWithAttachments,
@@ -882,7 +883,6 @@ export function App() {
   const [themeStyle, setThemeStyle] = useState<ThemeStyle>(readInitialThemeStyle);
   const workbenchSectionRef = useRef<HTMLElement | null>(null);
   const memorySectionRef = useRef<HTMLElement | null>(null);
-  const approvalsSectionRef = useRef<HTMLDivElement | null>(null);
   const chatThreadRef = useRef<HTMLDivElement | null>(null);
   const chatComposerRef = useRef<HTMLFormElement | null>(null);
   const [taskRecords, setTaskRecords] = useState<TaskRecord[]>([]);
@@ -2443,7 +2443,11 @@ export function App() {
       const result = await invoke<AppUpdateDownloadResult>("download_app_update");
       if (
         (status.latest_version !== null && result.latest_version !== status.latest_version) ||
-        (status.asset_name !== null && result.asset_name !== status.asset_name)
+        (status.asset_name !== null && result.asset_name !== status.asset_name) ||
+        !/^dsur1\.[0-9a-f]{32}\.[0-9]+$/u.test(result.download_receipt) ||
+        !/^[0-9a-f]{64}$/u.test(result.sha256) ||
+        !Number.isSafeInteger(result.byte_size) ||
+        result.byte_size <= 0
       ) {
         throw new Error(copy.appUpdate.downloadFailed);
       }
@@ -2467,7 +2471,7 @@ export function App() {
 
     try {
       const result = await invoke<AppUpdateInstallResult>("install_app_update", {
-        installerPath: downloadedAppUpdate.installer_path,
+        downloadReceipt: downloadedAppUpdate.download_receipt,
       });
       if (!result.restart_scheduled) {
         throw new Error(copy.appUpdate.installFailed);
@@ -4734,7 +4738,11 @@ export function App() {
       return;
     }
     window.requestAnimationFrame(() => {
-      approvalsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      const chatThread = chatThreadRef.current;
+      chatThread?.scrollTo({
+        top: chatThread.scrollHeight,
+        behavior: "smooth",
+      });
     });
   }, [pendingCapabilityRecords.length]);
   const latestOperationsBriefingRun = operationsBriefingRuns[0];
@@ -5466,7 +5474,7 @@ export function App() {
             </div>
           </details>
 
-          <details className="sidebar-tool operations-tool">
+          <details className="sidebar-tool operations-tool ordinary-user-hidden">
             <summary>
               <ClipboardList size={16} aria-hidden="true" />
               <span>{copy.skills.scenarioTemplates}</span>
@@ -5483,7 +5491,7 @@ export function App() {
             </div>
           </details>
 
-          <details className="sidebar-tool package-tool">
+          <details className="sidebar-tool package-tool ordinary-user-hidden">
             <summary>
               <PackageOpen size={16} aria-hidden="true" />
               <span>{copy.package.title}</span>
@@ -6117,6 +6125,70 @@ export function App() {
                     </div>
                   </article>
                 ) : null}
+                {pendingCapabilityRecords.length > 0 ? (
+                  <section
+                    className="chat-approval-queue"
+                    aria-label={copy.capabilities.pendingTitle}
+                  >
+                    <div className="chat-avatar" aria-hidden="true">
+                      <ShieldCheck size={16} />
+                    </div>
+                    <div className="approval-queue chat-approval-card">
+                      <div className="queue-heading">
+                        <strong>{copy.capabilities.pendingTitle}</strong>
+                        <span>{pendingCapabilityRecords.length}</span>
+                      </div>
+                      <div className="approval-list">
+                        {pendingCapabilityRecords.map((record) => (
+                          <article className="approval-row" key={record.request.id}>
+                            <div>
+                              <strong>{copy.capabilityOptions[record.request.capability]}</strong>
+                              <p>
+                                {copy.riskOptions[record.request.risk_level]} ·{" "}
+                                {copy.accessOptions[record.request.access_mode]}
+                              </p>
+                              {record.request.exact_tool ? (
+                                <p className="approval-preview">
+                                  {record.request.exact_tool.preview}
+                                </p>
+                              ) : null}
+                            </div>
+                            <div className="approval-actions">
+                              <button
+                                type="button"
+                                aria-label={copy.capabilities.approve}
+                                onClick={() =>
+                                  void resolveVisibleToolApproval(record.request.id, true)
+                                }
+                                disabled={
+                                  resolutionPending !== null || capabilityPending !== null
+                                }
+                              >
+                                <Check size={14} aria-hidden="true" />
+                                {resolutionPending === record.request.id
+                                  ? copy.capabilities.resolving
+                                  : copy.chatWorkbench.confirmAndRun}
+                              </button>
+                              <button
+                                type="button"
+                                aria-label={copy.capabilities.reject}
+                                onClick={() =>
+                                  void resolveVisibleToolApproval(record.request.id, false)
+                                }
+                                disabled={
+                                  resolutionPending !== null || capabilityPending !== null
+                                }
+                              >
+                                <X size={14} aria-hidden="true" />
+                                {copy.capabilities.reject}
+                              </button>
+                            </div>
+                          </article>
+                        ))}
+                      </div>
+                    </div>
+                  </section>
+                ) : null}
               </div>
 
               <div className="chat-input-dock">
@@ -6280,6 +6352,8 @@ export function App() {
                 {agentChatError ? <p className="package-error chat-feedback">{agentChatError}</p> : null}
               </div>
             </section>
+
+            <ConnectedWorkReviewPanel language={language} />
 
             {renderLegacyCenterManagementPanels ? (
               <>
@@ -7645,10 +7719,6 @@ export function App() {
                       const contract = agentToolContracts.find(
                         (candidate) => candidate.id === invocation.tool_id,
                       );
-                      const approvalRequestId =
-                        invocation.status === "waiting_for_confirmation"
-                          ? invocation.approval_request_id
-                          : null;
                       return (
                         <article className="sidebar-record-row" key={invocation.id}>
                           <div>
@@ -7664,32 +7734,6 @@ export function App() {
                           <span className={`access-status ${invocation.status}`}>
                             {copy.runStatus.toolStatus[invocation.status]}
                           </span>
-                          {approvalRequestId ? (
-                            <div className="approval-actions sidebar-approval-actions">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  void resolveVisibleToolApproval(approvalRequestId, true)
-                                }
-                                disabled={resolutionPending !== null || agentActionPending !== null}
-                              >
-                                <Check size={14} aria-hidden="true" />
-                                {resolutionPending === approvalRequestId
-                                  ? copy.capabilities.resolving
-                                  : copy.chatWorkbench.confirmAndRun}
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  void resolveVisibleToolApproval(approvalRequestId, false)
-                                }
-                                disabled={resolutionPending !== null || agentActionPending !== null}
-                              >
-                                <X size={14} aria-hidden="true" />
-                                {copy.capabilities.reject}
-                              </button>
-                            </div>
-                          ) : null}
                         </article>
                       );
                     })}
@@ -7697,7 +7741,7 @@ export function App() {
                 </>
               ) : null}
             </section>
-            <details className="inspector-details" open={pendingCapabilityRecords.length > 0}>
+            <details className="inspector-details">
               <summary>
                 <ShieldCheck size={16} aria-hidden="true" />
                 <span>{copy.runStatus.permissionsAndTools}</span>
@@ -7708,58 +7752,6 @@ export function App() {
                 <strong id="audit-panel-title">{copy.capabilities.title}</strong>
               </div>
               {capabilityError ? <p className="package-error">{capabilityError}</p> : null}
-              {pendingCapabilityRecords.length > 0 ? (
-                <div className="approval-queue" ref={approvalsSectionRef}>
-                  <div className="queue-heading">
-                    <strong>{copy.capabilities.pendingTitle}</strong>
-                    <span>{pendingCapabilityRecords.length}</span>
-                  </div>
-                  <div className="approval-list">
-                    {pendingCapabilityRecords.map((record) => (
-                      <article className="approval-row" key={record.request.id}>
-                        <div>
-                          <strong>{copy.capabilityOptions[record.request.capability]}</strong>
-                          <p>
-                            {copy.riskOptions[record.request.risk_level]} ·{" "}
-                            {copy.accessOptions[record.request.access_mode]}
-                          </p>
-                          {record.request.exact_tool ? (
-                            <p className="approval-preview">
-                              {record.request.exact_tool.preview}
-                            </p>
-                          ) : null}
-                        </div>
-                        <div className="approval-actions">
-                          <button
-                            type="button"
-                            aria-label={copy.capabilities.approve}
-                            onClick={() =>
-                              void resolveVisibleToolApproval(record.request.id, true)
-                            }
-                            disabled={resolutionPending !== null || capabilityPending !== null}
-                          >
-                            <Check size={14} aria-hidden="true" />
-                            {resolutionPending === record.request.id
-                              ? copy.capabilities.resolving
-                              : copy.chatWorkbench.confirmAndRun}
-                          </button>
-                          <button
-                            type="button"
-                            aria-label={copy.capabilities.reject}
-                            onClick={() =>
-                              void resolveVisibleToolApproval(record.request.id, false)
-                            }
-                            disabled={resolutionPending !== null || capabilityPending !== null}
-                          >
-                            <X size={14} aria-hidden="true" />
-                            {copy.capabilities.reject}
-                          </button>
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
               <form className="browser-tool" onSubmit={browseBrowserUrl}>
                 <div className="tool-heading">
                   <Globe2 size={16} aria-hidden="true" />

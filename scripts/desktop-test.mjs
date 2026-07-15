@@ -31,6 +31,8 @@ run(["node", "scripts/agent-chat-run-state.test.mjs"]);
 run(["node", "scripts/subagent-parallel.test.mjs"]);
 run(["node", "scripts/expert-team.test.mjs"]);
 run(["node", "scripts/automation-center.test.mjs"]);
+run(["node", "scripts/task-lifecycle.test.mjs"]);
+run(["node", "scripts/workspace-undo.test.mjs"]);
 run(["node", "scripts/agent-attachments.test.mjs"]);
 run(["node", "scripts/agent-chat-pending.test.mjs"]);
 run(["node", "scripts/agent-context-receipt.test.mjs"]);

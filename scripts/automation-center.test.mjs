@@ -4,6 +4,19 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const component = readFileSync("apps/desktop/src/AutomationCenter.tsx", "utf8");
+const app = readFileSync("apps/desktop/src/App.tsx", "utf8");
+const desktopIndex = readFileSync("apps/desktop/index.html", "utf8");
+const connectedWork = readFileSync("apps/desktop/src/ConnectedWorkReviewPanel.tsx", "utf8");
+const styles = readFileSync("apps/desktop/src/styles.css", "utf8");
+const connectedWorkCommands = readFileSync(
+  "apps/desktop/src-tauri/src/connected_work_commands.rs",
+  "utf8",
+);
+const connectedWorkCommandsProduction = connectedWorkCommands.split("#[cfg(test)]")[0];
+const connectorDraftStore = readFileSync(
+  "apps/desktop/src-tauri/src/kernel/event_store/connector_draft.rs",
+  "utf8",
+);
 const connectorHealth = readFileSync("apps/desktop/src/ConnectorHealthPanel.tsx", "utf8");
 const recoveryCenter = readFileSync("apps/desktop/src/RecoveryCenter.tsx", "utf8");
 const artifactDelivery = readFileSync("apps/desktop/src/ArtifactDeliveryPanel.tsx", "utf8");
@@ -222,9 +235,85 @@ assert.match(component, /update_automation_goal/);
 assert.match(component, /delete_automation/);
 assert.match(component, /run_automation_now/);
 assert.match(component, /resolve_automation_review_item/);
+assert.match(component, /actionRevision: item\.action_revision/);
 assert.match(component, /list_automation_review_items/);
 assert.match(component, /需要审阅或对外修改时仍会等待你确认/);
 assert.doesNotMatch(component, /cron|OAuth|PKCE|refresh_token|access_token/);
+assert.match(app, /ConnectedWorkReviewPanel/);
+assert.match(desktopIndex, /rel="icon"[^>]+href="\/ds-agent-mark\.png"/);
+assert.match(appCommands, /connected_mail_review/);
+assert.match(appCommands, /connected_calendar_review/);
+assert.match(appCommands, /dispatch_connected_work_agent_action/);
+assert.match(appCommands, /Never claim the email was sent/);
+assert.match(
+  appCommands,
+  /let source_run_id = agent_tool_run_id_for_action[\s\S]*dispatch_connected_work_agent_action/,
+  "chat requests must enter the durable local connected-work review path",
+);
+assert.match(connectedWork, /list_connected_work_reviews/);
+assert.match(connectedWork, /request_connected_work_approval/);
+assert.match(connectedWork, /reject_connected_work_review/);
+assert.match(connectedWork, /approve_and_run_connected_work_review/);
+assert.match(connectedWork, /actionRevision: review\.review\.action_revision/);
+assert.match(connectedWork, /内容无误，进入最终批准/);
+assert.match(connectedWork, /确认并执行/);
+assert.match(connectedWork, /这一步只冻结内容，不会修改外部账户/);
+assert.match(
+  styles,
+  /\.timeline:has\(> \.connected-work-review\)[\s\S]*grid-template-rows: minmax\(320px, 4fr\) minmax\(0, 6fr\)/,
+  "connected-work review must preserve a usable chat composer above its bounded review surface",
+);
+assert.match(
+  styles,
+  /\.connected-work-review[\s\S]*min-height: 0;[\s\S]*overflow-y: auto;[\s\S]*overscroll-behavior: contain/,
+  "connected-work cards must scroll inside the primary timeline instead of clipping the chat",
+);
+assert.match(
+  styles,
+  /@media \(max-width: 1120px\)[\s\S]*\.workbench,\s*\.workbench\.has-inspector\s*\{\s*grid-template-columns: minmax\(0, 1fr\)/,
+  "the responsive single-column layout must override the inspector-specific desktop grid",
+);
+assert.doesNotMatch(
+  connectedWork,
+  /access_request|request_fingerprint|preview_hash|intent_hash|idempotency_key|account_generation|credential_handle|refresh_token|access_token|client_secret/,
+  "connected-work UI must echo only the public review action revision",
+);
+assert.match(connectedWorkCommandsProduction, /registry\.execution_enabled\(\)/);
+assert.match(connectedWorkCommandsProduction, /registry\.supports/);
+assert.match(connectedWorkCommandsProduction, /prepare_foreground_connected_mail_review/);
+assert.match(connectedWorkCommandsProduction, /prepare_foreground_connected_calendar_review/);
+assert.match(connectedWorkCommandsProduction, /action\.content = None/);
+assert.match(connectorDraftStore, /foreground_connected_work_ids/);
+assert.match(connectorDraftStore, /AutomationDefinition::once_with_id/);
+assert.match(
+  connectedWorkCommandsProduction,
+  /approve_and_start_connected_work_review[\s\S]*apply_mutation[\s\S]*complete_connector_invocation/,
+  "connected-work command must approve, execute once, verify, then consume",
+);
+assert.match(
+  eventStore,
+  /complete_connector_invocation_internal[\s\S]*consume_completed_connected_work_projection\([\s\S]*transaction\.commit/,
+  "provider evidence and private connected-work consumption must commit atomically",
+);
+assert.doesNotMatch(
+  connectedWorkCommandsProduction,
+  /FakeConnectorProvider|Microsoft|Google|ConnectorSecret|credential_handle|refresh_token|access_token|client_secret/,
+  "production connected-work command must stay provider-neutral and credential-free",
+);
+assert.match(connectorDraftStore, /prepare_connector_calendar_proposal_approval/);
+assert.match(connectorDraftStore, /resolve_and_start_connector_invocation/);
+assert.match(
+  eventStore,
+  /fn start_connector_invocation[\s\S]*PERMISSION_RESOLUTION_RECORDED_EVENT[\s\S]*insert_kernel_event\(&transaction, event\)[\s\S]*INSERT INTO connector_approval_consumptions[\s\S]*UPDATE connector_invocations/,
+  "exact connected-work approval resolution and one-shot start must share one SQLite transaction",
+);
+assert.match(connectorDraftStore, /consume_connector_calendar_proposal/);
+assert.match(connectorDraftStore, /foreground desktop review surface/);
+assert.doesNotMatch(
+  connectorDraftStore.match(/pub enum ConnectedWorkReviewView \{[\s\S]*?\n\}/)?.[0] ?? "",
+  /Debug/,
+  "private connected-work review content must not gain Debug output",
+);
 assert.match(connectorHealth, /list_connector_account_summaries/);
 assert.match(connectorHealth, /disconnect_connector_account/);
 assert.doesNotMatch(connectorHealth, /credential_handle|refresh_token|access_token|client_secret/);
@@ -237,11 +326,13 @@ assert.match(appCommands, /ConnectorRuntimeRegistries::empty\(\)/);
 assert.match(connectorRuntimeRegistry, /trait ConnectorOAuthRegistry/);
 assert.match(connectorRuntimeRegistry, /trait ConnectorReadRegistry/);
 assert.match(connectorRuntimeRegistry, /trait ConnectorSyncRegistry/);
+assert.match(connectorRuntimeRegistry, /trait ConnectorMutationRegistry/);
+assert.match(connectorRuntimeRegistry, /EmptyConnectorMutationRegistry/);
 assert.match(connectorRuntimeRegistry, /EmptyConnectorReconcilerRegistry/);
 assert.match(connectorRuntimeRegistry, /EmptyConnectorRevocationRegistry/);
 assert.doesNotMatch(
   connectorRuntimeRegistry,
-  /ConnectorMutationProvider|ConnectorDraftProvider|BrowserUrlOpener|WindowsConnectorCredentialStore|MicrosoftOAuth|MicrosoftGraph|Google/,
+  /ConnectorDraftProvider|BrowserUrlOpener|WindowsConnectorCredentialStore|MicrosoftOAuth|MicrosoftGraph|Google/,
 );
 assert.doesNotMatch(
   main,
@@ -434,6 +525,10 @@ assert.match(main, /run_due_automation_sweep/);
 assert.match(main, /resume_connector_read_sync,/);
 assert.match(main, /inspect_connector_external_result,/);
 assert.match(main, /list_connector_read_activity,/);
+assert.match(main, /list_connected_work_reviews,/);
+assert.match(main, /request_connected_work_approval,/);
+assert.match(main, /reject_connected_work_review,/);
+assert.match(main, /approve_and_run_connected_work_review,/);
 assert.match(main, /start_explicit_connector_mail_search,/);
 assert.match(main, /start_explicit_connector_calendar_list,/);
 assert.match(main, /spawn_connector_read_worker\(state\.clone\(\)\)/);
@@ -479,7 +574,6 @@ assert.doesNotMatch(
   /Microsoft|Google|FakeConnectorProvider|ConnectorMutationProvider|apply_mutation/,
   "Recovery worker must remain provider-neutral and read-only",
 );
-const app = readFileSync("apps/desktop/src/App.tsx", "utf8");
 assert.match(app, /setInterval\(\(\) => \{[\s\S]*sweepAutomations/);
 
 assert.match(connector, /ConnectorCredentialHandle/);

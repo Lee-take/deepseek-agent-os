@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
@@ -6,16 +5,20 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::process::Command;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+
+use crate::kernel::app_update_receipt::{
+    land_update_reader_at, recover_update_receipts_at, schedule_install_at, APP_UPDATE_MAX_BYTES,
+};
 
 pub(crate) const APP_UPDATE_RELEASES_API_URL: &str =
     "https://api.github.com/repos/Lee-take/dsagent/releases";
-const APP_UPDATE_RELEASE_DOWNLOAD_PREFIX: &str =
-    "https://github.com/Lee-take/dsagent/releases/download/";
-const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX: &str =
-    "https://github.com/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/0.9.0";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.9.0";
+const APP_UPDATE_RELEASE_DOWNLOAD_PATH_PREFIX: &str = "/Lee-take/dsagent/releases/download/";
+const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PATH_PREFIX: &str =
+    "/Lee-take/deepseek-agent-os/releases/download/";
+const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/1.0.0";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v1.0.0";
 #[cfg(windows)]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -33,12 +36,13 @@ pub struct AppUpdateStatus {
 pub struct AppUpdateDownloadResult {
     pub latest_version: String,
     pub asset_name: String,
-    pub installer_path: String,
+    pub download_receipt: String,
+    pub sha256: String,
+    pub byte_size: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AppUpdateInstallResult {
-    pub installer_path: String,
     pub restart_scheduled: bool,
 }
 
@@ -86,48 +90,38 @@ pub(crate) fn download_update() -> Result<AppUpdateDownloadResult, String> {
     let latest_version = normalize_release_version(&release.tag_name);
     let asset = release_installable_asset(&release)
         .ok_or_else(|| "latest release has no Windows installer asset".to_string())?;
-    let installer_path = download_release_asset(asset)?;
+    let response = download_release_asset(asset)?;
+    let content_length = response.content_length();
+    let landed = land_update_reader_at(
+        &app_update_dir(),
+        &latest_version,
+        &asset.name,
+        content_length,
+        response,
+    )?;
 
     Ok(AppUpdateDownloadResult {
         latest_version,
         asset_name: asset.name.clone(),
-        installer_path: installer_path.display().to_string(),
+        download_receipt: landed.download_receipt,
+        sha256: landed.sha256,
+        byte_size: landed.byte_size,
     })
 }
 
-pub(crate) fn schedule_install(installer_path: &str) -> Result<AppUpdateInstallResult, String> {
-    let installer_path = validate_downloaded_update_installer_path(installer_path)?;
-    spawn_silent_update_runner(&installer_path)?;
+pub(crate) fn schedule_install(download_receipt: &str) -> Result<AppUpdateInstallResult, String> {
+    let scheduled = schedule_install_at(
+        &app_update_dir(),
+        download_receipt,
+        spawn_silent_update_runner,
+    )?;
     Ok(AppUpdateInstallResult {
-        installer_path: installer_path.display().to_string(),
-        restart_scheduled: true,
+        restart_scheduled: scheduled.restart_scheduled,
     })
 }
 
-pub(crate) fn validate_downloaded_update_installer_path(
-    installer_path: &str,
-) -> Result<PathBuf, String> {
-    let path = PathBuf::from(installer_path);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "update installer path has no file name".to_string())?;
-    if !is_windows_installer_asset(file_name) {
-        return Err("downloaded update is not a Windows installer".to_string());
-    }
-
-    let update_dir = app_update_dir();
-    fs::create_dir_all(&update_dir)
-        .map_err(|error| format!("failed to prepare update directory: {error}"))?;
-    let canonical_dir = fs::canonicalize(&update_dir)
-        .map_err(|error| format!("failed to verify update directory: {error}"))?;
-    let canonical_path = fs::canonicalize(&path)
-        .map_err(|error| format!("downloaded update installer is unavailable: {error}"))?;
-    if !canonical_path.starts_with(&canonical_dir) {
-        return Err("downloaded update installer is outside the update directory".to_string());
-    }
-
-    Ok(canonical_path)
+pub(crate) fn recover_app_update_state() -> Result<(), String> {
+    recover_update_receipts_at(&app_update_dir())
 }
 
 fn normalize_release_version(version: &str) -> String {
@@ -242,8 +236,22 @@ fn is_windows_installer_asset(asset_name: &str) -> bool {
 }
 
 fn release_asset_is_trusted(download_url: &str) -> bool {
-    download_url.starts_with(APP_UPDATE_RELEASE_DOWNLOAD_PREFIX)
-        || download_url.starts_with(APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PREFIX)
+    let Ok(url) = reqwest::Url::parse(download_url) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && (url
+            .path()
+            .starts_with(APP_UPDATE_RELEASE_DOWNLOAD_PATH_PREFIX)
+            || url
+                .path()
+                .starts_with(APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PATH_PREFIX))
 }
 
 fn release_installable_asset(release: &GithubRelease) -> Option<&GithubReleaseAsset> {
@@ -256,6 +264,7 @@ fn release_installable_asset(release: &GithubRelease) -> Option<&GithubReleaseAs
 fn app_update_http_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .user_agent(APP_UPDATE_USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| format!("failed to build update client: {error}"))
 }
@@ -338,54 +347,74 @@ fn latest_installable_update_release(
     })
 }
 
-fn safe_update_asset_file_name(asset_name: &str) -> String {
-    let sanitized: String = asset_name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric()
-                || character == '.'
-                || character == '-'
-                || character == '_'
-            {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if sanitized.is_empty() {
-        "ds-agent-update-installer.exe".to_string()
-    } else {
-        sanitized
-    }
-}
-
 fn app_update_dir() -> PathBuf {
     std::env::temp_dir().join("ds-agent-updates")
 }
 
-fn download_release_asset(asset: &GithubReleaseAsset) -> Result<PathBuf, String> {
+fn download_release_asset(
+    asset: &GithubReleaseAsset,
+) -> Result<reqwest::blocking::Response, String> {
     if !release_asset_is_trusted(&asset.browser_download_url) {
         return Err("update asset URL is not trusted".to_string());
     }
 
-    let file_name = safe_update_asset_file_name(&asset.name);
-    let update_dir = app_update_dir();
-    fs::create_dir_all(&update_dir)
-        .map_err(|error| format!("failed to prepare update directory: {error}"))?;
-    let installer_path = update_dir.join(file_name);
-    let bytes = app_update_http_client()?
+    let client = app_update_http_client()?;
+    let response = client
         .get(&asset.browser_download_url)
         .send()
-        .map_err(|error| format!("failed to download update installer: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("update installer download failed: {error}"))?
-        .bytes()
-        .map_err(|error| format!("failed to read update installer: {error}"))?;
-    fs::write(&installer_path, bytes)
-        .map_err(|error| format!("failed to save update installer: {error}"))?;
-    Ok(installer_path)
+        .map_err(|_| "failed to resolve the update installer download".to_string())?;
+    if response.status().is_success() {
+        return validate_terminal_download_response(response);
+    }
+    if response.status() != reqwest::StatusCode::FOUND {
+        return Err("update installer download endpoint returned an invalid status".to_string());
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "update installer redirect is missing".to_string())?;
+    let resolved = validated_release_asset_location(location)?;
+    let response = client
+        .get(resolved)
+        .send()
+        .map_err(|_| "failed to download the update installer".to_string())?;
+    validate_terminal_download_response(response)
+}
+
+fn validate_terminal_download_response(
+    response: reqwest::blocking::Response,
+) -> Result<reqwest::blocking::Response, String> {
+    if response.status().is_redirection()
+        || response.headers().contains_key(reqwest::header::LOCATION)
+        || !response.status().is_success()
+    {
+        return Err("update installer byte request did not terminate safely".to_string());
+    }
+    if response.content_length().is_none()
+        || response
+            .content_length()
+            .is_some_and(|size| size == 0 || size > APP_UPDATE_MAX_BYTES)
+    {
+        return Err("update installer response is not bounded".to_string());
+    }
+    Ok(response)
+}
+
+fn validated_release_asset_location(value: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "update installer redirect is invalid".to_string())?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("release-assets.githubusercontent.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+        || url.fragment().is_some()
+        || !url.path().starts_with("/github-production-release-asset/")
+    {
+        return Err("update installer redirect is not trusted".to_string());
+    }
+    Ok(url)
 }
 
 fn silent_update_install_command(installer_path: &Path) -> SilentUpdateInstallCommand {
@@ -421,6 +450,8 @@ fn app_update_runner_script(
     installer_path: &Path,
     app_path: &Path,
     current_process_id: u32,
+    expected_sha256: &str,
+    expected_size: u64,
 ) -> String {
     let install_command = silent_update_install_command(installer_path);
     let install_args = install_command
@@ -434,13 +465,26 @@ fn app_update_runner_script(
         concat!(
             "$ErrorActionPreference = 'Stop'\n",
             "$parentPid = {current_process_id}\n",
-            "try {{ Wait-Process -Id $parentPid -Timeout 30 -ErrorAction SilentlyContinue }} catch {{ }}\n",
-            "$process = Start-Process -FilePath {installer_program} -ArgumentList @({install_args}) -Wait -PassThru -WindowStyle Hidden\n",
-            "if ($process.ExitCode -eq 0) {{\n",
-            "  Start-Process -FilePath {app_path}\n",
+            "$installerPath = {installer_path}\n",
+            "$stream = [System.IO.FileStream]::new($installerPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)\n",
+            "try {{\n",
+            "  if ($stream.Length -ne {expected_size}) {{ exit 41 }}\n",
+            "  $stream.Position = 0\n",
+            "  $actualHash = (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash\n",
+            "  if ($actualHash -ne {expected_sha256}) {{ exit 42 }}\n",
+            "  try {{ Wait-Process -Id $parentPid -Timeout 30 -ErrorAction SilentlyContinue }} catch {{ }}\n",
+            "  $process = Start-Process -FilePath {installer_program} -ArgumentList @({install_args}) -Wait -PassThru -WindowStyle Hidden\n",
+            "  if ($process.ExitCode -eq 0) {{\n",
+            "    Start-Process -FilePath {app_path}\n",
+            "  }}\n",
+            "}} finally {{\n",
+            "  $stream.Dispose()\n",
             "}}\n"
         ),
         current_process_id = current_process_id,
+        installer_path = powershell_single_quoted(&installer_path.display().to_string()),
+        expected_sha256 = powershell_single_quoted(&expected_sha256.to_ascii_uppercase()),
+        expected_size = expected_size,
         installer_program = powershell_single_quoted(&install_command.program.display().to_string()),
         install_args = install_args,
         app_path = powershell_single_quoted(&app_path.display().to_string()),
@@ -448,30 +492,39 @@ fn app_update_runner_script(
 }
 
 #[cfg(windows)]
-fn spawn_silent_update_runner(installer_path: &Path) -> Result<(), String> {
+fn spawn_silent_update_runner(
+    installer_path: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<(), String> {
     let app_path =
         std::env::current_exe().map_err(|error| format!("failed to locate DS Agent: {error}"))?;
-    let update_dir = app_update_dir();
-    fs::create_dir_all(&update_dir)
-        .map_err(|error| format!("failed to prepare update directory: {error}"))?;
-    let runner_path = update_dir.join("install-and-restart-ds-agent.ps1");
-    fs::write(
-        &runner_path,
-        app_update_runner_script(installer_path, &app_path, std::process::id()),
-    )
-    .map_err(|error| format!("failed to prepare silent update runner: {error}"))?;
+    let script = app_update_runner_script(
+        installer_path,
+        &app_path,
+        std::process::id(),
+        expected_sha256,
+        expected_size,
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(
+        script
+            .encode_utf16()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
 
     let mut command = Command::new("powershell.exe");
     command
         .args([
             "-NoProfile",
+            "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-WindowStyle",
             "Hidden",
-            "-File",
+            "-EncodedCommand",
         ])
-        .arg(&runner_path)
+        .arg(encoded)
         .creation_flags(WINDOWS_CREATE_NO_WINDOW);
     command
         .spawn()
@@ -480,16 +533,21 @@ fn spawn_silent_update_runner(installer_path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn spawn_silent_update_runner(_installer_path: &Path) -> Result<(), String> {
+fn spawn_silent_update_runner(
+    _installer_path: &Path,
+    _expected_sha256: &str,
+    _expected_size: u64,
+) -> Result<(), String> {
     Err("silent app updates are only supported on Windows".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        app_update_current_version, is_newer_version, is_windows_installer_asset,
-        release_asset_is_trusted, release_installable_asset, silent_update_install_command,
-        update_status_from_release, update_status_from_releases, GithubRelease, GithubReleaseAsset,
+        app_update_current_version, app_update_runner_script, is_newer_version,
+        is_windows_installer_asset, release_asset_is_trusted, release_installable_asset,
+        silent_update_install_command, update_status_from_release, update_status_from_releases,
+        validated_release_asset_location, GithubRelease, GithubReleaseAsset,
     };
 
     #[test]
@@ -595,7 +653,7 @@ mod tests {
         let status = update_status_from_releases(releases, app_update_current_version());
 
         assert!(!status.update_available);
-        assert_eq!(status.current_version, "v0.9.0");
+        assert_eq!(status.current_version, "v1.0.0");
         assert_eq!(status.latest_version.as_deref(), Some("0.3.0"));
         assert!(status.asset_name.is_none());
     }
@@ -713,6 +771,18 @@ mod tests {
         assert!(!release_asset_is_trusted(
             "https://github.com/SomeoneElse/dsagent/releases/download/v0.1.2/DS.Agent_0.1.2_x64-setup.exe"
         ));
+        for url in [
+            "http://github.com/Lee-take/dsagent/releases/download/v0.1.2/update.exe",
+            "https://github.com.evil.invalid/Lee-take/dsagent/releases/download/v0.1.2/update.exe",
+            "https://user@github.com/Lee-take/dsagent/releases/download/v0.1.2/update.exe",
+            "https://github.com/Lee-take/dsagent/releases/download/v0.1.2/update.exe?redirect=evil",
+            "https://github.com/Lee-take/dsagent/releases/download/v0.1.2/update.exe#fragment",
+        ] {
+            assert!(
+                !release_asset_is_trusted(url),
+                "unexpected trusted URL: {url}"
+            );
+        }
     }
 
     #[test]
@@ -774,5 +844,44 @@ mod tests {
             )
         );
         assert_eq!(command.args, vec!["/S"]);
+    }
+
+    #[test]
+    fn app_update_redirect_accepts_only_the_exact_github_asset_host() {
+        assert!(validated_release_asset_location(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/file?sig=opaque"
+        )
+        .is_ok());
+        for location in [
+            "http://release-assets.githubusercontent.com/github-production-release-asset/1/file",
+            "https://release-assets.githubusercontent.com.evil.invalid/github-production-release-asset/1/file",
+            "https://user@release-assets.githubusercontent.com/github-production-release-asset/1/file",
+            "https://release-assets.githubusercontent.com/another-prefix/1/file",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/file#fragment",
+        ] {
+            assert!(validated_release_asset_location(location).is_err());
+        }
+    }
+
+    #[test]
+    fn app_update_runner_holds_and_revalidates_the_exact_installer_before_waiting() {
+        let script = app_update_runner_script(
+            std::path::Path::new(r"C:\managed\update.exe"),
+            std::path::Path::new(r"C:\Program Files\DS Agent\ds-agent.exe"),
+            42,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            12_345,
+        );
+        let open = script.find("[System.IO.FileStream]::new").unwrap();
+        let length = script.find("$stream.Length -ne 12345").unwrap();
+        let hash = script.find("Get-FileHash -InputStream $stream").unwrap();
+        let wait = script.find("Wait-Process -Id $parentPid").unwrap();
+        let install = script.find("Start-Process -FilePath").unwrap();
+        assert!(open < length && length < hash && hash < wait && wait < install);
+        assert!(script.contains("[System.IO.FileShare]::Read"));
+        assert!(
+            script.contains("'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'")
+        );
+        assert!(script.contains("$stream.Dispose()"));
     }
 }

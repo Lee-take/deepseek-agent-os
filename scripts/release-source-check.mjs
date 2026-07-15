@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-const expectedVersion = "0.9.0";
+const expectedVersion = "1.0.0";
 const maxSourceFileBytes = 2 * 1024 * 1024;
 const binaryReleaseExtensions = new Set([
   ".appimage",
@@ -47,6 +47,8 @@ const allowedSourceBinaryFiles = new Set([
 const requiredDocs = [
   "README.md",
   "docs/INSTALLATION.md",
+  "docs/RELEASE_NOTES_v1.0.0.md",
+  "docs/DS_AGENT_V1_COMPLETION_AUDIT.md",
   "docs/RELEASE_NOTES_v0.9.0.md",
   "docs/RELEASE_NOTES_v0.8.0.md",
   "docs/RELEASE_NOTES_v0.8.0-rc.1.md",
@@ -73,6 +75,8 @@ const publicReleaseCopyFiles = [
   "apps/desktop/package.json",
   "docs/INSTALLATION.md",
   "docs/OPEN_SOURCE_RELEASE.md",
+  "docs/RELEASE_NOTES_v1.0.0.md",
+  "docs/DS_AGENT_V1_COMPLETION_AUDIT.md",
   "docs/RELEASE_NOTES_v0.9.0.md",
   "docs/RELEASE_NOTES_v0.8.0.md",
   "docs/RELEASE_NOTES_v0.8.0-rc.1.md",
@@ -722,8 +726,12 @@ function checkRequiredDocs() {
       "README.md searchable DSAgent aliases",
     ],
     [
-      "Latest stable: [DS Agent v0.9.0]",
-      "README.md latest stable v0.9.0 link",
+      "Current source candidate: `DS Agent v1.0.0` (not published or installed)",
+      "README.md current source candidate v1.0.0 status",
+    ],
+    [
+      "Latest published stable: [DS Agent v0.9.0]",
+      "README.md latest published stable v0.9.0 link",
     ],
     [
       "Historical prerelease: [DS Agent v0.8.0-rc.1]",
@@ -918,7 +926,7 @@ function checkRequiredDocs() {
   }
 
   for (const phrase of [
-    "The current 0.9.0 stable release includes the permission loop",
+    "The current 1.0.0 source candidate includes the permission loop",
     "Harness architecture v1",
     "runs through a stable Agent OS Kernel plus Workflow Packs",
     "uses permissioned tool boundaries, source-linked evidence, bounded workflow runs, selective context assembly, and token-efficient DeepSeek routing",
@@ -1132,8 +1140,8 @@ function checkRequiredDocs() {
     "If the selected model route does not provide web search",
     "Screen inspection and computer control are permissioned Computer Use features.",
     "Computer control requires an explicit one-shot approval",
-    "Email read, draft, and send tools are approval and audit surfaces",
-    "Local folder read and work-package export use local folders and local export packages",
+    "Microsoft/Google-shaped mail and calendar flows are implemented and validated offline with adversarial fake providers",
+    "Production account registration and live-provider execution remain disabled",
     "If web search is blocked",
     "choose a free source-linked web-search option in the UI before running search",
     "choose a free source-linked web-search option when prompted",
@@ -1777,14 +1785,26 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludes(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.9.0"',
-    "app updater current release tag v0.9.0",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v1.0.0"',
+    "app updater current release tag v1.0.0",
   );
   checkTextDoesNotInclude(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.8.0"',
-    "app updater current release tag must not regress to v0.8.0",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.9.0"',
+    "app updater current release tag must not regress to v0.9.0",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v1.0.0.md",
+    readText("docs/RELEASE_NOTES_v1.0.0.md"),
+    "Package, desktop, Tauri and Cargo metadata are `1.0.0`, and the updater identity is `v1.0.0`.",
+    "v1.0.0 stable release notes updater identity",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v1.0.0.md",
+    readText("docs/RELEASE_NOTES_v1.0.0.md"),
+    "The final artifact was built and inspected without launching the installer or changing installed app data.",
+    "v1.0.0 stable release validation boundary",
   );
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v0.9.0.md",
@@ -1835,10 +1855,40 @@ function checkPublicReleaseCopyPositioning() {
     "app updater has background download command",
   );
   checkTextIncludes(
+    "apps/desktop/src-tauri/src/app_update_commands.rs",
+    readText("apps/desktop/src-tauri/src/app_update_commands.rs"),
+    "download_receipt: String",
+    "app updater install command accepts only an opaque receipt",
+  );
+  checkTextDoesNotInclude(
+    "apps/desktop/src-tauri/src/app_update_commands.rs",
+    readText("apps/desktop/src-tauri/src/app_update_commands.rs"),
+    "installer_path: String",
+    "app updater command boundary must not accept an installer path",
+  );
+  checkTextIncludes(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
     'args: vec!["/S".to_string()]',
     "app updater uses silent NSIS installer flag",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/kernel/app_update.rs",
+    readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
+    ".redirect(reqwest::redirect::Policy::none())",
+    "app updater disables automatic redirects",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/kernel/app_update_receipt.rs",
+    readText("apps/desktop/src-tauri/src/kernel/app_update_receipt.rs"),
+    "APP_UPDATE_MAX_BYTES",
+    "app updater enforces a streamed byte ceiling",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/kernel/app_update_receipt.rs",
+    readText("apps/desktop/src-tauri/src/kernel/app_update_receipt.rs"),
+    "install_pending",
+    "app updater persists an install crash checkpoint",
   );
   checkTextIncludes(
     "apps/desktop/src/App.tsx",
@@ -1857,6 +1907,12 @@ function checkPublicReleaseCopyPositioning() {
     readText("apps/desktop/src/App.tsx"),
     'invoke<AppUpdateInstallResult>("install_app_update"',
     "app update UI installs through deterministic local command",
+  );
+  checkTextIncludes(
+    "apps/desktop/src/App.tsx",
+    readText("apps/desktop/src/App.tsx"),
+    "downloadReceipt: downloadedAppUpdate.download_receipt",
+    "app update UI consumes the opaque download receipt",
   );
   checkTextIncludes(
     "apps/desktop/src/App.tsx",
@@ -2155,7 +2211,8 @@ function checkChatFirstCenterWorkbenchUi() {
   for (const snippet of [
     "className=\"sidebar-controls\"",
     "className=\"sidebar-tool operations-tool\"",
-    "className=\"sidebar-tool package-tool\"",
+    "className=\"sidebar-tool operations-tool ordinary-user-hidden\"",
+    "className=\"sidebar-tool package-tool ordinary-user-hidden\"",
     "className=\"sidebar-tool memory-tool\"",
     "className=\"sidebar-tool settings-tool\"",
     "copy.skills.title",
@@ -2184,9 +2241,17 @@ function checkChatFirstCenterWorkbenchUi() {
     "copy.chatWorkbench.networkSearchTitle",
     "copy.chatWorkbench.title",
     "copy.chatWorkbench.composerPlaceholder",
+    "className=\"chat-approval-queue\"",
   ]) {
     checkTextIncludes(appPath, app, snippet, `chat-first center workbench app snippet: ${snippet}`);
   }
+
+  checkTextIncludes(
+    stylesPath,
+    styles,
+    ".ordinary-user-hidden",
+    "ordinary-user plugin utilities stay source-retained and display-hidden",
+  );
 
   for (const phrase of [
     "DeepSeek 对话工作台",

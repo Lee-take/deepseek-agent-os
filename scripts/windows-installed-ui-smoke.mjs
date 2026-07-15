@@ -389,19 +389,6 @@ async function runInstalledSkillLifecycleSmoke(client) {
   if (clicked !== true) {
     throw new Error("Installed Skills and Plugins smoke could not find the catalog button.");
   }
-  await evaluate(
-    client,
-    `(() => {
-      const labels = new Set(["场景模板", "Scenario Templates"]);
-      const target = Array.from(document.querySelectorAll("summary")).find((element) =>
-        labels.has((element.textContent ?? "").trim()),
-      );
-      if (!target) return false;
-      target.click();
-      return true;
-    })()`,
-  );
-
   const deadline = Date.now() + timeoutMs;
   let catalogText = "";
   while (Date.now() < deadline) {
@@ -426,12 +413,8 @@ async function runInstalledSkillLifecycleSmoke(client) {
       hubOpen: document.querySelector("details.plugins-hub")?.open === true,
       headings: Array.from(document.querySelectorAll(".plugins-hub .skill-catalog-group h4"))
         .map((element) => (element.textContent ?? "").trim()),
-      scenarioOpen: Array.from(document.querySelectorAll(".plugins-hub details"))
-        .some((element) => element.open && ["场景模板", "Scenario Templates"].includes((element.querySelector(":scope > summary")?.textContent ?? "").trim())),
-      scenarioText: Array.from(document.querySelectorAll(".plugins-hub details"))
-        .filter((element) => ["场景模板", "Scenario Templates"].includes((element.querySelector(":scope > summary")?.textContent ?? "").trim()))
-        .map((element) => element.textContent ?? "")
-        .join("\\n"),
+      hiddenUtilityLabels: Array.from(document.querySelectorAll(".plugins-hub .ordinary-user-hidden"))
+        .map((element) => (element.querySelector(":scope > summary")?.textContent ?? "").trim()),
     }))()`,
   );
   const headings = Array.isArray(catalogDom?.headings) ? catalogDom.headings : [];
@@ -448,14 +431,19 @@ async function runInstalledSkillLifecycleSmoke(client) {
     installed_skills: ["已安装 Skill", "已安装技能", "Installed Skills"].some((token) =>
       headings.includes(token),
     ),
-    scenario_templates: ["场景模板", "Scenario Templates"].some((token) =>
-      catalogText.includes(token),
-    ),
+    scenario_templates_hidden:
+      !["场景模板", "Scenario Templates"].some((token) => catalogText.includes(token)) &&
+      ["场景模板", "Scenario Templates"].some((token) =>
+        catalogDom?.hiddenUtilityLabels?.includes(token),
+      ),
+    work_packages_hidden:
+      !["任务记录与工作包", "Task Records and Work Packages"].some((token) =>
+        catalogText.includes(token),
+      ) &&
+      ["任务记录与工作包", "Task Records and Work Packages"].some((token) =>
+        catalogDom?.hiddenUtilityLabels?.includes(token),
+      ),
     protected_builder: catalogText.includes("Skill/Plugin Builder"),
-    scenario_template_open: catalogDom?.scenarioOpen === true,
-    operations_briefing_is_template: ["运营简报", "Operations Briefing"].some((token) =>
-      String(catalogDom?.scenarioText ?? "").includes(token),
-    ),
   };
   const failedChecks = Object.entries(checks)
     .filter(([, passed]) => !passed)

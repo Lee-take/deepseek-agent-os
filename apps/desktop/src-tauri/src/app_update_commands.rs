@@ -18,9 +18,9 @@ pub fn download_app_update() -> Result<AppUpdateDownloadResult, String> {
 #[tauri::command]
 pub fn install_app_update(
     app: AppHandle,
-    installer_path: String,
+    download_receipt: String,
 ) -> Result<AppUpdateInstallResult, String> {
-    let result = schedule_install(&installer_path)?;
+    let result = schedule_install(&download_receipt)?;
     app.exit(0);
     Ok(result)
 }
