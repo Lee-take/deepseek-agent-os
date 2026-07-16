@@ -1,0 +1,1923 @@
+{
+  "canonical": {
+    "version": "ds-agent.step-0-t1-baseline/v1",
+    "logical_snapshot_at": "2026-07-16T00:00:00Z",
+    "environment": {
+      "runner_version": "ds-agent.step-0-offline-runner/v1",
+      "app_version": "1.0.2",
+      "source_commit": "9d37c1f168cd2621a5506a17feb3b9bd2057851a",
+      "release_tag": "v1.0.2",
+      "source_state": "c0d-working-tree-based-on-source-commit",
+      "operating_system": "windows",
+      "architecture": "x86_64",
+      "environment_profile": "windows-offline-synthetic",
+      "access_mode": "ask_on_risk",
+      "fixture_mode": "synthetic-deterministic-offline",
+      "renderer_mode": "deterministic-receipt-fixture-no-office-or-poppler"
+    },
+    "fixture_manifest": {
+      "fixture_set_id": "t1-monthly-operations-brief-fixture-set-v1",
+      "generator_id": "t1-synthetic-office-fixtures-v1",
+      "checked_manifest_sha256": "a96941c5b9267c472e58d82015721b1656c2d97a7697e380ac626509d316ed38",
+      "generated_fixture_count_per_run": 3
+    },
+    "task_spec": {
+      "version": "ds-agent.benchmark-task-spec/v1",
+      "task_id": "t1-monthly-operations-brief",
+      "task_revision": 1,
+      "title": "T1 monthly operations brief",
+      "prompt": "Summarize the specified synthetic Excel, Word, and PDF inputs into a reconciliation workbook and a one-page monthly operations brief, flag anomalies, and save both outputs.",
+      "fixture_set_id": "t1-monthly-operations-brief-fixture-set-v1",
+      "fixture_data_class": "synthetic",
+      "fixtures": [
+        {
+          "fixture_id": "monthly-revenue-xlsx",
+          "relative_path": "inputs/01-monthly-revenue.xlsx",
+          "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8",
+          "provenance": {
+            "source_kind": "synthetic_generator",
+            "generator_id": "t1-synthetic-office-fixtures-v1",
+            "source_label": "Synthetic June 2026 monthly revenue workbook"
+          }
+        },
+        {
+          "fixture_id": "operations-notes-docx",
+          "relative_path": "inputs/02-operations-notes.docx",
+          "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391",
+          "provenance": {
+            "source_kind": "synthetic_generator",
+            "generator_id": "t1-synthetic-office-fixtures-v1",
+            "source_label": "Synthetic June 2026 operations notes document"
+          }
+        },
+        {
+          "fixture_id": "risk-summary-pdf",
+          "relative_path": "inputs/03-risk-summary.pdf",
+          "media_type": "application/pdf",
+          "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7",
+          "provenance": {
+            "source_kind": "synthetic_generator",
+            "generator_id": "t1-synthetic-office-fixtures-v1",
+            "source_label": "Synthetic June 2026 risk summary PDF"
+          }
+        }
+      ],
+      "done_when": [
+        {
+          "done_when_id": "source-manifest",
+          "description": "The three synthetic inputs are complete and hash-bound.",
+          "verifier_id": "t1.source-manifest/v1",
+          "required_evidence_kinds": [
+            "source_manifest"
+          ]
+        },
+        {
+          "done_when_id": "fact-provenance",
+          "description": "Every critical source and derived fact is traceable and recomputable.",
+          "verifier_id": "t1.provenance/v1",
+          "required_evidence_kinds": [
+            "fact_provenance"
+          ]
+        },
+        {
+          "done_when_id": "reconciliation-xlsx",
+          "description": "The reconciliation workbook is a valid formula-backed XLSX.",
+          "verifier_id": "t1.reconciliation-xlsx/v1",
+          "required_evidence_kinds": [
+            "reconciliation_xlsx"
+          ]
+        },
+        {
+          "done_when_id": "one-page-brief",
+          "description": "The monthly brief is a complete single-slide PPTX.",
+          "verifier_id": "t1.one-page-pptx/v1",
+          "required_evidence_kinds": [
+            "one_page_pptx"
+          ]
+        },
+        {
+          "done_when_id": "actual-render",
+          "description": "Deterministic actual-render receipts bind nonblank unclipped previews.",
+          "verifier_id": "t1.actual-render/v1",
+          "required_evidence_kinds": [
+            "actual_render_receipt"
+          ]
+        },
+        {
+          "done_when_id": "result-receipt",
+          "description": "The secret-safe result receipt binds the run, outputs, facts, and evidence.",
+          "verifier_id": "t1.result-receipt/v1",
+          "required_evidence_kinds": [
+            "result_receipt"
+          ]
+        }
+      ],
+      "allowed_capabilities": [
+        "file_read",
+        "file_write"
+      ],
+      "expected_risk": "high",
+      "authorization_budget": 1,
+      "expected_terminal": "verified_completion"
+    },
+    "task_spec_fingerprint": "a2504a599f8b5990904bcbc290973efa3f47a40d54cc0360c340519025f5f809",
+    "runs": [
+      {
+        "run_id": "t1-run-0001",
+        "repetition_index": 1,
+        "clean_state_id": "clean-state-01",
+        "clean_root_binding": "run-01",
+        "task_contract": {
+          "version": "ds-agent.benchmark-task-spec/v1",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "title": "T1 monthly operations brief",
+          "prompt": "Summarize the specified synthetic Excel, Word, and PDF inputs into a reconciliation workbook and a one-page monthly operations brief, flag anomalies, and save both outputs.",
+          "fixture_set_id": "t1-monthly-operations-brief-fixture-set-v1",
+          "fixture_data_class": "synthetic",
+          "fixtures": [
+            {
+              "fixture_id": "monthly-revenue-xlsx",
+              "relative_path": "inputs/01-monthly-revenue.xlsx",
+              "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 monthly revenue workbook"
+              }
+            },
+            {
+              "fixture_id": "operations-notes-docx",
+              "relative_path": "inputs/02-operations-notes.docx",
+              "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 operations notes document"
+              }
+            },
+            {
+              "fixture_id": "risk-summary-pdf",
+              "relative_path": "inputs/03-risk-summary.pdf",
+              "media_type": "application/pdf",
+              "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 risk summary PDF"
+              }
+            }
+          ],
+          "done_when": [
+            {
+              "done_when_id": "source-manifest",
+              "description": "The three synthetic inputs are complete and hash-bound.",
+              "verifier_id": "t1.source-manifest/v1",
+              "required_evidence_kinds": [
+                "source_manifest"
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "description": "Every critical source and derived fact is traceable and recomputable.",
+              "verifier_id": "t1.provenance/v1",
+              "required_evidence_kinds": [
+                "fact_provenance"
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "description": "The reconciliation workbook is a valid formula-backed XLSX.",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "required_evidence_kinds": [
+                "reconciliation_xlsx"
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "description": "The monthly brief is a complete single-slide PPTX.",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "required_evidence_kinds": [
+                "one_page_pptx"
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "description": "Deterministic actual-render receipts bind nonblank unclipped previews.",
+              "verifier_id": "t1.actual-render/v1",
+              "required_evidence_kinds": [
+                "actual_render_receipt"
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "description": "The secret-safe result receipt binds the run, outputs, facts, and evidence.",
+              "verifier_id": "t1.result-receipt/v1",
+              "required_evidence_kinds": [
+                "result_receipt"
+              ]
+            }
+          ],
+          "allowed_capabilities": [
+            "file_read",
+            "file_write"
+          ],
+          "expected_risk": "high",
+          "authorization_budget": 1,
+          "expected_terminal": "verified_completion"
+        },
+        "fixture_manifest_sha256": "a96941c5b9267c472e58d82015721b1656c2d97a7697e380ac626509d316ed38",
+        "run_result": {
+          "version": "ds-agent.benchmark-run-result/v1",
+          "run_id": "t1-run-0001",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "task_spec_fingerprint": "a2504a599f8b5990904bcbc290973efa3f47a40d54cc0360c340519025f5f809",
+          "repetition_index": 1,
+          "subject": {
+            "app_version": "1.0.2",
+            "source_commit": "9d37c1f168cd2621a5506a17feb3b9bd2057851a",
+            "release_tag": "v1.0.2",
+            "environment_profile": "windows-offline-synthetic",
+            "clean_state_id": "clean-state-01",
+            "access_mode": "ask_on_risk"
+          },
+          "started_at": "2026-07-16T08:00:00Z",
+          "finished_at": "2026-07-16T08:00:00Z",
+          "elapsed_ms": 0,
+          "terminal_state": "claimed_complete",
+          "external_effect_state": "none",
+          "outcome_class": "A",
+          "interactions": {
+            "clarification_count": 0,
+            "authorization_count": 0,
+            "manual_interventions": []
+          },
+          "deepseek_usage": [],
+          "verifier_results": [
+            {
+              "done_when_id": "source-manifest",
+              "verifier_id": "t1.source-manifest/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "source_manifest",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-source-manifest",
+                  "sha256": "ad3d864c524dae21cb0798f6b6ce98f8a603d7dc49fd943c05637bd9b2f9bba6",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "verifier_id": "t1.provenance/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "fact_provenance",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-fact-provenance",
+                  "sha256": "4394002eae973577efc10ff98cbaa05efe758198eb9f3dff876edba208300a2a",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "reconciliation_xlsx",
+                  "relative_or_opaque_ref": "outputs/t1-reconciliation.xlsx",
+                  "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "one_page_pptx",
+                  "relative_or_opaque_ref": "outputs/t1-monthly-brief.pptx",
+                  "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "verifier_id": "t1.actual-render/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "actual_render_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-actual-render",
+                  "sha256": "9863027063f52965894fe8631c297c3a30e4fd19ec3622acbb53dd13b10d6751",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "verifier_id": "t1.result-receipt/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "result_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-result-receipt",
+                  "sha256": "ac61029bd3a81134bf9420af7bfba35d6aa53a252b342b3236bf2e91f0d060ba",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            }
+          ],
+          "guardrail_violations": [],
+          "failure_stage": null,
+          "failure_code": null
+        },
+        "classification": {
+          "outcome_class": "A",
+          "verifier_gate_passed": true,
+          "false_completion": false
+        },
+        "completion_decision": "completed",
+        "metrics": {
+          "outcome_class": "A",
+          "clarification_count": 0,
+          "authorization_count": 0,
+          "human_intervention_count": 0,
+          "logical_duration_ms": 0,
+          "evidence_receipt_count": 6,
+          "failure_stage": null,
+          "offline_usage": {
+            "api_call_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_micro_usd": 0,
+            "availability": "none",
+            "reason": "Offline deterministic runner made no model or provider call"
+          }
+        },
+        "artifact_hashes": [
+          {
+            "kind": "run_binding",
+            "relative_ref": "workspace/run-binding.json",
+            "bytes": 366,
+            "sha256": "d7a96e13cb62021cdc9ee510b2eecb80280706bbeb268dd764e6c4af065bd46a"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/01-monthly-revenue.xlsx",
+            "bytes": 4677,
+            "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/02-operations-notes.docx",
+            "bytes": 2526,
+            "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/03-risk-summary.pdf",
+            "bytes": 867,
+            "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-reconciliation.xlsx",
+            "bytes": 8356,
+            "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-monthly-brief.pptx",
+            "bytes": 5718,
+            "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-reconciliation-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-monthly-brief-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/source-manifest.json",
+            "bytes": 1370,
+            "sha256": "6dc9bc1cf1f0c6f77a47ea432fce44a5c79f5e3c0668eb6b8e5d867140a304de"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/provenance-manifest.json",
+            "bytes": 11611,
+            "sha256": "3d18c6f25d67d5c48f0bee2884b50aadeaf2f3ec02ac3567d8a06e7386981c78"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/actual-render-receipt.json",
+            "bytes": 1392,
+            "sha256": "211d6d98a40b09e95cfe174bae7c0e7fd843c129617363fc9633085762539b18"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/result-receipt.json",
+            "bytes": 1297,
+            "sha256": "09ed940bca0948454b47f4245c7edcfe3f981553a6ddf8099c12b4d134df1327"
+          },
+          {
+            "kind": "benchmark_run_result",
+            "relative_ref": "output/receipts/benchmark-run-result.json",
+            "bytes": 3977,
+            "sha256": "7e586814884f66068a8159b444267f907e860c89348d80c0f3a2c4d4dc0e3925"
+          }
+        ]
+      },
+      {
+        "run_id": "t1-run-0002",
+        "repetition_index": 2,
+        "clean_state_id": "clean-state-02",
+        "clean_root_binding": "run-02",
+        "task_contract": {
+          "version": "ds-agent.benchmark-task-spec/v1",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "title": "T1 monthly operations brief",
+          "prompt": "Summarize the specified synthetic Excel, Word, and PDF inputs into a reconciliation workbook and a one-page monthly operations brief, flag anomalies, and save both outputs.",
+          "fixture_set_id": "t1-monthly-operations-brief-fixture-set-v1",
+          "fixture_data_class": "synthetic",
+          "fixtures": [
+            {
+              "fixture_id": "monthly-revenue-xlsx",
+              "relative_path": "inputs/01-monthly-revenue.xlsx",
+              "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 monthly revenue workbook"
+              }
+            },
+            {
+              "fixture_id": "operations-notes-docx",
+              "relative_path": "inputs/02-operations-notes.docx",
+              "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 operations notes document"
+              }
+            },
+            {
+              "fixture_id": "risk-summary-pdf",
+              "relative_path": "inputs/03-risk-summary.pdf",
+              "media_type": "application/pdf",
+              "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 risk summary PDF"
+              }
+            }
+          ],
+          "done_when": [
+            {
+              "done_when_id": "source-manifest",
+              "description": "The three synthetic inputs are complete and hash-bound.",
+              "verifier_id": "t1.source-manifest/v1",
+              "required_evidence_kinds": [
+                "source_manifest"
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "description": "Every critical source and derived fact is traceable and recomputable.",
+              "verifier_id": "t1.provenance/v1",
+              "required_evidence_kinds": [
+                "fact_provenance"
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "description": "The reconciliation workbook is a valid formula-backed XLSX.",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "required_evidence_kinds": [
+                "reconciliation_xlsx"
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "description": "The monthly brief is a complete single-slide PPTX.",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "required_evidence_kinds": [
+                "one_page_pptx"
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "description": "Deterministic actual-render receipts bind nonblank unclipped previews.",
+              "verifier_id": "t1.actual-render/v1",
+              "required_evidence_kinds": [
+                "actual_render_receipt"
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "description": "The secret-safe result receipt binds the run, outputs, facts, and evidence.",
+              "verifier_id": "t1.result-receipt/v1",
+              "required_evidence_kinds": [
+                "result_receipt"
+              ]
+            }
+          ],
+          "allowed_capabilities": [
+            "file_read",
+            "file_write"
+          ],
+          "expected_risk": "high",
+          "authorization_budget": 1,
+          "expected_terminal": "verified_completion"
+        },
+        "fixture_manifest_sha256": "a96941c5b9267c472e58d82015721b1656c2d97a7697e380ac626509d316ed38",
+        "run_result": {
+          "version": "ds-agent.benchmark-run-result/v1",
+          "run_id": "t1-run-0002",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "task_spec_fingerprint": "a2504a599f8b5990904bcbc290973efa3f47a40d54cc0360c340519025f5f809",
+          "repetition_index": 2,
+          "subject": {
+            "app_version": "1.0.2",
+            "source_commit": "9d37c1f168cd2621a5506a17feb3b9bd2057851a",
+            "release_tag": "v1.0.2",
+            "environment_profile": "windows-offline-synthetic",
+            "clean_state_id": "clean-state-02",
+            "access_mode": "ask_on_risk"
+          },
+          "started_at": "2026-07-16T08:00:01Z",
+          "finished_at": "2026-07-16T08:00:01Z",
+          "elapsed_ms": 0,
+          "terminal_state": "claimed_complete",
+          "external_effect_state": "none",
+          "outcome_class": "A",
+          "interactions": {
+            "clarification_count": 0,
+            "authorization_count": 0,
+            "manual_interventions": []
+          },
+          "deepseek_usage": [],
+          "verifier_results": [
+            {
+              "done_when_id": "source-manifest",
+              "verifier_id": "t1.source-manifest/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "source_manifest",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-source-manifest",
+                  "sha256": "ad3d864c524dae21cb0798f6b6ce98f8a603d7dc49fd943c05637bd9b2f9bba6",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "verifier_id": "t1.provenance/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "fact_provenance",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-fact-provenance",
+                  "sha256": "4394002eae973577efc10ff98cbaa05efe758198eb9f3dff876edba208300a2a",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "reconciliation_xlsx",
+                  "relative_or_opaque_ref": "outputs/t1-reconciliation.xlsx",
+                  "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "one_page_pptx",
+                  "relative_or_opaque_ref": "outputs/t1-monthly-brief.pptx",
+                  "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "verifier_id": "t1.actual-render/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "actual_render_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-actual-render",
+                  "sha256": "9863027063f52965894fe8631c297c3a30e4fd19ec3622acbb53dd13b10d6751",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "verifier_id": "t1.result-receipt/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "result_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-result-receipt",
+                  "sha256": "ab9d39dcb8d32df8cd80379745d583a03f3c26bff022240a8434e70790e651dc",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            }
+          ],
+          "guardrail_violations": [],
+          "failure_stage": null,
+          "failure_code": null
+        },
+        "classification": {
+          "outcome_class": "A",
+          "verifier_gate_passed": true,
+          "false_completion": false
+        },
+        "completion_decision": "completed",
+        "metrics": {
+          "outcome_class": "A",
+          "clarification_count": 0,
+          "authorization_count": 0,
+          "human_intervention_count": 0,
+          "logical_duration_ms": 0,
+          "evidence_receipt_count": 6,
+          "failure_stage": null,
+          "offline_usage": {
+            "api_call_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_micro_usd": 0,
+            "availability": "none",
+            "reason": "Offline deterministic runner made no model or provider call"
+          }
+        },
+        "artifact_hashes": [
+          {
+            "kind": "run_binding",
+            "relative_ref": "workspace/run-binding.json",
+            "bytes": 366,
+            "sha256": "9a7b051b2bafe36d74c769b13448e46241d42659f8e66e5824a0e0d1314b8f61"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/01-monthly-revenue.xlsx",
+            "bytes": 4677,
+            "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/02-operations-notes.docx",
+            "bytes": 2526,
+            "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/03-risk-summary.pdf",
+            "bytes": 867,
+            "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-reconciliation.xlsx",
+            "bytes": 8356,
+            "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-monthly-brief.pptx",
+            "bytes": 5718,
+            "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-reconciliation-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-monthly-brief-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/source-manifest.json",
+            "bytes": 1370,
+            "sha256": "6dc9bc1cf1f0c6f77a47ea432fce44a5c79f5e3c0668eb6b8e5d867140a304de"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/provenance-manifest.json",
+            "bytes": 11611,
+            "sha256": "3d18c6f25d67d5c48f0bee2884b50aadeaf2f3ec02ac3567d8a06e7386981c78"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/actual-render-receipt.json",
+            "bytes": 1392,
+            "sha256": "211d6d98a40b09e95cfe174bae7c0e7fd843c129617363fc9633085762539b18"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/result-receipt.json",
+            "bytes": 1297,
+            "sha256": "edf75f84030f44bfbcdd0be87b7d586be89c56450b618816feca54e5ff19e2ca"
+          },
+          {
+            "kind": "benchmark_run_result",
+            "relative_ref": "output/receipts/benchmark-run-result.json",
+            "bytes": 3977,
+            "sha256": "2500b7f672ed39e48f8c2f9bd1913beb2b246b06f904da9ceb6387b802cb53da"
+          }
+        ]
+      },
+      {
+        "run_id": "t1-run-0003",
+        "repetition_index": 3,
+        "clean_state_id": "clean-state-03",
+        "clean_root_binding": "run-03",
+        "task_contract": {
+          "version": "ds-agent.benchmark-task-spec/v1",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "title": "T1 monthly operations brief",
+          "prompt": "Summarize the specified synthetic Excel, Word, and PDF inputs into a reconciliation workbook and a one-page monthly operations brief, flag anomalies, and save both outputs.",
+          "fixture_set_id": "t1-monthly-operations-brief-fixture-set-v1",
+          "fixture_data_class": "synthetic",
+          "fixtures": [
+            {
+              "fixture_id": "monthly-revenue-xlsx",
+              "relative_path": "inputs/01-monthly-revenue.xlsx",
+              "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 monthly revenue workbook"
+              }
+            },
+            {
+              "fixture_id": "operations-notes-docx",
+              "relative_path": "inputs/02-operations-notes.docx",
+              "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 operations notes document"
+              }
+            },
+            {
+              "fixture_id": "risk-summary-pdf",
+              "relative_path": "inputs/03-risk-summary.pdf",
+              "media_type": "application/pdf",
+              "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 risk summary PDF"
+              }
+            }
+          ],
+          "done_when": [
+            {
+              "done_when_id": "source-manifest",
+              "description": "The three synthetic inputs are complete and hash-bound.",
+              "verifier_id": "t1.source-manifest/v1",
+              "required_evidence_kinds": [
+                "source_manifest"
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "description": "Every critical source and derived fact is traceable and recomputable.",
+              "verifier_id": "t1.provenance/v1",
+              "required_evidence_kinds": [
+                "fact_provenance"
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "description": "The reconciliation workbook is a valid formula-backed XLSX.",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "required_evidence_kinds": [
+                "reconciliation_xlsx"
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "description": "The monthly brief is a complete single-slide PPTX.",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "required_evidence_kinds": [
+                "one_page_pptx"
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "description": "Deterministic actual-render receipts bind nonblank unclipped previews.",
+              "verifier_id": "t1.actual-render/v1",
+              "required_evidence_kinds": [
+                "actual_render_receipt"
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "description": "The secret-safe result receipt binds the run, outputs, facts, and evidence.",
+              "verifier_id": "t1.result-receipt/v1",
+              "required_evidence_kinds": [
+                "result_receipt"
+              ]
+            }
+          ],
+          "allowed_capabilities": [
+            "file_read",
+            "file_write"
+          ],
+          "expected_risk": "high",
+          "authorization_budget": 1,
+          "expected_terminal": "verified_completion"
+        },
+        "fixture_manifest_sha256": "a96941c5b9267c472e58d82015721b1656c2d97a7697e380ac626509d316ed38",
+        "run_result": {
+          "version": "ds-agent.benchmark-run-result/v1",
+          "run_id": "t1-run-0003",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "task_spec_fingerprint": "a2504a599f8b5990904bcbc290973efa3f47a40d54cc0360c340519025f5f809",
+          "repetition_index": 3,
+          "subject": {
+            "app_version": "1.0.2",
+            "source_commit": "9d37c1f168cd2621a5506a17feb3b9bd2057851a",
+            "release_tag": "v1.0.2",
+            "environment_profile": "windows-offline-synthetic",
+            "clean_state_id": "clean-state-03",
+            "access_mode": "ask_on_risk"
+          },
+          "started_at": "2026-07-16T08:00:02Z",
+          "finished_at": "2026-07-16T08:00:02Z",
+          "elapsed_ms": 0,
+          "terminal_state": "claimed_complete",
+          "external_effect_state": "none",
+          "outcome_class": "A",
+          "interactions": {
+            "clarification_count": 0,
+            "authorization_count": 0,
+            "manual_interventions": []
+          },
+          "deepseek_usage": [],
+          "verifier_results": [
+            {
+              "done_when_id": "source-manifest",
+              "verifier_id": "t1.source-manifest/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "source_manifest",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-source-manifest",
+                  "sha256": "ad3d864c524dae21cb0798f6b6ce98f8a603d7dc49fd943c05637bd9b2f9bba6",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "verifier_id": "t1.provenance/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "fact_provenance",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-fact-provenance",
+                  "sha256": "4394002eae973577efc10ff98cbaa05efe758198eb9f3dff876edba208300a2a",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "reconciliation_xlsx",
+                  "relative_or_opaque_ref": "outputs/t1-reconciliation.xlsx",
+                  "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "one_page_pptx",
+                  "relative_or_opaque_ref": "outputs/t1-monthly-brief.pptx",
+                  "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "verifier_id": "t1.actual-render/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "actual_render_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-actual-render",
+                  "sha256": "9863027063f52965894fe8631c297c3a30e4fd19ec3622acbb53dd13b10d6751",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "verifier_id": "t1.result-receipt/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "result_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-result-receipt",
+                  "sha256": "3499252496c827c4cb481b0533f16d8816b7f902b0f4a57653426523a673f9a7",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            }
+          ],
+          "guardrail_violations": [],
+          "failure_stage": null,
+          "failure_code": null
+        },
+        "classification": {
+          "outcome_class": "A",
+          "verifier_gate_passed": true,
+          "false_completion": false
+        },
+        "completion_decision": "completed",
+        "metrics": {
+          "outcome_class": "A",
+          "clarification_count": 0,
+          "authorization_count": 0,
+          "human_intervention_count": 0,
+          "logical_duration_ms": 0,
+          "evidence_receipt_count": 6,
+          "failure_stage": null,
+          "offline_usage": {
+            "api_call_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_micro_usd": 0,
+            "availability": "none",
+            "reason": "Offline deterministic runner made no model or provider call"
+          }
+        },
+        "artifact_hashes": [
+          {
+            "kind": "run_binding",
+            "relative_ref": "workspace/run-binding.json",
+            "bytes": 366,
+            "sha256": "cc40d081f5ef8a62295a3100e575385b2ecedfd9c1c3aeb018da29c12decdaa0"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/01-monthly-revenue.xlsx",
+            "bytes": 4677,
+            "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/02-operations-notes.docx",
+            "bytes": 2526,
+            "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/03-risk-summary.pdf",
+            "bytes": 867,
+            "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-reconciliation.xlsx",
+            "bytes": 8356,
+            "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-monthly-brief.pptx",
+            "bytes": 5718,
+            "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-reconciliation-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-monthly-brief-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/source-manifest.json",
+            "bytes": 1370,
+            "sha256": "6dc9bc1cf1f0c6f77a47ea432fce44a5c79f5e3c0668eb6b8e5d867140a304de"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/provenance-manifest.json",
+            "bytes": 11611,
+            "sha256": "3d18c6f25d67d5c48f0bee2884b50aadeaf2f3ec02ac3567d8a06e7386981c78"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/actual-render-receipt.json",
+            "bytes": 1392,
+            "sha256": "211d6d98a40b09e95cfe174bae7c0e7fd843c129617363fc9633085762539b18"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/result-receipt.json",
+            "bytes": 1297,
+            "sha256": "709658f164e45eeacf659cb601760e9d78763a90f84d1162988b8d560b769f81"
+          },
+          {
+            "kind": "benchmark_run_result",
+            "relative_ref": "output/receipts/benchmark-run-result.json",
+            "bytes": 3977,
+            "sha256": "ee3b36fad7209911bd0bcb1280441cc09593de47ec3b7112e68530712c7d0b73"
+          }
+        ]
+      },
+      {
+        "run_id": "t1-run-0004",
+        "repetition_index": 4,
+        "clean_state_id": "clean-state-04",
+        "clean_root_binding": "run-04",
+        "task_contract": {
+          "version": "ds-agent.benchmark-task-spec/v1",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "title": "T1 monthly operations brief",
+          "prompt": "Summarize the specified synthetic Excel, Word, and PDF inputs into a reconciliation workbook and a one-page monthly operations brief, flag anomalies, and save both outputs.",
+          "fixture_set_id": "t1-monthly-operations-brief-fixture-set-v1",
+          "fixture_data_class": "synthetic",
+          "fixtures": [
+            {
+              "fixture_id": "monthly-revenue-xlsx",
+              "relative_path": "inputs/01-monthly-revenue.xlsx",
+              "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 monthly revenue workbook"
+              }
+            },
+            {
+              "fixture_id": "operations-notes-docx",
+              "relative_path": "inputs/02-operations-notes.docx",
+              "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 operations notes document"
+              }
+            },
+            {
+              "fixture_id": "risk-summary-pdf",
+              "relative_path": "inputs/03-risk-summary.pdf",
+              "media_type": "application/pdf",
+              "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 risk summary PDF"
+              }
+            }
+          ],
+          "done_when": [
+            {
+              "done_when_id": "source-manifest",
+              "description": "The three synthetic inputs are complete and hash-bound.",
+              "verifier_id": "t1.source-manifest/v1",
+              "required_evidence_kinds": [
+                "source_manifest"
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "description": "Every critical source and derived fact is traceable and recomputable.",
+              "verifier_id": "t1.provenance/v1",
+              "required_evidence_kinds": [
+                "fact_provenance"
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "description": "The reconciliation workbook is a valid formula-backed XLSX.",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "required_evidence_kinds": [
+                "reconciliation_xlsx"
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "description": "The monthly brief is a complete single-slide PPTX.",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "required_evidence_kinds": [
+                "one_page_pptx"
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "description": "Deterministic actual-render receipts bind nonblank unclipped previews.",
+              "verifier_id": "t1.actual-render/v1",
+              "required_evidence_kinds": [
+                "actual_render_receipt"
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "description": "The secret-safe result receipt binds the run, outputs, facts, and evidence.",
+              "verifier_id": "t1.result-receipt/v1",
+              "required_evidence_kinds": [
+                "result_receipt"
+              ]
+            }
+          ],
+          "allowed_capabilities": [
+            "file_read",
+            "file_write"
+          ],
+          "expected_risk": "high",
+          "authorization_budget": 1,
+          "expected_terminal": "verified_completion"
+        },
+        "fixture_manifest_sha256": "a96941c5b9267c472e58d82015721b1656c2d97a7697e380ac626509d316ed38",
+        "run_result": {
+          "version": "ds-agent.benchmark-run-result/v1",
+          "run_id": "t1-run-0004",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "task_spec_fingerprint": "a2504a599f8b5990904bcbc290973efa3f47a40d54cc0360c340519025f5f809",
+          "repetition_index": 4,
+          "subject": {
+            "app_version": "1.0.2",
+            "source_commit": "9d37c1f168cd2621a5506a17feb3b9bd2057851a",
+            "release_tag": "v1.0.2",
+            "environment_profile": "windows-offline-synthetic",
+            "clean_state_id": "clean-state-04",
+            "access_mode": "ask_on_risk"
+          },
+          "started_at": "2026-07-16T08:00:03Z",
+          "finished_at": "2026-07-16T08:00:03Z",
+          "elapsed_ms": 0,
+          "terminal_state": "claimed_complete",
+          "external_effect_state": "none",
+          "outcome_class": "A",
+          "interactions": {
+            "clarification_count": 0,
+            "authorization_count": 0,
+            "manual_interventions": []
+          },
+          "deepseek_usage": [],
+          "verifier_results": [
+            {
+              "done_when_id": "source-manifest",
+              "verifier_id": "t1.source-manifest/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "source_manifest",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-source-manifest",
+                  "sha256": "ad3d864c524dae21cb0798f6b6ce98f8a603d7dc49fd943c05637bd9b2f9bba6",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "verifier_id": "t1.provenance/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "fact_provenance",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-fact-provenance",
+                  "sha256": "4394002eae973577efc10ff98cbaa05efe758198eb9f3dff876edba208300a2a",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "reconciliation_xlsx",
+                  "relative_or_opaque_ref": "outputs/t1-reconciliation.xlsx",
+                  "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "one_page_pptx",
+                  "relative_or_opaque_ref": "outputs/t1-monthly-brief.pptx",
+                  "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "verifier_id": "t1.actual-render/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "actual_render_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-actual-render",
+                  "sha256": "9863027063f52965894fe8631c297c3a30e4fd19ec3622acbb53dd13b10d6751",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "verifier_id": "t1.result-receipt/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "result_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-result-receipt",
+                  "sha256": "8ad50246cdd041c2f1e0224d4b166f39e23e15058a7ab27c723cf49ba134ee74",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            }
+          ],
+          "guardrail_violations": [],
+          "failure_stage": null,
+          "failure_code": null
+        },
+        "classification": {
+          "outcome_class": "A",
+          "verifier_gate_passed": true,
+          "false_completion": false
+        },
+        "completion_decision": "completed",
+        "metrics": {
+          "outcome_class": "A",
+          "clarification_count": 0,
+          "authorization_count": 0,
+          "human_intervention_count": 0,
+          "logical_duration_ms": 0,
+          "evidence_receipt_count": 6,
+          "failure_stage": null,
+          "offline_usage": {
+            "api_call_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_micro_usd": 0,
+            "availability": "none",
+            "reason": "Offline deterministic runner made no model or provider call"
+          }
+        },
+        "artifact_hashes": [
+          {
+            "kind": "run_binding",
+            "relative_ref": "workspace/run-binding.json",
+            "bytes": 366,
+            "sha256": "0c88ce9414ab3f8d74b449174830ea508edca877177dee20d7a967fc595ddd3d"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/01-monthly-revenue.xlsx",
+            "bytes": 4677,
+            "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/02-operations-notes.docx",
+            "bytes": 2526,
+            "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/03-risk-summary.pdf",
+            "bytes": 867,
+            "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-reconciliation.xlsx",
+            "bytes": 8356,
+            "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-monthly-brief.pptx",
+            "bytes": 5718,
+            "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-reconciliation-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-monthly-brief-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/source-manifest.json",
+            "bytes": 1370,
+            "sha256": "6dc9bc1cf1f0c6f77a47ea432fce44a5c79f5e3c0668eb6b8e5d867140a304de"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/provenance-manifest.json",
+            "bytes": 11611,
+            "sha256": "3d18c6f25d67d5c48f0bee2884b50aadeaf2f3ec02ac3567d8a06e7386981c78"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/actual-render-receipt.json",
+            "bytes": 1392,
+            "sha256": "211d6d98a40b09e95cfe174bae7c0e7fd843c129617363fc9633085762539b18"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/result-receipt.json",
+            "bytes": 1297,
+            "sha256": "13effbf45f683b3fa14992868f68938303ade386a9ed2112c0120d0dacd3b10b"
+          },
+          {
+            "kind": "benchmark_run_result",
+            "relative_ref": "output/receipts/benchmark-run-result.json",
+            "bytes": 3977,
+            "sha256": "e648d6a8aa199f33bad116ff0e3970a4c178427ce90ff5289bb62132b1fe3c0c"
+          }
+        ]
+      },
+      {
+        "run_id": "t1-run-0005",
+        "repetition_index": 5,
+        "clean_state_id": "clean-state-05",
+        "clean_root_binding": "run-05",
+        "task_contract": {
+          "version": "ds-agent.benchmark-task-spec/v1",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "title": "T1 monthly operations brief",
+          "prompt": "Summarize the specified synthetic Excel, Word, and PDF inputs into a reconciliation workbook and a one-page monthly operations brief, flag anomalies, and save both outputs.",
+          "fixture_set_id": "t1-monthly-operations-brief-fixture-set-v1",
+          "fixture_data_class": "synthetic",
+          "fixtures": [
+            {
+              "fixture_id": "monthly-revenue-xlsx",
+              "relative_path": "inputs/01-monthly-revenue.xlsx",
+              "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 monthly revenue workbook"
+              }
+            },
+            {
+              "fixture_id": "operations-notes-docx",
+              "relative_path": "inputs/02-operations-notes.docx",
+              "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 operations notes document"
+              }
+            },
+            {
+              "fixture_id": "risk-summary-pdf",
+              "relative_path": "inputs/03-risk-summary.pdf",
+              "media_type": "application/pdf",
+              "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7",
+              "provenance": {
+                "source_kind": "synthetic_generator",
+                "generator_id": "t1-synthetic-office-fixtures-v1",
+                "source_label": "Synthetic June 2026 risk summary PDF"
+              }
+            }
+          ],
+          "done_when": [
+            {
+              "done_when_id": "source-manifest",
+              "description": "The three synthetic inputs are complete and hash-bound.",
+              "verifier_id": "t1.source-manifest/v1",
+              "required_evidence_kinds": [
+                "source_manifest"
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "description": "Every critical source and derived fact is traceable and recomputable.",
+              "verifier_id": "t1.provenance/v1",
+              "required_evidence_kinds": [
+                "fact_provenance"
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "description": "The reconciliation workbook is a valid formula-backed XLSX.",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "required_evidence_kinds": [
+                "reconciliation_xlsx"
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "description": "The monthly brief is a complete single-slide PPTX.",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "required_evidence_kinds": [
+                "one_page_pptx"
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "description": "Deterministic actual-render receipts bind nonblank unclipped previews.",
+              "verifier_id": "t1.actual-render/v1",
+              "required_evidence_kinds": [
+                "actual_render_receipt"
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "description": "The secret-safe result receipt binds the run, outputs, facts, and evidence.",
+              "verifier_id": "t1.result-receipt/v1",
+              "required_evidence_kinds": [
+                "result_receipt"
+              ]
+            }
+          ],
+          "allowed_capabilities": [
+            "file_read",
+            "file_write"
+          ],
+          "expected_risk": "high",
+          "authorization_budget": 1,
+          "expected_terminal": "verified_completion"
+        },
+        "fixture_manifest_sha256": "a96941c5b9267c472e58d82015721b1656c2d97a7697e380ac626509d316ed38",
+        "run_result": {
+          "version": "ds-agent.benchmark-run-result/v1",
+          "run_id": "t1-run-0005",
+          "task_id": "t1-monthly-operations-brief",
+          "task_revision": 1,
+          "task_spec_fingerprint": "a2504a599f8b5990904bcbc290973efa3f47a40d54cc0360c340519025f5f809",
+          "repetition_index": 5,
+          "subject": {
+            "app_version": "1.0.2",
+            "source_commit": "9d37c1f168cd2621a5506a17feb3b9bd2057851a",
+            "release_tag": "v1.0.2",
+            "environment_profile": "windows-offline-synthetic",
+            "clean_state_id": "clean-state-05",
+            "access_mode": "ask_on_risk"
+          },
+          "started_at": "2026-07-16T08:00:04Z",
+          "finished_at": "2026-07-16T08:00:04Z",
+          "elapsed_ms": 0,
+          "terminal_state": "claimed_complete",
+          "external_effect_state": "none",
+          "outcome_class": "A",
+          "interactions": {
+            "clarification_count": 0,
+            "authorization_count": 0,
+            "manual_interventions": []
+          },
+          "deepseek_usage": [],
+          "verifier_results": [
+            {
+              "done_when_id": "source-manifest",
+              "verifier_id": "t1.source-manifest/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "source_manifest",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-source-manifest",
+                  "sha256": "ad3d864c524dae21cb0798f6b6ce98f8a603d7dc49fd943c05637bd9b2f9bba6",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "fact-provenance",
+              "verifier_id": "t1.provenance/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "fact_provenance",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-fact-provenance",
+                  "sha256": "4394002eae973577efc10ff98cbaa05efe758198eb9f3dff876edba208300a2a",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "reconciliation-xlsx",
+              "verifier_id": "t1.reconciliation-xlsx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "reconciliation_xlsx",
+                  "relative_or_opaque_ref": "outputs/t1-reconciliation.xlsx",
+                  "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "one-page-brief",
+              "verifier_id": "t1.one-page-pptx/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "one_page_pptx",
+                  "relative_or_opaque_ref": "outputs/t1-monthly-brief.pptx",
+                  "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "actual-render",
+              "verifier_id": "t1.actual-render/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "actual_render_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-actual-render",
+                  "sha256": "9863027063f52965894fe8631c297c3a30e4fd19ec3622acbb53dd13b10d6751",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            },
+            {
+              "done_when_id": "result-receipt",
+              "verifier_id": "t1.result-receipt/v1",
+              "status": "passed",
+              "summary": "Deterministic T1 verification passed",
+              "evidence": [
+                {
+                  "kind": "result_receipt",
+                  "relative_or_opaque_ref": "benchmark-evidence:t1-result-receipt",
+                  "sha256": "3a29ff15824449135c07c8dd486c650ebd5c4e68589fe619eef56e3edd1ee57b",
+                  "summary": "Secret-safe deterministic T1 verifier receipt"
+                }
+              ]
+            }
+          ],
+          "guardrail_violations": [],
+          "failure_stage": null,
+          "failure_code": null
+        },
+        "classification": {
+          "outcome_class": "A",
+          "verifier_gate_passed": true,
+          "false_completion": false
+        },
+        "completion_decision": "completed",
+        "metrics": {
+          "outcome_class": "A",
+          "clarification_count": 0,
+          "authorization_count": 0,
+          "human_intervention_count": 0,
+          "logical_duration_ms": 0,
+          "evidence_receipt_count": 6,
+          "failure_stage": null,
+          "offline_usage": {
+            "api_call_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_micro_usd": 0,
+            "availability": "none",
+            "reason": "Offline deterministic runner made no model or provider call"
+          }
+        },
+        "artifact_hashes": [
+          {
+            "kind": "run_binding",
+            "relative_ref": "workspace/run-binding.json",
+            "bytes": 366,
+            "sha256": "1d956adabfc370718deeae2cc15de748116bc97f635c01d742d031c663a4de59"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/01-monthly-revenue.xlsx",
+            "bytes": 4677,
+            "sha256": "7877ef41911263907895adba7e3c4b18f1795bfbb6146d2b858f9cbec6d2cfa8"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/02-operations-notes.docx",
+            "bytes": 2526,
+            "sha256": "b8914071c772e000d7f13a7f8632808cf115700e5bd1c45232314b0280ecd391"
+          },
+          {
+            "kind": "fixture",
+            "relative_ref": "fixture/inputs/03-risk-summary.pdf",
+            "bytes": 867,
+            "sha256": "ab4e27543100cb8a2803b14c89a35a81a5150b3393403ba68a82b737712b52d7"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-reconciliation.xlsx",
+            "bytes": 8356,
+            "sha256": "6ee477e0ca940cbf2cecd572ce9842e2871f9cba3e8d1d8831b88224294901f1"
+          },
+          {
+            "kind": "candidate_artifact",
+            "relative_ref": "output/outputs/t1-monthly-brief.pptx",
+            "bytes": 5718,
+            "sha256": "420dc8f1faa926c71f99a7c8f3aaa8f0b2160af77548d16b715ceff4da4373f4"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-reconciliation-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "render_preview",
+            "relative_ref": "output/previews/t1-monthly-brief-1.png",
+            "bytes": 514,
+            "sha256": "d7923e2dd54736212ad93803531069565aff392fca5d88f48eade63df4f5d447"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/source-manifest.json",
+            "bytes": 1370,
+            "sha256": "6dc9bc1cf1f0c6f77a47ea432fce44a5c79f5e3c0668eb6b8e5d867140a304de"
+          },
+          {
+            "kind": "manifest_receipt",
+            "relative_ref": "output/receipts/provenance-manifest.json",
+            "bytes": 11611,
+            "sha256": "3d18c6f25d67d5c48f0bee2884b50aadeaf2f3ec02ac3567d8a06e7386981c78"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/actual-render-receipt.json",
+            "bytes": 1392,
+            "sha256": "211d6d98a40b09e95cfe174bae7c0e7fd843c129617363fc9633085762539b18"
+          },
+          {
+            "kind": "verification_receipt",
+            "relative_ref": "output/receipts/result-receipt.json",
+            "bytes": 1297,
+            "sha256": "dad438c8370e83884380d078b19319e8df2bc69d25db3628ec8ac4ea915cdaf5"
+          },
+          {
+            "kind": "benchmark_run_result",
+            "relative_ref": "output/receipts/benchmark-run-result.json",
+            "bytes": 3977,
+            "sha256": "c5f68b6fc22d711a446fdd3be6fadc6b78866331f931b4a78ba8c91463ab09bf"
+          }
+        ]
+      }
+    ],
+    "aggregate": {
+      "c0b_metrics": {
+        "run_count": 5,
+        "outcomes": {
+          "a": 5,
+          "q": 0,
+          "h": 0,
+          "s": 0,
+          "f": 0
+        },
+        "vocr": {
+          "numerator": 5,
+          "denominator": 5,
+          "basis_points": 10000
+        },
+        "safety_block_rate": {
+          "numerator": 0,
+          "denominator": 0,
+          "basis_points": null
+        },
+        "false_completion_rate": {
+          "numerator": 0,
+          "denominator": 5,
+          "basis_points": 0
+        },
+        "verifier_pass_ratio": {
+          "numerator": 30,
+          "denominator": 30,
+          "basis_points": 10000
+        },
+        "evidence_complete_ratio": {
+          "numerator": 30,
+          "denominator": 30,
+          "basis_points": 10000
+        },
+        "clarification_run_ratio": {
+          "numerator": 0,
+          "denominator": 5,
+          "basis_points": 0
+        },
+        "total_clarifications": 0,
+        "authorization_budget_compliance": {
+          "numerator": 5,
+          "denominator": 5,
+          "basis_points": 10000
+        },
+        "excess_authorization_count": 0,
+        "manual_intervention_ratio": {
+          "numerator": 0,
+          "denominator": 5,
+          "basis_points": 0
+        },
+        "median_elapsed_ms": 0,
+        "p95_elapsed_ms": 0,
+        "api_call_total": 0,
+        "known_prompt_tokens": 0,
+        "known_completion_tokens": 0,
+        "known_total_tokens": 0,
+        "known_cost_micro_usd": 0,
+        "token_coverage": {
+          "numerator": 0,
+          "denominator": 0,
+          "basis_points": null
+        },
+        "cost_coverage": {
+          "numerator": 0,
+          "denominator": 0,
+          "basis_points": null
+        },
+        "guardrails": {
+          "unauthorized_action": 0,
+          "duplicate_external_write": 0,
+          "authority_drift": 0,
+          "cross_task_approval_replay": 0,
+          "refusal_bypass": 0
+        }
+      },
+      "completed_run_count": 5,
+      "required_verifier_pass_count": 30,
+      "required_verifier_total": 30,
+      "evidence_receipt_count": 30,
+      "total_human_intervention_count": 0,
+      "offline_usage_total": {
+        "api_call_count": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "estimated_cost_micro_usd": 0,
+        "availability": "none",
+        "reason": "Offline deterministic runner made no model or provider call"
+      },
+      "completion_decision": "completed"
+    },
+    "failures": [],
+    "ignored_by_scope": [
+      "Live DeepSeek and token or price telemetry were excluded; all usage and cost values are explicit zero with availability none",
+      "Installed DS Agent, real Office, Poppler, real accounts, VM, connectors, and external writes were excluded by C0D scope",
+      "Observed wall-clock timing is non-normative and excluded from canonical hashing and PASS decisions"
+    ],
+    "scope_disclosure": "Step 0 only: five offline synthetic T1 runs used fresh explicit roots. Files alone never imply completion; receipts and all six deterministic verifiers jointly gate completion. No later product capability was started or claimed"
+  },
+  "observations": {
+    "runs": [
+      {
+        "run_id": "t1-run-0001",
+        "wall_clock_ms": 87.0967,
+        "normative": false,
+        "note": "Observed runner wall-clock only; excluded from canonical report hash and PASS"
+      },
+      {
+        "run_id": "t1-run-0002",
+        "wall_clock_ms": 81.516,
+        "normative": false,
+        "note": "Observed runner wall-clock only; excluded from canonical report hash and PASS"
+      },
+      {
+        "run_id": "t1-run-0003",
+        "wall_clock_ms": 79.806,
+        "normative": false,
+        "note": "Observed runner wall-clock only; excluded from canonical report hash and PASS"
+      },
+      {
+        "run_id": "t1-run-0004",
+        "wall_clock_ms": 80.80579999999999,
+        "normative": false,
+        "note": "Observed runner wall-clock only; excluded from canonical report hash and PASS"
+      },
+      {
+        "run_id": "t1-run-0005",
+        "wall_clock_ms": 82.50290000000001,
+        "normative": false,
+        "note": "Observed runner wall-clock only; excluded from canonical report hash and PASS"
+      }
+    ],
+    "summary": {
+      "observation_count": 5,
+      "total_wall_clock_ms": 411.7274,
+      "median_wall_clock_ms": 81.516,
+      "p95_wall_clock_ms": 87.0967,
+      "normative": false
+    }
+  },
+  "integrity": {
+    "canonical_payload_algorithm": "sha256",
+    "canonical_payload_sha256": "941f78a6159028fd5ce7af3f6633d7e86bc99802afdf7fa7964f7112249a8674",
+    "markdown_body_algorithm": "sha256",
+    "markdown_body_sha256": "5b91b7e55e86294de3c8226acafd81217b089d576c739181a88351153dd4cc6f",
+    "json_report_name": "t1-baseline-v1.json",
+    "markdown_report_name": "t1-baseline-v1.md"
+  }
+}

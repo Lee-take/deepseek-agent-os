@@ -1,3 +1,4 @@
+pub mod baseline;
 pub mod fixtures;
 pub mod verifiers;
 
