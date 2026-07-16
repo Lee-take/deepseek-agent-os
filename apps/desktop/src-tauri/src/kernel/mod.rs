@@ -6,6 +6,7 @@ pub mod artifact_render;
 pub mod artifacts;
 pub mod attachments;
 pub mod automation;
+pub mod benchmark;
 pub mod capability;
 pub mod codex_bridge_contract;
 pub mod codex_bridge_http;
