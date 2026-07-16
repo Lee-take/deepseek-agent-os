@@ -696,7 +696,7 @@ struct AgentModelEnvelope {
     memory_candidates: Vec<AgentChatMemoryCandidateProposal>,
     #[serde(default)]
     soul_profile_update: Option<AgentSoulProfileUpdateProposal>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_agent_subagent_plan")]
     subagent_plan: Vec<AgentSubtaskPlanItem>,
     #[serde(default)]
     expert_output: Option<ExpertOutput>,
@@ -724,6 +724,15 @@ where
             Some(serde_json::to_string(&value).unwrap_or_default())
         }
     }))
+}
+
+fn deserialize_agent_subagent_plan<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AgentSubtaskPlanItem>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<AgentSubtaskPlanItem>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn agent_reply_text_from_value(value: &serde_json::Value) -> String {
@@ -4671,8 +4680,9 @@ fn agent_chat_response_from_telemetry(
         .as_ref()
         .map(|envelope| envelope.reply_to_user.trim())
         .filter(|value| !value.is_empty())
-        .unwrap_or(content.trim())
-        .to_string();
+        .map(str::to_string)
+        .or_else(|| extract_agent_reply_from_structured_content(&content))
+        .unwrap_or_else(|| content.trim().to_string());
     let protocol_version = parsed_envelope
         .as_ref()
         .and_then(|envelope| envelope.protocol_version.as_deref())
@@ -4998,6 +5008,23 @@ fn extract_markdown_fenced_json(content: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+fn extract_agent_reply_from_structured_content(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    let json_text = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        trimmed
+    } else {
+        extract_markdown_fenced_json(trimmed)?
+    };
+    let value = serde_json::from_str::<serde_json::Value>(json_text).ok()?;
+    let object = value.as_object()?;
+    ["reply_to_user", "reply", "user_reply"]
+        .iter()
+        .find_map(|key| object.get(*key))
+        .map(agent_reply_text_from_value)
+        .map(|reply| reply.trim().to_string())
+        .filter(|reply| !reply.is_empty())
 }
 
 fn default_agent_action_execution_state() -> String {
@@ -24160,6 +24187,75 @@ mod tests {
             reply.proposed_actions[0].target.as_deref(),
             Some("reports/live-smoke.md")
         );
+    }
+
+    #[test]
+    fn agent_chat_parses_fenced_envelope_with_null_subagent_plan_without_showing_raw_json() {
+        let model_envelope = r#"```json
+{
+  "protocol_version": "1.0",
+  "reply_to_user": "好的，已为你准备好祝酒词。",
+  "agent_actions": [],
+  "missing_prerequisites": [],
+  "soul_profile_update": null,
+  "subagent_plan": null,
+  "expert_output": null
+}
+```"#;
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+
+        let (reply, _) = agent_chat_with_transport(
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "你写个祝酒词。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskOnRisk,
+            },
+            None,
+        )
+        .expect("agent chat should tolerate a null optional subagent plan");
+
+        assert_eq!(reply.content, "好的，已为你准备好祝酒词。");
+        assert_eq!(reply.protocol_version, "1.0");
+        assert!(reply.subagent_plan.is_empty());
+        assert!(!reply.content.contains("protocol_version"));
+    }
+
+    #[test]
+    fn agent_chat_hides_protocol_json_when_an_optional_envelope_field_is_malformed() {
+        let model_envelope = r#"```json
+{
+  "protocol_version": "1.0",
+  "reply_to_user": "这是给用户看的回复。",
+  "agent_actions": {"unexpected": "object"},
+  "missing_prerequisites": []
+}
+```"#;
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+
+        let (reply, _) = agent_chat_with_transport(
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "给我一个简短回复。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskOnRisk,
+            },
+            None,
+        )
+        .expect("agent chat should preserve the safe user reply from malformed protocol JSON");
+
+        assert_eq!(reply.content, "这是给用户看的回复。");
+        assert_eq!(reply.protocol_version, "plain-text");
+        assert!(reply.proposed_actions.is_empty());
+        assert!(!reply.content.contains("agent_actions"));
     }
 
     #[test]

@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Lee-take/dsagent/releases/tag/v1.0.1">v1.0.1 stable</a> ·
-  <a href="https://github.com/Lee-take/dsagent/releases/download/v1.0.1/DS.Agent_1.0.1_x64-setup.exe">Download for Windows</a> ·
+  <a href="https://github.com/Lee-take/dsagent/releases/tag/v1.0.2">v1.0.2 stable</a> ·
+  <a href="https://github.com/Lee-take/dsagent/releases/download/v1.0.2/DS.Agent_1.0.2_x64-setup.exe">Download for Windows</a> ·
   <a href="LICENSE">Apache-2.0</a>
 </p>
 
@@ -155,7 +155,7 @@ high-risk action. See the full [model boundary](docs/AGENT_MODEL_BOUNDARY.md).
   reconciliation contracts validated with offline adversarial fake providers.
 
 Production Microsoft/Google account registration and live external-write
-authority remain disabled in v1.0.1. The release does not sign in to real
+authority remain disabled in v1.0.2. The release does not sign in to real
 accounts, send real email, or create, change, or cancel real calendar events.
 
 ## Why Rust
@@ -168,7 +168,7 @@ remain thin; the Kernel and persistent projections own business state.
 
 ## Quick start
 
-1. Download the [Windows x64 installer](https://github.com/Lee-take/dsagent/releases/download/v1.0.1/DS.Agent_1.0.1_x64-setup.exe).
+1. Download the [Windows x64 installer](https://github.com/Lee-take/dsagent/releases/download/v1.0.2/DS.Agent_1.0.2_x64-setup.exe).
 2. Make your own valid `DEEPSEEK_API_KEY` available to the DS Agent process.
 3. Choose one local workspace on first run.
 4. Describe the result you want in chat. DS Agent requests additional
@@ -178,7 +178,7 @@ A user-supplied DeepSeek API key is a required prerequisite. DS Agent does not
 bundle a shared key or bypass DeepSeek access requirements; use remains subject
 to DeepSeek's terms and account policies.
 
-The v1.0.1 installer is currently unsigned, so Windows may display an
+The v1.0.2 installer is currently unsigned, so Windows may display an
 unknown-publisher warning. Read the [installation guide](docs/INSTALLATION.md)
 before installing.
 
@@ -195,8 +195,8 @@ example `D:\build-target\ds-agent-v1-release`.
 
 ## Stable release
 
-- Release: [DS Agent v1.0.1](https://github.com/Lee-take/dsagent/releases/tag/v1.0.1)
-- Installer: `DS.Agent_1.0.1_x64-setup.exe`
+- Release: [DS Agent v1.0.2](https://github.com/Lee-take/dsagent/releases/tag/v1.0.2)
+- Installer: `DS.Agent_1.0.2_x64-setup.exe`
 - Size: `12,716,857 bytes`
 - SHA-256: `469C4EFA54F4C94A6E37D28C9C88D331B26E1770C6792DC93D02B451640E2A6F`
 - Fix: approvals now stay with their owning task, and one task with several
@@ -210,7 +210,7 @@ example `D:\build-target\ds-agent-v1-release`.
 - [Installation](docs/INSTALLATION.md)
 - [DS Agent and DeepSeek boundary](docs/AGENT_MODEL_BOUNDARY.md)
 - [v1 architecture](docs/architecture/DS_AGENT_V1_ARCHITECTURE_PLAN.md)
-- [v1.0.1 release notes](docs/RELEASE_NOTES_v1.0.1.md)
+- [v1.0.2 release notes](docs/RELEASE_NOTES_v1.0.2.md)
 - [v1 completion audit](docs/DS_AGENT_V1_COMPLETION_AUDIT.md)
 - [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [License](LICENSE)
 

@@ -48,10 +48,13 @@ import {
   createAgentChatRun,
   finishAgentRun,
   hasOpenAgentRunRecords,
+  idleDeepSeekStepState,
+  latestParentAgentRunStatus,
   queueAgentRunGuidance,
   requestAgentRunCancel,
   shouldRunDurableAgentWorker,
   shouldShowAgentStopControl,
+  userFacingAgentReplyContent,
 } from "./agentChatRunState";
 import type { AgentChatGuidanceStatus, AgentChatRun } from "./agentChatRunState";
 import {
@@ -631,7 +634,9 @@ function userFacingAgentMessageContent(
     return fallback.responseReadFailed;
   }
 
-  return message.content;
+  return message.role === "assistant"
+    ? userFacingAgentReplyContent(message.content)
+    : message.content;
 }
 
 function userFacingAgentActionDetail(action: AgentChatActionProposal): string {
@@ -4690,6 +4695,11 @@ export function App() {
   };
 
   const latestOperationsBriefingRun = operationsBriefingRuns[0];
+  const latestConversationAgentRunStatus = latestParentAgentRunStatus(
+    agentRunRecords,
+    activeAgentConversationId,
+  );
+  const latestAgentRunCompleted = latestConversationAgentRunStatus === "completed";
   const latestRunFailed = latestOperationsBriefingRun?.status === "failed";
   const latestRunReady = latestOperationsBriefingRun?.status === "draft_ready";
   const latestOperationsRunNeedsApproval =
@@ -4760,7 +4770,9 @@ export function App() {
       ? "blocked"
       : (showAgentEnvelopeStatus && latestAgentNeedsUserAction) || latestRunNeedsApproval
         ? "needs_action"
-        : (showAgentEnvelopeStatus && latestAgentAllActionsDone) || latestRunReady
+        : (showAgentEnvelopeStatus && latestAgentAllActionsDone) ||
+            latestAgentRunCompleted ||
+            latestRunReady
           ? "done"
           : showAgentEnvelopeStatus && latestAgentHasWaitingAction
             ? "running"
@@ -4887,7 +4899,10 @@ export function App() {
       key: "understand",
       label: copy.runStatus.steps.understand,
       detail: latestRunContextReceipt?.user_intent ?? copy.runStatus.stepDetails.understand,
-      state: latestOperationsBriefingRun || briefingPending ? "done" : "waiting",
+      state:
+        latestAgentRunCompleted || latestOperationsBriefingRun || briefingPending
+          ? "done"
+          : "waiting",
     },
     {
       key: "evidence",
@@ -4896,7 +4911,9 @@ export function App() {
         latestRunContextReceipt?.selected_evidence[0] ??
         latestOperationsBriefingRun?.evidence_folder_path ??
         copy.runStatus.stepDetails.evidence,
-      state: latestOperationsRunNeedsApproval
+      state: latestAgentRunCompleted
+        ? "done"
+        : latestOperationsRunNeedsApproval
         ? "needs_action"
         : latestOperationsBriefingRun
         ? "done"
@@ -4912,7 +4929,9 @@ export function App() {
       detail:
         latestRunContextReceipt?.selected_memories[0] ??
         copy.runStatus.stepDetails.memory,
-      state: latestOperationsBriefingRun
+      state: latestAgentRunCompleted
+        ? "done"
+        : latestOperationsBriefingRun
         ? "done"
         : briefingPending
           ? "current"
@@ -4924,13 +4943,13 @@ export function App() {
       detail: latestDeepSeekTelemetry
         ? latestDeepSeekTelemetryText
         : copy.runStatus.stepDetails.deepseek,
-      state: latestOperationsBriefingRun
+      state: latestAgentRunCompleted
+        ? "done"
+        : latestOperationsBriefingRun
         ? "done"
         : briefingPending
           ? "current"
-          : deepSeekCredentialStatus.chat_completion_ready
-            ? "waiting"
-            : "needs_action",
+          : idleDeepSeekStepState(deepSeekCredentialStatus.chat_completion_ready),
     },
     {
       key: "validate",
@@ -4938,7 +4957,9 @@ export function App() {
       detail:
         latestRunContextReceipt?.validation_results[0] ??
         copy.runStatus.stepDetails.validate,
-      state: latestRunFailed
+      state: latestAgentRunCompleted
+        ? "done"
+        : latestRunFailed
         ? "blocked"
         : latestRunReady
           ? "done"
@@ -4952,7 +4973,9 @@ export function App() {
       detail: latestRunFailed
         ? latestOperationsBriefingRun?.summary ?? copy.runStatus.stepDetails.report
         : copy.runStatus.stepDetails.report,
-      state: latestRunFailed
+      state: latestAgentRunCompleted
+        ? "done"
+        : latestRunFailed
         ? "blocked"
         : latestRunReady
           ? "done"

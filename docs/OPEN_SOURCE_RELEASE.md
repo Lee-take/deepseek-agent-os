@@ -100,8 +100,8 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
   exports or packaged assets do not enter generated source archives.
 - `.env.example` documents local DeepSeek and optional local bridge environment
   variables without storing secret values.
-- `docs/RELEASE_NOTES_v1.0.1.md` is the current patch release note.
-  `docs/RELEASE_NOTES_v1.0.0.md` and
+- `docs/RELEASE_NOTES_v1.0.2.md` is the current patch release note.
+  `docs/RELEASE_NOTES_v1.0.1.md`, `docs/RELEASE_NOTES_v1.0.0.md`, and
   `docs/DS_AGENT_V1_COMPLETION_AUDIT.md` preserve the immutable first stable
   release evidence. Historical release notes, including `v0.9.0`, `v0.8.0`,
   and `v0.8.0-rc.1`, remain unchanged.

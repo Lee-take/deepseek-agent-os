@@ -11,12 +11,66 @@ const {
   agentChatLoopSteps,
   createAgentChatRun,
   hasOpenAgentRunRecords,
+  idleDeepSeekStepState,
+  latestParentAgentRunStatus,
   queueAgentRunGuidance,
   requestAgentRunCancel,
   shouldRunDurableAgentWorker,
   shouldShowAgentStopControl,
+  userFacingAgentReplyContent,
   buildAgentGuidancePrompt,
 } = await import(runStateModuleUrl);
+
+test("uses the latest parent run from the active conversation for terminal workflow state", () => {
+  const status = latestParentAgentRunStatus(
+    [
+      {
+        conversation_id: "conversation-other",
+        role: "parent",
+        status: "waiting_for_confirmation",
+        updated_at: "2026-07-16T12:53:00.000Z",
+      },
+      {
+        conversation_id: "conversation-active",
+        role: "subagent",
+        status: "failed",
+        updated_at: "2026-07-16T12:52:30.000Z",
+      },
+      {
+        conversation_id: "conversation-active",
+        role: "parent",
+        status: "completed",
+        updated_at: "2026-07-16T12:52:00.000Z",
+      },
+    ],
+    "conversation-active",
+  );
+
+  assert.equal(status, "completed");
+});
+
+test("does not represent DeepSeek credential readiness as user confirmation", () => {
+  assert.equal(idleDeepSeekStepState(true), "waiting");
+  assert.equal(idleDeepSeekStepState(false), "blocked");
+});
+
+test("renders the user reply instead of persisted protocol JSON", () => {
+  const persistedContent = `\`\`\`json
+{
+  "protocol_version": "1.0",
+  "reply_to_user": "这是用户应该看到的正文。",
+  "agent_actions": [],
+  "subagent_plan": null
+}
+\`\`\``;
+
+  assert.equal(userFacingAgentReplyContent(persistedContent), "这是用户应该看到的正文。");
+});
+
+test("keeps ordinary assistant content unchanged", () => {
+  const content = "这是普通回复，不含协议外壳。";
+  assert.equal(userFacingAgentReplyContent(content), content);
+});
 
 test("starts the durable worker only when desktop recovery is idle and configured", () => {
   assert.equal(

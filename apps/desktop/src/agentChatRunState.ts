@@ -83,6 +83,78 @@ export function hasOpenAgentRunRecords(
   );
 }
 
+export function latestParentAgentRunStatus(
+  records: Array<{
+    conversation_id: string;
+    role: "parent" | "subagent";
+    status: AgentChatRunStatus;
+    updated_at: string;
+  }>,
+  conversationId: string,
+): AgentChatRunStatus | undefined {
+  return records
+    .filter(
+      (record) => record.role === "parent" && record.conversation_id === conversationId,
+    )
+    .sort(
+      (left, right) =>
+        new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
+    )[0]?.status;
+}
+
+export function idleDeepSeekStepState(
+  chatCompletionReady: boolean,
+): "waiting" | "blocked" {
+  return chatCompletionReady ? "waiting" : "blocked";
+}
+
+export function userFacingAgentReplyContent(content: string): string {
+  const trimmed = content.trim();
+  let jsonText = trimmed;
+  if (!(trimmed.startsWith("{") && trimmed.endsWith("}"))) {
+    const fenceStart = trimmed.indexOf("```");
+    if (fenceStart < 0) {
+      return content;
+    }
+    const afterFence = trimmed.slice(fenceStart + 3);
+    const firstNewline = afterFence.indexOf("\n");
+    if (firstNewline < 0) {
+      return content;
+    }
+    const label = afterFence.slice(0, firstNewline).trim();
+    if (label && label.toLowerCase() !== "json") {
+      return content;
+    }
+    const fencedBody = afterFence.slice(firstNewline + 1);
+    const fenceEnd = fencedBody.lastIndexOf("```");
+    if (fenceEnd < 0) {
+      return content;
+    }
+    jsonText = fencedBody.slice(0, fenceEnd).trim();
+  }
+
+  try {
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    const reply = parsed.reply_to_user ?? parsed.reply ?? parsed.user_reply;
+    if (typeof reply === "string" && reply.trim()) {
+      return reply.trim();
+    }
+    if (reply && typeof reply === "object" && !Array.isArray(reply)) {
+      const replyObject = reply as Record<string, unknown>;
+      for (const key of ["content", "text", "message", "body"]) {
+        const value = replyObject[key];
+        if (typeof value === "string" && value.trim()) {
+          return value.trim();
+        }
+      }
+    }
+  } catch {
+    return content;
+  }
+
+  return content;
+}
+
 export function shouldRunDurableAgentWorker(input: {
   desktopRuntime: boolean;
   setupNeeded: boolean;
