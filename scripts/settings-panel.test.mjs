@@ -13,24 +13,19 @@ const tauriDefaultCapabilityUrl = new URL(
   import.meta.url,
 );
 
-const {
-  deepSeekApiKeyCandidates,
-  settingsPanelItems,
-  shouldExposePluginsSidebarEntry,
-} = await import(settingsModuleUrl);
+const { settingsPanelItems, shouldExposePluginsSidebarEntry } = await import(settingsModuleUrl);
 
 test("settings panel exposes only the ordinary user configuration items", () => {
   assert.deepEqual(
     settingsPanelItems.map((item) => item.id),
     [
       "deepseek_api_key",
-      "deepseek_fallback_api_key",
       "deepseek_model",
       "deepseek_thinking",
       "interface_style",
       "soul_profile",
       "workspace_directory",
-      "deepseek_balance",
+      "deepseek_readiness",
     ],
   );
 
@@ -38,13 +33,12 @@ test("settings panel exposes only the ordinary user configuration items", () => 
     settingsPanelItems.map((item) => item.control),
     [
       "password",
-      "password",
       "select",
       "select",
       "select",
       "modal_button",
       "directory_picker",
-      "balance_reader",
+      "readiness_doctor",
     ],
   );
 });
@@ -107,10 +101,10 @@ test("primary DeepSeek API key shows a masked configured placeholder", () => {
   assert.match(i18nSource, /apiKeyConfiguredPlaceholder:\s*"••••••••••••••••（已配置）"/);
   assert.match(
     appSource,
-    /primaryDeepSeekApiKeyPlaceholder\s*=\s*sessionDeepSeekApiKey\s*\?\s*copy\.settingsPanel\.apiKeyPlaceholder\s*:\s*deepSeekCredentialStatus\.api_key_configured\s*\?\s*copy\.settingsPanel\.apiKeyConfiguredPlaceholder\s*:\s*copy\.settingsPanel\.apiKeyPlaceholder/,
+    /primaryDeepSeekApiKeyPlaceholder\s*=\s*deepSeekCredentialStatus\.configured\s*\?\s*copy\.settingsPanel\.apiKeyConfiguredPlaceholder\s*:\s*copy\.settingsPanel\.apiKeyPlaceholder/,
   );
   assert.match(appSource, /placeholder=\{primaryDeepSeekApiKeyPlaceholder\}/);
-  assert.match(appSource, /placeholder=\{copy\.settingsPanel\.fallbackApiKeyPlaceholder\}/);
+  assert.doesNotMatch(appSource, /fallbackApiKey|sessionDeepSeekApiKey/);
 });
 
 test("verified DeepSeek API keys show a compact green check indicator", () => {
@@ -225,11 +219,11 @@ test("workspace directory picker has Tauri dialog open permission", () => {
   );
 });
 
-test("DeepSeek API key candidates trim blanks and keep fallback order", () => {
-  assert.deepEqual(deepSeekApiKeyCandidates(" primary ", " fallback "), [
-    "primary",
-    "fallback",
-  ]);
-  assert.deepEqual(deepSeekApiKeyCandidates("same", " same "), ["same"]);
-  assert.deepEqual(deepSeekApiKeyCandidates("", " fallback "), ["fallback"]);
+test("DeepSeek readiness is rendered from the Kernel projection", () => {
+  const appSource = readFileSync(appSourceUrl, "utf8");
+
+  assert.match(appSource, /invoke<OnboardingReadinessProjection>\("get_onboarding_readiness"\)/);
+  assert.match(appSource, /copy\.onboarding\.deepseekMessages\[deepSeekCredentialStatus\.code\]/);
+  assert.match(appSource, /copy\.onboarding\.workspaceMessages\[workspaceReadiness\.code\]/);
+  assert.doesNotMatch(appSource, /get_deepseek_user_balance|get_deepseek_credential_status/);
 });

@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::connected_work_commands::{
     dispatch_connected_work_agent_action, is_connected_work_agent_action,
@@ -71,12 +72,16 @@ use crate::kernel::connectors::runtime_registry::{
     ConnectorMutationRegistry, ConnectorOAuthRegistry, ConnectorRuntimeRegistries,
 };
 use crate::kernel::deepseek::{
-    build_deepseek_chat_completion_request, current_deepseek_credential_status,
-    execute_deepseek_chat_completion, execute_deepseek_chat_completion_with_cache,
-    execute_deepseek_user_balance, DeepSeekChatCacheState, DeepSeekChatCacheStatus,
-    DeepSeekChatCompletionTransport, DeepSeekChatTelemetry, DeepSeekCredentialStatus,
-    DeepSeekMemoryChatCompletionCache, DeepSeekOperationsBriefingSynthesizer,
-    DeepSeekUserBalanceResponse, HttpDeepSeekChatCompletionTransport, DEEPSEEK_API_KEY_ENV,
+    build_deepseek_chat_completion_request, execute_deepseek_chat_completion,
+    execute_deepseek_chat_completion_with_cache, DeepSeekChatCacheState, DeepSeekChatCacheStatus,
+    DeepSeekChatCompletionTransport, DeepSeekChatTelemetry, DeepSeekMemoryChatCompletionCache,
+    DeepSeekOperationsBriefingSynthesizer, HttpDeepSeekChatCompletionTransport,
+};
+#[cfg(windows)]
+use crate::kernel::deepseek_credential::{
+    build_onboarding_readiness_projection, DeepSeekCredentialRuntime, DeepSeekReadinessProjection,
+    FileDeepSeekCredentialStateStore, OnboardingReadinessProjection,
+    WindowsDeepSeekCredentialStore,
 };
 use crate::kernel::deepseek_pricing::{
     estimate_deepseek_chat_cost_micro_usd, load_deepseek_pricing_state,
@@ -93,8 +98,9 @@ use crate::kernel::expert_team::{
 use crate::kernel::local_directory::{
     load_local_directory_state, local_directory_readiness_from_state,
     save_local_directory_settings as persist_local_directory_settings,
+    workspace_readiness_projection_from_setup_error, workspace_readiness_projection_from_state,
     LocalDirectoryReadinessStatus, LocalDirectorySettings, LocalDirectoryState,
-    LOCAL_MEMORY_DIR_NAME,
+    WorkspaceReadinessProjection, LOCAL_MEMORY_DIR_NAME,
 };
 use crate::kernel::models::FoundationState;
 use crate::kernel::models::TaskRecord;
@@ -187,6 +193,8 @@ pub struct AppState {
     connector_runtime: Arc<ConnectorRuntime<WindowsConnectorCredentialStore>>,
     computer_control_unlock: Arc<Mutex<ComputerControlUnlockState>>,
     deepseek_chat_cache: Arc<DeepSeekMemoryChatCompletionCache>,
+    #[cfg(windows)]
+    deepseek_credentials: Arc<DeepSeekCredentialRuntime<WindowsDeepSeekCredentialStore>>,
 }
 
 impl AppState {
@@ -200,15 +208,31 @@ impl AppState {
         event_store
             .recover_workspace_mutation_checkpoints(Utc::now())
             .map_err(event_store_error)?;
+        #[cfg(windows)]
+        let connector_vault_root = connector_vault_root.as_ref().to_path_buf();
+        #[cfg(windows)]
+        let deepseek_vault_root = connector_vault_root
+            .parent()
+            .unwrap_or(&connector_vault_root)
+            .join("deepseek-credential");
+        #[cfg(windows)]
+        let deepseek_credentials = Arc::new(DeepSeekCredentialRuntime::new(
+            WindowsDeepSeekCredentialStore::new(&deepseek_vault_root)
+                .map_err(|code| code.as_str().to_string())?,
+            FileDeepSeekCredentialStateStore::new(&deepseek_vault_root)
+                .map_err(|code| code.as_str().to_string())?,
+        ));
         Ok(Self {
             event_store: Arc::new(Mutex::new(event_store)),
             connector_registries: Arc::new(ConnectorRuntimeRegistries::empty()),
             #[cfg(windows)]
             connector_runtime: Arc::new(ConnectorRuntime::new(
-                WindowsConnectorCredentialStore::new(connector_vault_root)?,
+                WindowsConnectorCredentialStore::new(&connector_vault_root)?,
             )),
             computer_control_unlock: Arc::new(Mutex::new(ComputerControlUnlockState::generated())),
             deepseek_chat_cache: Arc::new(DeepSeekMemoryChatCompletionCache::default()),
+            #[cfg(windows)]
+            deepseek_credentials,
         })
     }
 
@@ -4407,8 +4431,8 @@ fn dispatch_agent_app_update_action_with_store_mutex(
 
 fn current_work_package_tool_readiness(
     local_directories: LocalDirectoryReadinessStatus,
+    deepseek: DeepSeekReadinessProjection,
 ) -> WorkPackageToolReadiness {
-    let deepseek = current_deepseek_credential_status();
     let foundation_state = FoundationState::default();
     let tool_strategy = model_driven_tool_strategy_for_current_platform(
         foundation_state.large_model_provider,
@@ -4455,6 +4479,45 @@ fn current_local_directory_readiness(
     let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
     let directory_state = load_local_directory_state(app_data_dir).map_err(event_store_error)?;
     Ok(local_directory_readiness_from_state(&directory_state))
+}
+
+#[cfg(windows)]
+fn current_workspace_readiness(app: &AppHandle) -> WorkspaceReadinessProjection {
+    let app_data_dir = match app.path().app_data_dir() {
+        Ok(path) => path,
+        Err(_) => return WorkspaceReadinessProjection::settings_invalid(),
+    };
+    match load_local_directory_state(app_data_dir) {
+        Ok(state) => workspace_readiness_projection_from_state(&state),
+        Err(_) => WorkspaceReadinessProjection::settings_invalid(),
+    }
+}
+
+#[cfg(windows)]
+fn onboarding_projection(
+    app: &AppHandle,
+    _state: &AppState,
+    deepseek: DeepSeekReadinessProjection,
+) -> OnboardingReadinessProjection {
+    build_onboarding_readiness_projection(
+        deepseek,
+        current_workspace_readiness(app),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+#[cfg(windows)]
+fn current_onboarding_projection(
+    app: &AppHandle,
+    state: &AppState,
+) -> OnboardingReadinessProjection {
+    onboarding_projection(
+        app,
+        state,
+        state
+            .deepseek_credentials
+            .projection(|name| std::env::var(name).ok()),
+    )
 }
 
 fn computer_tool_strategy_for_command(
@@ -4528,19 +4591,6 @@ fn agent_file_write_client(
             desktop_dir,
         ),
     })
-}
-
-fn operations_briefing_deepseek_api_key_for_provider(
-    read_env: impl Fn(&str) -> Option<String>,
-    large_model_provider: LargeModelProvider,
-) -> Option<String> {
-    if large_model_provider != LargeModelProvider::DeepSeek {
-        return None;
-    }
-
-    read_env(DEEPSEEK_API_KEY_ENV)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn deepseek_telemetry_with_pricing(
@@ -4626,48 +4676,6 @@ fn deepseek_cache_status_context_label(status: DeepSeekChatCacheStatus) -> &'sta
         DeepSeekChatCacheStatus::Hit => "hit",
         DeepSeekChatCacheStatus::Miss => "miss",
     }
-}
-
-fn agent_chat_api_key_from_env(read_env: impl Fn(&str) -> Option<String>) -> Option<String> {
-    read_env(DEEPSEEK_API_KEY_ENV).and_then(|value| normalize_agent_chat_api_key(Some(value)))
-}
-
-fn normalize_agent_chat_api_key(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-pub fn agent_chat_api_key_from_sources(
-    session_api_key: Option<String>,
-    read_env: impl Fn(&str) -> Option<String>,
-) -> Option<String> {
-    normalize_agent_chat_api_key(session_api_key).or_else(|| agent_chat_api_key_from_env(read_env))
-}
-
-fn push_unique_agent_chat_api_key(candidates: &mut Vec<String>, value: Option<String>) {
-    if let Some(api_key) = normalize_agent_chat_api_key(value) {
-        if !candidates.iter().any(|candidate| candidate == &api_key) {
-            candidates.push(api_key);
-        }
-    }
-}
-
-pub fn agent_chat_api_key_candidates_from_sources(
-    primary_api_key: Option<String>,
-    fallback_api_key: Option<String>,
-    read_env: impl Fn(&str) -> Option<String>,
-) -> Vec<String> {
-    let mut candidates = Vec::new();
-    push_unique_agent_chat_api_key(&mut candidates, primary_api_key);
-    push_unique_agent_chat_api_key(&mut candidates, fallback_api_key);
-    push_unique_agent_chat_api_key(&mut candidates, read_env(DEEPSEEK_API_KEY_ENV));
-    candidates
 }
 
 fn agent_chat_response_from_telemetry(
@@ -8557,9 +8565,9 @@ fn agent_chat_with_transport_and_runtime_context_with_api_key_fallback(
     request: AgentChatRequest,
     runtime_context: AgentChatRuntimeContext,
     pricing_settings: Option<&DeepSeekPricingSettings>,
-) -> Result<(AgentChatResponse, DeepSeekChatTelemetry, String), String> {
+) -> Result<(AgentChatResponse, DeepSeekChatTelemetry, usize), String> {
     let mut errors = Vec::new();
-    for api_key in api_keys {
+    for (index, api_key) in api_keys.iter().enumerate() {
         match agent_chat_with_transport_and_runtime_context(
             transport,
             cache,
@@ -8568,7 +8576,7 @@ fn agent_chat_with_transport_and_runtime_context_with_api_key_fallback(
             runtime_context.clone(),
             pricing_settings,
         ) {
-            Ok((response, telemetry)) => return Ok((response, telemetry, api_key.clone())),
+            Ok((response, telemetry)) => return Ok((response, telemetry, index)),
             Err(error) => errors.push(error),
         }
     }
@@ -8576,7 +8584,7 @@ fn agent_chat_with_transport_and_runtime_context_with_api_key_fallback(
     Err(errors
         .last()
         .cloned()
-        .unwrap_or_else(|| "DeepSeek Chat is not configured. Provide a DeepSeek API key for this session or set DEEPSEEK_API_KEY in the local desktop process.".to_string()))
+        .unwrap_or_else(|| "key_missing".to_string()))
 }
 
 fn run_agent_chat_with_clients(
@@ -8666,7 +8674,7 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
     let mut runtime_context = runtime_context;
     runtime_context.memory_context = memory_context;
     runtime_context.skill_catalog = skill_catalog;
-    let (response, first_telemetry, followup_api_key) =
+    let (response, first_telemetry, followup_api_key_index) =
         agent_chat_with_transport_and_runtime_context_with_api_key_fallback(
             transport,
             cache,
@@ -8723,7 +8731,7 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
             let result = agent_chat_with_transport_and_runtime_context(
                 transport,
                 cache,
-                &followup_api_key,
+                &api_keys[followup_api_key_index],
                 AgentChatRequest {
                     prompt: followup_prompt,
                     ..request.clone()
@@ -13885,8 +13893,49 @@ pub fn execute_agent_tool(
 }
 
 #[tauri::command]
-pub fn get_deepseek_credential_status() -> DeepSeekCredentialStatus {
-    current_deepseek_credential_status()
+pub fn get_onboarding_readiness(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> OnboardingReadinessProjection {
+    current_onboarding_projection(&app, &state)
+}
+
+#[tauri::command]
+pub fn save_deepseek_api_key(
+    app: AppHandle,
+    api_key: String,
+    state: State<'_, AppState>,
+) -> Result<OnboardingReadinessProjection, String> {
+    let transport = HttpDeepSeekChatCompletionTransport::new()
+        .map_err(|_| "provider_protocol_error".to_string())?;
+    let deepseek = state
+        .deepseek_credentials
+        .save_and_verify(api_key, &transport, |name| std::env::var(name).ok());
+    Ok(onboarding_projection(&app, &state, deepseek))
+}
+
+#[tauri::command]
+pub fn verify_deepseek_api_key(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<OnboardingReadinessProjection, String> {
+    let transport = HttpDeepSeekChatCompletionTransport::new()
+        .map_err(|_| "provider_protocol_error".to_string())?;
+    let deepseek = state
+        .deepseek_credentials
+        .verify(&transport, |name| std::env::var(name).ok());
+    Ok(onboarding_projection(&app, &state, deepseek))
+}
+
+#[tauri::command]
+pub fn remove_deepseek_api_key(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> OnboardingReadinessProjection {
+    let deepseek = state
+        .deepseek_credentials
+        .remove(|name| std::env::var(name).ok());
+    onboarding_projection(&app, &state, deepseek)
 }
 
 #[tauri::command]
@@ -13907,19 +13956,13 @@ pub fn run_agent_chat(
     thinking_level: ThinkingLevel,
     access_mode: AccessMode,
     network_search_source_model: Option<NetworkSearchSourceModel>,
-    api_key_override: Option<String>,
-    fallback_api_key_override: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<AgentChatResponse, String> {
-    let api_keys = agent_chat_api_key_candidates_from_sources(
-        api_key_override,
-        fallback_api_key_override,
-        |name| std::env::var(name).ok(),
-    );
-    if api_keys.is_empty() {
-        return Err("DeepSeek Chat is not configured. Provide a DeepSeek API key for this session or set DEEPSEEK_API_KEY in the local desktop process."
-            .to_string());
-    }
+    let api_key = state
+        .deepseek_credentials
+        .resolve_ready_key(|name| std::env::var(name).ok())
+        .map_err(|code| code.as_str().to_string())?;
+    let api_keys = Zeroizing::new(vec![api_key.expose().to_string()]);
     let pricing_settings = app
         .path()
         .app_data_dir()
@@ -13947,11 +13990,11 @@ pub fn run_agent_chat(
         &computer_strategy,
         computer_screenshot_evidence_base_dir(&app_data_dir, &directory_state),
     );
-    run_agent_chat_with_clients_and_api_keys_and_computer_use(
+    let result = run_agent_chat_with_clients_and_api_keys_and_computer_use(
         &state.event_store,
         &transport,
         &state.deepseek_chat_cache,
-        &api_keys,
+        api_keys.as_slice(),
         AgentChatRequest {
             prompt,
             model_route,
@@ -13965,7 +14008,8 @@ pub fn run_agent_chat(
         &search_client,
         &browser_client,
         &computer_use_client,
-    )
+    );
+    result
 }
 
 #[tauri::command]
@@ -13979,22 +14023,16 @@ pub async fn run_next_queued_agent_chat_worker(
     thinking_level: ThinkingLevel,
     access_mode: AccessMode,
     network_search_source_model: Option<NetworkSearchSourceModel>,
-    api_key_override: Option<String>,
-    fallback_api_key_override: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Option<AgentRunWorkerResult>, String> {
     let event_store = Arc::clone(&state.event_store);
     let cache = Arc::clone(&state.deepseek_chat_cache);
+    let credentials = Arc::clone(&state.deepseek_credentials);
     tauri::async_runtime::spawn_blocking(move || {
-        let api_keys = agent_chat_api_key_candidates_from_sources(
-            api_key_override,
-            fallback_api_key_override,
-            |name| std::env::var(name).ok(),
-        );
-        if api_keys.is_empty() {
-            return Err("DeepSeek Chat is not configured. Provide a DeepSeek API key for this session or set DEEPSEEK_API_KEY in the local desktop process."
-                .to_string());
-        }
+        let api_key = credentials
+            .resolve_ready_key(|name| std::env::var(name).ok())
+            .map_err(|code| code.as_str().to_string())?;
+        let api_keys = Zeroizing::new(vec![api_key.expose().to_string()]);
         let pricing_settings = app
             .path()
             .app_data_dir()
@@ -14010,7 +14048,8 @@ pub async fn run_next_queued_agent_chat_worker(
         let transport = HttpDeepSeekChatCompletionTransport::new()?;
         let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
         runtime_context.expert_staging_root = Some(app_data_dir.join("expert-team-staging"));
-        let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
+        let directory_state =
+            load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
         let desktop_dir = runtime_context.desktop_dir.clone();
         let file_client = LocalFileContentClient::new(512 * 1024);
         let file_write_client = agent_file_write_client(&directory_state, desktop_dir)?;
@@ -14024,11 +14063,11 @@ pub async fn run_next_queued_agent_chat_worker(
             computer_screenshot_evidence_base_dir(&app_data_dir, &directory_state),
         );
 
-        run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
+        let result = run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
             &event_store,
             &transport,
             &cache,
-            &api_keys,
+            api_keys.as_slice(),
             run_id,
             execution_prompt,
             worker_id,
@@ -14042,39 +14081,11 @@ pub async fn run_next_queued_agent_chat_worker(
             &search_client,
             &browser_client,
             &computer_use_client,
-        )
+        );
+        result
     })
     .await
     .map_err(|error| format!("agent worker task failed: {error}"))?
-}
-
-#[tauri::command]
-pub fn get_deepseek_user_balance(
-    api_key_override: Option<String>,
-    fallback_api_key_override: Option<String>,
-) -> Result<DeepSeekUserBalanceResponse, String> {
-    let api_keys = agent_chat_api_key_candidates_from_sources(
-        api_key_override,
-        fallback_api_key_override,
-        |name| std::env::var(name).ok(),
-    );
-    if api_keys.is_empty() {
-        return Err("DeepSeek API key is required to query user balance.".to_string());
-    }
-
-    let transport = HttpDeepSeekChatCompletionTransport::new()?;
-    let mut errors = Vec::new();
-    for api_key in api_keys {
-        match execute_deepseek_user_balance(&transport, &api_key) {
-            Ok(balance) => return Ok(balance),
-            Err(error) => errors.push(error),
-        }
-    }
-
-    Err(errors
-        .last()
-        .cloned()
-        .unwrap_or_else(|| "DeepSeek balance query failed.".to_string()))
 }
 
 #[tauri::command]
@@ -14276,8 +14287,10 @@ pub fn save_deepseek_pricing_settings(
 }
 
 #[tauri::command]
-pub fn get_network_search_route_status() -> NetworkSearchRouteStatus {
-    let deepseek_status = current_deepseek_credential_status();
+pub fn get_network_search_route_status(state: State<'_, AppState>) -> NetworkSearchRouteStatus {
+    let deepseek_status = state
+        .deepseek_credentials
+        .projection(|name| std::env::var(name).ok());
     let foundation_state = FoundationState::default();
     let tool_strategy = model_driven_tool_strategy_for_current_platform(
         foundation_state.large_model_provider,
@@ -14725,8 +14738,11 @@ pub fn list_durable_computer_use_steps(
 pub fn get_network_search_route_status_for_model(
     large_model_provider: LargeModelProvider,
     network_search_source_model: Option<NetworkSearchSourceModel>,
+    state: State<'_, AppState>,
 ) -> NetworkSearchRouteStatus {
-    let deepseek_status = current_deepseek_credential_status();
+    let deepseek_status = state
+        .deepseek_credentials
+        .projection(|name| std::env::var(name).ok());
     let tool_strategy = model_driven_tool_strategy_for_current_platform(
         large_model_provider,
         network_search_source_model,
@@ -14758,9 +14774,8 @@ pub fn get_model_driven_tool_strategy(
 }
 
 #[tauri::command]
-pub fn get_local_directory_state(app: AppHandle) -> Result<LocalDirectoryState, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
-    load_local_directory_state(app_data_dir).map_err(event_store_error)
+pub fn get_local_directory_state(app: AppHandle) -> WorkspaceReadinessProjection {
+    current_workspace_readiness(&app)
 }
 
 #[tauri::command]
@@ -14783,12 +14798,25 @@ pub fn save_local_directory_settings(
     app: AppHandle,
     workspace_dir: String,
     workspace_name: String,
-) -> Result<LocalDirectoryState, String> {
+    state: State<'_, AppState>,
+) -> Result<OnboardingReadinessProjection, String> {
     let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
-    let settings =
-        LocalDirectorySettings::from_workspace_dir_and_name(workspace_dir, workspace_name)
-            .map_err(event_store_error)?;
-    persist_local_directory_settings(app_data_dir, settings).map_err(event_store_error)
+    let workspace =
+        match LocalDirectorySettings::from_workspace_dir_and_name(workspace_dir, workspace_name) {
+            Ok(settings) => match persist_local_directory_settings(app_data_dir, settings) {
+                Ok(directory_state) => workspace_readiness_projection_from_state(&directory_state),
+                Err(error) => workspace_readiness_projection_from_setup_error(&error),
+            },
+            Err(error) => workspace_readiness_projection_from_setup_error(&error),
+        };
+    let deepseek = state
+        .deepseek_credentials
+        .projection(|name| std::env::var(name).ok());
+    Ok(build_onboarding_readiness_projection(
+        deepseek,
+        workspace,
+        env!("CARGO_PKG_VERSION"),
+    ))
 }
 
 #[tauri::command]
@@ -15369,19 +15397,18 @@ pub fn list_memory_maintenance_reviews(
 
 #[tauri::command]
 pub fn run_memory_background_maintenance(
-    api_key_override: Option<String>,
-    fallback_api_key_override: Option<String>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<MemoryBackgroundMaintenanceSummary, String> {
-    let api_keys = agent_chat_api_key_candidates_from_sources(
-        api_key_override,
-        fallback_api_key_override,
-        |name| std::env::var(name).ok(),
-    );
-    let store = state.event_store.lock().map_err(|_| lock_error())?;
-    if let Some(api_key) = api_keys.first() {
+    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let store =
+        EventStore::open(app_data_dir.join("kernel-events.sqlite3")).map_err(event_store_error)?;
+    if let Ok(api_key) = state
+        .deepseek_credentials
+        .resolve_ready_key(|name| std::env::var(name).ok())
+    {
         let transport = HttpDeepSeekChatCompletionTransport::new()?;
-        run_memory_background_maintenance_with_model_in_store(&store, &transport, api_key)
+        run_memory_background_maintenance_with_model_in_store(&store, &transport, api_key.expose())
     } else {
         run_memory_background_maintenance_in_store(&store)
     }
@@ -17010,7 +17037,12 @@ pub fn write_drive_boundary(
             task_records,
             memory_candidates,
             operations_briefing_runs,
-            current_work_package_tool_readiness(current_local_directory_readiness(&app)?),
+            current_work_package_tool_readiness(
+                current_local_directory_readiness(&app)?,
+                state
+                    .deepseek_credentials
+                    .projection(|name| std::env::var(name).ok()),
+            ),
         );
         serde_json::to_string_pretty(&package).map_err(event_store_error)?
     };
@@ -17068,15 +17100,20 @@ pub fn run_operations_briefing(
         approval_granted,
     };
     let mut deepseek_telemetry = Vec::new();
-    let mut outcome = if let Some(api_key) = operations_briefing_deepseek_api_key_for_provider(
-        |name| std::env::var(name).ok(),
-        large_model_provider,
-    ) {
+    let resolved_api_key = (large_model_provider == LargeModelProvider::DeepSeek)
+        .then(|| {
+            state
+                .deepseek_credentials
+                .resolve_ready_key(|name| std::env::var(name).ok())
+                .ok()
+        })
+        .flatten();
+    let mut outcome = if let Some(api_key) = resolved_api_key.as_ref() {
         let transport = HttpDeepSeekChatCompletionTransport::new()?;
         let synthesizer = DeepSeekOperationsBriefingSynthesizer::new_with_cache(
             &transport,
             state.deepseek_chat_cache.as_ref(),
-            api_key,
+            api_key.expose().to_string(),
             model_route,
             thinking_level,
         );
@@ -17433,7 +17470,12 @@ pub fn export_work_package(
         task_records,
         memory_candidates,
         operations_briefing_runs,
-        current_work_package_tool_readiness(current_local_directory_readiness(&app)?),
+        current_work_package_tool_readiness(
+            current_local_directory_readiness(&app)?,
+            state
+                .deepseek_credentials
+                .projection(|name| std::env::var(name).ok()),
+        ),
     ))
 }
 
@@ -17490,7 +17532,6 @@ mod tests {
         NetworkSearchAgentToolExecutor, TerminalReadAgentToolExecutor, WorkspaceCheckpointStore,
     };
     use crate::commands::{
-        agent_chat_api_key_candidates_from_sources, agent_chat_api_key_from_sources,
         agent_chat_with_dispatch_and_tool_followup, agent_chat_with_transport,
         apply_memory_candidate_update_if_current, block_subagent_mutating_actions,
         computer_screenshot_evidence_base_dir, computer_tool_strategy_for_command,
@@ -17510,9 +17551,9 @@ mod tests {
         dispatch_agent_skill_activate_tool_with_executor, dispatch_agent_skill_create_action,
         dispatch_agent_skill_uninstall_action, ensure_system_skill_builder,
         link_existing_memory_records, list_memory_maintenance_reviews_from_store,
-        normalize_agent_action_proposal, operations_briefing_deepseek_api_key_for_provider,
-        operations_briefing_model_route_context, operations_briefing_report_export_dir,
-        operations_briefing_template_seed_dir, operations_briefing_token_cache_context,
+        normalize_agent_action_proposal, operations_briefing_model_route_context,
+        operations_briefing_report_export_dir, operations_briefing_template_seed_dir,
+        operations_briefing_token_cache_context,
         propose_memory_update_candidate_from_feedback_in_store,
         record_agent_action_permission_requests, record_memory_maintenance_review_action_in_store,
         register_completed_office_artifact, resume_agent_chat_action_with_clients,
@@ -17591,6 +17632,55 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration as StdDuration;
     use uuid::Uuid;
+
+    fn command_source_section(source: &'static str, signature: &str) -> &'static str {
+        let start = source
+            .find(signature)
+            .expect("command signature is present");
+        let remainder = &source[start + signature.len()..];
+        let end = remainder
+            .find("\n#[tauri::command]")
+            .unwrap_or(remainder.len());
+        &source[start..start + signature.len() + end]
+    }
+
+    #[test]
+    fn deepseek_command_consumers_use_the_kernel_credential_runtime() {
+        const COMMANDS: &str = include_str!("commands.rs");
+        for signature in [
+            "pub fn run_agent_chat(",
+            "pub async fn run_next_queued_agent_chat_worker(",
+            "pub fn run_memory_background_maintenance(",
+            "pub fn run_operations_briefing(",
+        ] {
+            let section = command_source_section(COMMANDS, signature);
+            assert!(section.contains("deepseek_credentials"), "{signature}");
+            assert!(section.contains("resolve_ready_key"), "{signature}");
+            assert!(
+                !section.contains("std::env::var(DEEPSEEK_API_KEY_ENV)"),
+                "{signature}"
+            );
+        }
+
+        let save = command_source_section(COMMANDS, "pub fn save_deepseek_api_key(");
+        let verify = command_source_section(COMMANDS, "pub fn verify_deepseek_api_key(");
+        assert!(save.contains("deepseek_credentials"));
+        assert!(save.contains("save_and_verify"));
+        assert!(verify.contains("deepseek_credentials"));
+        assert!(verify.contains(".verify("));
+
+        const CREDENTIAL_RUNTIME: &str = include_str!("kernel/deepseek_credential.rs");
+        let balance = CREDENTIAL_RUNTIME
+            .find("verifier.fetch_user_balance")
+            .expect("balance verification is present");
+        let models = CREDENTIAL_RUNTIME
+            .find("verifier.fetch_models")
+            .expect("model verification is present");
+        assert!(
+            balance < models,
+            "balance verification must precede model verification"
+        );
+    }
 
     #[test]
     fn agent_chat_prompt_keeps_internal_receipts_out_of_ordinary_replies() {
@@ -29568,48 +29658,6 @@ schema_version: 1
     }
 
     #[test]
-    fn agent_chat_api_key_prefers_session_override_without_persisting_secret() {
-        let api_key = agent_chat_api_key_from_sources(Some("  session-key  ".to_string()), |_| {
-            Some("env-key".to_string())
-        })
-        .expect("session key should be accepted");
-
-        assert_eq!(api_key, "session-key");
-    }
-
-    #[test]
-    fn agent_chat_api_key_falls_back_to_environment_when_override_blank() {
-        let api_key = agent_chat_api_key_from_sources(Some("  ".to_string()), |_| {
-            Some(" env-key ".to_string())
-        })
-        .expect("env key should be accepted");
-
-        assert_eq!(api_key, "env-key");
-    }
-
-    #[test]
-    fn agent_chat_api_key_candidates_keep_primary_fallback_then_environment() {
-        let api_keys = agent_chat_api_key_candidates_from_sources(
-            Some(" primary-key ".to_string()),
-            Some(" fallback-key ".to_string()),
-            |name| (name == DEEPSEEK_API_KEY_ENV).then_some(" env-key ".to_string()),
-        );
-
-        assert_eq!(api_keys, vec!["primary-key", "fallback-key", "env-key"]);
-    }
-
-    #[test]
-    fn agent_chat_api_key_candidates_drop_blanks_and_duplicates() {
-        let api_keys = agent_chat_api_key_candidates_from_sources(
-            Some(" same-key ".to_string()),
-            Some("same-key".to_string()),
-            |name| (name == DEEPSEEK_API_KEY_ENV).then_some("  ".to_string()),
-        );
-
-        assert_eq!(api_keys, vec!["same-key"]);
-    }
-
-    #[test]
     fn computer_screenshot_evidence_base_prefers_user_evidence_dir() {
         let app_data_dir = std::path::PathBuf::from("fixtures/app-data");
         let state = LocalDirectoryState {
@@ -29958,31 +30006,6 @@ schema_version: 1
                 ComputerControlBackend::LocalWindowsInputControl
             );
         }
-    }
-
-    #[test]
-    fn operations_briefing_uses_deepseek_key_only_for_deepseek_provider() {
-        let key = operations_briefing_deepseek_api_key_for_provider(
-            |name| (name == "DEEPSEEK_API_KEY").then_some("test-secret-token".to_string()),
-            LargeModelProvider::DeepSeek,
-        );
-        let chatgpt_key = operations_briefing_deepseek_api_key_for_provider(
-            |name| (name == "DEEPSEEK_API_KEY").then_some("test-secret-token".to_string()),
-            LargeModelProvider::ChatGpt,
-        );
-
-        assert_eq!(key.as_deref(), Some("test-secret-token"));
-        assert_eq!(chatgpt_key, None);
-    }
-
-    #[test]
-    fn operations_briefing_ignores_blank_deepseek_key() {
-        let key = operations_briefing_deepseek_api_key_for_provider(
-            |name| (name == "DEEPSEEK_API_KEY").then_some("  ".to_string()),
-            LargeModelProvider::DeepSeek,
-        );
-
-        assert_eq!(key, None);
     }
 
     #[test]

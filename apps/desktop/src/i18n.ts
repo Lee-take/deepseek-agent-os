@@ -10,6 +10,8 @@ import type {
   ComputerControlBackend,
   ComputerScreenshotBackend,
   DriveBackend,
+  DeepSeekCredentialSource,
+  DeepSeekReadinessCode,
   EmailBackend,
   LargeModelProvider,
   Language,
@@ -38,6 +40,7 @@ import type {
   ThemeStyle,
   ThinkingLevel,
   WorkspaceScope,
+  WorkspaceReadinessCode,
 } from "./types";
 
 type RunStatusStepState = "done" | "current" | "waiting" | "needs_action" | "blocked";
@@ -77,11 +80,9 @@ type TranslationSet = {
   settingsPanel: {
     title: string;
     deepSeekApiKey: string;
-    fallbackApiKey: string;
     apiKeyPlaceholder: string;
     apiKeyConfiguredPlaceholder: string;
     apiKeyReady: string;
-    fallbackApiKeyPlaceholder: string;
     soulProfile: string;
     soulProfileOpen: string;
     soulProfileClose: string;
@@ -104,15 +105,30 @@ type TranslationSet = {
     workspaceDirectory: string;
     chooseWorkspace: string;
     saveWorkspace: string;
-    balance: string;
-    queryBalance: string;
-    queryingBalance: string;
-    balanceAvailable: string;
-    balanceUnavailable: string;
-    balanceNotQueried: string;
-    balanceFailed: string;
-    balanceEmpty: string;
     attribution: string;
+  };
+  onboarding: {
+    loadFailed: string;
+    commandFailed: string;
+    contactsDeepSeek: string;
+    keySaved: string;
+    keyRemoved: string;
+    checkFinished: string;
+    checking: string;
+    saveAndCheck: string;
+    replaceKey: string;
+    removeKey: string;
+    retryCheck: string;
+    chooseWorkspace: string;
+    doctorTitle: string;
+    doctorBody: string;
+    sourceLabel: string;
+    available: string;
+    unavailable: string;
+    notChecked: string;
+    credentialSource: Record<DeepSeekCredentialSource, string>;
+    deepseekMessages: Record<DeepSeekReadinessCode, string>;
+    workspaceMessages: Record<WorkspaceReadinessCode, string>;
   };
   controls: {
     modelRoute: string;
@@ -160,10 +176,7 @@ type TranslationSet = {
     deepSeekApi: string;
     deepSeekChatApi: string;
     deepSeekTelemetry: string;
-    apiBaseUrl: string;
-    chatEndpoint: string;
     deepSeekModels: string;
-    apiKeyEnv: string;
     apiKeyConfigured: string;
     apiKeyMissing: string;
     chatReady: string;
@@ -394,8 +407,6 @@ type TranslationSet = {
     title: string;
     required: string;
     ready: string;
-    appData: string;
-    settingsFile: string;
     workspaceName: string;
     workspaceNamePlaceholder: string;
     workspaceDir: string;
@@ -417,7 +428,6 @@ type TranslationSet = {
     statusConfigured: string;
     statusNotConfigured: string;
     help: string;
-    settingsFile: string;
     flashPrompt: string;
     flashCompletion: string;
     proPrompt: string;
@@ -928,11 +938,9 @@ export const translations: Record<Language, TranslationSet> = {
     settingsPanel: {
       title: "设置",
       deepSeekApiKey: "DeepSeek API key",
-      fallbackApiKey: "备用 DeepSeek API key",
-      apiKeyPlaceholder: "输入主 key，当前窗口内使用",
+      apiKeyPlaceholder: "输入 DeepSeek API key",
       apiKeyConfiguredPlaceholder: "••••••••••••••••（已配置）",
       apiKeyReady: "API key 已通过启动检测",
-      fallbackApiKeyPlaceholder: "主 key 不可用时自动尝试",
       soulProfile: "Soul",
       soulProfileOpen: "打开 Soul 设置",
       soulProfileClose: "关闭",
@@ -990,15 +998,56 @@ export const translations: Record<Language, TranslationSet> = {
       workspaceDirectory: "工作目录",
       chooseWorkspace: "选择目录",
       saveWorkspace: "保存目录",
-      balance: "DeepSeek 余额",
-      queryBalance: "读取真实余额",
-      queryingBalance: "正在读取",
-      balanceAvailable: "余额可用",
-      balanceUnavailable: "余额不足或不可用",
-      balanceNotQueried: "尚未读取余额",
-      balanceFailed: "DeepSeek 余额读取失败。",
-      balanceEmpty: "DeepSeek 未返回余额明细。",
       attribution: "DS Agent 由 Lee take 创建并维护。",
+    },
+    onboarding: {
+      loadFailed: "首次设置状态加载失败，请重试。",
+      commandFailed: "本次设置操作未能完成，请重试。",
+      contactsDeepSeek: "保存后会联系 DeepSeek，核验认证、余额可用性和 V4 Flash/Pro 模型。",
+      keySaved: "Key 已安全保存，核验结果已更新。",
+      keyRemoved: "本机保存的 Key 和核验记录已移除。",
+      checkFinished: "就绪检查已完成。",
+      checking: "正在检查…",
+      saveAndCheck: "保存并检查",
+      replaceKey: "替换并检查",
+      removeKey: "移除 Key",
+      retryCheck: "重试检查",
+      chooseWorkspace: "选择工作目录",
+      doctorTitle: "就绪检查",
+      doctorBody: "DS Agent 会检查 Key、余额、V4 模型和工作目录写入权限，不显示余额金额或内部路径。",
+      sourceLabel: "Key 来源",
+      available: "可用",
+      unavailable: "不可用",
+      notChecked: "尚未检查",
+      credentialSource: {
+        stored: "Windows 本机加密存储",
+        environment: "当前进程环境变量（不会自动保存）",
+        missing: "未配置",
+      },
+      deepseekMessages: {
+        ready: "DeepSeek 已验证，可以运行任务。",
+        not_checked: "Key 已存在，但尚未验证。",
+        key_missing: "请输入你自己的 DeepSeek API Key。",
+        key_format_invalid: "Key 为空或格式超出允许范围，请重新输入。",
+        authentication_failed: "DeepSeek 未接受这个 Key，请替换或移除。",
+        insufficient_balance: "DeepSeek 余额当前不可用，请充值后重试。",
+        rate_limited: "请求过于频繁，请稍后重试。",
+        network_unavailable: "无法连接网络，请检查网络后重试。",
+        network_timeout: "连接 DeepSeek 超时，请重试。",
+        model_unavailable: "所需 V4 模型当前不可用，请重试或更新 DS Agent。",
+        request_invalid: "DS Agent 与 DeepSeek 的请求不兼容，请停止并更新应用。",
+        provider_unavailable: "DeepSeek 暂时不可用，请稍后重试。",
+        provider_protocol_error: "DeepSeek 返回结果无法完成核验，请重试。",
+        credential_store_unavailable: "Windows 无法安全保存或读取 Key，请检查当前用户配置。",
+      },
+      workspaceMessages: {
+        ready: "工作目录及受管文件夹可写。",
+        workspace_missing: "请选择一个工作目录。",
+        workspace_unavailable: "工作目录不存在或不可访问，请重新选择。",
+        workspace_permission_denied: "工作目录不可写，请更改权限或选择其他目录。",
+        workspace_probe_cleanup_failed: "写入探针未能安全清理，请关闭占用程序后重试。",
+        workspace_settings_invalid: "工作目录设置无效，请重新配置。",
+      },
     },
     controls: {
       modelRoute: "模型类型",
@@ -1106,10 +1155,7 @@ export const translations: Record<Language, TranslationSet> = {
       deepSeekApi: "DeepSeek API",
       deepSeekChatApi: "DeepSeek Chat API",
       deepSeekTelemetry: "DeepSeek 遥测",
-      apiBaseUrl: "API 地址",
-      chatEndpoint: "Chat 接口",
       deepSeekModels: "DeepSeek 模型",
-      apiKeyEnv: "Key 环境变量",
       apiKeyConfigured: "已配置",
       apiKeyMissing: "未配置",
       chatReady: "已就绪",
@@ -1451,8 +1497,6 @@ export const translations: Record<Language, TranslationSet> = {
       title: "工作目录",
       required: "首次运行需要设置本机工作目录。",
       ready: "工作目录已设置。",
-      appData: "应用数据目录",
-      settingsFile: "目录配置",
       workspaceName: "工作区名称",
       workspaceNamePlaceholder: "例如：南昌福朋经营分析",
       workspaceDir: "工作目录",
@@ -1475,7 +1519,6 @@ export const translations: Record<Language, TranslationSet> = {
       statusConfigured: "已配置本地价格表",
       statusNotConfigured: "未配置本地价格表",
       help: "按 USD / 1M tokens 填写。价格保存在本机应用数据目录，不写死到开源代码。",
-      settingsFile: "价格配置",
       flashPrompt: "Flash 输入",
       flashCompletion: "Flash 输出",
       proPrompt: "Pro 输入",
@@ -2085,11 +2128,9 @@ export const translations: Record<Language, TranslationSet> = {
     settingsPanel: {
       title: "Settings",
       deepSeekApiKey: "DeepSeek API key",
-      fallbackApiKey: "Fallback DeepSeek API key",
-      apiKeyPlaceholder: "Enter the primary key for this window",
+      apiKeyPlaceholder: "Enter your DeepSeek API key",
       apiKeyConfiguredPlaceholder: "•••••••••••••••• (configured)",
       apiKeyReady: "API key passed startup check",
-      fallbackApiKeyPlaceholder: "Tried automatically if the primary key fails",
       soulProfile: "Soul",
       soulProfileOpen: "Open Soul settings",
       soulProfileClose: "Close",
@@ -2148,15 +2189,56 @@ export const translations: Record<Language, TranslationSet> = {
       workspaceDirectory: "Workspace directory",
       chooseWorkspace: "Choose folder",
       saveWorkspace: "Save folder",
-      balance: "DeepSeek balance",
-      queryBalance: "Read live balance",
-      queryingBalance: "Reading",
-      balanceAvailable: "Balance available",
-      balanceUnavailable: "Balance unavailable",
-      balanceNotQueried: "Balance not read yet",
-      balanceFailed: "DeepSeek balance query failed.",
-      balanceEmpty: "DeepSeek returned no balance details.",
       attribution: "DS Agent is created and maintained by Lee take.",
+    },
+    onboarding: {
+      loadFailed: "First-run readiness could not be loaded. Retry.",
+      commandFailed: "The setup action could not be completed. Retry.",
+      contactsDeepSeek: "Saving contacts DeepSeek to verify authentication, balance availability, and both V4 Flash/Pro models.",
+      keySaved: "The key was stored securely and readiness was updated.",
+      keyRemoved: "The locally stored key and verification receipt were removed.",
+      checkFinished: "The readiness check finished.",
+      checking: "Checking…",
+      saveAndCheck: "Save and check",
+      replaceKey: "Replace and check",
+      removeKey: "Remove key",
+      retryCheck: "Retry check",
+      chooseWorkspace: "Choose workspace",
+      doctorTitle: "Readiness doctor",
+      doctorBody: "DS Agent checks the key, balance availability, V4 models, and workspace writability without showing balance amounts or internal paths.",
+      sourceLabel: "Key source",
+      available: "Available",
+      unavailable: "Unavailable",
+      notChecked: "Not checked",
+      credentialSource: {
+        stored: "Encrypted on this Windows profile",
+        environment: "Current process environment (never stored automatically)",
+        missing: "Not configured",
+      },
+      deepseekMessages: {
+        ready: "DeepSeek is verified and ready for tasks.",
+        not_checked: "A key is present but has not been verified.",
+        key_missing: "Enter your own DeepSeek API key.",
+        key_format_invalid: "The key is empty or outside the allowed size. Enter it again.",
+        authentication_failed: "DeepSeek did not accept this key. Replace or remove it.",
+        insufficient_balance: "DeepSeek balance is unavailable. Add balance, then retry.",
+        rate_limited: "Too many requests. Wait briefly, then retry.",
+        network_unavailable: "The network is unavailable. Check the connection, then retry.",
+        network_timeout: "The DeepSeek connection timed out. Retry.",
+        model_unavailable: "A required V4 model is unavailable. Retry or update DS Agent.",
+        request_invalid: "DS Agent's request is not compatible with DeepSeek. Stop and update the app.",
+        provider_unavailable: "DeepSeek is temporarily unavailable. Retry later.",
+        provider_protocol_error: "The DeepSeek response could not be verified. Retry.",
+        credential_store_unavailable: "Windows could not securely store or read the key. Check this user profile.",
+      },
+      workspaceMessages: {
+        ready: "The workspace and managed folders are writable.",
+        workspace_missing: "Choose one workspace.",
+        workspace_unavailable: "The workspace is missing or unavailable. Choose it again.",
+        workspace_permission_denied: "The workspace is not writable. Change permissions or choose another folder.",
+        workspace_probe_cleanup_failed: "The write probe could not be cleaned up. Close blocking apps, then retry.",
+        workspace_settings_invalid: "Workspace settings are invalid. Configure the workspace again.",
+      },
     },
     controls: {
       modelRoute: "Model type",
@@ -2264,10 +2346,7 @@ export const translations: Record<Language, TranslationSet> = {
       deepSeekApi: "DeepSeek API",
       deepSeekChatApi: "DeepSeek Chat API",
       deepSeekTelemetry: "DeepSeek telemetry",
-      apiBaseUrl: "API base",
-      chatEndpoint: "Chat endpoint",
       deepSeekModels: "DeepSeek models",
-      apiKeyEnv: "Key environment",
       apiKeyConfigured: "Configured",
       apiKeyMissing: "Missing",
       chatReady: "Ready",
@@ -2613,8 +2692,6 @@ export const translations: Record<Language, TranslationSet> = {
       title: "Workspace",
       required: "First run needs a local workspace.",
       ready: "Workspace is configured.",
-      appData: "App data directory",
-      settingsFile: "Directory settings",
       workspaceName: "Workspace name",
       workspaceNamePlaceholder: "e.g. Operations Analysis",
       workspaceDir: "Workspace",
@@ -2637,7 +2714,6 @@ export const translations: Record<Language, TranslationSet> = {
       statusConfigured: "Local pricing configured",
       statusNotConfigured: "Local pricing not configured",
       help: "Enter USD / 1M tokens. Prices are stored in local app data, not hardcoded into the open-source project.",
-      settingsFile: "Pricing settings",
       flashPrompt: "Flash input",
       flashCompletion: "Flash output",
       proPrompt: "Pro input",

@@ -29,7 +29,7 @@ assert.doesNotMatch(commandAdapter, /installer_path: String/);
 
 const startupStart = app.indexOf('void invoke<FoundationState>("get_foundation_state")');
 const startupEnd = app.indexOf(
-  'void invoke<DeepSeekCredentialStatus>("get_deepseek_credential_status")',
+  'void invoke<OnboardingReadinessProjection>("get_onboarding_readiness")',
   startupStart,
 );
 const startup = app.slice(startupStart, startupEnd);

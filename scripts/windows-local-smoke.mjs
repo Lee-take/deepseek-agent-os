@@ -34,7 +34,7 @@ const model = (
   process.env.DEEPSEEK_WINDOWS_SMOKE_MODEL ??
   process.env.DEEPSEEK_BRIEFING_SMOKE_MODEL ??
   process.env.DEEPSEEK_SMOKE_MODEL ??
-  "deepseek-chat"
+  "deepseek-v4-flash"
 ).trim();
 const appDataDir =
   process.env.DEEPSEEK_AGENT_OS_APP_DATA_DIR ??

@@ -793,18 +793,79 @@ export type SkillExecutionRecord = {
   completed_at: string | null;
 };
 
-export type LocalDirectorySettings = {
-  workspace_dir: string;
-  workspace_name: string;
-  evidence_dir: string;
-  export_dir: string;
+export type DeepSeekCredentialSource = "stored" | "environment" | "missing";
+export type DeepSeekVerificationState =
+  | "not_checked"
+  | "checking"
+  | "verified"
+  | "blocked";
+export type DeepSeekReadinessCode =
+  | "ready"
+  | "not_checked"
+  | "key_missing"
+  | "key_format_invalid"
+  | "authentication_failed"
+  | "insufficient_balance"
+  | "rate_limited"
+  | "network_unavailable"
+  | "network_timeout"
+  | "model_unavailable"
+  | "request_invalid"
+  | "provider_unavailable"
+  | "provider_protocol_error"
+  | "credential_store_unavailable";
+
+export type DeepSeekReadinessProjection = {
+  source: DeepSeekCredentialSource;
+  configured: boolean;
+  verification: DeepSeekVerificationState;
+  code: DeepSeekReadinessCode;
+  chat_completion_ready: boolean;
+  balance_available: boolean | null;
+  flash_model: "deepseek-v4-flash";
+  pro_model: "deepseek-v4-pro";
+  flash_available: boolean | null;
+  pro_available: boolean | null;
+  retryable: boolean;
+  last_verified_at: string | null;
+  message_key: string;
 };
 
-export type LocalDirectoryState = {
-  app_data_dir: string;
-  settings_file: string;
-  settings: LocalDirectorySettings | null;
-  needs_setup: boolean;
+export type WorkspaceReadinessCode =
+  | "ready"
+  | "workspace_missing"
+  | "workspace_unavailable"
+  | "workspace_permission_denied"
+  | "workspace_probe_cleanup_failed"
+  | "workspace_settings_invalid";
+
+export type WorkspaceReadinessProjection = {
+  configured: boolean;
+  workspace_name: string | null;
+  workspace_root_display: string | null;
+  root_exists: boolean;
+  managed_directories_ready: boolean;
+  writable: boolean | null;
+  code: WorkspaceReadinessCode;
+  retryable: boolean;
+  message_key: string;
+};
+
+export type VersionReadinessProjection = {
+  current_version: string;
+  status: "current" | "update_available" | "check_unavailable";
+  blocking: false;
+  message_key: string;
+};
+
+export type OnboardingReadinessProjection = {
+  schema_version: 1;
+  overall: "setup_required" | "checking" | "blocked" | "ready";
+  next_step: "deepseek_key" | "workspace" | "doctor" | "ready";
+  deepseek: DeepSeekReadinessProjection;
+  workspace: WorkspaceReadinessProjection;
+  version: VersionReadinessProjection;
+  checked_at: string | null;
 };
 
 export type AppUpdateStatus = {
@@ -836,17 +897,6 @@ export type ToolBackendSettings = {
   computer_control: ComputerControlBackend;
 };
 
-export type DeepSeekCredentialStatus = {
-  base_url: string;
-  chat_completions_url: string;
-  api_key_env_var: string;
-  api_key_configured: boolean;
-  chat_completion_ready: boolean;
-  flash_model: string;
-  pro_model: string;
-  readiness_note: string;
-};
-
 export type DeepSeekChatCacheStatus = "disabled" | "hit" | "miss";
 
 export type DeepSeekChatTelemetry = {
@@ -873,18 +923,6 @@ export type AgentSoulProfileUpdateReceipt = {
   changed_fields: string[];
   undo_available: boolean;
   applied_at: string;
-};
-
-export type DeepSeekUserBalanceInfo = {
-  currency: string;
-  total_balance: string;
-  granted_balance: string;
-  topped_up_balance: string;
-};
-
-export type DeepSeekUserBalanceResponse = {
-  is_available: boolean;
-  balance_infos: DeepSeekUserBalanceInfo[];
 };
 
 export type AgentChatResponse = {
@@ -956,8 +994,6 @@ export type DeepSeekPricingSettings = {
 };
 
 export type DeepSeekPricingState = {
-  app_data_dir: string;
-  settings_file: string;
   settings: DeepSeekPricingSettings;
   pricing_configured: boolean;
   note: string;
@@ -1099,7 +1135,7 @@ export type ModelDrivenToolStrategy = {
 };
 
 export type WorkPackageToolReadiness = {
-  deepseek: DeepSeekCredentialStatus;
+  deepseek: DeepSeekReadinessProjection;
   network_search: NetworkSearchRouteStatus;
   computer_use: ComputerUseBackendStatus;
   local_directories: LocalDirectoryReadinessStatus;

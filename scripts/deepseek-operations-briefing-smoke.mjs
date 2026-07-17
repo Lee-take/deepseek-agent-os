@@ -19,7 +19,7 @@ const baseUrl = normalizeBaseUrl(
 const model = (
   process.env.DEEPSEEK_BRIEFING_SMOKE_MODEL ??
   process.env.DEEPSEEK_SMOKE_MODEL ??
-  "deepseek-chat"
+  "deepseek-v4-flash"
 ).trim();
 const evidenceDir =
   process.env.DEEPSEEK_BRIEFING_EVIDENCE_DIR ??

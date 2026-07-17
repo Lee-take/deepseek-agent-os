@@ -495,6 +495,7 @@ checkRootWorkspaceScripts();
 checkSmokeScriptReleaseLabels();
 checkExternalBridgeUserVisibleErrors();
 checkLocalReleaseHelperSelfTests();
+checkStepOneOnboardingReadinessContract();
 checkPackageManagerBaseline();
 checkGovernanceDocs();
 checkContributingPolicyStatus();
@@ -4115,7 +4116,7 @@ function checkSmokeScriptReleaseLabels() {
   const rustRuntimeExpectations = [
     [
       "apps/desktop/src-tauri/src/kernel/deepseek.rs",
-      "DeepSeek-Agent-OS/0.1.0 deepseek-chat",
+      "DS-Agent/1.0.2 deepseek-v4",
       "DeepSeek runtime User-Agent release label",
     ],
     [
@@ -4240,8 +4241,8 @@ function checkLocalReleaseHelperSelfTests() {
   checkTextIncludes(
     "scripts/windows-installed-ui-smoke.mjs",
     windowsInstalledUiSmoke,
-    "app_data_events_restored: true",
-    "Windows installed UI memory-feedback restores app-data event store",
+    "isolated_profile_cleanup",
+    "Windows installed UI smoke verifies isolated-profile cleanup",
   );
   checkTextIncludes(
     "scripts/windows-installed-ui-smoke.mjs",
@@ -4326,13 +4327,13 @@ function checkLocalReleaseHelperSelfTests() {
   checkTextIncludes(
     "scripts/release-local-check.mjs",
     releaseLocal,
-    '["npx", "pnpm@9.15.9", "test:windows-installed-ui"]',
-    "release-local self-test pins installed UI smoke command parts",
+    '"--isolated-profile"',
+    "release-local pins isolated installed UI smoke mode",
   );
   checkTextIncludes(
     "scripts/release-local-check.mjs",
     releaseLocal,
-    '["npx", "pnpm@9.15.9", "test:windows-installed-ui", "--", "--workflow"]',
+    '"--workflow"',
     "release-local self-test pins installed workflow smoke command parts",
   );
   checkTextIncludes(
@@ -4341,6 +4342,151 @@ function checkLocalReleaseHelperSelfTests() {
     "Self-test expected skip-live command list to exclude live smoke commands.",
     "release-local self-test pins skip-live live-smoke exclusion",
   );
+}
+
+function checkStepOneOnboardingReadinessContract() {
+  const v4DefaultFiles = [
+    ".env.example",
+    "scripts/deepseek-smoke.mjs",
+    "scripts/deepseek-operations-briefing-smoke.mjs",
+    "scripts/windows-local-smoke.mjs",
+  ];
+  for (const filePath of v4DefaultFiles) {
+    const content = readText(filePath);
+    checkTextIncludes(
+      filePath,
+      content,
+      "deepseek-v4-flash",
+      `${filePath} uses V4 Flash smoke default`,
+    );
+    checkTextDoesNotInclude(
+      filePath,
+      content,
+      "deepseek-chat",
+      `${filePath} has no retiring legacy smoke default`,
+    );
+  }
+
+  const app = readText("apps/desktop/src/App.tsx");
+  for (const forbidden of [
+    "fallbackApiKey",
+    "sessionDeepSeekApiKey",
+    "get_deepseek_credential_status",
+    "get_deepseek_user_balance",
+  ]) {
+    checkTextDoesNotInclude(
+      "apps/desktop/src/App.tsx",
+      app,
+      forbidden,
+      `onboarding UI excludes ${forbidden}`,
+    );
+  }
+  for (const required of [
+    "get_onboarding_readiness",
+    "save_deepseek_api_key",
+    "verify_deepseek_api_key",
+    "remove_deepseek_api_key",
+    'setDeepSeekApiKeyDraft("")',
+  ]) {
+    checkTextIncludes(
+      "apps/desktop/src/App.tsx",
+      app,
+      required,
+      `onboarding UI includes ${required}`,
+    );
+  }
+
+  const onboardingTest = readText("scripts/onboarding-readiness.test.mjs");
+  checkTextIncludes(
+    "scripts/onboarding-readiness.test.mjs",
+    onboardingTest,
+    "onboarding readiness tests passed",
+    "focused onboarding test is present",
+  );
+  checkTextIncludes(
+    "scripts/desktop-test.mjs",
+    readText("scripts/desktop-test.mjs"),
+    "scripts/onboarding-readiness.test.mjs",
+    "full desktop test runs onboarding contract",
+  );
+  const ci = readText(".github/workflows/ci.yml");
+  checkTextIncludes(
+    ".github/workflows/ci.yml",
+    ci,
+    "node scripts/onboarding-readiness.test.mjs",
+    "CI runs focused onboarding test offline",
+  );
+  checkTextIncludes(
+    ".github/workflows/ci.yml",
+    ci,
+    "node scripts/settings-panel.test.mjs",
+    "CI runs focused settings test offline",
+  );
+  checkTextIncludes(
+    ".github/workflows/ci.yml",
+    ci,
+    "node scripts/windows-installed-ui-smoke.mjs --self-test",
+    "CI runs isolated-profile helper self-test offline",
+  );
+  checkTextIncludes(
+    ".github/workflows/ci.yml",
+    ci,
+    "node scripts/release-local-check.mjs --self-test",
+    "CI runs release-local helper self-test offline",
+  );
+
+  const installedSmoke = readText("scripts/windows-installed-ui-smoke.mjs");
+  for (const required of [
+    "--isolated-profile",
+    "createIsolatedProfile",
+    "verifyIsolatedProfileRoot",
+    "APPDATA: profile.appDataDir",
+    "LOCALAPPDATA: profile.localAppDataDir",
+    "removeIsolatedProfile",
+    "verifyIsolatedLocalFilePath",
+    "runInstalledOnboardingSmoke",
+  ]) {
+    checkTextIncludes(
+      "scripts/windows-installed-ui-smoke.mjs",
+      installedSmoke,
+      required,
+      `installed UI smoke includes ${required}`,
+    );
+  }
+
+  const publicTypes = readText("apps/desktop/src/types.ts");
+  const projectionStart = publicTypes.indexOf("export type DeepSeekReadinessProjection");
+  const projectionEnd = publicTypes.indexOf("export type AppUpdateStatus", projectionStart);
+  const projections = publicTypes.slice(projectionStart, projectionEnd);
+  for (const forbidden of [
+    "api_key",
+    "key_hash",
+    "account",
+    "currency",
+    "total_balance",
+    "app_data_dir",
+    "settings_file",
+    "workspace_dir",
+    "vault",
+  ]) {
+    checkTextDoesNotInclude(
+      "apps/desktop/src/types.ts",
+      projections,
+      forbidden,
+      `public readiness projection excludes ${forbidden}`,
+    );
+  }
+  const pricingStart = publicTypes.indexOf("export type DeepSeekPricingState");
+  const pricingEnd = publicTypes.indexOf("export type NetworkSearchRouteStatus", pricingStart);
+  const pricingProjection = publicTypes.slice(pricingStart, pricingEnd);
+  for (const forbidden of ["app_data_dir", "settings_file", "vault"]) {
+    checkTextDoesNotInclude(
+      "apps/desktop/src/types.ts",
+      pricingProjection,
+      forbidden,
+      `public pricing projection excludes ${forbidden}`,
+    );
+  }
 }
 
 function checkOperationsBriefingSmokeEvidence() {

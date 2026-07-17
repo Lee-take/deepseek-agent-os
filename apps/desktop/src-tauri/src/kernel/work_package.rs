@@ -1,7 +1,7 @@
 use crate::kernel::computer_use::{
     computer_use_backend_status_for_strategy_with_codex_bridge_config, ComputerUseBackendStatus,
 };
-use crate::kernel::deepseek::{deepseek_credential_status_from_env, DeepSeekCredentialStatus};
+use crate::kernel::deepseek_credential::DeepSeekReadinessProjection;
 use crate::kernel::local_directory::LocalDirectoryReadinessStatus;
 use crate::kernel::models::{FoundationState, MemoryCandidate, TaskRecord};
 use crate::kernel::network_search::{
@@ -45,7 +45,11 @@ pub struct WorkPackage {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct WorkPackageToolReadiness {
-    pub deepseek: DeepSeekCredentialStatus,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_work_package_deepseek_readiness"
+    )]
+    pub deepseek: DeepSeekReadinessProjection,
     pub network_search: NetworkSearchRouteStatus,
     pub computer_use: ComputerUseBackendStatus,
     #[serde(default)]
@@ -54,9 +58,33 @@ pub struct WorkPackageToolReadiness {
     pub tool_strategy: ModelDrivenToolStrategy,
 }
 
+fn deserialize_work_package_deepseek_readiness<'de, D>(
+    deserializer: D,
+) -> Result<DeepSeekReadinessProjection, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    if value.get("source").is_none()
+        || value.get("verification").is_none()
+        || value.get("code").is_none()
+    {
+        return Ok(DeepSeekReadinessProjection::default());
+    }
+    let projection = serde_json::from_value::<DeepSeekReadinessProjection>(value)
+        .map_err(serde::de::Error::custom)?;
+    let coherent_ready = projection.verification
+        == crate::kernel::deepseek_credential::DeepSeekVerificationState::Verified
+        && projection.code == crate::kernel::deepseek_credential::DeepSeekReadinessCode::Ready;
+    if projection.chat_completion_ready != coherent_ready {
+        return Ok(DeepSeekReadinessProjection::default());
+    }
+    Ok(projection)
+}
+
 impl Default for WorkPackageToolReadiness {
     fn default() -> Self {
-        let deepseek = deepseek_credential_status_from_env(|_| None);
+        let deepseek = DeepSeekReadinessProjection::default();
         let foundation_state = FoundationState::default();
         let tool_strategy = model_driven_tool_strategy_with_native_network_search_bridge(
             foundation_state.large_model_provider,
@@ -343,8 +371,10 @@ mod tests {
         export_work_package, export_work_package_with_tool_readiness, parse_work_package_json,
         WorkPackageError, WorkPackageToolReadiness, REDACTED_SOURCE_MACHINE_EVIDENCE_HANDLE,
     };
-    use crate::kernel::deepseek::{
-        deepseek_credential_status_from_env, DeepSeekCredentialStatus, DEEPSEEK_API_KEY_ENV,
+    use crate::kernel::deepseek::{DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL};
+    use crate::kernel::deepseek_credential::{
+        DeepSeekCredentialSource, DeepSeekReadinessCode, DeepSeekReadinessProjection,
+        DeepSeekVerificationState,
     };
     use crate::kernel::local_directory::{
         local_directory_readiness_from_state, LocalDirectorySettings, LocalDirectoryState,
@@ -608,13 +638,21 @@ mod tests {
 
     #[test]
     fn tool_readiness_export_package_stays_secret_safe() {
-        let deepseek_status = deepseek_credential_status_from_env(|name| {
-            if name == DEEPSEEK_API_KEY_ENV {
-                Some("test-secret-token".to_string())
-            } else {
-                None
-            }
-        });
+        let deepseek_status = DeepSeekReadinessProjection {
+            source: DeepSeekCredentialSource::Environment,
+            configured: true,
+            verification: DeepSeekVerificationState::NotChecked,
+            code: DeepSeekReadinessCode::NotChecked,
+            chat_completion_ready: false,
+            balance_available: None,
+            flash_model: DEEPSEEK_FLASH_MODEL.to_string(),
+            pro_model: DEEPSEEK_PRO_MODEL.to_string(),
+            flash_available: None,
+            pro_available: None,
+            retryable: false,
+            last_verified_at: None,
+            message_key: "onboarding.deepseek.not_checked".to_string(),
+        };
         let package = export_work_package_with_tool_readiness(
             FoundationState::default(),
             Vec::new(),
@@ -628,8 +666,9 @@ mod tests {
 
         let package_json = serde_json::to_string(&package).expect("package serializes");
 
-        assert!(package.tool_readiness.deepseek.api_key_configured);
-        assert!(package_json.contains(DEEPSEEK_API_KEY_ENV));
+        assert!(package.tool_readiness.deepseek.configured);
+        assert!(package_json.contains("\"source\":\"environment\""));
+        assert!(!package_json.contains("DEEPSEEK_API_KEY"));
         assert!(package_json.contains("pending_user_confirmation"));
         assert!(package_json.contains("\"local_directories\""));
         if cfg!(target_os = "macos") {
@@ -707,20 +746,42 @@ mod tests {
 
         assert_eq!(
             package.tool_readiness.deepseek,
-            DeepSeekCredentialStatus {
-                base_url: "https://api.deepseek.com".to_string(),
-                chat_completions_url: "https://api.deepseek.com/chat/completions".to_string(),
-                api_key_env_var: DEEPSEEK_API_KEY_ENV.to_string(),
-                api_key_configured: false,
-                chat_completion_ready: false,
-                flash_model: "deepseek-v4-flash".to_string(),
-                pro_model: "deepseek-v4-pro".to_string(),
-                readiness_note:
-                    "set DEEPSEEK_API_KEY in the local process environment to enable Chat Completions requests"
-                        .to_string(),
-            }
+            DeepSeekReadinessProjection::default()
         );
         assert_eq!(package.tool_readiness, WorkPackageToolReadiness::default());
+    }
+
+    #[test]
+    fn tool_readiness_legacy_deepseek_shape_cannot_import_false_ready_authority() {
+        let mut tool_readiness = serde_json::to_value(WorkPackageToolReadiness::default())
+            .expect("readiness serializes");
+        tool_readiness["deepseek"] = serde_json::json!({
+            "base_url": "https://api.deepseek.com",
+            "chat_completions_url": "https://api.deepseek.com/chat/completions",
+            "api_key_env_var": "DEEPSEEK_API_KEY",
+            "api_key_configured": true,
+            "chat_completion_ready": true,
+            "flash_model": "deepseek-v4-flash",
+            "pro_model": "deepseek-v4-pro"
+        });
+        let package_json = serde_json::json!({
+            "version": "deepseek-agent-os.work-package.v1",
+            "exported_at": chrono::Utc::now(),
+            "foundation_state": FoundationState::default(),
+            "tool_readiness": tool_readiness,
+            "task_records": [],
+            "memory_candidates": [],
+            "operations_briefing_runs": []
+        })
+        .to_string();
+
+        let package = parse_work_package_json(&package_json).expect("legacy package parses");
+
+        assert_eq!(
+            package.tool_readiness.deepseek,
+            DeepSeekReadinessProjection::default()
+        );
+        assert!(!package.tool_readiness.deepseek.chat_completion_ready);
     }
 
     #[test]

@@ -90,8 +90,6 @@ impl DeepSeekPricingSettings {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeepSeekPricingState {
-    pub app_data_dir: String,
-    pub settings_file: String,
     pub settings: DeepSeekPricingSettings,
     pub pricing_configured: bool,
     pub note: String,
@@ -112,11 +110,7 @@ pub fn load_deepseek_pricing_state(
         DeepSeekPricingSettings::default()
     };
 
-    Ok(deepseek_pricing_state_from_settings(
-        app_data_dir,
-        &settings_file,
-        settings,
-    ))
+    Ok(deepseek_pricing_state_from_settings(settings))
 }
 
 pub fn save_deepseek_pricing_settings(
@@ -131,11 +125,7 @@ pub fn save_deepseek_pricing_settings(
         serde_json::to_string_pretty(&settings).map_err(DeepSeekPricingError::Json)?;
     fs::write(&settings_file, settings_json).map_err(DeepSeekPricingError::Write)?;
 
-    Ok(deepseek_pricing_state_from_settings(
-        app_data_dir,
-        &settings_file,
-        settings,
-    ))
+    Ok(deepseek_pricing_state_from_settings(settings))
 }
 
 pub fn estimate_deepseek_chat_cost_micro_usd(
@@ -171,15 +161,9 @@ pub fn try_estimate_deepseek_chat_cost_micro_usd(
     Ok(Some(total.min(u64::MAX as u128) as u64))
 }
 
-fn deepseek_pricing_state_from_settings(
-    app_data_dir: &Path,
-    settings_file: &Path,
-    settings: DeepSeekPricingSettings,
-) -> DeepSeekPricingState {
+fn deepseek_pricing_state_from_settings(settings: DeepSeekPricingSettings) -> DeepSeekPricingState {
     let pricing_configured = settings.enabled && settings.has_any_rate();
     DeepSeekPricingState {
-        app_data_dir: app_data_dir.to_string_lossy().to_string(),
-        settings_file: settings_file.to_string_lossy().to_string(),
         settings,
         pricing_configured,
         note: if pricing_configured {
@@ -313,9 +297,10 @@ mod tests {
 
         assert!(!state.settings.enabled);
         assert!(!state.pricing_configured);
-        assert!(state
-            .settings_file
-            .ends_with(DEEPSEEK_PRICING_SETTINGS_FILE));
+        let state_json = serde_json::to_string(&state).expect("state serializes");
+        assert!(!state_json.contains(&temp_dir.path().to_string_lossy().to_string()));
+        assert!(!state_json.contains("app_data_dir"));
+        assert!(!state_json.contains("settings_file"));
     }
 
     #[test]
@@ -335,6 +320,10 @@ mod tests {
 
         assert!(saved.pricing_configured);
         assert_eq!(saved.settings.flash_prompt_usd_per_million_tokens, "0.14");
+        assert!(temp_dir
+            .path()
+            .join(DEEPSEEK_PRICING_SETTINGS_FILE)
+            .is_file());
 
         let loaded = load_deepseek_pricing_state(temp_dir.path()).expect("state reloads");
         assert_eq!(loaded, saved);

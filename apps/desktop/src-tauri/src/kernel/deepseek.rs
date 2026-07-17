@@ -6,8 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::Mutex;
 use std::time::Instant;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const DEEPSEEK_AUTO_LABEL: &str = "DeepSeek Auto";
 pub const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
@@ -15,20 +17,10 @@ pub const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 pub const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEEPSEEK_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 pub const DEEPSEEK_USER_BALANCE_PATH: &str = "/user/balance";
+pub const DEEPSEEK_MODELS_PATH: &str = "/models";
 pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 pub const DEEPSEEK_CHAT_HTTP_TIMEOUT_SECS: u64 = 90;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct DeepSeekCredentialStatus {
-    pub base_url: String,
-    pub chat_completions_url: String,
-    pub api_key_env_var: String,
-    pub api_key_configured: bool,
-    pub chat_completion_ready: bool,
-    pub flash_model: String,
-    pub pro_model: String,
-    pub readiness_note: String,
-}
+const DEEPSEEK_RESPONSE_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeepSeekUserBalanceInfo {
@@ -43,6 +35,41 @@ pub struct DeepSeekUserBalanceResponse {
     pub is_available: bool,
     #[serde(default)]
     pub balance_infos: Vec<DeepSeekUserBalanceInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct DeepSeekModelDescriptor {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct DeepSeekModelListResponse {
+    #[serde(default)]
+    pub data: Vec<DeepSeekModelDescriptor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum DeepSeekTransportFailure {
+    #[error("deepseek_http_status_{0}")]
+    HttpStatus(u16),
+    #[error("deepseek_network_unavailable")]
+    NetworkUnavailable,
+    #[error("deepseek_network_timeout")]
+    Timeout,
+    #[error("deepseek_provider_protocol_error")]
+    Protocol,
+}
+
+pub trait DeepSeekReadinessTransport {
+    fn fetch_user_balance(
+        &self,
+        api_key: &str,
+    ) -> Result<DeepSeekUserBalanceResponse, DeepSeekTransportFailure>;
+
+    fn fetch_models(
+        &self,
+        api_key: &str,
+    ) -> Result<DeepSeekModelListResponse, DeepSeekTransportFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -229,10 +256,16 @@ pub struct DeepSeekOperationsBriefingSynthesizer<'a, T: DeepSeekChatCompletionTr
     thinking: ThinkingLevel,
 }
 
+impl<T: DeepSeekChatCompletionTransport> Drop for DeepSeekOperationsBriefingSynthesizer<'_, T> {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
+    }
+}
+
 impl HttpDeepSeekChatCompletionTransport {
     pub fn new() -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
-            .user_agent("DeepSeek-Agent-OS/0.1.0 deepseek-chat")
+            .user_agent("DS-Agent/1.0.2 deepseek-v4")
             .timeout(std::time::Duration::from_secs(
                 DEEPSEEK_CHAT_HTTP_TIMEOUT_SECS,
             ))
@@ -256,53 +289,99 @@ impl DeepSeekChatCompletionTransport for HttpDeepSeekChatCompletionTransport {
             .bearer_auth(api_key)
             .json(request)
             .send()
-            .map_err(|error| format!("deepseek chat request failed: {error}"))?;
+            .map_err(|error| safe_transport_failure(classify_reqwest_error(&error)))?;
         let status = response.status();
-        let body = response
-            .text()
-            .map_err(|error| format!("deepseek chat response could not be read: {error}"))?;
-
         if !status.is_success() {
-            return Err(format!(
-                "deepseek chat request returned HTTP {}: {}",
-                status.as_u16(),
-                truncate_for_error(&body, 240)
+            return Err(safe_transport_failure(
+                DeepSeekTransportFailure::HttpStatus(status.as_u16()),
             ));
         }
-
-        serde_json::from_str::<DeepSeekChatCompletionResponse>(&body)
-            .map_err(|error| format!("deepseek chat response could not be parsed: {error}"))
+        let mut body = read_bounded_response(response).map_err(safe_transport_failure)?;
+        let parsed = serde_json::from_slice::<DeepSeekChatCompletionResponse>(&body)
+            .map_err(|_| safe_transport_failure(DeepSeekTransportFailure::Protocol));
+        body.zeroize();
+        parsed
     }
 }
 
 impl HttpDeepSeekChatCompletionTransport {
-    pub fn get_user_balance(
+    fn fetch_json<T: for<'de> Deserialize<'de>>(
         &self,
         endpoint: &str,
         api_key: &str,
-    ) -> Result<DeepSeekUserBalanceResponse, String> {
+    ) -> Result<T, DeepSeekTransportFailure> {
         let response = self
             .client
             .get(endpoint)
             .bearer_auth(api_key)
             .send()
-            .map_err(|error| format!("deepseek balance request failed: {error}"))?;
+            .map_err(|error| classify_reqwest_error(&error))?;
         let status = response.status();
-        let body = response
-            .text()
-            .map_err(|error| format!("deepseek balance response could not be read: {error}"))?;
-
         if !status.is_success() {
-            return Err(format!(
-                "deepseek balance request returned HTTP {}: {}",
-                status.as_u16(),
-                truncate_for_error(&body, 240)
-            ));
+            return Err(DeepSeekTransportFailure::HttpStatus(status.as_u16()));
         }
-
-        serde_json::from_str::<DeepSeekUserBalanceResponse>(&body)
-            .map_err(|error| format!("deepseek balance response could not be parsed: {error}"))
+        let mut body = read_bounded_response(response)?;
+        let parsed = serde_json::from_slice(&body).map_err(|_| DeepSeekTransportFailure::Protocol);
+        body.zeroize();
+        parsed
     }
+}
+
+impl DeepSeekReadinessTransport for HttpDeepSeekChatCompletionTransport {
+    fn fetch_user_balance(
+        &self,
+        api_key: &str,
+    ) -> Result<DeepSeekUserBalanceResponse, DeepSeekTransportFailure> {
+        self.fetch_json(
+            &format!("{DEEPSEEK_API_BASE_URL}{DEEPSEEK_USER_BALANCE_PATH}"),
+            api_key,
+        )
+    }
+
+    fn fetch_models(
+        &self,
+        api_key: &str,
+    ) -> Result<DeepSeekModelListResponse, DeepSeekTransportFailure> {
+        self.fetch_json(
+            &format!("{DEEPSEEK_API_BASE_URL}{DEEPSEEK_MODELS_PATH}"),
+            api_key,
+        )
+    }
+}
+
+fn classify_reqwest_error(error: &reqwest::Error) -> DeepSeekTransportFailure {
+    if error.is_timeout() {
+        DeepSeekTransportFailure::Timeout
+    } else if error.is_connect() {
+        DeepSeekTransportFailure::NetworkUnavailable
+    } else {
+        DeepSeekTransportFailure::Protocol
+    }
+}
+
+fn safe_transport_failure(error: DeepSeekTransportFailure) -> String {
+    error.to_string()
+}
+
+fn read_bounded_response(
+    mut response: reqwest::blocking::Response,
+) -> Result<Vec<u8>, DeepSeekTransportFailure> {
+    if response
+        .content_length()
+        .map(|length| length > DEEPSEEK_RESPONSE_MAX_BYTES as u64)
+        .unwrap_or(false)
+    {
+        return Err(DeepSeekTransportFailure::Protocol);
+    }
+    let mut body = Vec::new();
+    Read::take(&mut response, (DEEPSEEK_RESPONSE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| DeepSeekTransportFailure::Protocol)?;
+    if body.len() > DEEPSEEK_RESPONSE_MAX_BYTES {
+        body.zeroize();
+        return Err(DeepSeekTransportFailure::Protocol);
+    }
+    Ok(body)
 }
 
 impl<'a, T: DeepSeekChatCompletionTransport> DeepSeekOperationsBriefingSynthesizer<'a, T> {
@@ -384,30 +463,6 @@ impl<T: DeepSeekChatCompletionTransport> OperationsBriefingSynthesizer
     }
 }
 
-pub fn deepseek_credential_status_from_env(
-    read_env: impl Fn(&str) -> Option<String>,
-) -> DeepSeekCredentialStatus {
-    let api_key_configured = read_env(DEEPSEEK_API_KEY_ENV)
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-
-    DeepSeekCredentialStatus {
-        base_url: DEEPSEEK_API_BASE_URL.to_string(),
-        chat_completions_url: deepseek_chat_completions_url(),
-        api_key_env_var: DEEPSEEK_API_KEY_ENV.to_string(),
-        api_key_configured,
-        chat_completion_ready: api_key_configured,
-        flash_model: DEEPSEEK_FLASH_MODEL.to_string(),
-        pro_model: DEEPSEEK_PRO_MODEL.to_string(),
-        readiness_note: if api_key_configured {
-            "DEEPSEEK_API_KEY is configured for Chat Completions requests".to_string()
-        } else {
-            "set DEEPSEEK_API_KEY in the local process environment to enable Chat Completions requests"
-                .to_string()
-        },
-    }
-}
-
 const OPERATIONS_BRIEFING_SYSTEM_PROMPT: &str = "You are an operations briefing analyst. Return strict JSON only. The JSON object must contain summary, anomalies, action_plan, and warnings. Do not invent evidence beyond the provided manifest.";
 const OPERATIONS_BRIEFING_MAX_MANIFEST_CHARS: usize = 12_000;
 
@@ -451,10 +506,6 @@ fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
         output.push(character);
     }
     output
-}
-
-pub fn current_deepseek_credential_status() -> DeepSeekCredentialStatus {
-    deepseek_credential_status_from_env(|name| std::env::var(name).ok())
 }
 
 pub fn deepseek_chat_completions_url() -> String {
@@ -521,21 +572,6 @@ pub fn execute_deepseek_chat_completion(
     let api_key = normalize_api_key(api_key)?;
     transport
         .post_chat_completion(&deepseek_chat_completions_url(), &api_key, request)
-        .map_err(|error| redact_secret(&error, &api_key))
-}
-
-pub fn execute_deepseek_user_balance(
-    transport: &HttpDeepSeekChatCompletionTransport,
-    api_key: &str,
-) -> Result<DeepSeekUserBalanceResponse, String> {
-    let api_key = api_key.trim().to_string();
-    if api_key.is_empty() {
-        return Err(format!("{DEEPSEEK_API_KEY_ENV} is required"));
-    }
-
-    let endpoint = format!("{DEEPSEEK_API_BASE_URL}{DEEPSEEK_USER_BALANCE_PATH}");
-    transport
-        .get_user_balance(&endpoint, &api_key)
         .map_err(|error| redact_secret(&error, &api_key))
 }
 
@@ -633,8 +669,8 @@ fn normalize_prompt(value: &str, label: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-fn normalize_api_key(value: &str) -> Result<String, String> {
-    let normalized = value.trim().to_string();
+fn normalize_api_key(value: &str) -> Result<Zeroizing<String>, String> {
+    let normalized = Zeroizing::new(value.trim().to_string());
     if normalized.is_empty() {
         return Err(format!("{DEEPSEEK_API_KEY_ENV} is required"));
     }
@@ -672,8 +708,7 @@ mod tests {
     use std::thread::JoinHandle;
 
     use super::{
-        build_deepseek_chat_completion_request, deepseek_credential_status_from_env,
-        effective_model, execute_deepseek_chat_completion,
+        build_deepseek_chat_completion_request, effective_model, execute_deepseek_chat_completion,
         execute_deepseek_chat_completion_with_cache, thinking_budget_name, DeepSeekChatCacheStatus,
         DeepSeekChatCompletionCache, DeepSeekChatCompletionResponse,
         DeepSeekChatCompletionTransport, DeepSeekChatCompletionUsage,
@@ -838,38 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn credential_status_reports_missing_env_key_without_secret() {
-        let status = deepseek_credential_status_from_env(|_| None);
-
-        assert_eq!(status.base_url, DEEPSEEK_API_BASE_URL);
-        assert_eq!(
-            status.chat_completions_url,
-            format!("{DEEPSEEK_API_BASE_URL}{DEEPSEEK_CHAT_COMPLETIONS_PATH}")
-        );
-        assert_eq!(status.api_key_env_var, DEEPSEEK_API_KEY_ENV);
-        assert!(!status.api_key_configured);
-        assert!(!status.chat_completion_ready);
-        assert_eq!(status.flash_model, DEEPSEEK_FLASH_MODEL);
-        assert_eq!(status.pro_model, DEEPSEEK_PRO_MODEL);
-    }
-
-    #[test]
-    fn credential_status_reports_present_env_key_without_serializing_secret() {
-        let status = deepseek_credential_status_from_env(|name| {
-            if name == DEEPSEEK_API_KEY_ENV {
-                Some("test-secret-token".to_string())
-            } else {
-                None
-            }
-        });
-        let serialized = serde_json::to_string(&status).expect("status serializes");
-
-        assert!(status.api_key_configured);
-        assert!(status.chat_completion_ready);
-        assert!(!serialized.contains("test-secret-token"));
-    }
-
-    #[test]
     fn chat_completion_request_uses_route_model_messages_and_deep_thinking() {
         let request = build_deepseek_chat_completion_request(
             ModelRoute::Auto,
@@ -957,7 +960,7 @@ mod tests {
         )
         .expect("request builds");
         let response_body = serde_json::json!({
-            "model": "deepseek-chat",
+            "model": "deepseek-v4-pro",
             "choices": [
                 {
                     "message": {
@@ -979,7 +982,7 @@ mod tests {
 
         assert_eq!(response.first_text(), Some("ok"));
         assert!(recorded.raw.starts_with("POST / HTTP/1.1"));
-        assert!(normalized_headers.contains("user-agent: deepseek-agent-os/0.1.0 deepseek-chat"));
+        assert!(normalized_headers.contains("user-agent: ds-agent/1.0.2 deepseek-v4"));
     }
 
     #[test]

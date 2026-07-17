@@ -15,6 +15,7 @@ pub mod computer_use_runtime;
 pub mod computer_use_session;
 pub mod connectors;
 pub mod deepseek;
+pub mod deepseek_credential;
 pub mod deepseek_pricing;
 pub mod event_store;
 pub mod expert_team;

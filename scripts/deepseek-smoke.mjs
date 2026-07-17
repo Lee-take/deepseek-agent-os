@@ -13,7 +13,7 @@ const apiKey = (process.env.DEEPSEEK_API_KEY ?? "").trim();
 const baseUrl = normalizeBaseUrl(
   process.env.DEEPSEEK_API_BASE_URL ?? "https://api.deepseek.com",
 );
-const model = (process.env.DEEPSEEK_SMOKE_MODEL ?? "deepseek-chat").trim();
+const model = (process.env.DEEPSEEK_SMOKE_MODEL ?? "deepseek-v4-flash").trim();
 const showContent = process.env.DEEPSEEK_SMOKE_SHOW_CONTENT === "1";
 
 if (!apiKey) {

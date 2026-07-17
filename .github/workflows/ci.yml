@@ -44,6 +44,13 @@ jobs:
       - name: Build desktop frontend
         run: pnpm --filter @deepseek-agent-os/desktop build
 
+      - name: Run onboarding and settings contract tests
+        run: |
+          node scripts/settings-panel.test.mjs
+          node scripts/onboarding-readiness.test.mjs
+          node scripts/windows-installed-ui-smoke.mjs --self-test
+          node scripts/release-local-check.mjs --self-test
+
       - name: Run Rust tests
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}\deepseek-agent-os-cargo-target
