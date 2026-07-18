@@ -19,6 +19,7 @@ pub mod deepseek_credential;
 pub mod deepseek_pricing;
 pub mod event_store;
 pub mod expert_team;
+pub mod goal_envelope;
 pub mod local_directory;
 pub mod models;
 pub mod network_sandbox;

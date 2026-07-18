@@ -95,6 +95,7 @@ use crate::kernel::expert_team::{
     ExpertCapability, ExpertEvidenceRef, ExpertExternalEffectState, ExpertMergeReceipt,
     ExpertOutput, ExpertQualityGate, ExpertReviewDecision, ExpertRole, ExpertTeamPlanItem,
 };
+use crate::kernel::goal_envelope::GoalEnvelopeProposal;
 use crate::kernel::local_directory::{
     load_local_directory_state, local_directory_readiness_from_state,
     save_local_directory_settings as persist_local_directory_settings,
@@ -308,7 +309,7 @@ const AGENT_TOOL_LOOP_MAX_ROUNDS: usize = 4;
 const AGENT_RUN_GUIDANCE_MAX_ITEMS_PER_ROUND: usize = 8;
 const AGENT_RUN_GUIDANCE_PROMPT_CHAR_LIMIT: usize = 12_000;
 const AGENT_SKILL_CATALOG_MAX_ITEMS: usize = 24;
-const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user from agent_actions, missing_prerequisites, required_confirmations, artifact_targets, memory_candidates, soul_profile_update, subagent_plan, and expert_output. Soul is the durable cross-conversation identity and collaboration profile, not an ordinary memory candidate. Whenever the current user message explicitly defines, changes, or confirms any Soul setting, soul_profile_update must contain fields, clear_fields, current_message_evidence, and optional confirmation_context. This includes short confirmations such as yes when the immediately preceding context proposed a Soul setting. current_message_evidence must be an exact non-empty excerpt of the current user message; confirmation_context, when needed, must be an exact excerpt of the supplied conversation context. Use only the allowed Soul field names supplied by DS Agent. Keep identity roles exact: preferred_name is the user's own name, address_as is how DS Agent addresses the user, user_calls_ds_agent is the user's name for DS Agent, and ds_agent_should_refer_to_itself_as is DS Agent's self-reference. Never put DS Agent's name into preferred_name. Do not propose Soul updates for guesses, third-party statements, transient one-turn instructions, or sensitive values. Do not tell the user the setting was saved; DS Agent appends a persistence receipt only after the update is validated and written. For a complex task that materially benefits from specialists, subagent_plan may contain 2-4 unique roles chosen from research, analysis, production, review. Every item requires key, role, prompt, depends_on, capabilities, resources, budget, output_contract, and retry_policy. Use an acyclic flow: research and analysis may run in parallel when independent; production depends on relevant evidence/analysis; review depends on production. Only production may request managed_staging_write and a logical write resource. A child never writes an approved destination. Review cannot mutate staged output and must bind its decision to the exact production revision. Never create nested subagents or desktop-control subtasks. Leave subagent_plan empty for simple work. When executing an expert attempt, return expert_output with summary, evidence-linked claims, optional staged_content/staged_relative_path for production, and an exact-revision review verdict for review; never return another subagent_plan. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
+const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user, goal_envelope, agent_actions, missing_prerequisites, required_confirmations, artifact_targets, memory_candidates, soul_profile_update, subagent_plan, and expert_output. When proposing a goal_envelope, use version ds-agent.goal-envelope-proposal/v1 and include user_goal, assumptions, constraints, done_when, required_artifacts, verifiers, proposed_capabilities, external_targets, and stop_conditions. assumptions, constraints, proposed_capabilities, and stop_conditions are string arrays. Each done_when item has done_when_id and description; each required_artifact has artifact_id and description; each verifier has verifier_id, done_when_id, description, and evidence_kind; each external_target has target_id and description. The goal_envelope is only a proposal: it cannot approve execution, trust a path or external target, handle a secret, or declare completion. Soul is the durable cross-conversation identity and collaboration profile, not an ordinary memory candidate. Whenever the current user message explicitly defines, changes, or confirms any Soul setting, soul_profile_update must contain fields, clear_fields, current_message_evidence, and optional confirmation_context. This includes short confirmations such as yes when the immediately preceding context proposed a Soul setting. current_message_evidence must be an exact non-empty excerpt of the current user message; confirmation_context, when needed, must be an exact excerpt of the supplied conversation context. Use only the allowed Soul field names supplied by DS Agent. Keep identity roles exact: preferred_name is the user's own name, address_as is how DS Agent addresses the user, user_calls_ds_agent is the user's name for DS Agent, and ds_agent_should_refer_to_itself_as is DS Agent's self-reference. Never put DS Agent's name into preferred_name. Do not propose Soul updates for guesses, third-party statements, transient one-turn instructions, or sensitive values. Do not tell the user the setting was saved; DS Agent appends a persistence receipt only after the update is validated and written. For a complex task that materially benefits from specialists, subagent_plan may contain 2-4 unique roles chosen from research, analysis, production, review. Every item requires key, role, prompt, depends_on, capabilities, resources, budget, output_contract, and retry_policy. Use an acyclic flow: research and analysis may run in parallel when independent; production depends on relevant evidence/analysis; review depends on production. Only production may request managed_staging_write and a logical write resource. A child never writes an approved destination. Review cannot mutate staged output and must bind its decision to the exact production revision. Never create nested subagents or desktop-control subtasks. Leave subagent_plan empty for simple work. When executing an expert attempt, return expert_output with summary, evidence-linked claims, optional staged_content/staged_relative_path for production, and an exact-revision review verdict for review; never return another subagent_plan. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
 const AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT: usize = 1200;
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
@@ -497,6 +498,8 @@ pub struct AgentChatResponse {
     pub role: String,
     pub content: String,
     pub protocol_version: String,
+    #[serde(default)]
+    pub goal_envelope: Option<GoalEnvelopeProposal>,
     pub proposed_actions: Vec<AgentChatActionProposal>,
     pub missing_prerequisites: Vec<AgentChatMissingPrerequisite>,
     pub memory_candidates: Vec<MemoryCandidate>,
@@ -708,6 +711,8 @@ struct AgentModelEnvelope {
         deserialize_with = "deserialize_agent_reply_to_user"
     )]
     reply_to_user: String,
+    #[serde(default, deserialize_with = "deserialize_agent_goal_envelope")]
+    goal_envelope: Option<GoalEnvelopeProposal>,
     #[serde(default, alias = "proposed_actions")]
     agent_actions: Vec<AgentChatActionProposal>,
     #[serde(default)]
@@ -732,6 +737,18 @@ where
 {
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(agent_reply_text_from_value(&value))
+}
+
+fn deserialize_agent_goal_envelope<'de, D>(
+    deserializer: D,
+) -> Result<Option<GoalEnvelopeProposal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Value>::deserialize(deserializer)?
+        .map(GoalEnvelopeProposal::parse_value)
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 fn deserialize_agent_protocol_version<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -4698,6 +4715,9 @@ fn agent_chat_response_from_telemetry(
         .filter(|value| !value.is_empty())
         .unwrap_or("plain-text")
         .to_string();
+    let goal_envelope = parsed_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.goal_envelope.clone());
     let mut memory_candidate_proposals = parsed_envelope
         .as_ref()
         .map(|envelope| envelope.memory_candidates.clone())
@@ -4744,6 +4764,7 @@ fn agent_chat_response_from_telemetry(
         role: "assistant".to_string(),
         content: display_content,
         protocol_version,
+        goal_envelope,
         proposed_actions,
         missing_prerequisites,
         memory_candidates,
@@ -10331,6 +10352,9 @@ fn merge_agent_chat_followup_response(
     mut initial_response: AgentChatResponse,
     mut followup_response: AgentChatResponse,
 ) -> AgentChatResponse {
+    if followup_response.goal_envelope.is_none() {
+        followup_response.goal_envelope = initial_response.goal_envelope.take();
+    }
     initial_response
         .proposed_actions
         .append(&mut followup_response.proposed_actions);
@@ -12049,6 +12073,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                     role: response.role.clone(),
                     content: response.content.clone(),
                     protocol_version: response.protocol_version.clone(),
+                    goal_envelope: None,
                     proposed_actions: vec![action.clone()],
                     missing_prerequisites: Vec::new(),
                     memory_candidates: Vec::new(),
@@ -12127,6 +12152,7 @@ fn resume_agent_chat_action_with_clients_and_computer_use(
         role: "assistant".to_string(),
         content: String::new(),
         protocol_version: "ds-agent-action-resume-v1".to_string(),
+        goal_envelope: None,
         proposed_actions: vec![action],
         missing_prerequisites: Vec::new(),
         memory_candidates: Vec::new(),
@@ -17938,6 +17964,7 @@ mod tests {
             role: "assistant".to_string(),
             content: "我会检查版本。".to_string(),
             protocol_version: "ds-agent-envelope-v1".to_string(),
+            goal_envelope: None,
             proposed_actions: vec![AgentChatActionProposal {
                 action_type: "app_update_check".to_string(),
                 title: Some("检查 DS Agent 版本更新".to_string()),
@@ -23990,6 +24017,67 @@ mod tests {
             true
         );
         assert_eq!(reply_json["missing_prerequisites"][0]["kind"], "workspace");
+    }
+
+    #[test]
+    fn agent_chat_exposes_goal_envelope_only_as_a_model_proposal() {
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope/v1",
+            "reply_to_user": "我会先提出可验证的任务目标。",
+            "goal_envelope": {
+                "version": "ds-agent.goal-envelope-proposal/v1",
+                "user_goal": "Create a verified operating brief.",
+                "assumptions": [],
+                "constraints": ["Use only sources selected by the user."],
+                "done_when": [{
+                    "done_when_id": "brief-ready",
+                    "description": "The proposed brief is complete."
+                }],
+                "required_artifacts": [{
+                    "artifact_id": "operating-brief",
+                    "description": "A proposed one-page presentation."
+                }],
+                "verifiers": [{
+                    "verifier_id": "brief-render-verifier-v1",
+                    "done_when_id": "brief-ready",
+                    "description": "Verify the rendered slide has no overflow.",
+                    "evidence_kind": "rendered-presentation"
+                }],
+                "proposed_capabilities": ["office.presentation.propose"],
+                "external_targets": [{
+                    "target_id": "selected-workspace",
+                    "description": "A user-selected workspace that DS Agent must validate locally."
+                }],
+                "stop_conditions": ["Stop if a required source is missing."]
+            },
+            "agent_actions": [],
+            "missing_prerequisites": []
+        });
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+
+        let (reply, _) = agent_chat_with_transport(
+            &transport,
+            &cache,
+            "test-secret",
+            AgentChatRequest {
+                prompt: "请生成经营简报。".to_string(),
+                model_route: ModelRoute::Flash,
+                thinking_level: ThinkingLevel::Fast,
+                access_mode: AccessMode::AskOnRisk,
+            },
+            None,
+        )
+        .expect("goal envelope proposal parses");
+
+        let proposal = reply.goal_envelope.expect("goal proposal is exposed");
+        assert_eq!(proposal.user_goal, "Create a verified operating brief.");
+        assert_eq!(
+            proposal.proposed_capabilities,
+            vec!["office.presentation.propose"]
+        );
+        assert!(reply.proposed_actions.is_empty());
+        assert!(reply.missing_prerequisites.is_empty());
     }
 
     #[test]

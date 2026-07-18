@@ -925,11 +925,47 @@ export type AgentSoulProfileUpdateReceipt = {
   applied_at: string;
 };
 
+export type GoalDoneWhenProposal = {
+  done_when_id: string;
+  description: string;
+};
+
+export type GoalRequiredArtifactProposal = {
+  artifact_id: string;
+  description: string;
+};
+
+export type GoalVerifierProposal = {
+  verifier_id: string;
+  done_when_id: string;
+  description: string;
+  evidence_kind: string;
+};
+
+export type GoalExternalTargetProposal = {
+  target_id: string;
+  description: string;
+};
+
+export type GoalEnvelopeProposal = {
+  version: "ds-agent.goal-envelope-proposal/v1";
+  user_goal: string;
+  assumptions: string[];
+  constraints: string[];
+  done_when: GoalDoneWhenProposal[];
+  required_artifacts: GoalRequiredArtifactProposal[];
+  verifiers: GoalVerifierProposal[];
+  proposed_capabilities: string[];
+  external_targets: GoalExternalTargetProposal[];
+  stop_conditions: string[];
+};
+
 export type AgentChatResponse = {
   id: string;
   role: "assistant";
   content: string;
   protocol_version: string;
+  goal_envelope: GoalEnvelopeProposal | null;
   proposed_actions: AgentChatActionProposal[];
   missing_prerequisites: AgentChatMissingPrerequisite[];
   memory_candidates: MemoryCandidate[];
