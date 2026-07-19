@@ -1,14 +1,20 @@
 # Code signing policy
 
-Last updated: 2026-07-18
+Last updated: 2026-07-19
 
 ## Current status
 
-DS Agent `v1.0.2` is unsigned. Windows may therefore display an unknown-publisher
-warning for that historical release. The project is preparing an application
-for the SignPath Foundation open-source program, but no DS Agent binary may be
-represented as SignPath-signed until the application is approved and the
-published artifact independently verifies as Authenticode `Valid`.
+DS Agent `v1.1.0` is intentionally published unsigned. Both `ds-agent.exe` and
+the Windows x64 NSIS installer are expected to report Authenticode `NotSigned`.
+Windows may therefore display `Unknown publisher` or a Microsoft Defender
+SmartScreen warning. Users should download only over HTTPS from the official
+GitHub Release and verify the published SHA-256 before running the installer.
+
+The SignPath Foundation application is submitted and approval is pending. No
+DS Agent binary may be represented as SignPath-signed until the application is
+approved and a later-version artifact independently verifies as Authenticode
+`Valid`. The project will not replace the immutable `v1.1.0` tag or asset if
+signing becomes available later.
 
 For releases accepted into that program: **Free code signing provided by
 [SignPath.io](https://signpath.io/), certificate by
@@ -51,13 +57,17 @@ them; guessed or placeholder identifiers are forbidden.
 
 ## Release verification
 
-Before a signed installer is published, maintainers must verify both the
-application executable and installer with Windows Authenticode. Evidence must
-bind the exact source commit, file name, product version, byte size, SHA-256,
-signer subject and certificate chain, timestamp, and `Valid` signature status.
-The installer downloaded back from GitHub must match the reviewed release
-asset. An invalid, missing, expired, unexpectedly issued, or unbound signature
-stops publication.
+For the unsigned `v1.1.0` exception, maintainers verify and disclose the actual
+`NotSigned` status of both the application executable and installer. Evidence
+must bind the exact source commit, file name, product version, byte size, and
+SHA-256. The installer downloaded back from GitHub must match the reviewed
+Release asset exactly. An unexpected signer, signature identity, hash, version,
+source, or asset mismatch stops publication.
+
+For any later release explicitly described as signed, maintainers must also
+verify the expected signer subject, certificate chain, timestamp, and
+Authenticode `Valid` status independently for both files. An invalid, missing,
+expired, unexpectedly issued, or unbound signature stops that signed release.
 
 ## Project purpose and restrictions
 

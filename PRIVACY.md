@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Last updated: 2026-07-18
+Last updated: 2026-07-19
 
 This policy describes the current published DS Agent desktop application and
 public project. DS Agent is local-first and does not operate a project cloud
@@ -14,10 +14,13 @@ User-selected workspaces hold approved evidence, exports, reports, work
 packages, screenshots, and other artifacts. This information is not silently
 synced to a DS Agent-operated server.
 
-The current stable `v1.0.2` reads a user-supplied DeepSeek API key from the
-desktop process environment. The project does not provide a shared key. API
-keys must not be written to events, logs, UI state, exports, screenshots, or
-work packages.
+The current stable `v1.1.0` accepts one user-supplied DeepSeek API key through
+the onboarding screen and stores it in a dedicated Windows DPAPI-protected
+local vault. A process-environment key remains an explicit compatibility
+fallback and is never silently copied into that vault. The project does not
+provide a shared key. The raw key exists in frontend memory only while it is
+being entered and submitted; it must not be retained in UI state, events, logs,
+exports, screenshots, work packages, or verification receipts.
 
 Uninstalling the application may not delete a user-selected workspace or every
 application-data file. Review and remove those local locations separately when
@@ -28,10 +31,12 @@ you no longer want to retain them.
 DS Agent transfers information to networked systems only for work requested by
 the user or person operating the application:
 
-- **DeepSeek.** Model-backed work sends the user's prompt and the bounded
-  context selected for that request to the configured DeepSeek API. The
-  user-supplied API key is used for authentication. DeepSeek processes that
-  request under its [privacy policy](https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html).
+- **DeepSeek.** Explicit credential verification contacts DeepSeek's balance
+  and model-list endpoints. Model-backed work sends the user's prompt and the
+  bounded context selected for that request to the configured DeepSeek API.
+  The user-supplied API key is used for authentication. DeepSeek processes
+  those requests under its
+  [privacy policy](https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html).
 - **Web search and visited sites.** Source-linked web search can send the search
   query to DuckDuckGo, a user-configured route, or an optional user-started
   local bridge. Opening or submitting a requested web page sends normal
@@ -53,7 +58,7 @@ the user or person operating the application:
 The optional local desktop bridge accepts only loopback addresses and is
 started and controlled by the user. DS Agent does not install or supervise that
 service. Production Microsoft and Google account registration and live
-mail/calendar writes are disabled in `v1.0.2`; offline connector contracts do
+mail/calendar writes are disabled in `v1.1.0`; offline connector contracts do
 not authorize a production account or external write.
 
 ## What can be included in a model request
@@ -72,10 +77,11 @@ approval of a local action does not grant unrelated network authority.
 
 ## User choices
 
-Users control whether to configure a DeepSeek key, request model-backed work,
-run web search, open a web destination, import a remote skill source, or start
-an optional local bridge. Remove the relevant credential or do not invoke the
-network-backed capability to prevent that route from being used.
+Users control whether to configure or remove a DeepSeek key, run its explicit
+verification, request model-backed work, run web search, open a web destination,
+import a remote skill source, or start an optional local bridge. Remove the
+relevant credential or do not invoke the network-backed capability to prevent
+that route from being used.
 
 For a sensitive security or privacy issue, use
 [GitHub Private Vulnerability Reporting](https://github.com/Lee-take/dsagent/security/advisories/new).

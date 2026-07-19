@@ -2,7 +2,16 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import net from "node:net";
@@ -14,6 +23,7 @@ const rawArgs = process.argv.slice(2).filter((arg) => arg !== "--");
 const allowedArgs = new Set([
   "--agent-chat",
   "--help",
+  "--isolated-profile",
   "--memory-feedback",
   "--memory-maintenance",
   "--office",
@@ -31,6 +41,7 @@ if (rawArgs.includes("--help")) {
       "",
       "Flags:",
       "  --agent-chat Exercise the installed Tauri agent chat command bridge.",
+      "  --isolated-profile Run with new verified temp APPDATA and LOCALAPPDATA roots (required).",
       "  --memory-feedback Exercise installed memory candidate + selected-memory feedback bridge.",
       "  --memory-maintenance Exercise installed background memory update/archive maintenance.",
       "  --office Exercise installed Office artifact creation and Word open verification.",
@@ -45,6 +56,7 @@ if (rawArgs.includes("--help")) {
 const args = new Set(rawArgs);
 const selfTestMode = args.has("--self-test");
 const executablePath = selfTestMode ? null : resolveExecutablePath();
+const isolatedProfileMode = args.has("--isolated-profile");
 const includeWorkflowSmoke =
   args.has("--workflow") ||
   process.env.DEEPSEEK_AGENT_OS_INSTALLED_UI_WORKFLOW_SMOKE === "1";
@@ -72,15 +84,20 @@ const workflowTimeoutMs = readPositiveInteger(
   process.env.DEEPSEEK_AGENT_OS_INSTALLED_WORKFLOW_TIMEOUT_MS ?? "120000",
   "DEEPSEEK_AGENT_OS_INSTALLED_WORKFLOW_TIMEOUT_MS",
 );
-const screenshotDir =
+let screenshotDir =
   process.env.DEEPSEEK_AGENT_OS_UI_SMOKE_SCREENSHOT_DIR ??
   path.join(os.tmpdir(), "deepseek-agent-os-ui-smoke");
-const workflowRootDir =
+let workflowRootDir =
   process.env.DEEPSEEK_AGENT_OS_INSTALLED_WORKFLOW_DIR ??
   path.join(os.tmpdir(), "deepseek-agent-os-installed-workflow-smoke");
 
 if (!selfTestMode && !isWindows) {
   console.error("test:windows-installed-ui only runs on Windows.");
+  process.exit(1);
+}
+
+if (!selfTestMode && !isolatedProfileMode) {
+  console.error("test:windows-installed-ui requires --isolated-profile.");
   process.exit(1);
 }
 
@@ -102,15 +119,19 @@ if (!selfTestMode && typeof WebSocket !== "function") {
 
 let child;
 let cdp;
+let isolatedProfile;
 
 async function main() {
   try {
+    isolatedProfile = await createIsolatedProfile();
+    screenshotDir = isolatedProfile.screenshotDir;
+    workflowRootDir = isolatedProfile.workspaceDir;
     const port = await findFreePort();
-    const env = {
-      ...process.env,
+    ensureNoExternalWebViewProfileOverride(process.env);
+    const env = isolatedProfileEnvironment(process.env, isolatedProfile, {
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: webView2ArgsForPort(port),
       [uiSmokeRemoteDebuggingPortEnv]: String(port),
-    };
+    });
     child = spawn(executablePath, [], {
       env,
       stdio: ["ignore", "ignore", "pipe"],
@@ -133,6 +154,7 @@ async function main() {
       cdp,
       "Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__)",
     );
+    const onboarding = await runInstalledOnboardingSmoke(cdp, bodyText);
     const screenshotPath = await captureScreenshot(cdp, screenshotDir);
     const agentChat = includeAgentChatSmoke
       ? await runInstalledAgentChatSmoke(cdp)
@@ -177,6 +199,8 @@ async function main() {
           url,
           body_chars: String(bodyText).length,
           checks,
+          isolated_profile: true,
+          onboarding,
           screenshot: screenshotPath,
           agent_chat: agentChat ?? "skipped",
           memory_feedback: memoryFeedback ?? "skipped",
@@ -210,6 +234,20 @@ async function main() {
       cdp.close();
     }
     terminateProcessTree(child);
+    if (isolatedProfile) {
+      try {
+        await removeIsolatedProfile(isolatedProfile);
+        console.log(JSON.stringify({ isolated_profile_cleanup: "verified" }));
+      } catch {
+        console.error(
+          JSON.stringify({
+            ok: false,
+            error: "Isolated profile cleanup could not be verified.",
+          }),
+        );
+        process.exitCode = 1;
+      }
+    }
   }
 }
 
@@ -226,6 +264,83 @@ function defaultInstalledExecutablePath() {
     "DS Agent",
     "ds-agent.exe",
   );
+}
+
+async function createIsolatedProfile() {
+  const tempRoot = await realpath(os.tmpdir());
+  const root = await mkdtemp(path.join(tempRoot, "ds-agent-ui-profile-"));
+  try {
+    const verifiedRoot = await verifyIsolatedProfileRoot(root, tempRoot);
+    const profile = {
+      root: verifiedRoot,
+      tempRoot,
+      appDataDir: path.join(verifiedRoot, "appdata"),
+      localAppDataDir: path.join(verifiedRoot, "localappdata"),
+      workspaceDir: path.join(verifiedRoot, "workspace"),
+      reportDir: path.join(verifiedRoot, "reports"),
+      screenshotDir: path.join(verifiedRoot, "reports", "screenshots"),
+    };
+    await Promise.all(
+      [
+        profile.appDataDir,
+        profile.localAppDataDir,
+        profile.workspaceDir,
+        profile.reportDir,
+        profile.screenshotDir,
+      ].map((directory) => mkdir(directory, { recursive: true })),
+    );
+    return profile;
+  } catch {
+    const verifiedRoot = await verifyIsolatedProfileRoot(root, tempRoot).catch(() => null);
+    if (verifiedRoot) {
+      await rm(verifiedRoot, { recursive: true, force: true }).catch(() => undefined);
+    }
+    throw new Error("Isolated profile could not be initialized.");
+  }
+}
+
+async function verifyIsolatedProfileRoot(root, expectedTempRoot = os.tmpdir()) {
+  const [resolvedRoot, resolvedTempRoot] = await Promise.all([
+    realpath(root),
+    realpath(expectedTempRoot),
+  ]);
+  const stat = await lstat(resolvedRoot);
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    path.dirname(resolvedRoot).toLowerCase() !== resolvedTempRoot.toLowerCase() ||
+    !path.basename(resolvedRoot).startsWith("ds-agent-ui-profile-")
+  ) {
+    throw new Error("Isolated profile root validation failed.");
+  }
+  return resolvedRoot;
+}
+
+function isolatedProfileEnvironment(baseEnv, profile, overrides = {}) {
+  return {
+    ...baseEnv,
+    ...overrides,
+    APPDATA: profile.appDataDir,
+    LOCALAPPDATA: profile.localAppDataDir,
+    WEBVIEW2_USER_DATA_FOLDER: path.join(profile.localAppDataDir, "webview2"),
+    DS_AGENT_UI_SMOKE_PROFILE_MODE: "isolated-clean",
+    DS_AGENT_UI_SMOKE_APP_DATA_DIR: profile.appDataDir,
+  };
+}
+
+function ensureNoExternalWebViewProfileOverride(env) {
+  const browserArgs = String(env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS ?? "");
+  if (/--(?:user-data-dir|profile-directory|disk-cache-dir)(?:=|\s)/i.test(browserArgs)) {
+    throw new Error("External WebView2 profile arguments are not allowed in isolated mode.");
+  }
+}
+
+async function removeIsolatedProfile(profile) {
+  const verifiedRoot = await verifyIsolatedProfileRoot(profile.root, profile.tempRoot);
+  await rm(verifiedRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  if (existsSync(verifiedRoot)) {
+    throw new Error("Isolated profile cleanup failed.");
+  }
 }
 
 function webView2ArgsForPort(port) {
@@ -373,6 +488,69 @@ async function invokeTauri(client, command, params = {}, timeout = workflowTimeo
   );
 }
 
+async function runInstalledOnboardingSmoke(client, bodyText) {
+  const readiness = await invokeTauri(client, "get_onboarding_readiness", {});
+  const serialized = JSON.stringify(readiness);
+  const expectedSource = process.env.DEEPSEEK_API_KEY?.trim()
+    ? "environment"
+    : "missing";
+  const expectedCode = expectedSource === "environment" ? "not_checked" : "key_missing";
+  if (
+    readiness?.schema_version !== 1 ||
+    readiness?.deepseek?.source !== expectedSource ||
+    readiness?.deepseek?.code !== expectedCode ||
+    readiness?.deepseek?.chat_completion_ready !== false ||
+    readiness?.workspace?.code !== "workspace_missing"
+  ) {
+    const safeProjection = {
+      schema_version: readiness?.schema_version ?? null,
+      deepseek_source: readiness?.deepseek?.source ?? null,
+      deepseek_code: readiness?.deepseek?.code ?? null,
+      chat_completion_ready: readiness?.deepseek?.chat_completion_ready ?? null,
+      workspace_code: readiness?.workspace?.code ?? null,
+    };
+    throw new Error(
+      `Isolated onboarding projection was not a clean first-run state: ${JSON.stringify(safeProjection)}`,
+    );
+  }
+  if (
+    /api_key|key_hash|fingerprint|account|currency|amount|total_balance|app_data|settings_file|vault|workspace_dir|evidence_dir|export_dir/i.test(
+      serialized,
+    )
+  ) {
+    throw new Error("Isolated onboarding projection exposed a forbidden field.");
+  }
+  const copySignals = onboardingCopySignals(bodyText);
+  if (expectedSource === "missing" && (!copySignals.missingKey || !copySignals.contactsDeepSeek)) {
+    throw new Error("Isolated onboarding UI did not show missing-Key contact disclosure.");
+  }
+  if (expectedSource === "environment" && !copySignals.retry) {
+    throw new Error("Isolated onboarding UI did not show environment-Key retry copy.");
+  }
+  return {
+    source: readiness.deepseek.source,
+    deepseek_code: readiness.deepseek.code,
+    workspace_code: readiness.workspace.code,
+    secret_free_projection: true,
+    copy_signals: copySignals,
+  };
+}
+
+function onboardingCopySignals(value) {
+  const text = String(value ?? "");
+  return {
+    missingKey:
+      text.includes("请输入你自己的 DeepSeek API Key") ||
+      text.includes("Enter your own DeepSeek API Key"),
+    contactsDeepSeek:
+      text.includes("联系 DeepSeek") || text.includes("contacts DeepSeek"),
+    workspace:
+      text.includes("请选择一个工作目录") || text.includes("Choose one workspace"),
+    retry:
+      text.includes("重试检查") || text.includes("Retry check"),
+  };
+}
+
 async function runInstalledSkillLifecycleSmoke(client) {
   const clicked = await evaluate(
     client,
@@ -465,6 +643,7 @@ async function runInstalledAgentChatSmoke(client) {
     throw new Error("DEEPSEEK_API_KEY is required for --agent-chat smoke.");
   }
 
+  await ensureInstalledDeepSeekReady(client);
   const telemetryBefore = await listDeepSeekTelemetry(client);
   const response = await invokeTauri(
     client,
@@ -476,7 +655,6 @@ async function runInstalledAgentChatSmoke(client) {
       thinkingLevel: "fast",
       accessMode: "ask_on_risk",
       networkSearchSourceModel: null,
-      apiKeyOverride: null,
     },
     workflowTimeoutMs,
   );
@@ -510,6 +688,20 @@ async function runInstalledAgentChatSmoke(client) {
       latest_total_tokens: latest.total_tokens ?? null,
     },
   };
+}
+
+async function ensureInstalledDeepSeekReady(client) {
+  const readiness = await invokeTauri(client, "verify_deepseek_api_key", {});
+  if (
+    readiness?.deepseek?.source !== "environment" ||
+    readiness?.deepseek?.chat_completion_ready !== true ||
+    readiness?.deepseek?.code !== "ready"
+  ) {
+    throw new Error(
+      `DeepSeek environment Key did not reach ready state: ${readiness?.deepseek?.code ?? "unknown"}`,
+    );
+  }
+  return readiness;
 }
 
 async function runInstalledMemoryFeedbackSmoke(client) {
@@ -800,6 +992,9 @@ async function runInstalledWorkflowSmoke(client) {
   let appDataEventsRestored = false;
 
   try {
+    if (expectModelTelemetry) {
+      await ensureInstalledDeepSeekReady(client);
+    }
     const savedDirectoryState = await invokeTauri(
       client,
       "save_local_directory_settings",
@@ -810,7 +1005,7 @@ async function runInstalledWorkflowSmoke(client) {
         exportDir,
       },
     );
-    if (savedDirectoryState?.needs_setup) {
+    if (savedDirectoryState?.workspace?.code !== "ready") {
       throw new Error("Temporary installed workflow directories were not accepted.");
     }
 
@@ -955,7 +1150,7 @@ async function runInstalledOfficeArtifactSmoke(client) {
       evidenceDir,
       exportDir,
     });
-    if (savedDirectoryState?.needs_setup) {
+    if (savedDirectoryState?.workspace?.code !== "ready") {
       throw new Error("Temporary installed office artifact directories were not accepted.");
     }
 
@@ -1307,11 +1502,13 @@ async function backupLocalFile(filePath) {
     return null;
   }
 
+  const verifiedFilePath = await verifyIsolatedLocalFilePath(filePath);
+
   try {
     return {
-      filePath,
+      filePath: verifiedFilePath,
       existed: true,
-      content: await readFile(filePath),
+      content: await readFile(verifiedFilePath),
     };
   } catch (error) {
     if (error?.code === "ENOENT") {
@@ -1330,15 +1527,55 @@ async function restoreLocalFile(backup) {
     return true;
   }
 
+  const verifiedFilePath = await verifyIsolatedLocalFilePath(backup.filePath);
+
   if (backup.existed) {
-    await mkdir(path.dirname(backup.filePath), { recursive: true });
-    await writeFile(backup.filePath, backup.content);
-    const restoredContent = await readFile(backup.filePath);
+    await mkdir(path.dirname(verifiedFilePath), { recursive: true });
+    await writeFile(verifiedFilePath, backup.content);
+    const restoredContent = await readFile(verifiedFilePath);
     return restoredContent.equals(backup.content);
   }
 
-  await rm(backup.filePath, { force: true });
-  return !existsSync(backup.filePath);
+  await rm(verifiedFilePath, { force: true });
+  return !existsSync(verifiedFilePath);
+}
+
+async function verifyIsolatedLocalFilePath(filePath) {
+  if (!isolatedProfile?.root || !isolatedProfile?.tempRoot) {
+    throw new Error("Local smoke file access requires an active isolated profile.");
+  }
+  const verifiedRoot = await verifyIsolatedProfileRoot(
+    isolatedProfile.root,
+    isolatedProfile.tempRoot,
+  );
+  const resolvedPath = path.resolve(filePath);
+  const parent = await realpath(path.dirname(resolvedPath));
+  if (!pathIsInsideRoot(resolvedPath, verifiedRoot) || !pathIsInsideRoot(parent, verifiedRoot)) {
+    throw new Error("Local smoke file path escaped the isolated profile.");
+  }
+  try {
+    const metadata = await lstat(resolvedPath);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new Error("Local smoke file path is unsafe.");
+    }
+    const canonicalFile = await realpath(resolvedPath);
+    if (!pathIsInsideRoot(canonicalFile, verifiedRoot)) {
+      throw new Error("Local smoke file path escaped the isolated profile.");
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  return resolvedPath;
+}
+
+function pathIsInsideRoot(candidate, root) {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === "" ||
+    (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
+  );
 }
 
 function assertWorkflowRestoresVerified({
@@ -1553,6 +1790,9 @@ async function runSelfTest() {
   if (!allowedArgs.has("--office")) {
     throw new Error("Self-test expected --office to be a supported installed UI smoke flag.");
   }
+  if (!allowedArgs.has("--isolated-profile")) {
+    throw new Error("Self-test expected --isolated-profile to be supported.");
+  }
   if (!allowedArgs.has("--skill-lifecycle")) {
     throw new Error("Self-test expected --skill-lifecycle to be a supported installed UI smoke flag.");
   }
@@ -1584,6 +1824,57 @@ async function runSelfTest() {
   if (!meaningfulBodyText("DS Agent 工作台 Operations 记忆 审批 ".repeat(16))) {
     throw new Error("Self-test expected legacy workbench text to stay meaningful.");
   }
+  const missingKeySignals = onboardingCopySignals(
+    "请输入你自己的 DeepSeek API Key。保存后会联系 DeepSeek，核验认证。",
+  );
+  if (!missingKeySignals.missingKey || !missingKeySignals.contactsDeepSeek) {
+    throw new Error("Self-test expected deterministic missing-Key onboarding copy.");
+  }
+  const repairSignals = onboardingCopySignals("请选择一个工作目录。重试检查");
+  if (!repairSignals.workspace || !repairSignals.retry) {
+    throw new Error("Self-test expected deterministic workspace and retry copy.");
+  }
+
+  const isolatedProfileTest = await createIsolatedProfile();
+  isolatedProfile = isolatedProfileTest;
+  const isolatedEnv = isolatedProfileEnvironment(
+    { APPDATA: "real-appdata", LOCALAPPDATA: "real-localappdata" },
+    isolatedProfileTest,
+  );
+  if (
+    isolatedEnv.APPDATA !== isolatedProfileTest.appDataDir ||
+    isolatedEnv.LOCALAPPDATA !== isolatedProfileTest.localAppDataDir ||
+    isolatedEnv.DS_AGENT_UI_SMOKE_PROFILE_MODE !== "isolated-clean" ||
+    isolatedEnv.DS_AGENT_UI_SMOKE_APP_DATA_DIR !== isolatedProfileTest.appDataDir
+  ) {
+    throw new Error("Self-test expected isolated app-data and WebView profile overrides.");
+  }
+  assertSelfTestThrows(
+    () =>
+      ensureNoExternalWebViewProfileOverride({
+        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--user-data-dir=C:\\real-profile",
+      }),
+    "not allowed",
+  );
+  ensureNoExternalWebViewProfileOverride({
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--disable-features=Example",
+  });
+  const unsafeRoot = path.join(os.tmpdir(), "deepseek-agent-os-ui-smoke-self-test");
+  await mkdir(unsafeRoot, { recursive: true });
+  await assertAsyncSelfTestThrows(
+    () => verifyIsolatedProfileRoot(unsafeRoot, os.tmpdir()),
+    "validation failed",
+  );
+  await assertAsyncSelfTestThrows(
+    () => backupLocalFile(path.join(unsafeRoot, "outside.bin")),
+    "escaped the isolated profile",
+  );
+  await removeSelfTestDirectory(unsafeRoot, "deepseek-agent-os-ui-smoke-self-test");
+  await removeIsolatedProfile(isolatedProfileTest);
+  isolatedProfile = undefined;
+  if (existsSync(isolatedProfileTest.root)) {
+    throw new Error("Self-test expected isolated profile cleanup.");
+  }
 
   const attempts = [
     "",
@@ -1605,10 +1896,14 @@ async function runSelfTest() {
   if (!meaningfulBodyText(bodyText)) {
     throw new Error("Self-test expected meaningful body text.");
   }
-  const restoreTestDir = await mkdir(
-    path.join(os.tmpdir(), "deepseek-agent-os-ui-smoke-self-test"),
-    { recursive: true },
-  ).then(() => path.join(os.tmpdir(), "deepseek-agent-os-ui-smoke-self-test"));
+  const restoreTestDir = await mkdtemp(
+    path.join(await realpath(os.tmpdir()), "ds-agent-ui-profile-self-test-"),
+  );
+  const restoreTestProfile = {
+    root: restoreTestDir,
+    tempRoot: await realpath(os.tmpdir()),
+  };
+  isolatedProfile = restoreTestProfile;
   const missingSettingsFile = path.join(restoreTestDir, "missing-local-directories.json");
   await rm(missingSettingsFile, { force: true });
   const missingBackup = await backupSettingsFile(missingSettingsFile);
@@ -1654,6 +1949,8 @@ async function runSelfTest() {
   if (!restoredEventsContent.equals(originalEventsContent)) {
     throw new Error("Self-test expected existing event store content to be restored.");
   }
+  await removeIsolatedProfile(restoreTestProfile);
+  isolatedProfile = undefined;
   assertWorkflowRestoresVerified({
     settingsRestored: true,
     appDataEventsRestored: true,
@@ -1677,9 +1974,42 @@ async function runSelfTest() {
   console.log("windows-installed-ui-smoke self-test ok");
 }
 
+async function removeSelfTestDirectory(root, expectedName) {
+  const [resolvedRoot, resolvedTempRoot] = await Promise.all([
+    realpath(root),
+    realpath(os.tmpdir()),
+  ]);
+  const stat = await lstat(resolvedRoot);
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    path.dirname(resolvedRoot).toLowerCase() !== resolvedTempRoot.toLowerCase() ||
+    path.basename(resolvedRoot) !== expectedName
+  ) {
+    throw new Error("Self-test cleanup root validation failed.");
+  }
+  await rm(resolvedRoot, { recursive: true, force: true });
+  if (existsSync(resolvedRoot)) {
+    throw new Error("Self-test cleanup failed.");
+  }
+}
+
 function assertSelfTestThrows(action, expectedMessage) {
   try {
     action();
+  } catch (error) {
+    if (String(error?.message ?? error).includes(expectedMessage)) {
+      return;
+    }
+    throw error;
+  }
+
+  throw new Error(`Self-test expected error containing: ${expectedMessage}`);
+}
+
+async function assertAsyncSelfTestThrows(action, expectedMessage) {
+  try {
+    await action();
   } catch (error) {
     if (String(error?.message ?? error).includes(expectedMessage)) {
       return;

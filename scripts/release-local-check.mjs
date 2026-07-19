@@ -161,7 +161,13 @@ function buildInstalledUiCommand({
   skipLiveDeepSeek,
   env,
 }) {
-  const parts = ["npx", "pnpm@9.15.9", "test:windows-installed-ui"];
+  const parts = [
+    "npx",
+    "pnpm@9.15.9",
+    "test:windows-installed-ui",
+    "--",
+    "--isolated-profile",
+  ];
   const command = {
     name: includeInstalledWorkflow
       ? "Windows installed UI workflow smoke"
@@ -170,7 +176,7 @@ function buildInstalledUiCommand({
   };
 
   if (includeInstalledWorkflow) {
-    parts.push("--", "--workflow");
+    parts.push("--workflow");
   }
 
   if (includeInstalledWorkflow && skipLiveDeepSeek) {
@@ -189,6 +195,7 @@ function buildInstalledMemoryMaintenanceCommand({ skipLiveDeepSeek, env }) {
       "pnpm@9.15.9",
       "test:windows-installed-ui",
       "--",
+      "--isolated-profile",
       "--memory-maintenance",
     ],
   };
@@ -350,7 +357,13 @@ function runSelfTest() {
   assertSelfTestCommandParts(
     [installedUiCommand],
     "Windows installed UI smoke",
-    ["npx", "pnpm@9.15.9", "test:windows-installed-ui"],
+    [
+      "npx",
+      "pnpm@9.15.9",
+      "test:windows-installed-ui",
+      "--",
+      "--isolated-profile",
+    ],
   );
   const installedWorkflowCommand = buildInstalledUiCommand({
     includeInstalledWorkflow: true,
@@ -360,7 +373,14 @@ function runSelfTest() {
   assertSelfTestCommandParts(
     [installedWorkflowCommand],
     "Windows installed UI workflow smoke",
-    ["npx", "pnpm@9.15.9", "test:windows-installed-ui", "--", "--workflow"],
+    [
+      "npx",
+      "pnpm@9.15.9",
+      "test:windows-installed-ui",
+      "--",
+      "--isolated-profile",
+      "--workflow",
+    ],
   );
   const installedWorkflowPlan = buildReleaseLocalPlan({
     skipLiveDeepSeek: false,
@@ -373,7 +393,14 @@ function runSelfTest() {
   assertSelfTestCommandParts(
     installedWorkflowPlan.commands,
     "Windows installed UI memory maintenance smoke",
-    ["npx", "pnpm@9.15.9", "test:windows-installed-ui", "--", "--memory-maintenance"],
+    [
+      "npx",
+      "pnpm@9.15.9",
+      "test:windows-installed-ui",
+      "--",
+      "--isolated-profile",
+      "--memory-maintenance",
+    ],
   );
 
   const command = buildInstalledUiCommand({

@@ -74,7 +74,6 @@ import {
 } from "./agentAttachments";
 import type { AgentAttachment } from "./agentAttachments";
 import {
-  deepSeekApiKeyCandidates,
   settingsPanelItems,
   shouldExposePluginsSidebarEntry,
 } from "./settingsPanel";
@@ -112,13 +111,11 @@ import type {
   DeepSeekChatCacheState,
   DeepSeekChatTelemetry,
   DeepSeekPricingState,
-  DeepSeekUserBalanceResponse,
   ComputerUseBackendStatus,
-  DeepSeekCredentialStatus,
   FoundationState,
   LargeModelProvider,
   Language,
-  LocalDirectoryState,
+  OnboardingReadinessProjection,
   MemoryBackgroundMaintenanceSummary,
   MemoryCandidate,
   MemoryCandidateRecord,
@@ -192,16 +189,43 @@ const fallbackState: FoundationState = {
   },
 };
 
-const fallbackDeepSeekCredentialStatus: DeepSeekCredentialStatus = {
-  base_url: "https://api.deepseek.com",
-  chat_completions_url: "https://api.deepseek.com/chat/completions",
-  api_key_env_var: "DEEPSEEK_API_KEY",
-  api_key_configured: false,
-  chat_completion_ready: false,
-  flash_model: "deepseek-v4-flash",
-  pro_model: "deepseek-v4-pro",
-  readiness_note:
-    "set DEEPSEEK_API_KEY in the local process environment to enable Chat Completions requests",
+const fallbackOnboardingReadiness: OnboardingReadinessProjection = {
+  schema_version: 1,
+  overall: "setup_required",
+  next_step: "deepseek_key",
+  deepseek: {
+    source: "missing",
+    configured: false,
+    verification: "not_checked",
+    code: "key_missing",
+    chat_completion_ready: false,
+    balance_available: null,
+    flash_model: "deepseek-v4-flash",
+    pro_model: "deepseek-v4-pro",
+    flash_available: null,
+    pro_available: null,
+    retryable: false,
+    last_verified_at: null,
+    message_key: "onboarding.deepseek.key_missing",
+  },
+  workspace: {
+    configured: false,
+    workspace_name: null,
+    workspace_root_display: null,
+    root_exists: false,
+    managed_directories_ready: false,
+    writable: null,
+    code: "workspace_missing",
+    retryable: true,
+    message_key: "onboarding.workspace.workspace_missing",
+  },
+  version: {
+    current_version: "1.1.0",
+    status: "current",
+    blocking: false,
+    message_key: "onboarding.version.current",
+  },
+  checked_at: null,
 };
 
 const fallbackDeepSeekChatCacheState: DeepSeekChatCacheState = {
@@ -299,13 +323,6 @@ const fallbackModelDrivenToolStrategy: ModelDrivenToolStrategy = {
     "Selected model route needs a separate source-linked web-search option before search can run.",
 };
 
-const fallbackLocalDirectoryState: LocalDirectoryState = {
-  app_data_dir: "",
-  settings_file: "",
-  settings: null,
-  needs_setup: true,
-};
-
 const fallbackAgentSoulProfileState: AgentSoulProfileState = {
   exists: false,
   content: "",
@@ -324,8 +341,6 @@ const fallbackAppUpdateStatus: AppUpdateStatus = {
 };
 
 const fallbackDeepSeekPricingState: DeepSeekPricingState = {
-  app_data_dir: "",
-  settings_file: "",
   pricing_configured: false,
   note: "DeepSeek cost estimates are disabled until a local pricing table is configured",
   settings: {
@@ -417,7 +432,7 @@ type MemoryEditDraft = {
 
 type WorkflowStepState = "done" | "current" | "waiting" | "needs_action" | "blocked";
 type WorkflowStatusTone = "ready" | "running" | "needs_action" | "done" | "blocked";
-type AgentChatSetupPrompt = "deepseek_key" | "workspace" | "network_search";
+type AgentChatSetupPrompt = "deepseek_key" | "workspace" | "doctor" | "network_search";
 type QueuedAgentPrompt = {
   prompt: string;
   displayPrompt: string;
@@ -861,8 +876,11 @@ function capabilityFamilyIcon(family: CapabilityFamily) {
 
 export function App() {
   const [state, setState] = useState<FoundationState>(fallbackState);
-  const [deepSeekCredentialStatus, setDeepSeekCredentialStatus] =
-    useState<DeepSeekCredentialStatus>(fallbackDeepSeekCredentialStatus);
+  const [onboardingReadiness, setOnboardingReadiness] =
+    useState<OnboardingReadinessProjection>(fallbackOnboardingReadiness);
+  const deepSeekCredentialStatus = onboardingReadiness.deepseek;
+  const workspaceReadiness = onboardingReadiness.workspace;
+  const localDirectoryNeedsSetup = workspaceReadiness.code !== "ready";
   const [deepSeekChatCacheState, setDeepSeekChatCacheState] =
     useState<DeepSeekChatCacheState>(fallbackDeepSeekChatCacheState);
   const [deepSeekTelemetry, setDeepSeekTelemetry] = useState<DeepSeekChatTelemetry[]>([]);
@@ -876,8 +894,6 @@ export function App() {
   const [computerUseSteps, setComputerUseSteps] = useState<ComputerUseStepView[]>([]);
   const [modelToolStrategy, setModelToolStrategy] =
     useState<ModelDrivenToolStrategy>(fallbackModelDrivenToolStrategy);
-  const [localDirectoryState, setLocalDirectoryState] =
-    useState<LocalDirectoryState>(fallbackLocalDirectoryState);
   const [soulProfileState, setSoulProfileState] =
     useState<AgentSoulProfileState>(fallbackAgentSoulProfileState);
   const [appUpdateStatus, setAppUpdateStatus] =
@@ -1014,10 +1030,7 @@ export function App() {
   const [agentChatNotice, setAgentChatNotice] = useState("");
   const [agentSetupPrompt, setAgentSetupPrompt] = useState<AgentChatSetupPrompt | null>(null);
   const [pendingAgentPrompt, setPendingAgentPrompt] = useState("");
-  const [sessionDeepSeekApiKey, setSessionDeepSeekApiKey] = useState("");
-  const [fallbackDeepSeekApiKey, setFallbackDeepSeekApiKey] = useState("");
   const [deepSeekApiKeyDraft, setDeepSeekApiKeyDraft] = useState("");
-  const [deepSeekBalance, setDeepSeekBalance] = useState<DeepSeekUserBalanceResponse | null>(null);
   const [exportedPackageJson, setExportedPackageJson] = useState("");
   const [importPackageJson, setImportPackageJson] = useState("");
   const [importPreview, setImportPreview] = useState<WorkPackageImportPreview | null>(null);
@@ -1081,7 +1094,8 @@ export function App() {
   const [deepSeekCacheError, setDeepSeekCacheError] = useState("");
   const [deepSeekPricingNotice, setDeepSeekPricingNotice] = useState("");
   const [deepSeekPricingError, setDeepSeekPricingError] = useState("");
-  const [deepSeekBalanceError, setDeepSeekBalanceError] = useState("");
+  const [deepSeekReadinessNotice, setDeepSeekReadinessNotice] = useState("");
+  const [deepSeekReadinessError, setDeepSeekReadinessError] = useState("");
   const [packagePending, setPackagePending] = useState(false);
   const [memoryPending, setMemoryPending] = useState(false);
   const [memoryCandidatePending, setMemoryCandidatePending] = useState(false);
@@ -1112,7 +1126,7 @@ export function App() {
   const [appUpdateInstallPending, setAppUpdateInstallPending] = useState(false);
   const [deepSeekCachePending, setDeepSeekCachePending] = useState(false);
   const [deepSeekPricingPending, setDeepSeekPricingPending] = useState(false);
-  const [deepSeekBalancePending, setDeepSeekBalancePending] = useState(false);
+  const [deepSeekReadinessPending, setDeepSeekReadinessPending] = useState(false);
   const [capabilityPending, setCapabilityPending] = useState<CapabilityKind | null>(null);
   const [resolutionPending, setResolutionPending] = useState<string | null>(null);
   const agentMessagesRef = useRef(agentMessages);
@@ -1389,42 +1403,29 @@ export function App() {
           unlockHint: "The local unlock above is also required before execution.",
           screenshotHint: "Capture a fresh screenshot in Computer Use tools before re-observing.",
         };
-  const deepSeekBalanceStatus = deepSeekBalance
-    ? deepSeekBalance.is_available
-      ? copy.settingsPanel.balanceAvailable
-      : copy.settingsPanel.balanceUnavailable
-    : copy.settingsPanel.balanceNotQueried;
-  const deepSeekBalanceDetails = deepSeekBalance
-    ? deepSeekBalance.balance_infos.length > 0
-      ? deepSeekBalance.balance_infos
-          .map(
-            (info) =>
-              `${info.currency} ${info.total_balance} (${info.topped_up_balance} + ${info.granted_balance})`,
-          )
-          .join(" / ")
-      : copy.settingsPanel.balanceEmpty
-    : "";
-  const primaryDeepSeekApiKeyPlaceholder = sessionDeepSeekApiKey
-    ? copy.settingsPanel.apiKeyPlaceholder
-    : deepSeekCredentialStatus.api_key_configured
+  const deepSeekReadinessMessage =
+    copy.onboarding.deepseekMessages[deepSeekCredentialStatus.code];
+  const workspaceReadinessMessage =
+    copy.onboarding.workspaceMessages[workspaceReadiness.code];
+  const primaryDeepSeekApiKeyPlaceholder = deepSeekCredentialStatus.configured
       ? copy.settingsPanel.apiKeyConfiguredPlaceholder
       : copy.settingsPanel.apiKeyPlaceholder;
   const primaryDeepSeekApiKeyReady = deepSeekCredentialStatus.chat_completion_ready;
-  const fallbackDeepSeekApiKeyReady = false;
+  const canRetryDeepSeekReadiness =
+    deepSeekCredentialStatus.retryable ||
+    deepSeekCredentialStatus.code === "not_checked" ||
+    deepSeekCredentialStatus.code === "ready";
+  const modelAvailabilityMessage = (available: boolean | null) =>
+    available === null
+      ? copy.onboarding.notChecked
+      : available
+        ? copy.onboarding.available
+        : copy.onboarding.unavailable;
 
-  const hydrateLocalDirectoryInputs = (directoryState: LocalDirectoryState) => {
-    if (!directoryState.settings) {
-      return;
+  const hydrateWorkspaceInputs = (readiness: OnboardingReadinessProjection) => {
+    if (readiness.workspace.workspace_name) {
+      setSetupWorkspaceName(readiness.workspace.workspace_name);
     }
-
-    const { workspace_dir, workspace_name, evidence_dir, export_dir } =
-      directoryState.settings;
-    setSetupWorkspaceName(workspace_name);
-    setSetupWorkspaceDir(workspace_dir);
-    setBriefingFolderPath((current) => current || evidence_dir);
-    setFolderPath((current) => current || evidence_dir);
-    setDriveLocation((current) => current || workspace_dir);
-    setDriveWriteLocation((current) => current || export_dir);
   };
 
   const hydrateDeepSeekPricingInputs = (pricingState: DeepSeekPricingState) => {
@@ -1479,11 +1480,10 @@ export function App() {
   useEffect(() => {
     if (!hasDesktopRuntime()) {
       setState(fallbackState);
-      setDeepSeekCredentialStatus(fallbackDeepSeekCredentialStatus);
+      setOnboardingReadiness(fallbackOnboardingReadiness);
       setDeepSeekChatCacheState(fallbackDeepSeekChatCacheState);
       setDeepSeekTelemetry([]);
       setComputerControlUnlockStatus(fallbackComputerControlUnlockStatus);
-      setLocalDirectoryState(fallbackLocalDirectoryState);
       applySoulProfileState(fallbackAgentSoulProfileState);
       setAppUpdateStatus(fallbackAppUpdateStatus);
       setDeepSeekPricingState(fallbackDeepSeekPricingState);
@@ -1500,9 +1500,18 @@ export function App() {
         }
       })
       .catch(() => setState(fallbackState));
-    void invoke<DeepSeekCredentialStatus>("get_deepseek_credential_status")
-      .then(setDeepSeekCredentialStatus)
-      .catch(() => setDeepSeekCredentialStatus(fallbackDeepSeekCredentialStatus));
+    void invoke<OnboardingReadinessProjection>("get_onboarding_readiness")
+      .then((readiness) => {
+        setOnboardingReadiness(readiness);
+        hydrateWorkspaceInputs(readiness);
+        if (readiness.overall !== "ready") {
+          setAgentSetupPrompt(readiness.next_step === "ready" ? "doctor" : readiness.next_step);
+        }
+      })
+      .catch(() => {
+        setOnboardingReadiness(fallbackOnboardingReadiness);
+        setDeepSeekReadinessError(copy.onboarding.loadFailed);
+      });
     void invoke<DeepSeekChatCacheState>("get_deepseek_chat_cache_state")
       .then(setDeepSeekChatCacheState)
       .catch(() => setDeepSeekChatCacheState(fallbackDeepSeekChatCacheState));
@@ -1516,15 +1525,6 @@ export function App() {
       setComputerUseSessions([]);
       setComputerUseSteps([]);
     });
-    void invoke<LocalDirectoryState>("get_local_directory_state")
-      .then((directoryState) => {
-        setLocalDirectoryState(directoryState);
-        hydrateLocalDirectoryInputs(directoryState);
-      })
-      .catch(() => {
-        setLocalDirectoryState(fallbackLocalDirectoryState);
-        setSetupError(copy.localSetup.loadFailed);
-      });
     void invoke<AgentSoulProfileState>("get_agent_soul_profile")
       .then(applySoulProfileState)
       .catch(() => {
@@ -2304,7 +2304,7 @@ export function App() {
 
   const persistLocalDirectorySetup = async (
     options: { workspaceDir?: string; workspaceName?: string } = {},
-  ): Promise<boolean> => {
+  ): Promise<OnboardingReadinessProjection | null> => {
     const workspaceDir = options.workspaceDir ?? setupWorkspaceDir;
     const workspaceName = options.workspaceName ?? setupWorkspaceName;
     setSetupPending(true);
@@ -2312,20 +2312,22 @@ export function App() {
     setSetupNotice("");
 
     try {
-      const directoryState = await invoke<LocalDirectoryState>(
+      const readiness = await invoke<OnboardingReadinessProjection>(
         "save_local_directory_settings",
         {
           workspaceDir,
           workspaceName,
         },
       );
-      setLocalDirectoryState(directoryState);
-      hydrateLocalDirectoryInputs(directoryState);
-      setSetupNotice(copy.localSetup.saved);
-      return true;
-    } catch (error) {
-      setSetupError(String(error) || copy.localSetup.failed);
-      return false;
+      setOnboardingReadiness(readiness);
+      hydrateWorkspaceInputs(readiness);
+      if (readiness.workspace.code === "ready") {
+        setSetupNotice(copy.localSetup.saved);
+      }
+      return readiness;
+    } catch {
+      setSetupError(copy.localSetup.failed);
+      return null;
     } finally {
       setSetupPending(false);
     }
@@ -2385,32 +2387,67 @@ export function App() {
     }
   };
 
-  const queryDeepSeekBalance = async () => {
-    setDeepSeekBalancePending(true);
-    setDeepSeekBalanceError("");
-
+  const saveDeepSeekKey = async (apiKey: string): Promise<OnboardingReadinessProjection | null> => {
+    setDeepSeekReadinessPending(true);
+    setDeepSeekReadinessError("");
+    setDeepSeekReadinessNotice("");
     try {
-      const apiKeyCandidates = deepSeekApiKeyCandidates(
-        sessionDeepSeekApiKey,
-        fallbackDeepSeekApiKey,
-      );
-      if (!deepSeekCredentialStatus.chat_completion_ready && apiKeyCandidates.length === 0) {
-        setDeepSeekBalanceError(copy.chatWorkbench.deepSeekKeyRequired);
-        return;
+      const readiness = await invoke<OnboardingReadinessProjection>("save_deepseek_api_key", {
+        apiKey,
+      });
+      setOnboardingReadiness(readiness);
+      if (
+        readiness.deepseek.source === "stored" &&
+        readiness.deepseek.code !== "key_format_invalid" &&
+        readiness.deepseek.code !== "credential_store_unavailable"
+      ) {
+        setDeepSeekReadinessNotice(copy.onboarding.keySaved);
       }
-
-      const balance = await invoke<DeepSeekUserBalanceResponse>(
-        "get_deepseek_user_balance",
-        {
-          apiKeyOverride: apiKeyCandidates[0] ?? null,
-          fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
-        },
-      );
-      setDeepSeekBalance(balance);
-    } catch (error) {
-      setDeepSeekBalanceError(String(error) || copy.settingsPanel.balanceFailed);
+      return readiness;
+    } catch {
+      setDeepSeekReadinessError(copy.onboarding.commandFailed);
+      return null;
     } finally {
-      setDeepSeekBalancePending(false);
+      setDeepSeekApiKeyDraft("");
+      setDeepSeekReadinessPending(false);
+    }
+  };
+
+  const retryDeepSeekReadiness = async (): Promise<OnboardingReadinessProjection | null> => {
+    setDeepSeekReadinessPending(true);
+    setDeepSeekReadinessError("");
+    setDeepSeekReadinessNotice("");
+    try {
+      const readiness = await invoke<OnboardingReadinessProjection>(
+        "verify_deepseek_api_key",
+      );
+      setOnboardingReadiness(readiness);
+      setDeepSeekReadinessNotice(copy.onboarding.checkFinished);
+      return readiness;
+    } catch {
+      setDeepSeekReadinessError(copy.onboarding.commandFailed);
+      return null;
+    } finally {
+      setDeepSeekApiKeyDraft("");
+      setDeepSeekReadinessPending(false);
+    }
+  };
+
+  const removeDeepSeekKey = async () => {
+    setDeepSeekReadinessPending(true);
+    setDeepSeekReadinessError("");
+    setDeepSeekReadinessNotice("");
+    try {
+      const readiness = await invoke<OnboardingReadinessProjection>(
+        "remove_deepseek_api_key",
+      );
+      setOnboardingReadiness(readiness);
+      setDeepSeekReadinessNotice(copy.onboarding.keyRemoved);
+    } catch {
+      setDeepSeekReadinessError(copy.onboarding.commandFailed);
+    } finally {
+      setDeepSeekApiKeyDraft("");
+      setDeepSeekReadinessPending(false);
     }
   };
 
@@ -2438,8 +2475,8 @@ export function App() {
           setSetupWorkspaceDir(previousWorkspaceDir);
         }
       }
-    } catch (error) {
-      setSetupError(String(error) || copy.localSetup.chooseFailed);
+    } catch {
+      setSetupError(copy.localSetup.chooseFailed);
     }
   };
 
@@ -2570,7 +2607,7 @@ export function App() {
   };
 
   useEffect(() => {
-    if (!hasDesktopRuntime() || localDirectoryState.needs_setup) {
+    if (!hasDesktopRuntime() || localDirectoryNeedsSetup) {
       return;
     }
     let cancelled = false;
@@ -2589,7 +2626,7 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [localDirectoryState.needs_setup]);
+  }, [localDirectoryNeedsSetup]);
 
   useEffect(() => {
     if (!hasDesktopRuntime() || (!agentChatPending && !hasOpenAgentRuns)) {
@@ -2607,24 +2644,19 @@ export function App() {
   }, [agentChatPending, hasOpenAgentRuns]);
 
   useEffect(() => {
-    if (!hasDesktopRuntime() || localDirectoryState.needs_setup) {
+    if (!hasDesktopRuntime() || localDirectoryNeedsSetup) {
       return;
     }
 
     let cancelled = false;
     const runNextDurableAgentTask = async () => {
-      const apiKeyCandidates = deepSeekApiKeyCandidates(
-        sessionDeepSeekApiKey,
-        fallbackDeepSeekApiKey,
-      );
       if (cancelled || !shouldRunDurableAgentWorker({
         desktopRuntime: hasDesktopRuntime(),
-        setupNeeded: localDirectoryState.needs_setup,
+        setupNeeded: localDirectoryNeedsSetup,
         workerBusy: backgroundAgentWorkerBusyRef.current,
         chatPending: agentChatPendingRef.current,
         queuedLocalCount: queuedAgentPromptRef.current.length,
-        credentialReady:
-          deepSeekCredentialStatus.chat_completion_ready || apiKeyCandidates.length > 0,
+        credentialReady: deepSeekCredentialStatus.chat_completion_ready,
       })) {
         return;
       }
@@ -2676,8 +2708,6 @@ export function App() {
                 thinkingLevel: state.thinking_level,
                 accessMode: state.access_mode,
                 networkSearchSourceModel: state.network_search_source_model || null,
-                apiKeyOverride: apiKeyCandidates[0] ?? null,
-                fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
               }),
             ),
           );
@@ -2733,8 +2763,6 @@ export function App() {
             thinkingLevel: state.thinking_level,
             accessMode: state.access_mode,
             networkSearchSourceModel: state.network_search_source_model || null,
-            apiKeyOverride: apiKeyCandidates[0] ?? null,
-            fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
           },
         );
         if (!workerResult || cancelled) {
@@ -2862,9 +2890,7 @@ export function App() {
     };
   }, [
     deepSeekCredentialStatus.chat_completion_ready,
-    fallbackDeepSeekApiKey,
-    localDirectoryState.needs_setup,
-    sessionDeepSeekApiKey,
+    localDirectoryNeedsSetup,
     state.access_mode,
     state.large_model_provider,
     state.model_route,
@@ -2885,16 +2911,8 @@ export function App() {
   };
 
   const runMemoryBackgroundMaintenance = async () => {
-    const apiKeyCandidates = deepSeekApiKeyCandidates(
-      sessionDeepSeekApiKey,
-      fallbackDeepSeekApiKey,
-    );
     const summary = await invoke<MemoryBackgroundMaintenanceSummary>(
       "run_memory_background_maintenance",
-      {
-        apiKeyOverride: apiKeyCandidates[0] ?? null,
-        fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
-      },
     );
     await Promise.all([refreshMemoryCandidateRecords(), refreshMemoryMaintenanceReviews()]);
     return summary;
@@ -3812,8 +3830,7 @@ export function App() {
 
   const runOperationsBriefingWorkflow = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const trimmedPath =
-      briefingFolderPath.trim() || localDirectoryState.settings?.evidence_dir.trim() || "";
+    const trimmedPath = briefingFolderPath.trim();
     if (!trimmedPath) {
       setBriefingError(copy.operationsBriefing.failed);
       return;
@@ -4047,7 +4064,6 @@ export function App() {
   const sendAgentPrompt = async (
     promptValue: string,
     options: {
-      apiKeyOverride?: string;
       skipWorkspaceSetup?: boolean;
       skipNetworkSearchSetup?: boolean;
       isGuidanceContinuation?: boolean;
@@ -4100,20 +4116,14 @@ export function App() {
     }
 
     const runToken = (agentChatRunTokenRef.current += 1);
-    const apiKeyCandidates = deepSeekApiKeyCandidates(
-      options.apiKeyOverride ?? sessionDeepSeekApiKey,
-      fallbackDeepSeekApiKey,
-    );
-    if (!deepSeekCredentialStatus.chat_completion_ready && apiKeyCandidates.length === 0) {
+    if (onboardingReadiness.overall !== "ready") {
       setPendingAgentPrompt(prompt);
       setDeepSeekApiKeyDraft("");
-      setAgentSetupPrompt("deepseek_key");
-      return;
-    }
-
-    if (localDirectoryState.needs_setup && !options.skipWorkspaceSetup) {
-      setPendingAgentPrompt(prompt);
-      setAgentSetupPrompt("workspace");
+      setAgentSetupPrompt(
+        onboardingReadiness.next_step === "ready"
+          ? "doctor"
+          : onboardingReadiness.next_step,
+      );
       return;
     }
 
@@ -4253,8 +4263,6 @@ export function App() {
           thinkingLevel: state.thinking_level,
           accessMode: state.access_mode,
           networkSearchSourceModel: state.network_search_source_model || null,
-          apiKeyOverride: apiKeyCandidates[0] ?? null,
-          fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
         });
         void invoke<AgentRunRecord>("record_agent_run_step_record", {
           runId: agentRunId,
@@ -4277,8 +4285,6 @@ export function App() {
             thinkingLevel: state.thinking_level,
             accessMode: state.access_mode,
             networkSearchSourceModel: state.network_search_source_model || null,
-            apiKeyOverride: apiKeyCandidates[0] ?? null,
-            fallbackApiKeyOverride: apiKeyCandidates[1] ?? null,
           },
         );
         if (!workerResult) {
@@ -4547,25 +4553,34 @@ export function App() {
 
   const continueAgentAfterDeepSeekKey = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const trimmedKey = deepSeekApiKeyDraft.trim();
-    if (!trimmedKey) {
+    let submittedKey = deepSeekApiKeyDraft.trim();
+    if (!submittedKey) {
       setAgentChatError(copy.chatWorkbench.deepSeekKeyRequired);
       return;
     }
-    setSessionDeepSeekApiKey(trimmedKey);
+    const readiness = await saveDeepSeekKey(submittedKey);
+    submittedKey = "";
+    if (!readiness) {
+      return;
+    }
+    if (readiness.overall !== "ready") {
+      setAgentSetupPrompt(readiness.next_step === "ready" ? "doctor" : readiness.next_step);
+      return;
+    }
+    const prompt = pendingAgentPrompt;
     setAgentSetupPrompt(null);
-    await sendAgentPrompt(pendingAgentPrompt, {
-      apiKeyOverride: trimmedKey,
-      attachments: agentAttachments,
-    });
     setPendingAgentPrompt("");
-    setDeepSeekApiKeyDraft("");
+    await sendAgentPrompt(prompt, { attachments: agentAttachments });
   };
 
   const continueAgentAfterWorkspaceSetup = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const saved = await persistLocalDirectorySetup();
-    if (!saved) {
+    const readiness = await persistLocalDirectorySetup();
+    if (!readiness) {
+      return;
+    }
+    if (readiness.overall !== "ready") {
+      setAgentSetupPrompt(readiness.next_step === "ready" ? "doctor" : readiness.next_step);
       return;
     }
     const prompt = pendingAgentPrompt;
@@ -4575,6 +4590,38 @@ export function App() {
       skipWorkspaceSetup: true,
       attachments: agentAttachments,
     });
+  };
+
+  const continueAgentAfterDoctor = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    let readiness: OnboardingReadinessProjection | null = null;
+    if (deepSeekCredentialStatus.chat_completion_ready) {
+      setDeepSeekReadinessPending(true);
+      setDeepSeekReadinessError("");
+      try {
+        readiness = await invoke<OnboardingReadinessProjection>(
+          "get_onboarding_readiness",
+        );
+        setOnboardingReadiness(readiness);
+      } catch {
+        setDeepSeekReadinessError(copy.onboarding.commandFailed);
+      } finally {
+        setDeepSeekReadinessPending(false);
+      }
+    } else {
+      readiness = await retryDeepSeekReadiness();
+    }
+    if (!readiness) {
+      return;
+    }
+    if (readiness.overall !== "ready") {
+      setAgentSetupPrompt(readiness.next_step === "ready" ? "doctor" : readiness.next_step);
+      return;
+    }
+    const prompt = pendingAgentPrompt;
+    setAgentSetupPrompt(null);
+    setPendingAgentPrompt("");
+    await sendAgentPrompt(prompt, { attachments: agentAttachments });
   };
 
   const continueAgentAfterNetworkSearchSetup = async (event: FormEvent<HTMLFormElement>) => {
@@ -4919,7 +4966,7 @@ export function App() {
         ? "done"
         : briefingPending
           ? "current"
-          : localDirectoryState.needs_setup
+          : localDirectoryNeedsSetup
             ? "blocked"
             : "waiting",
     },
@@ -5181,15 +5228,25 @@ export function App() {
                 aria-label={copy.settingsPanel.title}
                 data-settings-count={settingsPanelItemCount}
               >
-                <label>
-                  <span>{copy.settingsPanel.deepSeekApiKey}</span>
+                <form
+                  className="deepseek-key-settings"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    if (deepSeekApiKeyDraft.trim()) {
+                      void saveDeepSeekKey(deepSeekApiKeyDraft);
+                    }
+                  }}
+                >
+                  <label>
+                    <span>{copy.settingsPanel.deepSeekApiKey}</span>
                   <div className="api-key-input-row">
                     <input
                       type="password"
-                      value={sessionDeepSeekApiKey}
+                      value={deepSeekApiKeyDraft}
                       aria-label={copy.settingsPanel.deepSeekApiKey}
                       placeholder={primaryDeepSeekApiKeyPlaceholder}
-                      onChange={(event) => setSessionDeepSeekApiKey(event.target.value)}
+                      autoComplete="off"
+                      onChange={(event) => setDeepSeekApiKeyDraft(event.target.value)}
                     />
                     {primaryDeepSeekApiKeyReady ? (
                       <span
@@ -5201,28 +5258,29 @@ export function App() {
                       </span>
                     ) : null}
                   </div>
-                </label>
-                <label>
-                  <span>{copy.settingsPanel.fallbackApiKey}</span>
-                  <div className="api-key-input-row">
-                    <input
-                      type="password"
-                      value={fallbackDeepSeekApiKey}
-                      aria-label={copy.settingsPanel.fallbackApiKey}
-                      placeholder={copy.settingsPanel.fallbackApiKeyPlaceholder}
-                      onChange={(event) => setFallbackDeepSeekApiKey(event.target.value)}
-                    />
-                    {fallbackDeepSeekApiKeyReady ? (
-                      <span
-                        className="api-key-ready-indicator"
-                        aria-label={copy.settingsPanel.apiKeyReady}
-                        title={copy.settingsPanel.apiKeyReady}
+                  </label>
+                  <div className="deepseek-key-actions">
+                    <button
+                      type="submit"
+                      disabled={deepSeekReadinessPending || !deepSeekApiKeyDraft.trim()}
+                    >
+                      {deepSeekReadinessPending
+                        ? copy.onboarding.checking
+                        : deepSeekCredentialStatus.configured
+                          ? copy.onboarding.replaceKey
+                          : copy.onboarding.saveAndCheck}
+                    </button>
+                    {deepSeekCredentialStatus.source === "stored" ? (
+                      <button
+                        type="button"
+                        onClick={() => void removeDeepSeekKey()}
+                        disabled={deepSeekReadinessPending}
                       >
-                        √
-                      </span>
+                        {copy.onboarding.removeKey}
+                      </button>
                     ) : null}
                   </div>
-                </label>
+                </form>
                 <label>
                   <span>{copy.controls.modelRoute}</span>
                   <select
@@ -5278,7 +5336,10 @@ export function App() {
                       <input
                         value={setupWorkspaceDir}
                         aria-label={copy.settingsPanel.workspaceDirectory}
-                        placeholder={copy.localSetup.workspacePlaceholder}
+                        placeholder={
+                          workspaceReadiness.workspace_root_display ||
+                          copy.localSetup.workspacePlaceholder
+                        }
                         readOnly
                       />
                       <button
@@ -5294,26 +5355,34 @@ export function App() {
                   {setupNotice ? <p className="package-message">{setupNotice}</p> : null}
                   {setupError ? <p className="package-error">{setupError}</p> : null}
                 </div>
-                <div className="settings-balance-panel">
+                <div className="settings-balance-panel readiness-doctor-panel">
                   <div>
-                    <span>{copy.settingsPanel.balance}</span>
-                    <p className="setup-status">{deepSeekBalanceStatus}</p>
-                    {deepSeekBalanceDetails ? (
-                      <p className="setup-status">{deepSeekBalanceDetails}</p>
-                    ) : null}
+                    <span>{copy.onboarding.doctorTitle}</span>
+                    <p className="setup-status">{deepSeekReadinessMessage}</p>
+                    <p className="setup-status">{workspaceReadinessMessage}</p>
+                    <p className="setup-status">
+                      {copy.onboarding.credentialSource[deepSeekCredentialStatus.source]}
+                    </p>
                   </div>
                   <button
                     type="button"
-                    onClick={() => void queryDeepSeekBalance()}
-                    disabled={deepSeekBalancePending}
+                    onClick={() => void retryDeepSeekReadiness()}
+                    disabled={
+                      deepSeekReadinessPending ||
+                      !deepSeekCredentialStatus.configured ||
+                      !canRetryDeepSeekReadiness
+                    }
                   >
                     <Database size={14} aria-hidden="true" />
-                    {deepSeekBalancePending
-                      ? copy.settingsPanel.queryingBalance
-                      : copy.settingsPanel.queryBalance}
+                    {deepSeekReadinessPending
+                      ? copy.onboarding.checking
+                      : copy.onboarding.retryCheck}
                   </button>
-                  {deepSeekBalanceError ? (
-                    <p className="package-error">{deepSeekBalanceError}</p>
+                  {deepSeekReadinessNotice ? (
+                    <p className="package-message">{deepSeekReadinessNotice}</p>
+                  ) : null}
+                  {deepSeekReadinessError ? (
+                    <p className="package-error">{deepSeekReadinessError}</p>
                   ) : null}
                 </div>
                 <p className="product-attribution">{copy.settingsPanel.attribution}</p>
@@ -5693,7 +5762,7 @@ export function App() {
             </div>
           </details>
 
-          <details className="sidebar-tool settings-tool" open={localDirectoryState.needs_setup}>
+          <details className="sidebar-tool settings-tool" open={localDirectoryNeedsSetup}>
             <summary>
               <MonitorCog size={16} aria-hidden="true" />
               <span>{copy.inspector.title}</span>
@@ -5764,17 +5833,17 @@ export function App() {
             </section>
             <details
               className={
-                localDirectoryState.needs_setup
+                localDirectoryNeedsSetup
                   ? "setup-disclosure setup-required"
                   : "setup-disclosure"
               }
-              open={localDirectoryState.needs_setup}
+              open={localDirectoryNeedsSetup}
             >
               <summary className="section-heading">
                 <FolderOpen size={18} aria-hidden="true" />
                 <span>{copy.localSetup.title}</span>
                 <small>
-                  {localDirectoryState.needs_setup
+                  {localDirectoryNeedsSetup
                     ? copy.localSetup.required
                     : copy.localSetup.ready}
                 </small>
@@ -5833,12 +5902,6 @@ export function App() {
                 <p className="setup-status" title={deepSeekPricingState.note}>
                   {deepSeekPricingState.note}
                 </p>
-                <dl className="setup-meta">
-                  <div>
-                    <dt>{copy.deepSeekPricing.settingsFile}</dt>
-                    <dd>{deepSeekPricingState.settings_file || copy.backendLabels.notSelected}</dd>
-                  </div>
-                </dl>
                 <form className="setup-form" onSubmit={saveDeepSeekPricingSetup}>
                   <label className="setup-checkbox">
                     <input
@@ -8601,26 +8664,22 @@ export function App() {
                 <div>
                   <dt>{copy.backendLabels.deepSeekApi}</dt>
                   <dd>
-                    {deepSeekCredentialStatus.api_key_configured
+                    {deepSeekCredentialStatus.configured
                       ? copy.backendLabels.apiKeyConfigured
                       : copy.backendLabels.apiKeyMissing}
                   </dd>
                 </div>
                 <div>
                   <dt>{copy.backendLabels.deepSeekChatApi}</dt>
-                  <dd title={deepSeekCredentialStatus.readiness_note}>
+                  <dd title={deepSeekReadinessMessage}>
                     {deepSeekCredentialStatus.chat_completion_ready
                       ? copy.backendLabels.chatReady
                       : copy.backendLabels.chatNotReady}
                   </dd>
                 </div>
                 <div>
-                  <dt>{copy.backendLabels.apiBaseUrl}</dt>
-                  <dd>{deepSeekCredentialStatus.base_url}</dd>
-                </div>
-                <div>
-                  <dt>{copy.backendLabels.chatEndpoint}</dt>
-                  <dd>{deepSeekCredentialStatus.chat_completions_url}</dd>
+                  <dt>{copy.onboarding.sourceLabel}</dt>
+                  <dd>{copy.onboarding.credentialSource[deepSeekCredentialStatus.source]}</dd>
                 </div>
                 <div>
                   <dt>{copy.backendLabels.deepSeekModels}</dt>
@@ -8655,10 +8714,6 @@ export function App() {
                         : copy.backendLabels.clearCache}
                     </button>
                   </dd>
-                </div>
-                <div>
-                  <dt>{copy.backendLabels.apiKeyEnv}</dt>
-                  <dd>{deepSeekCredentialStatus.api_key_env_var}</dd>
                 </div>
                 <div>
                   <dt>{copy.backendLabels.email}</dt>
@@ -8891,12 +8946,23 @@ export function App() {
                   aria-label={copy.chatWorkbench.deepSeekKeyPlaceholder}
                   placeholder={copy.chatWorkbench.deepSeekKeyPlaceholder}
                   autoFocus
+                  autoComplete="off"
                   onChange={(event) => setDeepSeekApiKeyDraft(event.target.value)}
                 />
+                <p className="setup-status">{deepSeekReadinessMessage}</p>
+                <p className="setup-help">{copy.onboarding.contactsDeepSeek}</p>
+                {deepSeekReadinessError ? (
+                  <p className="package-error">{deepSeekReadinessError}</p>
+                ) : null}
                 <div className="setup-modal-actions">
-                  <button type="submit">
+                  <button
+                    type="submit"
+                    disabled={deepSeekReadinessPending || !deepSeekApiKeyDraft.trim()}
+                  >
                     <Send size={14} aria-hidden="true" />
-                    {copy.chatWorkbench.continue}
+                    {deepSeekReadinessPending
+                      ? copy.onboarding.checking
+                      : copy.onboarding.saveAndCheck}
                   </button>
                   <button
                     type="button"
@@ -8946,6 +9012,7 @@ export function App() {
                     </button>
                   </div>
                 </label>
+                <p className="setup-status">{workspaceReadinessMessage}</p>
                 <p className="setup-help">{copy.localSetup.managedStructure}</p>
                 {setupError ? <p className="package-error">{setupError}</p> : null}
                 <div className="setup-modal-actions">
@@ -8960,6 +9027,69 @@ export function App() {
                       setPendingAgentPrompt("");
                     }}
                     disabled={setupPending}
+                  >
+                    <X size={14} aria-hidden="true" />
+                    {copy.chatWorkbench.cancel}
+                  </button>
+                </div>
+              </form>
+            ) : null}
+
+            {agentSetupPrompt === "doctor" ? (
+              <form className="setup-modal-form" onSubmit={continueAgentAfterDoctor}>
+                <header>
+                  <ShieldCheck size={18} aria-hidden="true" />
+                  <div>
+                    <h2 id="agent-setup-modal-title">{copy.onboarding.doctorTitle}</h2>
+                    <p>{copy.onboarding.doctorBody}</p>
+                  </div>
+                </header>
+                <div className="readiness-doctor-list">
+                  <p>{deepSeekReadinessMessage}</p>
+                  <p>{workspaceReadinessMessage}</p>
+                  <p>
+                    {deepSeekCredentialStatus.flash_model}:{" "}
+                    {modelAvailabilityMessage(deepSeekCredentialStatus.flash_available)}
+                  </p>
+                  <p>
+                    {deepSeekCredentialStatus.pro_model}:{" "}
+                    {modelAvailabilityMessage(deepSeekCredentialStatus.pro_available)}
+                  </p>
+                </div>
+                {deepSeekReadinessError ? (
+                  <p className="package-error">{deepSeekReadinessError}</p>
+                ) : null}
+                <div className="setup-modal-actions">
+                  <button
+                    type="submit"
+                    disabled={
+                      deepSeekReadinessPending ||
+                      (!deepSeekCredentialStatus.chat_completion_ready &&
+                        !canRetryDeepSeekReadiness)
+                    }
+                  >
+                    <RefreshCw size={14} aria-hidden="true" />
+                    {deepSeekReadinessPending
+                      ? copy.onboarding.checking
+                      : copy.onboarding.retryCheck}
+                  </button>
+                  {workspaceReadiness.code !== "ready" ? (
+                    <button
+                      type="button"
+                      onClick={() => setAgentSetupPrompt("workspace")}
+                      disabled={deepSeekReadinessPending}
+                    >
+                      <FolderOpen size={14} aria-hidden="true" />
+                      {copy.onboarding.chooseWorkspace}
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAgentSetupPrompt(null);
+                      setPendingAgentPrompt("");
+                    }}
+                    disabled={deepSeekReadinessPending}
                   >
                     <X size={14} aria-hidden="true" />
                     {copy.chatWorkbench.cancel}

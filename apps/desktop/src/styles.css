@@ -1862,6 +1862,36 @@ h1 {
   white-space: nowrap;
 }
 
+.deepseek-key-settings {
+  display: grid;
+  gap: 8px;
+}
+
+.deepseek-key-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.deepseek-key-actions button {
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.readiness-doctor-panel p,
+.readiness-doctor-list p {
+  margin: 0;
+}
+
+.readiness-doctor-list {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--surface-control) 68%, transparent);
+  padding: 10px;
+}
+
 .workflow-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

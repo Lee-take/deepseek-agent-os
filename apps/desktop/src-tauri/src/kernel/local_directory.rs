@@ -1,8 +1,10 @@
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub const LOCAL_DIRECTORY_SETTINGS_FILE: &str = "local-directories.json";
 pub const LOCAL_EVIDENCE_DIR_NAME: &str = "evidence";
@@ -48,6 +50,9 @@ pub enum LocalDirectoryError {
 
     #[error("local directory settings are invalid json: {0}")]
     Json(serde_json::Error),
+
+    #[error("local workspace managed directories must stay inside the workspace root")]
+    ManagedDirectoryEscape,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -168,8 +173,23 @@ impl LocalDirectorySettings {
     }
 
     fn ensure_directory_structure(&self) -> Result<(), LocalDirectoryError> {
+        let workspace = Path::new(&self.workspace_dir);
+        fs::create_dir_all(workspace).map_err(LocalDirectoryError::Create)?;
+        let canonical_workspace = workspace
+            .canonicalize()
+            .map_err(LocalDirectoryError::Create)?;
         for directory in self.standard_directories() {
-            fs::create_dir_all(directory).map_err(LocalDirectoryError::Create)?;
+            let directory = PathBuf::from(directory);
+            if !directory.starts_with(workspace) {
+                return Err(LocalDirectoryError::ManagedDirectoryEscape);
+            }
+            fs::create_dir_all(&directory).map_err(LocalDirectoryError::Create)?;
+            let canonical = directory
+                .canonicalize()
+                .map_err(LocalDirectoryError::Create)?;
+            if !canonical.starts_with(&canonical_workspace) {
+                return Err(LocalDirectoryError::ManagedDirectoryEscape);
+            }
         }
 
         Ok(())
@@ -246,6 +266,108 @@ pub struct LocalDirectoryReadinessStatus {
     pub note: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceReadinessCode {
+    Ready,
+    WorkspaceMissing,
+    WorkspaceUnavailable,
+    WorkspacePermissionDenied,
+    WorkspaceProbeCleanupFailed,
+    WorkspaceSettingsInvalid,
+}
+
+impl WorkspaceReadinessCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::WorkspaceMissing => "workspace_missing",
+            Self::WorkspaceUnavailable => "workspace_unavailable",
+            Self::WorkspacePermissionDenied => "workspace_permission_denied",
+            Self::WorkspaceProbeCleanupFailed => "workspace_probe_cleanup_failed",
+            Self::WorkspaceSettingsInvalid => "workspace_settings_invalid",
+        }
+    }
+
+    pub fn retryable(self) -> bool {
+        !matches!(self, Self::Ready | Self::WorkspaceSettingsInvalid)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceReadinessProjection {
+    pub configured: bool,
+    pub workspace_name: Option<String>,
+    pub workspace_root_display: Option<String>,
+    pub root_exists: bool,
+    pub managed_directories_ready: bool,
+    pub writable: Option<bool>,
+    pub code: WorkspaceReadinessCode,
+    pub retryable: bool,
+    pub message_key: String,
+}
+
+impl WorkspaceReadinessProjection {
+    fn for_code(
+        settings: Option<&LocalDirectorySettings>,
+        code: WorkspaceReadinessCode,
+        root_exists: bool,
+        managed_directories_ready: bool,
+        writable: Option<bool>,
+    ) -> Self {
+        Self {
+            configured: settings.is_some(),
+            workspace_name: settings.map(|settings| settings.workspace_name.clone()),
+            workspace_root_display: settings
+                .map(|settings| derive_workspace_name(&settings.workspace_dir)),
+            root_exists,
+            managed_directories_ready,
+            writable,
+            code,
+            retryable: code.retryable(),
+            message_key: format!("onboarding.workspace.{}", code.as_str()),
+        }
+    }
+
+    pub fn settings_invalid() -> Self {
+        Self::for_code(
+            None,
+            WorkspaceReadinessCode::WorkspaceSettingsInvalid,
+            false,
+            false,
+            None,
+        )
+    }
+}
+
+pub fn workspace_readiness_projection_from_setup_error(
+    error: &LocalDirectoryError,
+) -> WorkspaceReadinessProjection {
+    let code = match error {
+        LocalDirectoryError::WorkspaceNotDirectory
+        | LocalDirectoryError::EvidenceNotDirectory
+        | LocalDirectoryError::ExportNotDirectory => WorkspaceReadinessCode::WorkspaceUnavailable,
+        LocalDirectoryError::Create(error) | LocalDirectoryError::Migrate(error) => {
+            match error.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    WorkspaceReadinessCode::WorkspacePermissionDenied
+                }
+                _ => WorkspaceReadinessCode::WorkspaceUnavailable,
+            }
+        }
+        LocalDirectoryError::MissingWorkspace
+        | LocalDirectoryError::MissingEvidence
+        | LocalDirectoryError::MissingExport
+        | LocalDirectoryError::Read(_)
+        | LocalDirectoryError::Write(_)
+        | LocalDirectoryError::Json(_)
+        | LocalDirectoryError::ManagedDirectoryEscape => {
+            WorkspaceReadinessCode::WorkspaceSettingsInvalid
+        }
+    };
+    WorkspaceReadinessProjection::for_code(None, code, false, false, None)
+}
+
 impl Default for LocalDirectoryReadinessStatus {
     fn default() -> Self {
         Self {
@@ -286,6 +408,133 @@ pub fn local_directory_readiness_from_state(
     }
 }
 
+pub fn workspace_readiness_projection_from_state(
+    state: &LocalDirectoryState,
+) -> WorkspaceReadinessProjection {
+    let Some(settings) = state.settings.as_ref() else {
+        return WorkspaceReadinessProjection::for_code(
+            None,
+            WorkspaceReadinessCode::WorkspaceMissing,
+            false,
+            false,
+            None,
+        );
+    };
+    let workspace = Path::new(&settings.workspace_dir);
+    if !workspace.is_dir() {
+        return WorkspaceReadinessProjection::for_code(
+            Some(settings),
+            WorkspaceReadinessCode::WorkspaceUnavailable,
+            false,
+            false,
+            None,
+        );
+    }
+    let canonical_workspace = match workspace.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            return WorkspaceReadinessProjection::for_code(
+                Some(settings),
+                WorkspaceReadinessCode::WorkspaceUnavailable,
+                true,
+                false,
+                None,
+            )
+        }
+    };
+    let managed_directories_ready = settings
+        .standard_directories()
+        .into_iter()
+        .all(|directory| {
+            let directory = PathBuf::from(directory);
+            directory.is_dir()
+                && directory
+                    .canonicalize()
+                    .map(|canonical| canonical.starts_with(&canonical_workspace))
+                    .unwrap_or(false)
+        });
+    if !managed_directories_ready {
+        return WorkspaceReadinessProjection::for_code(
+            Some(settings),
+            WorkspaceReadinessCode::WorkspaceSettingsInvalid,
+            true,
+            false,
+            None,
+        );
+    }
+    match workspace_write_probe(workspace) {
+        Ok(()) => WorkspaceReadinessProjection::for_code(
+            Some(settings),
+            WorkspaceReadinessCode::Ready,
+            true,
+            true,
+            Some(true),
+        ),
+        Err(WorkspaceReadinessCode::WorkspaceProbeCleanupFailed) => {
+            WorkspaceReadinessProjection::for_code(
+                Some(settings),
+                WorkspaceReadinessCode::WorkspaceProbeCleanupFailed,
+                true,
+                true,
+                Some(false),
+            )
+        }
+        Err(_) => WorkspaceReadinessProjection::for_code(
+            Some(settings),
+            WorkspaceReadinessCode::WorkspacePermissionDenied,
+            true,
+            true,
+            Some(false),
+        ),
+    }
+}
+
+fn workspace_write_probe(root: &Path) -> Result<(), WorkspaceReadinessCode> {
+    workspace_write_probe_with_cleanup(root, |path| fs::remove_file(path))
+}
+
+fn workspace_write_probe_with_cleanup(
+    root: &Path,
+    cleanup: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), WorkspaceReadinessCode> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| WorkspaceReadinessCode::WorkspaceUnavailable)?;
+    let probe = root.join(format!(".ds-agent-readiness-{}.tmp", Uuid::new_v4()));
+    if probe.parent() != Some(root) || !probe.starts_with(root) {
+        return Err(WorkspaceReadinessCode::WorkspaceSettingsInvalid);
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|_| WorkspaceReadinessCode::WorkspacePermissionDenied)?;
+    let write_result = file
+        .write_all(b"ds-agent-readiness-v1")
+        .and_then(|_| file.sync_all());
+    drop(file);
+    if write_result.is_err() {
+        let _ = fs::remove_file(&probe);
+        return Err(WorkspaceReadinessCode::WorkspacePermissionDenied);
+    }
+    let canonical_probe = match probe.canonicalize() {
+        Ok(path) if path.starts_with(&canonical_root) => path,
+        _ => {
+            let _ = fs::remove_file(&probe);
+            return Err(WorkspaceReadinessCode::WorkspaceSettingsInvalid);
+        }
+    };
+    if cleanup(&canonical_probe).is_err() {
+        let _ = fs::remove_file(&canonical_probe);
+        return Err(WorkspaceReadinessCode::WorkspaceProbeCleanupFailed);
+    }
+    if canonical_probe.exists() {
+        let _ = fs::remove_file(&canonical_probe);
+        return Err(WorkspaceReadinessCode::WorkspaceProbeCleanupFailed);
+    }
+    Ok(())
+}
+
 pub fn load_local_directory_state(
     app_data_dir: impl AsRef<Path>,
 ) -> Result<LocalDirectoryState, LocalDirectoryError> {
@@ -298,7 +547,8 @@ pub fn load_local_directory_state(
             serde_json::from_str(&settings_json).map_err(LocalDirectoryError::Json)?;
         settings.normalize_derived_directories()?;
         if settings.workspace_exists() {
-            settings.ensure_directory_structure()?;
+            // Existing compatible settings are repaired in place without moving data.
+            let _ = settings.ensure_directory_structure();
         }
         Some(settings)
     } else {
@@ -494,10 +744,12 @@ mod tests {
     use std::fs;
 
     use super::{
-        load_local_directory_state, save_local_directory_settings, LocalDirectorySettings,
-        LOCAL_DIRECTORY_SETTINGS_FILE, LOCAL_EVIDENCE_DIR_NAME, LOCAL_EXPORT_DIR_NAME,
-        LOCAL_LOGS_DIR_NAME, LOCAL_MEMORY_DIR_NAME, LOCAL_REPORTS_DIR_NAME, LOCAL_RUNS_DIR_NAME,
-        LOCAL_SOURCES_DIR_NAME, LOCAL_WORK_PACKAGES_DIR_NAME,
+        load_local_directory_state, save_local_directory_settings,
+        workspace_readiness_projection_from_setup_error, workspace_readiness_projection_from_state,
+        workspace_write_probe_with_cleanup, LocalDirectoryError, LocalDirectorySettings,
+        WorkspaceReadinessCode, LOCAL_DIRECTORY_SETTINGS_FILE, LOCAL_EVIDENCE_DIR_NAME,
+        LOCAL_EXPORT_DIR_NAME, LOCAL_LOGS_DIR_NAME, LOCAL_MEMORY_DIR_NAME, LOCAL_REPORTS_DIR_NAME,
+        LOCAL_RUNS_DIR_NAME, LOCAL_SOURCES_DIR_NAME, LOCAL_WORK_PACKAGES_DIR_NAME,
     };
 
     #[test]
@@ -577,6 +829,36 @@ mod tests {
         assert!(workspace_dir.join(LOCAL_EVIDENCE_DIR_NAME).is_dir());
         assert!(workspace_dir.join(LOCAL_EXPORT_DIR_NAME).is_dir());
         assert!(temp_dir.path().join(LOCAL_DIRECTORY_SETTINGS_FILE).exists());
+    }
+
+    #[test]
+    fn first_run_workspace_setup_does_not_migrate_unrelated_existing_data() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_data_dir = temp_dir.path().join("fresh-app-data");
+        let unrelated_workspace = temp_dir.path().join("old-workspace");
+        let unrelated_file = unrelated_workspace
+            .join(LOCAL_EVIDENCE_DIR_NAME)
+            .join("keep.txt");
+        fs::create_dir_all(unrelated_file.parent().expect("unrelated parent"))
+            .expect("create unrelated workspace");
+        fs::write(&unrelated_file, "keep in place").expect("write unrelated data");
+        let new_workspace = temp_dir.path().join("new-workspace");
+
+        save_local_directory_settings(
+            &app_data_dir,
+            LocalDirectorySettings::from_workspace_dir(new_workspace.to_string_lossy().to_string())
+                .expect("new settings"),
+        )
+        .expect("first-run settings save");
+
+        assert_eq!(
+            fs::read_to_string(&unrelated_file).expect("unrelated data remains"),
+            "keep in place"
+        );
+        assert!(!new_workspace
+            .join(LOCAL_EVIDENCE_DIR_NAME)
+            .join("keep.txt")
+            .exists());
     }
 
     #[test]
@@ -734,10 +1016,139 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_workspace_settings_are_not_rewritten_or_deleted() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let settings_file = temp_dir.path().join(LOCAL_DIRECTORY_SETTINGS_FILE);
+        fs::write(&settings_file, "{not valid json").expect("write corrupt settings");
+
+        let error = load_local_directory_state(temp_dir.path())
+            .expect_err("corrupt settings must be reported");
+
+        assert!(matches!(error, super::LocalDirectoryError::Json(_)));
+        assert_eq!(
+            fs::read_to_string(settings_file).expect("corrupt settings preserved"),
+            "{not valid json"
+        );
+    }
+
+    #[test]
     fn local_directory_settings_reject_blank_required_paths() {
         let error = LocalDirectorySettings::from_workspace_dir(" ".to_string())
             .expect_err("blank workspace should fail");
 
         assert_eq!(error.to_string(), "workspace directory is required");
+    }
+
+    #[test]
+    fn workspace_readiness_uses_bounded_probe_and_redacted_display() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("Hotel Workspace");
+        let state = save_local_directory_settings(
+            temp_dir.path().join("app-data"),
+            LocalDirectorySettings::from_workspace_dir_and_name(
+                workspace_dir.to_string_lossy().to_string(),
+                "Hotel Ops".to_string(),
+            )
+            .expect("settings"),
+        )
+        .expect("save");
+
+        let projection = workspace_readiness_projection_from_state(&state);
+        let json = serde_json::to_string(&projection).expect("projection json");
+
+        assert_eq!(projection.code, WorkspaceReadinessCode::Ready);
+        assert_eq!(projection.writable, Some(true));
+        assert_eq!(projection.workspace_name.as_deref(), Some("Hotel Ops"));
+        assert_eq!(
+            projection.workspace_root_display.as_deref(),
+            Some("Hotel Workspace")
+        );
+        assert!(!json.contains(&temp_dir.path().to_string_lossy().to_string()));
+        assert!(fs::read_dir(&workspace_dir)
+            .expect("workspace entries")
+            .all(|entry| !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ds-agent-readiness-")));
+    }
+
+    #[test]
+    fn workspace_managed_directories_cannot_escape_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        let outside = temp_dir.path().join("outside");
+        let settings = LocalDirectorySettings::from_optional_dirs(
+            workspace_dir.to_string_lossy().to_string(),
+            None,
+            Some(outside.to_string_lossy().to_string()),
+            None,
+        )
+        .expect("settings parse");
+
+        let error = save_local_directory_settings(temp_dir.path().join("app-data"), settings)
+            .expect_err("escape must fail");
+
+        assert!(matches!(
+            error,
+            super::LocalDirectoryError::ManagedDirectoryEscape
+        ));
+        assert!(!outside.exists());
+    }
+
+    #[test]
+    fn workspace_probe_cleanup_failure_blocks_readiness_without_residue() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let error = workspace_write_probe_with_cleanup(temp_dir.path(), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected cleanup failure",
+            ))
+        })
+        .expect_err("cleanup failure must block");
+
+        assert_eq!(error, WorkspaceReadinessCode::WorkspaceProbeCleanupFailed);
+        assert!(fs::read_dir(temp_dir.path())
+            .expect("root entries")
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn workspace_probe_maps_create_failure_to_permission_denied() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let file_root = temp_dir.path().join("not-a-directory");
+        fs::write(&file_root, "occupied").expect("write file root");
+
+        let error = workspace_write_probe_with_cleanup(&file_root, |_| Ok(()))
+            .expect_err("probe create must fail");
+
+        assert_eq!(error, WorkspaceReadinessCode::WorkspacePermissionDenied);
+        assert_eq!(
+            fs::read_to_string(file_root).expect("file root remains"),
+            "occupied"
+        );
+    }
+
+    #[test]
+    fn workspace_setup_errors_map_to_stable_secret_free_codes() {
+        let permission =
+            workspace_readiness_projection_from_setup_error(&LocalDirectoryError::Create(
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "private path detail"),
+            ));
+        let invalid = workspace_readiness_projection_from_setup_error(
+            &LocalDirectoryError::ManagedDirectoryEscape,
+        );
+        let permission_json = serde_json::to_string(&permission).expect("projection serializes");
+
+        assert_eq!(
+            permission.code,
+            WorkspaceReadinessCode::WorkspacePermissionDenied
+        );
+        assert_eq!(
+            invalid.code,
+            WorkspaceReadinessCode::WorkspaceSettingsInvalid
+        );
+        assert!(!permission_json.contains("private path detail"));
     }
 }

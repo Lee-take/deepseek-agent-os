@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+mod app_paths;
 mod app_update_commands;
 mod artifact_commands;
 mod automation_commands;
@@ -10,6 +11,7 @@ mod kernel;
 mod lifecycle_commands;
 mod workspace_undo_commands;
 
+use app_paths::resolve_app_data_dir;
 use app_update_commands::{check_app_update, download_app_update, install_app_update};
 use artifact_commands::{
     get_artifact_visual_preview, list_artifact_deliveries, spawn_artifact_recovery_worker,
@@ -33,15 +35,15 @@ use commands::{
     export_operations_briefing_report, export_work_package, finish_agent_run_record,
     get_agent_soul_profile, get_computer_control_unlock_status, get_computer_use_backend_status,
     get_computer_use_backend_status_for_model, get_deepseek_chat_cache_state,
-    get_deepseek_credential_status, get_deepseek_pricing_state, get_deepseek_user_balance,
-    get_foundation_state, get_local_directory_state, get_model_driven_tool_strategy,
-    get_network_search_route_status, get_network_search_route_status_for_model,
-    import_work_package, ingest_evidence_folder, install_local_skill_manifest,
-    install_local_skill_zip_package, install_remote_skill_zip_package,
-    install_skill_from_repository_url, link_memory_candidate_to_conflicts, link_memory_records,
-    list_agent_context_receipts, list_agent_run_records, list_agent_tool_contracts,
-    list_agent_tool_invocations, list_capability_access_records, list_capability_catalog,
-    list_capability_invocations, list_deepseek_chat_telemetry, list_durable_computer_use_sessions,
+    get_deepseek_pricing_state, get_foundation_state, get_local_directory_state,
+    get_model_driven_tool_strategy, get_network_search_route_status,
+    get_network_search_route_status_for_model, get_onboarding_readiness, import_work_package,
+    ingest_evidence_folder, install_local_skill_manifest, install_local_skill_zip_package,
+    install_remote_skill_zip_package, install_skill_from_repository_url,
+    link_memory_candidate_to_conflicts, link_memory_records, list_agent_context_receipts,
+    list_agent_run_records, list_agent_tool_contracts, list_agent_tool_invocations,
+    list_capability_access_records, list_capability_catalog, list_capability_invocations,
+    list_deepseek_chat_telemetry, list_durable_computer_use_sessions,
     list_durable_computer_use_steps, list_memory_candidate_records,
     list_memory_maintenance_reviews, list_memory_records, list_operations_briefing_runs,
     list_pending_capability_access_records, list_permission_audit_entries,
@@ -54,19 +56,20 @@ use commands::{
     queue_expert_team_retries, queue_parent_agent_synthesis, read_drive_boundary,
     read_email_boundary, read_local_file, record_agent_run_artifact_record,
     record_agent_run_step_record, record_memory_maintenance_review_action, record_permission_audit,
-    record_selected_memory_feedback, reobserve_durable_computer_use_session,
-    replace_memory_candidate_conflicts, request_agent_run_cancel_record, request_capability_access,
-    reset_skill_trust, resolve_capability_access_request, resolve_memory_candidate,
-    resume_agent_chat_action, run_agent_chat, run_durable_computer_use_step,
-    run_memory_background_maintenance, run_next_queued_agent_chat_worker, run_operations_briefing,
-    run_skill_update_sweep, run_terminal_read, run_terminal_write, save_agent_soul_profile,
+    record_selected_memory_feedback, remove_deepseek_api_key,
+    reobserve_durable_computer_use_session, replace_memory_candidate_conflicts,
+    request_agent_run_cancel_record, request_capability_access, reset_skill_trust,
+    resolve_capability_access_request, resolve_memory_candidate, resume_agent_chat_action,
+    run_agent_chat, run_durable_computer_use_step, run_memory_background_maintenance,
+    run_next_queued_agent_chat_worker, run_operations_briefing, run_skill_update_sweep,
+    run_terminal_read, run_terminal_write, save_agent_soul_profile, save_deepseek_api_key,
     save_deepseek_pricing_settings, save_local_directory_settings, search_memory_records,
     search_network_boundary, seed_operations_briefing_evidence_templates, send_email_boundary,
     set_skill_enabled, stage_agent_attachments, start_agent_run_record,
     start_durable_computer_use_session, submit_browser_boundary,
     take_over_durable_computer_use_step, uninstall_skill, unlock_computer_control,
-    update_memory_candidate_conflict, update_memory_record, verify_skill_source,
-    write_drive_boundary, write_file_boundary, AppState,
+    update_memory_candidate_conflict, update_memory_record, verify_deepseek_api_key,
+    verify_skill_source, write_drive_boundary, write_file_boundary, AppState,
 };
 use connected_work_commands::{
     approve_and_run_connected_work_review, list_connected_work_reviews,
@@ -261,7 +264,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let app_data_dir = app.path().app_data_dir()?;
+            let app_data_dir = resolve_app_data_dir(app.handle()).map_err(std::io::Error::other)?;
             std::fs::create_dir_all(&app_data_dir)?;
             #[cfg(windows)]
             app.manage(
@@ -313,7 +316,10 @@ fn main() {
             list_agent_tool_contracts,
             list_agent_tool_invocations,
             execute_agent_tool,
-            get_deepseek_credential_status,
+            get_onboarding_readiness,
+            save_deepseek_api_key,
+            verify_deepseek_api_key,
+            remove_deepseek_api_key,
             get_network_search_route_status,
             get_computer_use_backend_status,
             get_network_search_route_status_for_model,
@@ -373,7 +379,6 @@ fn main() {
             record_agent_run_step_record,
             record_agent_run_artifact_record,
             finish_agent_run_record,
-            get_deepseek_user_balance,
             clear_deepseek_chat_cache,
             list_deepseek_chat_telemetry,
             list_agent_context_receipts,
