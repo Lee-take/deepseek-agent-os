@@ -9,13 +9,15 @@ project does not depend on the maintainer's local directories.
 The published Windows release provides a normal NSIS setup executable:
 
 ```text
-DS.Agent_1.0.2_x64-setup.exe
+DS.Agent_1.1.0_x64-setup.exe
 ```
 
-Version `1.0.2` is the current published stable release. Earlier commits, tags,
-Releases, and assets remain immutable. The installer is unsigned, so Windows
-may show an unknown-publisher warning. Verify its SHA-256 against the digest in
-the `v1.0.2` GitHub Release before running it. The installer
+Version `1.1.0` is the current published stable release. Earlier commits, tags,
+Releases, and assets remain immutable. Both `ds-agent.exe` and the installer are
+Authenticode `NotSigned`, so Windows may show `Unknown publisher` or a Microsoft
+Defender SmartScreen warning. Download only over HTTPS from the official GitHub
+Release and verify its byte size and SHA-256 against the `v1.1.0` Release before
+running it. The installer
 embeds the Microsoft WebView2 bootstrapper and runs it silently when the target
 machine needs the WebView2 runtime; users do not need Node.js, pnpm, Rust, or a
 source checkout to run the installed app.
@@ -23,21 +25,52 @@ source checkout to run the installed app.
 The installer-selected application directory is only for program files. It is
 not the workspace, evidence folder, export folder, or event database location.
 
+## Code signing policy and verification
+
+DS Agent `v1.1.0` is intentionally unsigned. Its HTTPS source, immutable tag,
+exact byte size, and SHA-256 are the verification route for this asset. The
+SignPath Foundation application is submitted and approval is pending; no
+publisher, certificate, or signed status is claimed for v1.1.0. If signing is
+approved later, it starts with a new version and does not replace this tag or
+asset.
+
+For releases accepted into the open-source signing program: **Free code signing
+provided by SignPath.io, certificate by SignPath Foundation.** The complete
+[Code signing policy](../CODE_SIGNING_POLICY.md) defines provenance, approval,
+verification, and incident handling. The [privacy policy](../PRIVACY.md)
+describes current local data and user-triggered network behavior.
+
+On Windows, inspect a downloaded installer without launching it:
+
+```powershell
+Get-AuthenticodeSignature .\DS.Agent_1.1.0_x64-setup.exe |
+  Select-Object Status, StatusMessage, SignerCertificate, TimeStamperCertificate
+Get-FileHash .\DS.Agent_1.1.0_x64-setup.exe -Algorithm SHA256
+```
+
+For `v1.1.0`, `Status` is expected to be `NotSigned`. An unexpected signer,
+signature identity, hash, version, source, or asset mismatch is a stop
+condition. For a future release explicitly documented as signed, any status
+other than `Valid` is also a stop condition.
+
 At first run, choose one local workspace root. DS Agent uses that workspace for
 approved local file actions and maintains subdirectories for evidence, exports,
 reports, workflow runs, work packages, memory, logs, and future artifact types
 as needed. Ordinary users should not need to choose separate internal folders
 before starting their first chat task.
 
-The required first-run setup is intentionally small: configure
-`DEEPSEEK_API_KEY` and choose that one local workspace root. Live network search
-is optional. If a task needs current web information, configure one additional
-source-linked search route, such as a search-capable model/provider key or an
-available free web-search option.
+The required first-run setup is intentionally small: enter one user-supplied
+DeepSeek API Key, explicitly verify balance and availability of
+`deepseek-v4-flash` and `deepseek-v4-pro`, and choose one local workspace root.
+The Key is stored in a dedicated Windows DPAPI vault; readiness receipts do not
+contain the Key, provider response body, balance amount, account details, or an
+absolute vault path. An environment Key remains an explicit operator
+compatibility fallback and is never silently copied into the vault.
 
 The app stores this local directory choice in `local-directories.json` under
-the OS app data directory. The setup panel shows the exact app data and
-settings-file paths for the current machine.
+the OS app data directory. The ordinary setup projection shows a compact
+workspace display name and readiness state, not internal app-data, settings,
+managed-directory, or vault paths.
 
 Good first tasks to try:
 
@@ -110,27 +143,29 @@ strongest local gate before that publication decision:
 npx pnpm@9.15.9 test:release-local -- --require-live-deepseek --include-installed-workflow
 ```
 
-When a Windows DS Agent install already exists, the installed WebView2 UI can be
-smoke-tested locally:
+When a Windows DS Agent install already exists, its executable can be launched
+against a fresh isolated profile without reading or changing the user's normal
+DS Agent AppData:
 
 ```powershell
-npx pnpm@9.15.9 test:windows-installed-ui
+npx pnpm@9.15.9 test:windows-installed-ui -- --isolated-profile
 ```
 
-This launches the installed `ds-agent.exe` with a temporary WebView2 DevTools
-port, checks that the UI renders at `tauri.localhost`, verifies that the
-desktop command layer is available, and saves a screenshot under the OS temp
-directory. It is not run in GitHub CI.
+This creates independent temporary `APPDATA`, `LOCALAPPDATA`, WebView2,
+workspace, and report roots, checks that the UI renders at `tauri.localhost`,
+verifies the desktop command layer, and verifies cleanup after exit. It does not
+back up, read, or restore the user's normal DS Agent profile. It is not run in
+GitHub CI.
 
 For a fuller installed-app workflow check, run:
 
 ```powershell
-npx pnpm@9.15.9 test:windows-installed-ui -- --workflow
+npx pnpm@9.15.9 test:windows-installed-ui -- --isolated-profile --workflow
 ```
 
 The workflow smoke uses temporary local directories, seeds Operations Briefing
-templates, runs the briefing, exports Markdown/HTML/PDF reports, and restores
-the original local directory settings file and app-data event store. When
+templates, runs the briefing, exports Markdown/HTML/PDF reports, and verifies
+the isolated profile is removed after exit. When
 `DEEPSEEK_API_KEY` is configured, it also requires a newly recorded DeepSeek
 telemetry event from the installed app process.
 
@@ -139,22 +174,26 @@ needs verification on a macOS host.
 
 ## DeepSeek API Key
 
-DeepSeek model-backed Operations Briefing synthesis is enabled only when the
-selected large-model provider is DeepSeek and the desktop process can read a
-non-empty `DEEPSEEK_API_KEY` environment variable.
+DeepSeek model-backed work is enabled only after the Kernel readiness
+projection reports a verified user-supplied Key, available balance, and both
+required V4 models. Use the in-app onboarding screen to save, verify, replace,
+retry, or remove that Key. The ordinary UI never displays the stored value.
 
 See `.env.example` for local environment variable names. Do not commit `.env`
 files or API keys.
 
-For a persistent Windows user environment variable:
+For development/operator compatibility, an environment Key can be used instead
+of the local vault. It is not copied into the vault and still requires explicit
+verification. For a persistent Windows user environment variable:
 
 ```powershell
 [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "your-key-here", "User")
 ```
 
-Restart the desktop app after setting the variable. The runtime inspector only
-shows whether the key is configured; it never displays, stores, exports, or
-serializes the key value.
+Restart the desktop app after setting the variable, then run the in-app
+verification. The readiness projection shows only source, stable status codes,
+required model availability, and retry/repair actions; it never displays,
+stores, exports, or serializes the key value.
 
 To verify the local key without launching the app, run:
 
@@ -268,8 +307,9 @@ enabled and authorized in a future release.
 
 - If the app asks for setup again, verify that the app data directory is
   writable and that `local-directories.json` still exists.
-- If DeepSeek synthesis stays unavailable, restart the app after setting
-  `DEEPSEEK_API_KEY` and check the runtime inspector.
+- If DeepSeek stays unavailable, use onboarding or Settings to retry the
+  explicit Key check and follow the stable authentication, balance, network,
+  model, or credential-store repair message.
 - If web search is blocked, choose a free source-linked web-search option when
   prompted.
 - If screenshot or control fails, check OS permission notes in the Tool Route

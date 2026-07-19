@@ -63,6 +63,13 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
   setup behavior, and Operations Briefing scope.
 - If an unsigned installer is attached, disclose the unsigned status in the
   release notes and provide a SHA-256 checksum.
+- The immutable `v1.0.2` installer remains unsigned. `v1.1.0` is also an
+  explicitly disclosed unsigned exception: both the application executable and
+  NSIS installer must read back as `NotSigned`, and the Release must warn about
+  `Unknown publisher` and Microsoft Defender SmartScreen while binding the
+  HTTPS asset to its exact source, version, byte size, and SHA-256. A later
+  release must not be represented as signed unless both files satisfy
+  `CODE_SIGNING_POLICY.md` and independently verify as Authenticode `Valid`.
 
 ## Release Hygiene Artifacts
 
@@ -71,6 +78,13 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
 - `CONTRIBUTING.md` explains the `0.1.0` Windows-first preview policy.
 - `SECURITY.md` documents current security boundaries and private reporting
   expectations.
+- `PRIVACY.md` documents local data handling and every current category of
+  user-triggered network activity.
+- `CODE_SIGNING_POLICY.md` documents signing roles, manual approval,
+  source-to-binary provenance, two-stage application/installer signing, and
+  independent Authenticode verification. Until SignPath approval provides real
+  identifiers, CI must not contain guessed organization, project, policy, or
+  artifact slugs and the repository must not contain a signing token.
 - GitHub Private Vulnerability Reporting is enabled for sensitive security
   reports.
 - `.github/pull_request_template.md` keeps PRs scoped to existing preview work.
@@ -100,8 +114,9 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
   exports or packaged assets do not enter generated source archives.
 - `.env.example` documents local DeepSeek and optional local bridge environment
   variables without storing secret values.
-- `docs/RELEASE_NOTES_v1.0.2.md` is the current patch release note.
-  `docs/RELEASE_NOTES_v1.0.1.md`, `docs/RELEASE_NOTES_v1.0.0.md`, and
+- `docs/RELEASE_NOTES_v1.1.0.md` is the current stable release note.
+  `docs/RELEASE_NOTES_v1.0.2.md`, `docs/RELEASE_NOTES_v1.0.1.md`,
+  `docs/RELEASE_NOTES_v1.0.0.md`, and
   `docs/DS_AGENT_V1_COMPLETION_AUDIT.md` preserve the immutable first stable
   release evidence. Historical release notes, including `v0.9.0`, `v0.8.0`,
   and `v0.8.0-rc.1`, remain unchanged.

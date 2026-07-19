@@ -1,15 +1,17 @@
 # Security Policy
 
-DeepSeek Agent OS is an alpha local-first desktop project. The 0.1.0 preview is
-a source-first public preview and is not an official DeepSeek product. Security
+DS Agent is a local-first Windows desktop agent. DS Agent v1.1.0 is the current
+published stable release and is not an official DeepSeek product. Security
 reports are welcome, especially around local credentials, permission gates,
-audit records, Computer Use boundaries, and package import/export behavior.
+audit records, Computer Use boundaries, update integrity, code signing, and
+package import/export behavior.
 
 ## Supported Version
 
 | Version | Supported |
 | --- | --- |
-| 0.1.0 | Security reports accepted; no stability guarantee |
+| 1.1.0 | Supported |
+| 1.0.2 | Supported |
 
 ## Reporting A Vulnerability
 
@@ -28,8 +30,13 @@ Include:
 
 ## Security Boundaries
 
-- DeepSeek API keys are read from the local process environment and must not be
-  stored in events, UI state, logs, or exported work packages.
+- Current stable v1.1.0 stores one user-supplied DeepSeek API key in a dedicated
+  Windows DPAPI vault. A process-environment key is an explicit compatibility
+  fallback and is not copied into the vault. Presence alone is never treated as
+  verified readiness; balance and required V4 model checks produce only a
+  secret-free local receipt. Raw keys, provider bodies, account details, and
+  absolute vault paths must not be stored in events, retained UI state, logs,
+  screenshots, or exported work packages.
 - `pnpm test:secrets` scans tracked and unignored repository files for live
   `sk-` style keys and non-empty `DEEPSEEK_API_KEY` assignments without printing
   candidate values.
@@ -42,6 +49,11 @@ Include:
 - Web search evidence must preserve source URLs.
 - Import writes memories as reviewable candidates, not automatic long-term
   memory.
+- Release identity must follow the [code signing policy](CODE_SIGNING_POLICY.md).
+  An unsigned or invalidly signed artifact must not be represented as a signed
+  release. DS Agent v1.1.0 is explicitly disclosed as Authenticode `NotSigned`;
+  Windows may show `Unknown publisher` or a Microsoft Defender SmartScreen
+  warning. See also the [privacy policy](PRIVACY.md).
 
 ## Out Of Scope For Alpha
 
