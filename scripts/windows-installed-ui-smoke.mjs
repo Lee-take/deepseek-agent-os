@@ -324,6 +324,7 @@ function isolatedProfileEnvironment(baseEnv, profile, overrides = {}) {
     LOCALAPPDATA: profile.localAppDataDir,
     WEBVIEW2_USER_DATA_FOLDER: path.join(profile.localAppDataDir, "webview2"),
     DS_AGENT_UI_SMOKE_PROFILE_MODE: "isolated-clean",
+    DS_AGENT_UI_SMOKE_APP_DATA_DIR: profile.appDataDir,
   };
 }
 
@@ -501,7 +502,16 @@ async function runInstalledOnboardingSmoke(client, bodyText) {
     readiness?.deepseek?.chat_completion_ready !== false ||
     readiness?.workspace?.code !== "workspace_missing"
   ) {
-    throw new Error("Isolated onboarding projection was not a clean first-run state.");
+    const safeProjection = {
+      schema_version: readiness?.schema_version ?? null,
+      deepseek_source: readiness?.deepseek?.source ?? null,
+      deepseek_code: readiness?.deepseek?.code ?? null,
+      chat_completion_ready: readiness?.deepseek?.chat_completion_ready ?? null,
+      workspace_code: readiness?.workspace?.code ?? null,
+    };
+    throw new Error(
+      `Isolated onboarding projection was not a clean first-run state: ${JSON.stringify(safeProjection)}`,
+    );
   }
   if (
     /api_key|key_hash|fingerprint|account|currency|amount|total_balance|app_data|settings_file|vault|workspace_dir|evidence_dir|export_dir/i.test(
@@ -1834,9 +1844,10 @@ async function runSelfTest() {
   if (
     isolatedEnv.APPDATA !== isolatedProfileTest.appDataDir ||
     isolatedEnv.LOCALAPPDATA !== isolatedProfileTest.localAppDataDir ||
-    isolatedEnv.DS_AGENT_UI_SMOKE_PROFILE_MODE !== "isolated-clean"
+    isolatedEnv.DS_AGENT_UI_SMOKE_PROFILE_MODE !== "isolated-clean" ||
+    isolatedEnv.DS_AGENT_UI_SMOKE_APP_DATA_DIR !== isolatedProfileTest.appDataDir
   ) {
-    throw new Error("Self-test expected isolated APPDATA and LOCALAPPDATA overrides.");
+    throw new Error("Self-test expected isolated app-data and WebView profile overrides.");
   }
   assertSelfTestThrows(
     () =>

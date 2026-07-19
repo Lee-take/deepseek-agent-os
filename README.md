@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Lee-take/dsagent/releases/tag/v1.0.2">v1.0.2 stable</a> ·
-  <a href="https://github.com/Lee-take/dsagent/releases/download/v1.0.2/DS.Agent_1.0.2_x64-setup.exe">Download for Windows</a> ·
+  <a href="https://github.com/Lee-take/dsagent/releases/tag/v1.1.0">v1.1.0 stable</a> ·
+  <a href="https://github.com/Lee-take/dsagent/releases/download/v1.1.0/DS.Agent_1.1.0_x64-setup.exe">Download for Windows</a> ·
   <a href="LICENSE">Apache-2.0</a>
 </p>
 
@@ -155,7 +155,7 @@ high-risk action. See the full [model boundary](docs/AGENT_MODEL_BOUNDARY.md).
   reconciliation contracts validated with offline adversarial fake providers.
 
 Production Microsoft/Google account registration and live external-write
-authority remain disabled in v1.0.2. The release does not sign in to real
+authority remain disabled in v1.1.0. The release does not sign in to real
 accounts, send real email, or create, change, or cancel real calendar events.
 
 ## Why Rust
@@ -168,9 +168,11 @@ remain thin; the Kernel and persistent projections own business state.
 
 ## Quick start
 
-1. Download the [Windows x64 installer](https://github.com/Lee-take/dsagent/releases/download/v1.0.2/DS.Agent_1.0.2_x64-setup.exe).
-2. Make your own valid `DEEPSEEK_API_KEY` available to the DS Agent process.
-3. Choose one local workspace on first run.
+1. Download the [Windows x64 installer](https://github.com/Lee-take/dsagent/releases/download/v1.1.0/DS.Agent_1.1.0_x64-setup.exe).
+2. Enter your own valid DeepSeek API key in onboarding and run the explicit
+   balance/model verification. The key is stored locally with Windows DPAPI.
+3. Choose one local workspace and let the readiness doctor verify its managed
+   directories and writability.
 4. Describe the result you want in chat. DS Agent requests additional
    permissions or prerequisites only when the task needs them.
 
@@ -178,9 +180,21 @@ A user-supplied DeepSeek API key is a required prerequisite. DS Agent does not
 bundle a shared key or bypass DeepSeek access requirements; use remains subject
 to DeepSeek's terms and account policies.
 
-The v1.0.2 installer is currently unsigned, so Windows may display an
-unknown-publisher warning. Read the [installation guide](docs/INSTALLATION.md)
-before installing.
+The v1.1.0 application executable and installer are Authenticode `NotSigned`.
+Windows may display `Unknown publisher` or a Microsoft Defender SmartScreen
+warning. Download only over HTTPS from this repository, verify the SHA-256 in
+the GitHub Release, and read the [installation guide](docs/INSTALLATION.md)
+before running the installer.
+
+## Code signing policy
+
+DS Agent `v1.1.0` is intentionally unsigned. The SignPath Foundation application
+is submitted and approval is pending; no release is represented as signed.
+If the project is accepted, signing starts with a later new version and does not
+replace this immutable tag or asset. For releases accepted into the program:
+**Free code signing provided by SignPath.io, certificate by SignPath
+Foundation.** See the full [code signing policy](CODE_SIGNING_POLICY.md) and
+[privacy policy](PRIVACY.md).
 
 ### Build from source
 
@@ -195,24 +209,26 @@ example `D:\build-target\ds-agent-v1-release`.
 
 ## Stable release
 
-- Release: [DS Agent v1.0.2](https://github.com/Lee-take/dsagent/releases/tag/v1.0.2)
-- Installer: `DS.Agent_1.0.2_x64-setup.exe`
-- Size: `12,716,857 bytes`
-- SHA-256: `469C4EFA54F4C94A6E37D28C9C88D331B26E1770C6792DC93D02B451640E2A6F`
-- Fix: approvals now stay with their owning task, and one task with several
-  permissions needs only one confirm-or-reject decision.
-- Validation: source secret scan, production frontend build, Node/UI checks,
-  and 852 Rust tests with 845 passed, seven permission-gated live/GUI tests
-  intentionally ignored, and zero failed.
+- Release: [DS Agent v1.1.0](https://github.com/Lee-take/dsagent/releases/tag/v1.1.0)
+- Installer: `DS.Agent_1.1.0_x64-setup.exe`
+- Integrity: verify the final byte size and SHA-256 published in the GitHub
+  Release before running the installer.
+- Onboarding: one user-supplied Key, Windows DPAPI storage, explicit DeepSeek
+  balance/V4 model verification, secret-free readiness, and workspace doctor.
+- Compatibility: existing workspace settings remain readable; environment-key
+  operators require explicit verification; conversations and connector vaults
+  are not rewritten.
 
 ## Documentation
 
 - [Installation](docs/INSTALLATION.md)
 - [DS Agent and DeepSeek boundary](docs/AGENT_MODEL_BOUNDARY.md)
 - [v1 architecture](docs/architecture/DS_AGENT_V1_ARCHITECTURE_PLAN.md)
-- [v1.0.2 release notes](docs/RELEASE_NOTES_v1.0.2.md)
+- [v1.1.0 release notes](docs/RELEASE_NOTES_v1.1.0.md)
 - [v1 completion audit](docs/DS_AGENT_V1_COMPLETION_AUDIT.md)
-- [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [License](LICENSE)
+- [Security](SECURITY.md) · [Privacy](PRIVACY.md) ·
+  [Code signing policy](CODE_SIGNING_POLICY.md) ·
+  [Contributing](CONTRIBUTING.md) · [License](LICENSE)
 
 DS Agent is an independent open-source project. It is not an official DeepSeek
 product and does not claim DeepSeek ownership, authorization, or endorsement.

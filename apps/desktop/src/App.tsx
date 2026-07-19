@@ -222,7 +222,7 @@ const fallbackOnboardingReadiness: OnboardingReadinessProjection = {
     message_key: "onboarding.workspace.workspace_missing",
   },
   version: {
-    current_version: "1.0.2",
+    current_version: "1.1.0",
     status: "current",
     blocking: false,
     message_key: "onboarding.version.current",

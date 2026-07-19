@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-const expectedVersion = "1.0.2";
+const expectedVersion = "1.1.0";
 const maxSourceFileBytes = 2 * 1024 * 1024;
 const binaryReleaseExtensions = new Set([
   ".appimage",
@@ -49,7 +49,10 @@ const allowedSourceBinaryFiles = new Set([
 const requiredDocs = [
   "README.md",
   "README.zh-CN.md",
+  "CODE_SIGNING_POLICY.md",
+  "PRIVACY.md",
   "docs/INSTALLATION.md",
+  "docs/RELEASE_NOTES_v1.1.0.md",
   "docs/RELEASE_NOTES_v1.0.2.md",
   "docs/RELEASE_NOTES_v1.0.1.md",
   "docs/RELEASE_NOTES_v1.0.0.md",
@@ -74,6 +77,8 @@ const publicReleaseCopyFiles = [
   ".github/ISSUE_TEMPLATE/deepseek_compatibility.yml",
   ".github/pull_request_template.md",
   "CONTRIBUTING.md",
+  "CODE_SIGNING_POLICY.md",
+  "PRIVACY.md",
   "README.md",
   "README.zh-CN.md",
   "SECURITY.md",
@@ -81,6 +86,7 @@ const publicReleaseCopyFiles = [
   "apps/desktop/package.json",
   "docs/INSTALLATION.md",
   "docs/OPEN_SOURCE_RELEASE.md",
+  "docs/RELEASE_NOTES_v1.1.0.md",
   "docs/RELEASE_NOTES_v1.0.2.md",
   "docs/RELEASE_NOTES_v1.0.1.md",
   "docs/RELEASE_NOTES_v1.0.0.md",
@@ -344,6 +350,8 @@ const requiredGovernanceDocs = [
   "LICENSE",
   "SECURITY.md",
   "CONTRIBUTING.md",
+  "CODE_SIGNING_POLICY.md",
+  "PRIVACY.md",
   "docs/OPEN_SOURCE_RELEASE.md",
 ];
 const requiredGitHubHygieneFiles = [
@@ -498,6 +506,7 @@ checkLocalReleaseHelperSelfTests();
 checkStepOneOnboardingReadinessContract();
 checkPackageManagerBaseline();
 checkGovernanceDocs();
+checkCodeSigningAndPrivacyPolicies();
 checkContributingPolicyStatus();
 checkOpenSourceReleaseStatus();
 checkEnvironmentHygiene();
@@ -715,7 +724,7 @@ function checkRequiredDocs() {
   for (const [phrase, label] of [
     ["One Kernel. Modular capabilities. Verifiable execution.", "English README product promise"],
     ["DS Agent is a local Agent Harness optimized for DeepSeek", "English README DeepSeek-first positioning"],
-    ["v1.0.2 stable", "English README formal stable status"],
+    ["v1.1.0 stable", "English README formal stable status"],
     ["The key difference is that Memory, Automation, Computer Use, parallel Subagents, and Skills are not isolated plugins", "English README unified Kernel thesis"],
     ["contract-first modular Harness architecture", "English README modular architecture"],
     ["Five core capabilities, one engineering philosophy", "English README five-capability framing"],
@@ -727,7 +736,7 @@ function checkRequiredDocs() {
     ["goal → done-when contract → context → plan → permission → execution → evidence → verification → recovery", "English README Loop Engineering contract"],
     ["DeepSeek and DS Agent boundary", "English README model boundary"],
     ["Why Rust", "English README Rust rationale"],
-    ["Production Microsoft/Google account registration and live external-write authority remain disabled in v1.0.2", "English README connector authority boundary"],
+    ["Production Microsoft/Google account registration and live external-write authority remain disabled in v1.1.0", "English README connector authority boundary"],
     ["README.zh-CN.md", "English README language switch"],
     ["Search aliases: DS Agent, DSAgent, dsagent, DeepSeek Agent OS.", "English README searchable aliases"],
   ]) {
@@ -736,7 +745,7 @@ function checkRequiredDocs() {
   for (const [phrase, label] of [
     ["一个 Kernel，模块化能力，统一可信执行。", "Chinese README product promise"],
     ["DS Agent 是专门为 DeepSeek 优化的本地 Agent Harness", "Chinese README DeepSeek-first positioning"],
-    ["v1.0.2 正式稳定版", "Chinese README formal stable status"],
+    ["v1.1.0 正式稳定版", "Chinese README formal stable status"],
     ["真正的差异点是：记忆、自动化执行、Computer Use、Subagent 并行协作和技能", "Chinese README unified Kernel thesis"],
     ["契约优先的模块化 Harness 架构", "Chinese README modular architecture"],
     ["五项核心能力，一套工程理念", "Chinese README five-capability framing"],
@@ -748,7 +757,7 @@ function checkRequiredDocs() {
     ["目标 → 完成条件 → 上下文 → 规划 → 权限 → 执行 → 证据 → 验证 → 恢复", "Chinese README Loop Engineering contract"],
     ["DeepSeek 与 DS Agent 的工作边界", "Chinese README model boundary"],
     ["为什么使用 Rust", "Chinese README Rust rationale"],
-    ["v1.0.2 仍未开放生产 Microsoft/Google 账号注册和真实外部写入权限", "Chinese README connector authority boundary"],
+    ["v1.1.0 仍未开放生产 Microsoft/Google 账号注册和真实外部写入权限", "Chinese README connector authority boundary"],
     ["README.md", "Chinese README language switch"],
     ["中文搜索别名：DS Agent、DSAgent、dsagent、DeepSeek Agent OS。", "Chinese README searchable aliases"],
   ]) {
@@ -1596,20 +1605,44 @@ function checkPublicReleaseCopyPositioning() {
   checkTextIncludes(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
-    'APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/1.0.2"',
-    "app updater User-Agent v1.0.2",
+    'APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/1.1.0"',
+    "app updater User-Agent v1.1.0",
   );
   checkTextIncludes(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
-    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v1.0.2"',
-    "app updater current release tag v1.0.2",
+    'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v1.1.0"',
+    "app updater current release tag v1.1.0",
   );
   checkTextDoesNotInclude(
     "apps/desktop/src-tauri/src/kernel/app_update.rs",
     readText("apps/desktop/src-tauri/src/kernel/app_update.rs"),
     'APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v0.9.0"',
     "app updater current release tag must not regress to v0.9.0",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v1.1.0.md",
+    readText("docs/RELEASE_NOTES_v1.1.0.md"),
+    "Package, desktop, Tauri, Cargo, updater, and installer metadata are `1.1.0` / `v1.1.0`.",
+    "v1.1.0 stable release notes version identity",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v1.1.0.md",
+    readText("docs/RELEASE_NOTES_v1.1.0.md"),
+    "both `ds-agent.exe` and",
+    "v1.1.0 application unsigned disclosure",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v1.1.0.md",
+    readText("docs/RELEASE_NOTES_v1.1.0.md"),
+    "`DS.Agent_1.1.0_x64-setup.exe` are intentionally Authenticode `NotSigned`",
+    "v1.1.0 installer unsigned disclosure",
+  );
+  checkTextIncludesCollapsed(
+    "docs/RELEASE_NOTES_v1.1.0.md",
+    readText("docs/RELEASE_NOTES_v1.1.0.md"),
+    "The cancelled formal 20-run Windows lab was not performed and is not claimed as release evidence.",
+    "v1.1.0 no false formal-lab claim",
   );
   checkTextIncludesCollapsed(
     "docs/RELEASE_NOTES_v1.0.2.md",
@@ -2562,8 +2595,8 @@ function checkReleaseGateDocs() {
     checkTextIncludesCollapsed(
       docPath,
       content,
-      "restores the original local directory settings file and app-data event store",
-      `${docPath} installed workflow restore docs`,
+      "verifies the isolated profile is removed after exit",
+      `${docPath} installed workflow isolated cleanup docs`,
     );
     checkTextIncludesCollapsed(
       docPath,
@@ -2604,7 +2637,7 @@ function checkReleaseGateDocs() {
     checkTextIncludes(
       docPath,
       content,
-      "npx pnpm@9.15.9 test:windows-installed-ui -- --workflow",
+      "npx pnpm@9.15.9 test:windows-installed-ui -- --isolated-profile --workflow",
       `${docPath} direct installed workflow command docs`,
     );
     checkTextIncludesCollapsed(
@@ -2622,7 +2655,7 @@ function checkReleaseGateDocs() {
     checkTextIncludesCollapsed(
       docPath,
       content,
-      "desktop command layer is available",
+      "verifies the desktop command layer",
       `${docPath} installed UI command-layer smoke docs`,
     );
 
@@ -3353,17 +3386,11 @@ function checkGovernanceDocs() {
   );
 
   const securityPolicy = readText("SECURITY.md");
-  checkTextIncludes(
+  checkTextIncludesCollapsed(
     "SECURITY.md",
     securityPolicy,
-    "0.1.0 preview",
-    "SECURITY.md current preview scope",
-  );
-  checkTextIncludes(
-    "SECURITY.md",
-    securityPolicy,
-    "source-first public preview",
-    "SECURITY.md source-first public preview scope",
+    "DS Agent v1.1.0 is the current published stable release",
+    "SECURITY.md current stable scope",
   );
   checkTextIncludes(
     "SECURITY.md",
@@ -3388,6 +3415,18 @@ function checkGovernanceDocs() {
     securityPolicy,
     "Computer Use remains experimental and high-risk",
     "SECURITY.md Computer Use high-risk status",
+  );
+  checkTextIncludesCollapsed(
+    "SECURITY.md",
+    securityPolicy,
+    "Current stable v1.1.0 stores one user-supplied DeepSeek API key in a dedicated Windows DPAPI vault",
+    "SECURITY.md current stable credential boundary",
+  );
+  checkTextIncludesCollapsed(
+    "SECURITY.md",
+    securityPolicy,
+    "A process-environment key is an explicit compatibility fallback and is not copied into the vault",
+    "SECURITY.md environment-key compatibility boundary",
   );
   const collapsedSecurityPolicy = securityPolicy.replace(/\s+/g, " ").trim();
   for (const phrase of [
@@ -3429,6 +3468,74 @@ function checkGovernanceDocs() {
     "DS Agent does not install, launch, or supervise local bridge services",
     "SECURITY.md user-managed local bridge service boundary",
   );
+}
+
+function checkCodeSigningAndPrivacyPolicies() {
+  const signingPolicy = readText("CODE_SIGNING_POLICY.md");
+  const privacyPolicy = readText("PRIVACY.md");
+  const readme = readText("README.md");
+  const readmeZh = readText("README.zh-CN.md");
+  const installation = readText("docs/INSTALLATION.md");
+  const openSourceRelease = readText("docs/OPEN_SOURCE_RELEASE.md");
+
+  for (const [phrase, label] of [
+    ["# Code signing policy", "code-signing policy title"],
+    ["DS Agent `v1.1.0` is intentionally published unsigned", "code-signing current unsigned status"],
+    ["The SignPath Foundation application is submitted and approval is pending", "code-signing pending application status"],
+    ["Free code signing provided by", "SignPath acknowledgement"],
+    ["certificate by", "SignPath certificate acknowledgement"],
+    ["Authors and committers", "code-signing author role"],
+    ["Reviewers for outside contributions", "code-signing reviewer role"],
+    ["Signing approver", "code-signing approver role"],
+    ["Every signing request requires a manual decision", "manual signing approval"],
+    ["GitHub-hosted Windows runner", "origin-verifiable hosted build"],
+    ["sign `ds-agent.exe` before it is packaged into NSIS", "application-before-installer signing order"],
+    ["separately sign the resulting NSIS installer", "installer signing stage"],
+    ["Private keys and signing API tokens must never be committed", "signing secret exclusion"],
+    ["guessed or placeholder identifiers are forbidden", "signing placeholder exclusion"],
+    ["Authenticode `Valid`", "Authenticode validity gate"],
+    ["not designed to discover or exploit vulnerabilities", "non-hacking project purpose"],
+    ["PRIVACY.md", "code-signing privacy link"],
+  ]) {
+    checkTextIncludesCollapsed("CODE_SIGNING_POLICY.md", signingPolicy, phrase, label);
+  }
+
+  for (const [phrase, label] of [
+    ["# Privacy Policy", "privacy policy title"],
+    ["does not operate a project cloud backend, advertising service, or project analytics or telemetry service", "no project telemetry service"],
+    ["The current stable `v1.1.0` accepts one user-supplied DeepSeek API key", "privacy current credential behavior"],
+    ["dedicated Windows DPAPI-protected local vault", "privacy DPAPI storage boundary"],
+    ["https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html", "DeepSeek privacy disclosure"],
+    ["DuckDuckGo's privacy policy", "web-search privacy disclosure"],
+    ["https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement", "GitHub privacy disclosure"],
+    ["Hugging Face", "skill-source privacy disclosure"],
+    ["WebView2 data and privacy documentation", "WebView2 privacy disclosure"],
+    ["accepts only loopback addresses", "local bridge privacy boundary"],
+    ["Production Microsoft and Google account registration and live mail/calendar writes are disabled in `v1.1.0`", "disabled connector privacy boundary"],
+    ["not uploaded merely because the application is open", "no passive content upload"],
+  ]) {
+    checkTextIncludesCollapsed("PRIVACY.md", privacyPolicy, phrase, label);
+  }
+
+  for (const [filePath, content] of [["README.md", readme], ["README.zh-CN.md", readmeZh]]) {
+    checkTextIncludes(filePath, content, "CODE_SIGNING_POLICY.md", `${filePath} code-signing link`);
+    checkTextIncludes(filePath, content, "PRIVACY.md", `${filePath} privacy link`);
+    checkTextIncludesCollapsed(filePath, content, "Free code signing provided by SignPath.io, certificate by SignPath Foundation", `${filePath} SignPath acknowledgement`);
+    checkTextIncludes(filePath, content, "NotSigned", `${filePath} unsigned Authenticode disclosure`);
+    checkTextIncludes(filePath, content, "Unknown publisher", `${filePath} unknown-publisher warning`);
+    checkTextIncludes(filePath, content, "SmartScreen", `${filePath} SmartScreen warning`);
+    checkTextIncludes(filePath, content, "docs/RELEASE_NOTES_v1.1.0.md", `${filePath} v1.1.0 release-notes link`);
+    checkTextDoesNotInclude(filePath, content, "12,716,857 bytes", `${filePath} no stale v1.0.1 asset size`);
+    checkTextDoesNotInclude(filePath, content, "469C4EFA54F4C94A6E37D28C9C88D331B26E1770C6792DC93D02B451640E2A6F", `${filePath} no stale v1.0.1 asset SHA-256`);
+  }
+
+  checkTextIncludesCollapsed("docs/INSTALLATION.md", installation, "## Code signing policy and verification", "installation code-signing section");
+  checkTextIncludes("docs/INSTALLATION.md", installation, "Get-AuthenticodeSignature", "installation Authenticode readback command");
+  checkTextIncludesCollapsed("docs/INSTALLATION.md", installation, "Both `ds-agent.exe` and the installer are Authenticode `NotSigned`", "installation dual-artifact unsigned disclosure");
+  checkTextIncludes("docs/INSTALLATION.md", installation, "SmartScreen", "installation SmartScreen warning");
+  checkTextIncludes("docs/OPEN_SOURCE_RELEASE.md", openSourceRelease, "CODE_SIGNING_POLICY.md", "open-source release code-signing policy");
+  checkTextIncludes("docs/OPEN_SOURCE_RELEASE.md", openSourceRelease, "PRIVACY.md", "open-source release privacy policy");
+  checkTextIncludesCollapsed("docs/OPEN_SOURCE_RELEASE.md", openSourceRelease, "must not contain a signing token", "open-source release no signing secret policy");
 }
 
 function checkContributingPolicyStatus() {
@@ -4116,7 +4223,7 @@ function checkSmokeScriptReleaseLabels() {
   const rustRuntimeExpectations = [
     [
       "apps/desktop/src-tauri/src/kernel/deepseek.rs",
-      "DS-Agent/1.0.2 deepseek-v4",
+      "DS-Agent/1.1.0 deepseek-v4",
       "DeepSeek runtime User-Agent release label",
     ],
     [
@@ -4442,6 +4549,7 @@ function checkStepOneOnboardingReadinessContract() {
     "verifyIsolatedProfileRoot",
     "APPDATA: profile.appDataDir",
     "LOCALAPPDATA: profile.localAppDataDir",
+    "DS_AGENT_UI_SMOKE_APP_DATA_DIR: profile.appDataDir",
     "removeIsolatedProfile",
     "verifyIsolatedLocalFilePath",
     "runInstalledOnboardingSmoke",
@@ -4453,6 +4561,39 @@ function checkStepOneOnboardingReadinessContract() {
       `installed UI smoke includes ${required}`,
     );
   }
+
+  const appPaths = readText("apps/desktop/src-tauri/src/app_paths.rs");
+  for (const required of [
+    "DS_AGENT_UI_SMOKE_PROFILE_MODE",
+    "DS_AGENT_UI_SMOKE_APP_DATA_DIR",
+    "std::env::temp_dir()",
+    "isolated app-data override escaped the verified temp profile",
+  ]) {
+    checkTextIncludes(
+      "apps/desktop/src-tauri/src/app_paths.rs",
+      appPaths,
+      required,
+      `isolated app-data resolver includes ${required}`,
+    );
+  }
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/main.rs",
+    readText("apps/desktop/src-tauri/src/main.rs"),
+    "resolve_app_data_dir(app.handle())",
+    "desktop startup uses the isolated app-data resolver",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/commands.rs",
+    readText("apps/desktop/src-tauri/src/commands.rs"),
+    "resolved_app_data_dir()",
+    "desktop commands use the isolated app-data resolver",
+  );
+  checkTextDoesNotInclude(
+    "apps/desktop/src-tauri/src/commands.rs",
+    readText("apps/desktop/src-tauri/src/commands.rs"),
+    ".app_data_dir()",
+    "desktop commands do not bypass the isolated app-data resolver",
+  );
 
   const publicTypes = readText("apps/desktop/src/types.ts");
   const projectionStart = publicTypes.indexOf("export type DeepSeekReadinessProjection");
