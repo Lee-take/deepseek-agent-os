@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Lee-take/dsagent/releases/tag/v1.2.0">v1.2.0 stable</a> ·
-  <a href="https://github.com/Lee-take/dsagent/releases/download/v1.2.0/DS.Agent_1.2.0_x64-setup.exe">Download for Windows</a> ·
+  <a href="https://github.com/Lee-take/dsagent/releases/tag/v1.3.0">v1.3.0 stable</a> ·
+  <a href="https://github.com/Lee-take/dsagent/releases/download/v1.3.0/DS.Agent_1.3.0_x64-setup.exe">Download for Windows</a> ·
   <a href="LICENSE">Apache-2.0</a>
 </p>
 
@@ -132,10 +132,13 @@ does not claim completion from model confidence alone. Local files, browser
 actions, Office artifacts, and Computer Use are complete only when observable
 evidence satisfies the task's completion criteria.
 
-In v1.2.0, DeepSeek may propose a bounded `GoalEnvelope`, but only the local
-Kernel can validate and freeze it. The chat UI shows a read-only projection;
-completion remains blocked until locally authoritative verifier evidence covers
-every frozen `done_when` condition and required artifact identity.
+In v1.3.0, DeepSeek may propose a bounded `GoalEnvelope`, but only the local
+Kernel can validate and freeze it. For the same queued task, the Kernel alone
+derives the capability manifest, risk, and preview shown in one exact-task
+authorization card. Approval creates only exact authority; it does not execute
+a Tool, resume the task, or mark the Goal complete. Completion remains blocked
+until locally authoritative verifier evidence covers every frozen `done_when`
+condition and required artifact identity.
 
 ## DeepSeek and DS Agent boundary
 
@@ -160,7 +163,7 @@ high-risk action. See the full [model boundary](docs/AGENT_MODEL_BOUNDARY.md).
   reconciliation contracts validated with offline adversarial fake providers.
 
 Production Microsoft/Google account registration and live external-write
-authority remain disabled in v1.2.0. The release does not sign in to real
+authority remain disabled in v1.3.0. The release does not sign in to real
 accounts, send real email, or create, change, or cancel real calendar events.
 
 ## Why Rust
@@ -173,7 +176,7 @@ remain thin; the Kernel and persistent projections own business state.
 
 ## Quick start
 
-1. Download the [Windows x64 installer](https://github.com/Lee-take/dsagent/releases/download/v1.2.0/DS.Agent_1.2.0_x64-setup.exe).
+1. Download the [Windows x64 installer](https://github.com/Lee-take/dsagent/releases/download/v1.3.0/DS.Agent_1.3.0_x64-setup.exe).
 2. Enter your own valid DeepSeek API key in onboarding and run the explicit
    balance/model verification. The key is stored locally with Windows DPAPI.
 3. Choose one local workspace and let the readiness doctor verify its managed
@@ -185,7 +188,7 @@ A user-supplied DeepSeek API key is a required prerequisite. DS Agent does not
 bundle a shared key or bypass DeepSeek access requirements; use remains subject
 to DeepSeek's terms and account policies.
 
-The v1.2.0 application executable and installer are Authenticode `NotSigned`.
+The v1.3.0 application executable and installer are Authenticode `NotSigned`.
 Windows may display `Unknown publisher` or a Microsoft Defender SmartScreen
 warning. Download only over HTTPS from this repository, verify the SHA-256 in
 the GitHub Release, and read the [installation guide](docs/INSTALLATION.md)
@@ -193,10 +196,10 @@ before running the installer.
 
 ## Code signing policy
 
-DS Agent `v1.2.0` is intentionally unsigned. The SignPath Foundation application
+DS Agent `v1.3.0` is intentionally unsigned. The SignPath Foundation application
 is submitted and approval is pending; no release is represented as signed.
 If the project is accepted, signing starts with a later new version and does not
-replace the immutable v1.1.0 or v1.2.0 tag or asset. For releases accepted into the program:
+replace the immutable v1.1.0, v1.2.0, or v1.3.0 tag or asset. For releases accepted into the program:
 **Free code signing provided by SignPath.io, certificate by SignPath
 Foundation.** See the full [code signing policy](CODE_SIGNING_POLICY.md) and
 [privacy policy](PRIVACY.md).
@@ -214,8 +217,8 @@ example `D:\build-target\ds-agent-v1-release`.
 
 ## Stable release
 
-- Release: [DS Agent v1.2.0](https://github.com/Lee-take/dsagent/releases/tag/v1.2.0)
-- Installer: `DS.Agent_1.2.0_x64-setup.exe`
+- Release: [DS Agent v1.3.0](https://github.com/Lee-take/dsagent/releases/tag/v1.3.0)
+- Installer: `DS.Agent_1.3.0_x64-setup.exe`
 - Integrity: verify the final byte size and SHA-256 published in the GitHub
   Release before running the installer.
 - Onboarding: one user-supplied Key, Windows DPAPI storage, explicit DeepSeek
@@ -226,12 +229,16 @@ example `D:\build-target\ds-agent-v1-release`.
 - Goal contract: bounded model proposal, Kernel validation/freeze, read-only UI
   state, and fail-closed evidence coverage for every completion condition and
   required artifact.
+- Task authorization: one Kernel-derived exact-task card with manifest/risk/
+  preview binding, one user decision, per-capability audit, and exact revocation;
+  approval does not execute or resume the task.
 
 ## Documentation
 
 - [Installation](docs/INSTALLATION.md)
 - [DS Agent and DeepSeek boundary](docs/AGENT_MODEL_BOUNDARY.md)
 - [v1 architecture](docs/architecture/DS_AGENT_V1_ARCHITECTURE_PLAN.md)
+- [v1.3.0 release notes](docs/RELEASE_NOTES_v1.3.0.md)
 - [v1.2.0 release notes](docs/RELEASE_NOTES_v1.2.0.md)
 - [v1.1.0 release notes](docs/RELEASE_NOTES_v1.1.0.md)
 - [v1 completion audit](docs/DS_AGENT_V1_COMPLETION_AUDIT.md)

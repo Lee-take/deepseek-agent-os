@@ -1,3 +1,9 @@
+!macro NSIS_HOOK_PREINSTALL
+  ; Do not embed source-file mtimes in the NSIS data block. The application PE
+  ; and checked-in resources are content-bound; timestamps are not identity.
+  SetDateSave off
+!macroend
+
 !macro NSIS_HOOK_POSTINSTALL
   !if "${STARTMENUFOLDER}" != ""
     Delete "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"

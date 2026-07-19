@@ -1,6 +1,6 @@
 # Security Policy
 
-DS Agent is a local-first Windows desktop agent. DS Agent v1.2.0 is the current
+DS Agent is a local-first Windows desktop agent. DS Agent v1.3.0 is the current
 published stable release and is not an official DeepSeek product. Security
 reports are welcome, especially around local credentials, permission gates,
 audit records, Computer Use boundaries, update integrity, code signing, and
@@ -10,6 +10,7 @@ package import/export behavior.
 
 | Version | Supported |
 | --- | --- |
+| 1.3.0 | Supported |
 | 1.2.0 | Supported |
 | 1.1.0 | Supported |
 | 1.0.2 | Supported |
@@ -31,7 +32,7 @@ Include:
 
 ## Security Boundaries
 
-- Current stable v1.2.0 stores one user-supplied DeepSeek API key in a dedicated
+- Current stable v1.3.0 stores one user-supplied DeepSeek API key in a dedicated
   Windows DPAPI vault. A process-environment key is an explicit compatibility
   fallback and is not copied into the vault. Presence alone is never treated as
   verified readiness; balance and required V4 model checks produce only a
@@ -43,6 +44,12 @@ Include:
   text, frontend state, approval state, or artifact existence cannot directly
   mark a goal complete; stale, unknown, failed, duplicate, mismatched, or
   incomplete evidence fails closed.
+- A model-returned capability proposal is descriptive only. The Kernel binds it
+  to the exact frozen task/Goal, derives the manifest/risk/preview, and persists
+  one grouped authorization. Approval/rejection/revocation bind the exact task,
+  group, projection, manifest, preview, revision, fingerprint, hash, scopes,
+  targets, and expiry. Approval grants only exact authority; it does not execute
+  a Tool, resume a task, or mark a Goal complete.
 - `pnpm test:secrets` scans tracked and unignored repository files for live
   `sk-` style keys and non-empty `DEEPSEEK_API_KEY` assignments without printing
   candidate values.
@@ -57,7 +64,7 @@ Include:
   memory.
 - Release identity must follow the [code signing policy](CODE_SIGNING_POLICY.md).
   An unsigned or invalidly signed artifact must not be represented as a signed
-  release. DS Agent v1.2.0 is explicitly disclosed as Authenticode `NotSigned`;
+  release. DS Agent v1.3.0 is explicitly disclosed as Authenticode `NotSigned`;
   Windows may show `Unknown publisher` or a Microsoft Defender SmartScreen
   warning. See also the [privacy policy](PRIVACY.md).
 

@@ -14,7 +14,7 @@ User-selected workspaces hold approved evidence, exports, reports, work
 packages, screenshots, and other artifacts. This information is not silently
 synced to a DS Agent-operated server.
 
-The current stable `v1.2.0` accepts one user-supplied DeepSeek API key through
+The current stable `v1.3.0` accepts one user-supplied DeepSeek API key through
 the onboarding screen and stores it in a dedicated Windows DPAPI-protected
 local vault. A process-environment key remains an explicit compatibility
 fallback and is never silently copied into that vault. The project does not
@@ -22,11 +22,14 @@ provide a shared key. The raw key exists in frontend memory only while it is
 being entered and submitted; it must not be retained in UI state, events, logs,
 exports, screenshots, work packages, or verification receipts.
 
-Goal contracts, lifecycle events, and UI projections are bounded and designed
+Goal contracts, exact-task grouped authorizations, lifecycle events, and UI
+projections are bounded and designed
 to exclude raw secrets, provider bodies, absolute app-data or vault paths,
 local authority material, and internal claim tokens. The read-only UI receives
 stable status/reason codes, bounded goal text, revision/fingerprint values, and
-coverage counts; it does not receive a local completion writer.
+coverage counts plus a redacted authorization intent; it does not receive the
+private capability proposal, a preparation/compiler command, or a local
+completion writer.
 
 Uninstalling the application may not delete a user-selected workspace or every
 application-data file. Review and remove those local locations separately when
@@ -64,7 +67,7 @@ the user or person operating the application:
 The optional local desktop bridge accepts only loopback addresses and is
 started and controlled by the user. DS Agent does not install or supervise that
 service. Production Microsoft and Google account registration and live
-mail/calendar writes are disabled in `v1.2.0`; offline connector contracts do
+mail/calendar writes are disabled in `v1.3.0`; offline connector contracts do
 not authorize a production account or external write.
 
 ## What can be included in a model request

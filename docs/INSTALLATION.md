@@ -9,14 +9,14 @@ project does not depend on the maintainer's local directories.
 The published Windows release provides a normal NSIS setup executable:
 
 ```text
-DS.Agent_1.2.0_x64-setup.exe
+DS.Agent_1.3.0_x64-setup.exe
 ```
 
-Version `1.2.0` is the current published stable release. Earlier commits, tags,
+Version `1.3.0` is the current published stable release. Earlier commits, tags,
 Releases, and assets remain immutable. Both `ds-agent.exe` and the installer are
 Authenticode `NotSigned`, so Windows may show `Unknown publisher` or a Microsoft
 Defender SmartScreen warning. Download only over HTTPS from the official GitHub
-Release and verify its byte size and SHA-256 against the `v1.2.0` Release before
+Release and verify its byte size and SHA-256 against the `v1.3.0` Release before
 running it. The installer
 embeds the Microsoft WebView2 bootstrapper and runs it silently when the target
 machine needs the WebView2 runtime; users do not need Node.js, pnpm, Rust, or a
@@ -27,12 +27,12 @@ not the workspace, evidence folder, export folder, or event database location.
 
 ## Code signing policy and verification
 
-DS Agent `v1.2.0` is intentionally unsigned. Its HTTPS source, immutable tag,
+DS Agent `v1.3.0` is intentionally unsigned. Its HTTPS source, immutable tag,
 exact byte size, and SHA-256 are the verification route for this asset. The
 SignPath Foundation application is submitted and approval is pending; no
-publisher, certificate, or signed status is claimed for v1.2.0. If signing is
+publisher, certificate, or signed status is claimed for v1.3.0. If signing is
 approved later, it starts with a new version and does not replace this tag or
-asset or any immutable v1.1.0 publication.
+asset or any immutable v1.1.0 or v1.2.0 publication.
 
 For releases accepted into the open-source signing program: **Free code signing
 provided by SignPath.io, certificate by SignPath Foundation.** The complete
@@ -43,12 +43,12 @@ describes current local data and user-triggered network behavior.
 On Windows, inspect a downloaded installer without launching it:
 
 ```powershell
-Get-AuthenticodeSignature .\DS.Agent_1.2.0_x64-setup.exe |
+Get-AuthenticodeSignature .\DS.Agent_1.3.0_x64-setup.exe |
   Select-Object Status, StatusMessage, SignerCertificate, TimeStamperCertificate
-Get-FileHash .\DS.Agent_1.2.0_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\DS.Agent_1.3.0_x64-setup.exe -Algorithm SHA256
 ```
 
-For `v1.2.0`, `Status` is expected to be `NotSigned`. An unexpected signer,
+For `v1.3.0`, `Status` is expected to be `NotSigned`. An unexpected signer,
 signature identity, hash, version, source, or asset mismatch is a stop
 condition. For a future release explicitly documented as signed, any status
 other than `Valid` is also a stop condition.
@@ -77,6 +77,12 @@ freezes the bounded contract. The chat surface is read-only: it can show the
 goal state, stable reason codes, revision/fingerprint, and verifier/artifact
 coverage counts, but it cannot create local validation, evidence, or completion
 authority.
+
+For a queued task whose Goal is frozen, the Kernel may derive one exact-task
+authorization card from a private descriptive capability proposal. Approve,
+reject, and revoke operate only on the Kernel-issued task/group/manifest/preview
+intent. Approval grants exact authority only; it does not execute a Tool, resume
+the task, or mark the Goal complete.
 
 Good first tasks to try:
 
