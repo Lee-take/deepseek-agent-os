@@ -508,6 +508,7 @@ checkLocalReleaseHelperSelfTests();
 checkStepOneOnboardingReadinessContract();
 checkStepTwoGoalEnvelopeReleaseBoundary();
 checkStepThreeCapabilityManifestReleaseBoundary();
+checkStepThreeGroupedApprovalKernelBoundary();
 checkPackageManagerBaseline();
 checkGovernanceDocs();
 checkCodeSigningAndPrivacyPolicies();
@@ -4737,6 +4738,69 @@ function checkStepThreeCapabilityManifestReleaseBoundary() {
     ["apps/desktop/src/App.tsx", app, "C3A adds no authorization UI"],
   ]) {
     checkTextDoesNotInclude(filePath, content, "task_capability_manifest", label);
+  }
+}
+
+function checkStepThreeGroupedApprovalKernelBoundary() {
+  const domainPath =
+    "apps/desktop/src-tauri/src/kernel/task_grouped_approval.rs";
+  const storePath =
+    "apps/desktop/src-tauri/src/kernel/event_store/grouped_approval.rs";
+  const domain = readText(domainPath);
+  const groupedStore = readText(storePath);
+  const eventStore = readText("apps/desktop/src-tauri/src/kernel/event_store.rs");
+  const kernelModules = readText("apps/desktop/src-tauri/src/kernel/mod.rs");
+  const commands = readText("apps/desktop/src-tauri/src/commands.rs");
+  const publicTypes = readText("apps/desktop/src/types.ts");
+  const app = readText("apps/desktop/src/App.tsx");
+
+  for (const [filePath, content, phrase, label] of [
+    [domainPath, domain, "ds-agent.task-grouped-approval/v1", "task grouped approval version"],
+    [domainPath, domain, "deny_unknown_fields", "task grouped approval unknown-field rejection"],
+    [domainPath, domain, "ds-agent.task-grouped-approval-id.v1", "domain-separated grouped approval identity"],
+    [domainPath, domain, "ds-agent.task-grouped-approval-integrity.v1", "grouped projection integrity binding"],
+    [domainPath, domain, "ds-agent.task-grouped-approval-request-fingerprint.v1", "exact task capability request fingerprint"],
+    [domainPath, domain, "exact_tool_preview_hash", "existing exact-tool preview contract reuse"],
+    [domainPath, domain, "DeepSeekModel", "model self-approval rejection actor"],
+    [domainPath, domain, "FrontendPayload", "frontend self-approval rejection actor"],
+    [storePath, groupedStore, "CREATE TABLE IF NOT EXISTS task_grouped_approval_state", "additive grouped approval migration"],
+    [storePath, groupedStore, "CREATE TABLE IF NOT EXISTS task_grouped_approval_item_audit", "per-capability durable audit migration"],
+    [storePath, groupedStore, "prepare_task_grouped_approval", "single grouped preparation path"],
+    [storePath, groupedStore, "resolve_task_grouped_approval", "single grouped resolution path"],
+    [storePath, groupedStore, "revoke_task_grouped_approval", "grouped revocation path"],
+    [storePath, groupedStore, "expire_task_grouped_approval", "grouped expiry path"],
+    [storePath, groupedStore, "authorize_task_grouped_capability", "exact task capability authority check"],
+    ["apps/desktop/src-tauri/src/kernel/event_store.rs", eventStore, "single exact-task resolver", "legacy per-item resolver is blocked"],
+    ["apps/desktop/src-tauri/src/kernel/event_store.rs", eventStore, "dedicated transactional state machine", "forged grouped events are blocked"],
+    [storePath, groupedStore, "exact_group_approval_uses_one_user_resolution_and_per_capability_audit", "single resolution and per-capability audit regression"],
+    [storePath, groupedStore, "tampered_projection_or_per_item_audit_fails_closed_on_restart", "restart tamper regression"],
+    [storePath, groupedStore, "additive_migration_is_idempotent_and_preserves_legacy_exact_tool_approval", "legacy exact-tool migration regression"],
+    ["apps/desktop/src-tauri/src/kernel/event_store.rs", eventStore, "grouped_approval::migrate(self)?", "Event Store grouped approval migration registration"],
+    ["apps/desktop/src-tauri/src/kernel/mod.rs", kernelModules, "pub mod task_grouped_approval;", "Kernel grouped approval module registration"],
+  ]) {
+    checkTextIncludes(filePath, content, phrase, label);
+  }
+
+  for (const [filePath, content, label] of [
+    ["apps/desktop/src-tauri/src/commands.rs", commands, "C3B adds no grouped authorization command"],
+    ["apps/desktop/src/types.ts", publicTypes, "C3B adds no public grouped authorization DTO"],
+    ["apps/desktop/src/App.tsx", app, "C3B adds no authorization UI"],
+  ]) {
+    checkTextDoesNotInclude(filePath, content, "task_grouped_approval", label);
+  }
+
+  for (const forbidden of [
+    "apply_mutation(",
+    "send_mail(",
+    "create_event(",
+    "computer_control",
+  ]) {
+    checkTextDoesNotInclude(
+      storePath,
+      groupedStore,
+      forbidden,
+      `C3B grouped approval Kernel excludes execution path ${forbidden}`,
+    );
   }
 }
 

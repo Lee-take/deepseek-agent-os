@@ -32,6 +32,7 @@ pub mod skill;
 pub mod skill_source;
 pub mod soul;
 pub mod task_capability_manifest;
+pub mod task_grouped_approval;
 pub mod task_lifecycle;
 pub mod tool_runtime;
 pub mod tool_strategy;

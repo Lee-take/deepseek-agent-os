@@ -3,6 +3,7 @@
 mod artifact;
 mod computer_use;
 mod connector_draft;
+mod grouped_approval;
 mod read_execution;
 mod revocation;
 mod workspace_undo;
@@ -1977,6 +1978,7 @@ impl EventStore {
                    END"#,
             [],
         )?;
+        grouped_approval::migrate(self)?;
         self.replay_execution_projection_events()?;
         self.fail_legacy_connector_attachment_tools()?;
         Ok(())
@@ -10330,6 +10332,30 @@ impl EventStore {
     }
 
     pub fn append(&self, event: &KernelEvent) -> EventStoreResult<()> {
+        if event.event_type.starts_with("task_grouped_approval.") {
+            return Err(EventStoreError::InvalidState(
+                "task grouped approval events require the dedicated transactional state machine"
+                    .to_string(),
+            ));
+        }
+        if event.event_type == PERMISSION_RESOLUTION_RECORDED_EVENT {
+            let resolution: PermissionResolution = serde_json::from_str(&event.payload_json)?;
+            if grouped_approval::is_grouped_request(self, resolution.request_id)? {
+                return Err(EventStoreError::InvalidState(
+                    "task grouped approval resolution cannot use the generic event path"
+                        .to_string(),
+                ));
+            }
+        }
+        if event.event_type == CAPABILITY_ACCESS_REQUESTED_EVENT {
+            let request: CapabilityAccessRequest = serde_json::from_str(&event.payload_json)?;
+            if grouped_approval::is_grouped_request(self, request.id)? {
+                return Err(EventStoreError::InvalidState(
+                    "task grouped approval request cannot be replaced through the generic event path"
+                        .to_string(),
+                ));
+            }
+        }
         let transaction = self.conn.unchecked_transaction()?;
         Self::insert_kernel_event(&transaction, event)?;
         transaction.commit()?;
@@ -14051,11 +14077,15 @@ impl EventStore {
     pub fn list_pending_capability_access_records(
         &self,
     ) -> EventStoreResult<Vec<CapabilityAccessRecord>> {
-        Ok(self
-            .list_capability_access_records()?
-            .into_iter()
-            .filter(|record| record.effective_status == CapabilityAccessStatus::PendingApproval)
-            .collect())
+        let mut pending = Vec::new();
+        for record in self.list_capability_access_records()? {
+            if record.effective_status == CapabilityAccessStatus::PendingApproval
+                && !grouped_approval::is_grouped_request(self, record.request.id)?
+            {
+                pending.push(record);
+            }
+        }
+        Ok(pending)
     }
 
     pub fn has_user_approved_capability(
@@ -14090,6 +14120,11 @@ impl EventStore {
         approved: bool,
         note: String,
     ) -> EventStoreResult<PermissionResolution> {
+        if grouped_approval::is_grouped_request(self, request_id)? {
+            return Err(EventStoreError::InvalidState(
+                "task grouped approval requires the single exact-task resolver".to_string(),
+            ));
+        }
         let record = self.capability_access_record_by_id(request_id)?;
 
         if record.request.capability == CapabilityKind::ConnectorAttachmentRead {
@@ -14126,6 +14161,11 @@ impl EventStore {
         expected_preview_revision: u32,
         expected_preview_hash: &str,
     ) -> EventStoreResult<PermissionResolution> {
+        if grouped_approval::is_grouped_request(self, request_id)? {
+            return Err(EventStoreError::InvalidState(
+                "task grouped approval requires the single exact-task resolver".to_string(),
+            ));
+        }
         let record = self.capability_access_record_by_id(request_id)?;
         if record.request.capability != CapabilityKind::ConnectorWrite
             || record.effective_status != CapabilityAccessStatus::PendingApproval
@@ -14171,6 +14211,11 @@ impl EventStore {
         expected_preview_revision: u32,
         expected_preview_hash: &str,
     ) -> EventStoreResult<PermissionResolution> {
+        if grouped_approval::is_grouped_request(self, request_id)? {
+            return Err(EventStoreError::InvalidState(
+                "task grouped approval requires the single exact-task resolver".to_string(),
+            ));
+        }
         let record = self.capability_access_record_by_id(request_id)?;
         if record.request.capability != CapabilityKind::ConnectorAttachmentRead
             || record.effective_status != CapabilityAccessStatus::PendingApproval
