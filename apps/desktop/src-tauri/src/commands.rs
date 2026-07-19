@@ -98,7 +98,8 @@ use crate::kernel::expert_team::{
 };
 use crate::kernel::goal_envelope::GoalEnvelopeProposal;
 use crate::kernel::goal_lifecycle::{
-    GoalEnvelopeUiProjection, GoalLifecycleStatus, GoalTargetBindingKind, GoalValidationContext,
+    GoalEnvelopeUiProjection, GoalEnvelopeUiStatus, GoalLifecycleStatus, GoalTargetBindingKind,
+    GoalValidationContext,
 };
 use crate::kernel::local_directory::{
     load_local_directory_state, local_directory_readiness_from_state,
@@ -157,6 +158,9 @@ use crate::kernel::skill_source::{
 };
 use crate::kernel::soul::{
     AgentSoulProfileUpdateAudit, AgentSoulProfileUpdateProposal, AgentSoulProfileUpdateReceipt,
+};
+use crate::kernel::task_capability_manifest::{
+    TaskCapabilityManifestContext, TaskCapabilityProposal,
 };
 use crate::kernel::task_grouped_approval::{
     TaskGroupedAuthorizationIntent, TaskGroupedAuthorizationView,
@@ -317,6 +321,7 @@ const AGENT_RUN_GUIDANCE_MAX_ITEMS_PER_ROUND: usize = 8;
 const AGENT_RUN_GUIDANCE_PROMPT_CHAR_LIMIT: usize = 12_000;
 const AGENT_SKILL_CATALOG_MAX_ITEMS: usize = 24;
 const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user, goal_envelope, agent_actions, missing_prerequisites, required_confirmations, artifact_targets, memory_candidates, soul_profile_update, subagent_plan, and expert_output. When proposing a goal_envelope, use version ds-agent.goal-envelope-proposal/v1 and include user_goal, assumptions, constraints, done_when, required_artifacts, verifiers, proposed_capabilities, external_targets, and stop_conditions. assumptions, constraints, proposed_capabilities, and stop_conditions are string arrays. Each done_when item has done_when_id and description; each required_artifact has artifact_id and description; each verifier has verifier_id, done_when_id, description, and evidence_kind; each external_target has target_id and description. The goal_envelope is only a proposal: it cannot approve execution, trust a path or external target, handle a secret, or declare completion. Soul is the durable cross-conversation identity and collaboration profile, not an ordinary memory candidate. Whenever the current user message explicitly defines, changes, or confirms any Soul setting, soul_profile_update must contain fields, clear_fields, current_message_evidence, and optional confirmation_context. This includes short confirmations such as yes when the immediately preceding context proposed a Soul setting. current_message_evidence must be an exact non-empty excerpt of the current user message; confirmation_context, when needed, must be an exact excerpt of the supplied conversation context. Use only the allowed Soul field names supplied by DS Agent. Keep identity roles exact: preferred_name is the user's own name, address_as is how DS Agent addresses the user, user_calls_ds_agent is the user's name for DS Agent, and ds_agent_should_refer_to_itself_as is DS Agent's self-reference. Never put DS Agent's name into preferred_name. Do not propose Soul updates for guesses, third-party statements, transient one-turn instructions, or sensitive values. Do not tell the user the setting was saved; DS Agent appends a persistence receipt only after the update is validated and written. For a complex task that materially benefits from specialists, subagent_plan may contain 2-4 unique roles chosen from research, analysis, production, review. Every item requires key, role, prompt, depends_on, capabilities, resources, budget, output_contract, and retry_policy. Use an acyclic flow: research and analysis may run in parallel when independent; production depends on relevant evidence/analysis; review depends on production. Only production may request managed_staging_write and a logical write resource. A child never writes an approved destination. Review cannot mutate staged output and must bind its decision to the exact production revision. Never create nested subagents or desktop-control subtasks. Leave subagent_plan empty for simple work. When executing an expert attempt, return expert_output with summary, evidence-linked claims, optional staged_content/staged_relative_path for production, and an exact-revision review verdict for review; never return another subagent_plan. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
+const AGENT_TASK_CAPABILITY_PROPOSAL_PROMPT: &str = "When a goal proposes one or more local capabilities, also return task_capability_proposal using version ds-agent.task-capability-proposal/v1. It contains expires_at and a canonically sorted capabilities array. Each capability entry contains capability, application_ids, path_target_ids, account_target_ids, recipient_target_ids, time_window_target_ids, external_target_ids, and verifier_ids. Cover every proposed capability, external target, and verifier from the same goal exactly once across the entries. Sort the capability entries and every ID array lexically. Use application_ids=[\"ds-agent\"] for work performed by DS Agent, and use only target and verifier IDs from the same goal_envelope. This is descriptive-only: never include task IDs, goal revisions or fingerprints, internal tool IDs, risk, grants, authority, actors, approvals, resolutions, claims, tokens, permission state, manifest revisions or fingerprints, or any preview/hash/schema/renderer fields. DS Agent Kernel derives and validates all authority-bearing values after it freezes the goal.";
 const AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT: usize = 1200;
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
@@ -513,6 +518,8 @@ pub struct AgentChatResponse {
     pub goal_envelope: Option<GoalEnvelopeProposal>,
     #[serde(default, skip_deserializing)]
     pub goal_projection: Option<GoalEnvelopeUiProjection>,
+    #[serde(skip)]
+    task_capability_proposal: Option<TaskCapabilityProposal>,
     pub proposed_actions: Vec<AgentChatActionProposal>,
     pub missing_prerequisites: Vec<AgentChatMissingPrerequisite>,
     pub memory_candidates: Vec<MemoryCandidate>,
@@ -726,6 +733,11 @@ struct AgentModelEnvelope {
     reply_to_user: String,
     #[serde(default, deserialize_with = "deserialize_agent_goal_envelope")]
     goal_envelope: Option<GoalEnvelopeProposal>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_agent_task_capability_proposal"
+    )]
+    task_capability_proposal: Option<TaskCapabilityProposal>,
     #[serde(default, alias = "proposed_actions")]
     agent_actions: Vec<AgentChatActionProposal>,
     #[serde(default)]
@@ -760,6 +772,18 @@ where
 {
     Option::<serde_json::Value>::deserialize(deserializer)?
         .map(GoalEnvelopeProposal::parse_value)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_agent_task_capability_proposal<'de, D>(
+    deserializer: D,
+) -> Result<Option<TaskCapabilityProposal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Value>::deserialize(deserializer)?
+        .map(TaskCapabilityProposal::parse_value)
         .transpose()
         .map_err(serde::de::Error::custom)
 }
@@ -4734,6 +4758,9 @@ fn agent_chat_response_from_telemetry(
     let goal_envelope = parsed_envelope
         .as_ref()
         .and_then(|envelope| envelope.goal_envelope.clone());
+    let task_capability_proposal = parsed_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.task_capability_proposal.clone());
     let mut memory_candidate_proposals = parsed_envelope
         .as_ref()
         .map(|envelope| envelope.memory_candidates.clone())
@@ -4782,6 +4809,7 @@ fn agent_chat_response_from_telemetry(
         protocol_version,
         goal_envelope,
         goal_projection: None,
+        task_capability_proposal,
         proposed_actions,
         missing_prerequisites,
         memory_candidates,
@@ -8389,10 +8417,12 @@ fn agent_chat_with_transport_and_runtime_context(
     }
 
     let protocol_user_prompt = build_agent_chat_protocol_user_prompt(&request, &runtime_context);
+    let system_prompt =
+        format!("{AGENT_CHAT_SYSTEM_PROMPT}\n\n{AGENT_TASK_CAPABILITY_PROPOSAL_PROMPT}");
     let deepseek_request = build_deepseek_chat_completion_request(
         request.model_route,
         request.thinking_level,
-        AGENT_CHAT_SYSTEM_PROMPT,
+        &system_prompt,
         &protocol_user_prompt,
     )?;
     let execution =
@@ -8668,6 +8698,19 @@ fn goal_validation_context_for_agent_chat(
     context
 }
 
+fn task_capability_manifest_context_for_agent_chat(
+    runtime_context: &AgentChatRuntimeContext,
+) -> TaskCapabilityManifestContext {
+    let mut context =
+        TaskCapabilityManifestContext::default().with_application("ds-agent", "DS Agent");
+    if runtime_context.workspace_authority_material.is_some() {
+        context = context
+            .with_target_display("workspace", "Selected workspace")
+            .with_target_display("selected-workspace", "Selected workspace");
+    }
+    context
+}
+
 fn reconcile_agent_goal_projection(
     store: &Mutex<EventStore>,
     response: &mut AgentChatResponse,
@@ -8690,9 +8733,29 @@ fn reconcile_agent_goal_projection(
                 .map_err(event_store_error)?;
         }
     }
-    response.goal_projection = store
+    let projection = store
         .goal_envelope_ui_projection(goal_id)
         .map_err(event_store_error)?;
+    if projection
+        .as_ref()
+        .is_some_and(|projection| projection.status == GoalEnvelopeUiStatus::Frozen)
+    {
+        if let Some(proposal) = response.task_capability_proposal.as_ref() {
+            let context = task_capability_manifest_context_for_agent_chat(runtime_context);
+            store
+                .prepare_task_grouped_approval_from_proposal(
+                    goal_id,
+                    proposal,
+                    &context,
+                    Utc::now(),
+                )
+                .map_err(event_store_error)?;
+        }
+    }
+    response.goal_projection = projection;
+    if response.goal_projection.is_some() {
+        response.goal_envelope = None;
+    }
     Ok(())
 }
 
@@ -10454,6 +10517,10 @@ fn merge_agent_chat_followup_response(
     if followup_response.goal_projection.is_none() {
         followup_response.goal_projection = initial_response.goal_projection.take();
     }
+    if followup_response.task_capability_proposal.is_none() {
+        followup_response.task_capability_proposal =
+            initial_response.task_capability_proposal.take();
+    }
     initial_response
         .proposed_actions
         .append(&mut followup_response.proposed_actions);
@@ -12174,6 +12241,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
                     protocol_version: response.protocol_version.clone(),
                     goal_envelope: None,
                     goal_projection: None,
+                    task_capability_proposal: None,
                     proposed_actions: vec![action.clone()],
                     missing_prerequisites: Vec::new(),
                     memory_candidates: Vec::new(),
@@ -12254,6 +12322,7 @@ fn resume_agent_chat_action_with_clients_and_computer_use(
         protocol_version: "ds-agent-action-resume-v1".to_string(),
         goal_envelope: None,
         goal_projection: None,
+        task_capability_proposal: None,
         proposed_actions: vec![action],
         missing_prerequisites: Vec::new(),
         memory_candidates: Vec::new(),
@@ -17765,8 +17834,10 @@ mod tests {
     };
     use crate::kernel::deepseek_pricing::DeepSeekPricingSettings;
     use crate::kernel::event_store::EventStore;
+    use crate::kernel::goal_lifecycle::GoalEnvelopeUiStatus;
     use crate::kernel::local_directory::{
-        LocalDirectorySettings, LocalDirectoryState, LOCAL_DIRECTORY_SETTINGS_FILE,
+        LocalDirectorySettings, LocalDirectoryState, WorkspaceReadinessCode,
+        LOCAL_DIRECTORY_SETTINGS_FILE,
     };
     use crate::kernel::models::{
         AccessMode, ComputerControlBackend, ComputerScreenshotBackend, LargeModelProvider,
@@ -18112,6 +18183,7 @@ mod tests {
             protocol_version: "ds-agent-envelope-v1".to_string(),
             goal_envelope: None,
             goal_projection: None,
+            task_capability_proposal: None,
             proposed_actions: vec![AgentChatActionProposal {
                 action_type: "app_update_check".to_string(),
                 title: Some("检查 DS Agent 版本更新".to_string()),
@@ -24331,6 +24403,154 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn c3d_production_chat_seam_prepares_one_durable_group_without_executing_tools() {
+        let evidence_kind = builtin_tool_catalog()
+            .into_iter()
+            .find(|contract| contract.id == FILE_READ_TOOL_ID)
+            .and_then(|contract| {
+                contract
+                    .verification
+                    .required_evidence_kinds
+                    .into_iter()
+                    .next()
+            })
+            .expect("file read verifier kind");
+        let model_envelope = serde_json::json!({
+            "protocol_version": "ds-agent-envelope/v1",
+            "reply_to_user": "I prepared one exact task authorization for review.",
+            "goal_envelope": {
+                "version": "ds-agent.goal-envelope-proposal/v1",
+                "user_goal": "Read the selected workspace sources and verify the receipt.",
+                "assumptions": [],
+                "constraints": ["Use only the selected workspace."],
+                "done_when": [{
+                    "done_when_id": "sources-verified",
+                    "description": "The selected sources have a verified local read receipt."
+                }],
+                "required_artifacts": [],
+                "verifiers": [{
+                    "verifier_id": "source-verifier-v1",
+                    "done_when_id": "sources-verified",
+                    "description": "Verify the local file read receipt.",
+                    "evidence_kind": evidence_kind
+                }],
+                "proposed_capabilities": [FILE_READ_TOOL_ID],
+                "external_targets": [{
+                    "target_id": "workspace",
+                    "description": "The locally selected workspace."
+                }],
+                "stop_conditions": ["Stop if the workspace binding changes."]
+            },
+            "task_capability_proposal": {
+                "version": "ds-agent.task-capability-proposal/v1",
+                "expires_at": "2099-01-02T03:04:05Z",
+                "capabilities": [{
+                    "capability": CapabilityKind::FileRead.as_str(),
+                    "application_ids": ["ds-agent"],
+                    "path_target_ids": ["workspace"],
+                    "account_target_ids": [],
+                    "recipient_target_ids": [],
+                    "time_window_target_ids": [],
+                    "external_target_ids": ["workspace"],
+                    "verifier_ids": ["source-verifier-v1"]
+                }]
+            },
+            "agent_actions": [],
+            "missing_prerequisites": []
+        });
+        let transport = RecordingDeepSeekTransport::new(model_envelope.to_string());
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let store = Mutex::new(EventStore::open_memory().unwrap());
+        let start = AgentRunStart::queued(
+            "c3d-production-conversation".to_string(),
+            "Read and verify the selected workspace sources.".to_string(),
+            0,
+        )
+        .expect("queued run start");
+        store
+            .lock()
+            .expect("store lock")
+            .append_agent_run_start(&start)
+            .expect("queued run appends");
+        let runtime_context = AgentChatRuntimeContext {
+            workspace_ready: AgentChatReadiness::Ready,
+            workspace_readiness_code: WorkspaceReadinessCode::Ready,
+            workspace_authority_material: Some(b"c3d-workspace-authority".to_vec()),
+            ..AgentChatRuntimeContext::default()
+        };
+        let file_client = RecordingFileContentClient::new("must not be read");
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let outcome = run_next_queued_agent_chat_with_clients_and_api_keys(
+            &store,
+            &transport,
+            &cache,
+            &["test-secret".to_string()],
+            "c3d-production-worker".to_string(),
+            ModelRoute::Flash,
+            ThinkingLevel::Fast,
+            AccessMode::AskEveryStep,
+            runtime_context.clone(),
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("ordinary queued production chat seam succeeds")
+        .expect("queued run exists");
+        assert_eq!(outcome.record.id, start.id);
+        assert_eq!(outcome.record.status, AgentRunStatus::Completed);
+        let mut response = outcome.response;
+
+        let projection = response
+            .goal_projection
+            .as_ref()
+            .expect("frozen goal projection");
+        assert_eq!(projection.goal_id, start.id);
+        assert_eq!(projection.status, GoalEnvelopeUiStatus::Frozen);
+        let goal_id = projection.goal_id;
+        assert!(response.goal_envelope.is_none());
+        let serialized_response = serde_json::to_string(&response).unwrap();
+        assert!(!serialized_response.contains("task_capability_proposal"));
+        assert!(!serialized_response.contains(FILE_READ_TOOL_ID));
+
+        let mut replay_context = runtime_context;
+        replay_context.active_run_id = Some(start.id);
+        super::reconcile_agent_goal_projection(
+            &store,
+            &mut response,
+            &replay_context,
+            AccessMode::AskEveryStep,
+        )
+        .expect("duplicate chat reconciliation is idempotent");
+        let views = store
+            .lock()
+            .unwrap()
+            .list_task_grouped_authorizations(Utc::now())
+            .unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].intent.task_id, goal_id);
+        assert_eq!(
+            views[0].status,
+            crate::kernel::task_grouped_approval::TaskGroupedApprovalStatus::Pending
+        );
+        assert_eq!(views[0].applications, vec!["DS Agent"]);
+        assert_eq!(views[0].paths, vec!["Selected workspace"]);
+        assert_eq!(views[0].capability_audits.len(), 1);
+        assert_eq!(
+            views[0].capability_audits[0].capability,
+            CapabilityKind::FileRead
+        );
+        assert!(file_client.recorded_calls().is_empty());
+        assert!(file_write_client.recorded_calls().is_empty());
+        assert!(search_client.recorded_calls().is_empty());
+        assert!(browser_client.recorded_calls().is_empty());
     }
 
     #[test]

@@ -11,7 +11,10 @@ use crate::kernel::policy::{
     exact_tool_preview_hash, request_capability_access, CapabilityAccessRequest,
     CapabilityAccessStatus, PermissionResolution, PolicyDecision,
 };
-use crate::kernel::task_capability_manifest::{TaskAuthorizationPreview, TaskCapabilityManifest};
+use crate::kernel::task_capability_manifest::{
+    compile_task_capability_manifest, task_authorization_preview, TaskAuthorizationPreview,
+    TaskCapabilityManifest, TaskCapabilityManifestContext, TaskCapabilityProposal,
+};
 use crate::kernel::task_grouped_approval::{
     capability_request_event_id_for, event_id_for, item_event_id_for, legacy_consumption_id_for,
     permission_resolution_event_id_for, permission_resolution_id_for, TaskGroupedApproval,
@@ -95,6 +98,28 @@ pub(super) fn migrate(store: &EventStore) -> EventStoreResult<()> {
 }
 
 impl EventStore {
+    pub fn prepare_task_grouped_approval_from_proposal(
+        &self,
+        task_id: Uuid,
+        proposal: &TaskCapabilityProposal,
+        context: &TaskCapabilityManifestContext,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<TaskGroupedApproval> {
+        let goal = self
+            .goal_envelope_projection(task_id)?
+            .ok_or_else(|| invalid("task capability proposal requires a frozen goal"))?;
+        let bound_proposal = proposal
+            .bind_to_frozen_goal(task_id, &goal)
+            .map_err(|_| invalid("task capability proposal is stale or invalid"))?;
+        let manifest = compile_task_capability_manifest(task_id, &goal, &bound_proposal, context)
+            .map_err(|_| {
+            invalid("task capability proposal cannot compile for the frozen goal")
+        })?;
+        let preview = task_authorization_preview(&manifest)
+            .map_err(|_| invalid("task authorization preview cannot be derived"))?;
+        self.prepare_task_grouped_approval(task_id, &manifest, &preview, now)
+    }
+
     pub fn prepare_task_grouped_approval(
         &self,
         task_id: Uuid,
@@ -1099,8 +1124,9 @@ mod tests {
     use crate::kernel::policy::{request_capability_access, CapabilityGrantState, CapabilityKind};
     use crate::kernel::task_capability_manifest::{
         compile_task_capability_manifest, task_authorization_preview,
-        TaskCapabilityManifestContext, TaskCapabilityManifestProposal, TaskCapabilityNeedProposal,
-        TASK_CAPABILITY_MANIFEST_VERSION,
+        TaskCapabilityDescriptionProposal, TaskCapabilityManifestContext,
+        TaskCapabilityManifestProposal, TaskCapabilityNeedProposal, TaskCapabilityProposal,
+        TASK_CAPABILITY_MANIFEST_VERSION, TASK_CAPABILITY_PROPOSAL_VERSION,
     };
     use crate::kernel::task_grouped_approval::TaskGroupedCapabilityAuditStatus;
     use crate::kernel::tool_runtime::{CONNECTOR_MUTATE_TOOL_ID, FILE_WRITE_TOOL_ID};
@@ -1258,17 +1284,54 @@ mod tests {
                 },
             ],
         };
-        let context = TaskCapabilityManifestContext::default()
+        let context = manifest_context(path_label);
+        let manifest = compile_task_capability_manifest(task_id, &goal, &proposal, &context)
+            .expect("manifest compiles");
+        let preview = task_authorization_preview(&manifest).expect("preview renders");
+        (manifest, preview)
+    }
+
+    fn manifest_context(path_label: &str) -> TaskCapabilityManifestContext {
+        TaskCapabilityManifestContext::default()
             .with_application("excel", "Microsoft Excel")
             .with_application("outlook", "Microsoft Outlook")
             .with_target_display("finance-account", "Work mailbox account")
             .with_target_display("finance-recipient", "finance-test@example.com")
             .with_target_display("report-folder", path_label)
-            .with_target_display("weekday-window", "Weekdays 09:00-17:00 Asia/Shanghai");
-        let manifest = compile_task_capability_manifest(task_id, &goal, &proposal, &context)
-            .expect("manifest compiles");
-        let preview = task_authorization_preview(&manifest).expect("preview renders");
-        (manifest, preview)
+            .with_target_display("weekday-window", "Weekdays 09:00-17:00 Asia/Shanghai")
+    }
+
+    fn descriptive_proposal(expires_at: DateTime<Utc>) -> TaskCapabilityProposal {
+        TaskCapabilityProposal {
+            version: TASK_CAPABILITY_PROPOSAL_VERSION.to_string(),
+            expires_at,
+            capabilities: vec![
+                TaskCapabilityDescriptionProposal {
+                    capability: "connector_write".to_string(),
+                    application_ids: vec!["outlook".to_string()],
+                    path_target_ids: Vec::new(),
+                    account_target_ids: vec!["finance-account".to_string()],
+                    recipient_target_ids: vec!["finance-recipient".to_string()],
+                    time_window_target_ids: vec!["weekday-window".to_string()],
+                    external_target_ids: vec![
+                        "finance-account".to_string(),
+                        "finance-recipient".to_string(),
+                        "weekday-window".to_string(),
+                    ],
+                    verifier_ids: vec!["external-verifier-v1".to_string()],
+                },
+                TaskCapabilityDescriptionProposal {
+                    capability: "file_write".to_string(),
+                    application_ids: vec!["excel".to_string()],
+                    path_target_ids: vec!["report-folder".to_string()],
+                    account_target_ids: Vec::new(),
+                    recipient_target_ids: Vec::new(),
+                    time_window_target_ids: Vec::new(),
+                    external_target_ids: vec!["report-folder".to_string()],
+                    verifier_ids: vec!["report-verifier-v1".to_string()],
+                },
+            ],
+        }
     }
 
     fn compiled_fixture(store: &EventStore) -> (TaskCapabilityManifest, TaskAuthorizationPreview) {
@@ -1836,6 +1899,80 @@ mod tests {
         reopened
             .authorize_task_grouped_capability(&claim, fixed_now() + chrono::Duration::minutes(4))
             .expect("restart preserves exact authority");
+    }
+
+    #[test]
+    fn c3d_production_producer_is_idempotent_across_reconciliation_restart_and_terminal_state() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("c3d-producer.db");
+        let store = EventStore::open(&path).unwrap();
+        frozen_goal_for(&store, TASK_ID, b"path-authority-v1");
+        let proposal = descriptive_proposal(fixed_expiry());
+        let context = manifest_context("Workspace / reports");
+
+        let first = store
+            .prepare_task_grouped_approval_from_proposal(TASK_ID, &proposal, &context, fixed_now())
+            .unwrap();
+        let duplicate = store
+            .prepare_task_grouped_approval_from_proposal(
+                TASK_ID,
+                &proposal,
+                &context,
+                fixed_now() + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        assert_eq!(first, duplicate);
+        assert_eq!(event_count(&store, TASK_GROUPED_APPROVAL_PREPARED_EVENT), 1);
+        assert_eq!(
+            store
+                .list_task_grouped_authorizations(fixed_now())
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(store);
+
+        let reopened = EventStore::open(&path).unwrap();
+        let replay = reopened
+            .prepare_task_grouped_approval_from_proposal(
+                TASK_ID,
+                &proposal,
+                &context,
+                fixed_now() + chrono::Duration::seconds(2),
+            )
+            .unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(
+            event_count(&reopened, TASK_GROUPED_APPROVAL_PREPARED_EVENT),
+            1
+        );
+
+        let approved = approve(&reopened, &replay);
+        let terminal_replay = reopened
+            .prepare_task_grouped_approval_from_proposal(
+                TASK_ID,
+                &proposal,
+                &context,
+                fixed_now() + chrono::Duration::minutes(2),
+            )
+            .unwrap();
+        assert_eq!(terminal_replay, approved);
+        assert_eq!(terminal_replay.status, TaskGroupedApprovalStatus::Approved);
+        assert_eq!(
+            event_count(&reopened, TASK_GROUPED_APPROVAL_PREPARED_EVENT),
+            1
+        );
+
+        let expired_store = EventStore::open_memory().unwrap();
+        frozen_goal_for(&expired_store, TASK_ID, b"path-authority-v1");
+        let expired = descriptive_proposal(fixed_now());
+        assert!(expired_store
+            .prepare_task_grouped_approval_from_proposal(TASK_ID, &expired, &context, fixed_now(),)
+            .is_err());
+        assert!(expired_store
+            .list_task_grouped_authorizations(fixed_now())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

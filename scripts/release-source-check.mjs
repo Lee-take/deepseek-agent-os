@@ -4733,7 +4733,6 @@ function checkStepThreeCapabilityManifestReleaseBoundary() {
 
   for (const [filePath, content, label] of [
     ["apps/desktop/src-tauri/src/kernel/event_store.rs", eventStore, "C3A adds no durable authorization state"],
-    ["apps/desktop/src-tauri/src/commands.rs", commands, "C3A adds no command authority"],
     ["apps/desktop/src/types.ts", publicTypes, "C3A adds no public manifest DTO"],
     ["apps/desktop/src/App.tsx", app, "C3A adds no authorization UI"],
   ]) {
@@ -4742,10 +4741,13 @@ function checkStepThreeCapabilityManifestReleaseBoundary() {
 }
 
 function checkStepThreeGroupedApprovalKernelBoundary() {
+  const manifestPath =
+    "apps/desktop/src-tauri/src/kernel/task_capability_manifest.rs";
   const domainPath =
     "apps/desktop/src-tauri/src/kernel/task_grouped_approval.rs";
   const storePath =
     "apps/desktop/src-tauri/src/kernel/event_store/grouped_approval.rs";
+  const manifest = readText(manifestPath);
   const domain = readText(domainPath);
   const groupedStore = readText(storePath);
   const eventStore = readText("apps/desktop/src-tauri/src/kernel/event_store.rs");
@@ -4756,8 +4758,20 @@ function checkStepThreeGroupedApprovalKernelBoundary() {
   const desktopTest = readText("scripts/desktop-test.mjs");
   const uiTestPath = "scripts/task-grouped-authorization-ui.test.mjs";
   const uiTest = readText(uiTestPath);
+  const groupedProduction = groupedStore.slice(
+    0,
+    groupedStore.indexOf("\n#[cfg(test)]\nmod tests"),
+  );
+  const commandsProduction = commands.slice(
+    0,
+    commands.indexOf("\n#[cfg(test)]\nmod tests"),
+  );
 
   for (const [filePath, content, phrase, label] of [
+    [manifestPath, manifest, "ds-agent.task-capability-proposal/v1", "descriptive task capability proposal version"],
+    [manifestPath, manifest, "pub struct TaskCapabilityProposal", "strict descriptive task capability proposal"],
+    [manifestPath, manifest, "bind_to_frozen_goal", "Kernel frozen-goal proposal binding"],
+    [manifestPath, manifest, "c3d_descriptive_proposal_is_strict_bounded_and_contains_no_kernel_authority", "C3D strict model proposal regression"],
     [domainPath, domain, "ds-agent.task-grouped-approval/v1", "task grouped approval version"],
     [domainPath, domain, "deny_unknown_fields", "task grouped approval unknown-field rejection"],
     [domainPath, domain, "ds-agent.task-grouped-approval-id.v1", "domain-separated grouped approval identity"],
@@ -4769,6 +4783,9 @@ function checkStepThreeGroupedApprovalKernelBoundary() {
     [storePath, groupedStore, "CREATE TABLE IF NOT EXISTS task_grouped_approval_state", "additive grouped approval migration"],
     [storePath, groupedStore, "CREATE TABLE IF NOT EXISTS task_grouped_approval_item_audit", "per-capability durable audit migration"],
     [storePath, groupedStore, "prepare_task_grouped_approval", "single grouped preparation path"],
+    [storePath, groupedProduction, "prepare_task_grouped_approval_from_proposal", "production grouped authorization producer"],
+    [storePath, groupedProduction, "compile_task_capability_manifest", "producer compiles the Kernel manifest"],
+    [storePath, groupedProduction, "task_authorization_preview", "producer renders the Kernel preview"],
     [storePath, groupedStore, "resolve_task_grouped_approval", "single grouped resolution path"],
     [storePath, groupedStore, "revoke_task_grouped_approval", "grouped revocation path"],
     [storePath, groupedStore, "expire_task_grouped_approval", "grouped expiry path"],
@@ -4789,6 +4806,11 @@ function checkStepThreeGroupedApprovalKernelBoundary() {
     [storePath, groupedStore, "refresh_task_grouped_approval_state", "stale grouped authorization refresh"],
     [storePath, groupedStore, "c3c_exact_ui_intent_rejects_tamper_replay_and_frontend_authority_fields", "C3C adversarial IPC intent regression"],
     [storePath, groupedStore, "c3c_ui_read_refreshes_expiry_and_survives_restart_without_new_authority", "C3C restart and expiry UI regression"],
+    [storePath, groupedStore, "c3d_production_producer_is_idempotent_across_reconciliation_restart_and_terminal_state", "C3D producer durability regression"],
+    ["apps/desktop/src-tauri/src/commands.rs", commandsProduction, "task_capability_proposal", "ordinary structured response carries a private capability proposal"],
+    ["apps/desktop/src-tauri/src/commands.rs", commandsProduction, "prepare_task_grouped_approval_from_proposal", "ordinary chat reconciliation reaches the production producer"],
+    ["apps/desktop/src-tauri/src/commands.rs", commandsProduction, "response.goal_envelope = None", "ordinary response strips raw goal authority after projection"],
+    ["apps/desktop/src-tauri/src/commands.rs", commands, "c3d_production_chat_seam_prepares_one_durable_group_without_executing_tools", "C3D queued chat production seam regression"],
     ["apps/desktop/src-tauri/src/commands.rs", commands, "pub fn list_task_grouped_authorizations", "thin grouped authorization list command"],
     ["apps/desktop/src-tauri/src/commands.rs", commands, "pub fn resolve_task_grouped_authorization", "thin grouped authorization resolve command"],
     ["apps/desktop/src-tauri/src/commands.rs", commands, "pub fn revoke_task_grouped_authorization", "thin grouped authorization revoke command"],
@@ -4801,6 +4823,41 @@ function checkStepThreeGroupedApprovalKernelBoundary() {
   ]) {
     checkTextIncludes(filePath, content, phrase, label);
   }
+
+  const groupedPreparationCalls =
+    groupedProduction.match(/self\.prepare_task_grouped_approval\(/g)?.length ?? 0;
+  if (groupedPreparationCalls !== 1) {
+    failures.push(
+      `${storePath} must have exactly one production call into the durable grouped preparation path`,
+    );
+  } else {
+    checks.push("single production grouped authorization producer call");
+  }
+
+  checkTextDoesNotInclude(
+    "apps/desktop/src-tauri/src/commands.rs",
+    commands,
+    "pub fn prepare_task_grouped_approval",
+    "no public prepare command can mint grouped authority",
+  );
+  checkTextDoesNotInclude(
+    "apps/desktop/src-tauri/src/commands.rs",
+    commands,
+    "pub fn compile_task_capability_manifest",
+    "no public manifest compiler command can mint Kernel authority",
+  );
+  checkTextDoesNotInclude(
+    "apps/desktop/src/types.ts",
+    publicTypes,
+    "TaskCapabilityProposal",
+    "model proposal remains private to the Rust boundary",
+  );
+  checkTextDoesNotInclude(
+    "apps/desktop/src/App.tsx",
+    app,
+    "prepare_task_grouped_approval",
+    "frontend cannot invoke grouped authority preparation",
+  );
 
   checkTextDoesNotInclude(
     domainPath,

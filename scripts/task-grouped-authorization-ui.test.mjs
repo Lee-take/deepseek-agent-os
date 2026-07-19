@@ -67,6 +67,17 @@ assert.match(app, /invoke<TaskGroupedAuthorizationView>\("revoke_task_grouped_au
 assert.match(app, /await refreshTaskGroupedAuthorizationState\(\)/);
 assert.match(app, /setTaskGroupedAuthorizations\(\[\]\)/);
 assert.match(app, /!taskGroupedAuthorization\s*&&\s*messageApprovalActions\.length > 0/);
+assert.match(
+  app,
+  /taskGroupedAuthorizations\.find\([\s\S]{0,240}authorization\.intent\.task_id === message\.goal_projection\?\.goal_id/,
+);
+const queuedWorkerStart = app.indexOf('"run_next_queued_agent_chat_worker"');
+const queuedWorkerEnd = app.indexOf("const refreshMemoryCandidateRecords", queuedWorkerStart);
+assert.ok(queuedWorkerStart >= 0 && queuedWorkerEnd > queuedWorkerStart);
+const queuedWorker = app.slice(queuedWorkerStart, queuedWorkerEnd);
+assert.match(queuedWorker, /goal_projection: workerResult\.response\.goal_projection/);
+assert.match(queuedWorker, /refreshCapabilityState\(\)/);
+assert.doesNotMatch(app, /prepare_task_grouped_approval(?:_from_proposal)?/);
 assert.doesNotMatch(
   app,
   /resolve_task_grouped_authorization"[\s\S]{0,300}(capability|risk|scope|target|authority|preview|grant|actor|claim|token)\s*:/i,
@@ -97,6 +108,7 @@ for (const phrase of [
 assert.match(commands, /pub fn list_task_grouped_authorizations/);
 assert.match(commands, /pub fn resolve_task_grouped_authorization/);
 assert.match(commands, /pub fn revoke_task_grouped_authorization/);
+assert.doesNotMatch(commands, /pub fn prepare_task_grouped_approval/);
 assert.doesNotMatch(commands, /TaskGroupedApprovalActor::(DeepSeekModel|FrontendPayload)/);
 
 console.log("Grouped authorization UI and IPC authority boundary checks passed");

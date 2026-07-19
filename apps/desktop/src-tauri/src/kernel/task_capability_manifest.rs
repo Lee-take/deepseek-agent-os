@@ -14,6 +14,7 @@ use crate::kernel::policy::{
 use crate::kernel::tool_runtime::{builtin_tool_catalog, ToolContract};
 
 pub const TASK_CAPABILITY_MANIFEST_VERSION: &str = "ds-agent.task-capability-manifest/v1";
+pub const TASK_CAPABILITY_PROPOSAL_VERSION: &str = "ds-agent.task-capability-proposal/v1";
 pub const TASK_CAPABILITY_MANIFEST_SCHEMA_REVISION: u32 = 1;
 pub const TASK_AUTHORIZATION_PREVIEW_VERSION: &str = "ds-agent.task-authorization-preview/v1";
 pub const TASK_AUTHORIZATION_PREVIEW_SCHEMA_REVISION: u32 = 1;
@@ -113,6 +114,183 @@ pub struct TaskCapabilityNeedProposal {
     pub time_window_target_ids: Vec<String>,
     pub external_target_ids: Vec<String>,
     pub verifier_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCapabilityDescriptionProposal {
+    pub capability: String,
+    pub application_ids: Vec<String>,
+    pub path_target_ids: Vec<String>,
+    pub account_target_ids: Vec<String>,
+    pub recipient_target_ids: Vec<String>,
+    pub time_window_target_ids: Vec<String>,
+    pub external_target_ids: Vec<String>,
+    pub verifier_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TaskCapabilityProposal {
+    pub version: String,
+    pub expires_at: DateTime<Utc>,
+    pub capabilities: Vec<TaskCapabilityDescriptionProposal>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskCapabilityProposalWire {
+    version: String,
+    expires_at: DateTime<Utc>,
+    capabilities: Vec<TaskCapabilityDescriptionProposal>,
+}
+
+impl From<TaskCapabilityProposalWire> for TaskCapabilityProposal {
+    fn from(wire: TaskCapabilityProposalWire) -> Self {
+        Self {
+            version: wire.version,
+            expires_at: wire.expires_at,
+            capabilities: wire.capabilities,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskCapabilityProposal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let proposal = Self::from(TaskCapabilityProposalWire::deserialize(deserializer)?);
+        proposal.validate().map_err(serde::de::Error::custom)?;
+        Ok(proposal)
+    }
+}
+
+impl TaskCapabilityProposal {
+    pub fn parse_json(json: &str) -> Result<Self, TaskCapabilityManifestError> {
+        if json.len() > MAX_JSON_BYTES {
+            return Err(TaskCapabilityManifestError::JsonTooLarge);
+        }
+        let wire: TaskCapabilityProposalWire =
+            serde_json::from_str(json).map_err(|_| TaskCapabilityManifestError::InvalidJson)?;
+        let proposal = Self::from(wire);
+        proposal.validate()?;
+        Ok(proposal)
+    }
+
+    pub fn parse_value(value: Value) -> Result<Self, TaskCapabilityManifestError> {
+        let encoded =
+            serde_json::to_vec(&value).map_err(|_| TaskCapabilityManifestError::InvalidJson)?;
+        if encoded.len() > MAX_JSON_BYTES {
+            return Err(TaskCapabilityManifestError::JsonTooLarge);
+        }
+        let wire: TaskCapabilityProposalWire =
+            serde_json::from_value(value).map_err(|_| TaskCapabilityManifestError::InvalidJson)?;
+        let proposal = Self::from(wire);
+        proposal.validate()?;
+        Ok(proposal)
+    }
+
+    pub fn to_json(&self) -> Result<String, TaskCapabilityManifestError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|_| TaskCapabilityManifestError::InvalidJson)
+    }
+
+    pub fn validate(&self) -> Result<(), TaskCapabilityManifestError> {
+        if self.version != TASK_CAPABILITY_PROPOSAL_VERSION {
+            return Err(TaskCapabilityManifestError::UnsupportedVersion);
+        }
+        if self.capabilities.is_empty() || self.capabilities.len() > MAX_CAPABILITIES {
+            return Err(TaskCapabilityManifestError::CollectionOutOfBounds);
+        }
+        validate_strict_order(
+            self.capabilities
+                .iter()
+                .map(|entry| entry.capability.as_str()),
+        )?;
+        let capability_catalog = builtin_capability_catalog();
+        for entry in &self.capabilities {
+            validate_id(&entry.capability)?;
+            if capability_from_name(&capability_catalog, &entry.capability).is_none() {
+                return Err(TaskCapabilityManifestError::UnknownCapability);
+            }
+            validate_id_list(&entry.application_ids)?;
+            validate_id_list(&entry.path_target_ids)?;
+            validate_id_list(&entry.account_target_ids)?;
+            validate_id_list(&entry.recipient_target_ids)?;
+            validate_id_list(&entry.time_window_target_ids)?;
+            validate_id_list(&entry.external_target_ids)?;
+            validate_nonempty_id_list(&entry.verifier_ids)?;
+            for target_id in entry
+                .path_target_ids
+                .iter()
+                .chain(&entry.account_target_ids)
+                .chain(&entry.recipient_target_ids)
+                .chain(&entry.time_window_target_ids)
+            {
+                if entry.external_target_ids.binary_search(target_id).is_err() {
+                    return Err(TaskCapabilityManifestError::IncompleteGoalBinding);
+                }
+            }
+        }
+        let encoded =
+            serde_json::to_vec(self).map_err(|_| TaskCapabilityManifestError::InvalidJson)?;
+        if encoded.len() > MAX_JSON_BYTES {
+            return Err(TaskCapabilityManifestError::JsonTooLarge);
+        }
+        Ok(())
+    }
+
+    pub fn bind_to_frozen_goal(
+        &self,
+        canonical_task_id: Uuid,
+        goal: &GoalLifecycleProjection,
+    ) -> Result<TaskCapabilityManifestProposal, TaskCapabilityManifestError> {
+        self.validate()?;
+        let frozen = goal
+            .frozen()
+            .ok_or(TaskCapabilityManifestError::GoalNotFrozen)?;
+        if canonical_task_id != goal.goal_id {
+            return Err(TaskCapabilityManifestError::TaskGoalIdentityMismatch);
+        }
+
+        let mut capabilities = Vec::with_capacity(self.capabilities.len());
+        for entry in &self.capabilities {
+            let mut tool_ids = frozen
+                .envelope
+                .validated_capabilities
+                .iter()
+                .filter(|binding| binding.capability == entry.capability)
+                .map(|binding| binding.tool_id.clone())
+                .collect::<Vec<_>>();
+            tool_ids.sort();
+            if tool_ids.is_empty() {
+                return Err(TaskCapabilityManifestError::GoalCapabilityMismatch);
+            }
+            capabilities.push(TaskCapabilityNeedProposal {
+                capability: entry.capability.clone(),
+                tool_ids,
+                application_ids: entry.application_ids.clone(),
+                path_target_ids: entry.path_target_ids.clone(),
+                account_target_ids: entry.account_target_ids.clone(),
+                recipient_target_ids: entry.recipient_target_ids.clone(),
+                time_window_target_ids: entry.time_window_target_ids.clone(),
+                external_target_ids: entry.external_target_ids.clone(),
+                verifier_ids: entry.verifier_ids.clone(),
+            });
+        }
+
+        let proposal = TaskCapabilityManifestProposal {
+            version: TASK_CAPABILITY_MANIFEST_VERSION.to_string(),
+            task_id: canonical_task_id,
+            goal_id: goal.goal_id,
+            goal_revision: frozen.revision.clone(),
+            goal_fingerprint: frozen.fingerprint.clone(),
+            expires_at: self.expires_at,
+            capabilities,
+        };
+        proposal.validate()?;
+        Ok(proposal)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1129,7 +1307,7 @@ fn validate_id(value: &str) -> Result<(), TaskCapabilityManifestError> {
     {
         return Err(TaskCapabilityManifestError::InvalidIdentifier);
     }
-    if contains_secret_like_content(value) {
+    if contains_secret_like_content(value) || contains_private_internal_reference(value) {
         return Err(TaskCapabilityManifestError::SecretLikeContent);
     }
     Ok(())
@@ -1500,6 +1678,39 @@ mod tests {
         }
     }
 
+    fn descriptive_proposal() -> TaskCapabilityProposal {
+        TaskCapabilityProposal {
+            version: TASK_CAPABILITY_PROPOSAL_VERSION.to_string(),
+            expires_at: "2030-01-02T03:04:05Z".parse().unwrap(),
+            capabilities: vec![
+                TaskCapabilityDescriptionProposal {
+                    capability: "connector_write".to_string(),
+                    application_ids: vec!["outlook".to_string()],
+                    path_target_ids: Vec::new(),
+                    account_target_ids: vec!["finance-account".to_string()],
+                    recipient_target_ids: vec!["finance-recipient".to_string()],
+                    time_window_target_ids: vec!["weekday-window".to_string()],
+                    external_target_ids: vec![
+                        "finance-account".to_string(),
+                        "finance-recipient".to_string(),
+                        "weekday-window".to_string(),
+                    ],
+                    verifier_ids: vec!["external-verifier-v1".to_string()],
+                },
+                TaskCapabilityDescriptionProposal {
+                    capability: "file_write".to_string(),
+                    application_ids: vec!["excel".to_string()],
+                    path_target_ids: vec!["report-folder".to_string()],
+                    account_target_ids: Vec::new(),
+                    recipient_target_ids: Vec::new(),
+                    time_window_target_ids: Vec::new(),
+                    external_target_ids: vec!["report-folder".to_string()],
+                    verifier_ids: vec!["report-verifier-v1".to_string()],
+                },
+            ],
+        }
+    }
+
     fn compiled_fixture() -> (
         GoalLifecycleProjection,
         TaskCapabilityManifestProposal,
@@ -1520,6 +1731,134 @@ mod tests {
     fn rehash_manifest(manifest: &mut TaskCapabilityManifest) {
         manifest.revision = manifest_revision_for(manifest);
         manifest.fingerprint = manifest_fingerprint_for(manifest);
+    }
+
+    #[test]
+    fn c3d_descriptive_proposal_is_strict_bounded_and_contains_no_kernel_authority() {
+        let proposal = descriptive_proposal();
+        let serialized = proposal.to_json().unwrap();
+        for forbidden in [
+            "task_id",
+            "goal_id",
+            "goal_revision",
+            "goal_fingerprint",
+            "tool_ids",
+            "risk",
+            "grant",
+            "actor",
+            "approval",
+            "preview",
+            "claim",
+            "token",
+        ] {
+            assert!(!serialized.contains(forbidden), "{forbidden}");
+        }
+
+        let mut unsupported = serde_json::to_value(&proposal).unwrap();
+        unsupported["version"] = Value::String("ds-agent.task-capability-proposal/v2".to_string());
+        assert_eq!(
+            TaskCapabilityProposal::parse_value(unsupported),
+            Err(TaskCapabilityManifestError::UnsupportedVersion)
+        );
+
+        let mut missing = serde_json::to_value(&proposal).unwrap();
+        missing.as_object_mut().unwrap().remove("expires_at");
+        assert_eq!(
+            TaskCapabilityProposal::parse_value(missing),
+            Err(TaskCapabilityManifestError::InvalidJson)
+        );
+
+        for field in [
+            "risk",
+            "grant",
+            "authority",
+            "actor",
+            "approval",
+            "resolution",
+            "claim",
+            "token",
+            "permission_state",
+            "manifest_revision",
+            "manifest_fingerprint",
+            "preview",
+            "preview_hash",
+            "renderer_revision",
+        ] {
+            let mut top = serde_json::to_value(&proposal).unwrap();
+            top[field] = Value::String("forged".to_string());
+            assert_eq!(
+                TaskCapabilityProposal::parse_value(top),
+                Err(TaskCapabilityManifestError::InvalidJson),
+                "top-level {field}"
+            );
+
+            let mut nested = serde_json::to_value(&proposal).unwrap();
+            nested["capabilities"][0][field] = Value::String("forged".to_string());
+            assert_eq!(
+                TaskCapabilityProposal::parse_value(nested),
+                Err(TaskCapabilityManifestError::InvalidJson),
+                "nested {field}"
+            );
+        }
+
+        let mut duplicate = proposal.clone();
+        duplicate.capabilities[1] = duplicate.capabilities[0].clone();
+        assert_eq!(
+            duplicate.validate(),
+            Err(TaskCapabilityManifestError::DuplicateValue)
+        );
+        let mut noncanonical = proposal.clone();
+        noncanonical.capabilities.reverse();
+        assert_eq!(
+            noncanonical.validate(),
+            Err(TaskCapabilityManifestError::NonCanonicalOrder)
+        );
+        let mut private_reference = proposal.clone();
+        private_reference.capabilities[0].application_ids = vec!["provider_ref".to_string()];
+        assert_eq!(
+            private_reference.validate(),
+            Err(TaskCapabilityManifestError::SecretLikeContent)
+        );
+        let mut secret = proposal.clone();
+        secret.capabilities[0].application_ids =
+            vec![format!("{}{}", "sk", "-abcdefghijklmnopqrstuvwxyz")];
+        assert_eq!(
+            secret.validate(),
+            Err(TaskCapabilityManifestError::SecretLikeContent)
+        );
+        let mut absolute_path = proposal.clone();
+        absolute_path.capabilities[1].path_target_ids = vec!["c:\\private".to_string()];
+        assert!(absolute_path.validate().is_err());
+        assert_eq!(
+            TaskCapabilityProposal::parse_json(&format!(
+                "{{\"padding\":\"{}\"}}",
+                "x".repeat(MAX_JSON_BYTES)
+            )),
+            Err(TaskCapabilityManifestError::JsonTooLarge)
+        );
+    }
+
+    #[test]
+    fn c3d_kernel_binds_descriptive_needs_to_the_exact_frozen_goal_and_catalog_tools() {
+        let store = EventStore::open_memory().unwrap();
+        let goal = frozen_goal(&store);
+        let proposal = descriptive_proposal();
+        let bound = proposal.bind_to_frozen_goal(TASK_ID, &goal).unwrap();
+        let frozen = goal.frozen().unwrap();
+
+        assert_eq!(bound.task_id, TASK_ID);
+        assert_eq!(bound.goal_id, TASK_ID);
+        assert_eq!(bound.goal_revision, frozen.revision);
+        assert_eq!(bound.goal_fingerprint, frozen.fingerprint);
+        assert_eq!(
+            bound.capabilities[0].tool_ids,
+            vec![CONNECTOR_MUTATE_TOOL_ID]
+        );
+        assert_eq!(bound.capabilities[1].tool_ids, vec![FILE_WRITE_TOOL_ID]);
+        assert_eq!(
+            proposal.bind_to_frozen_goal(Uuid::from_u128(0xdead), &goal),
+            Err(TaskCapabilityManifestError::TaskGoalIdentityMismatch)
+        );
     }
 
     #[test]

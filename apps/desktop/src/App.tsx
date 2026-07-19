@@ -2989,6 +2989,7 @@ export function App() {
           content: workerResult.response.content,
           model: workerResult.response.model,
           protocol_version: workerResult.response.protocol_version,
+          goal_projection: workerResult.response.goal_projection,
           proposed_actions: workerResult.response.proposed_actions,
           missing_prerequisites: workerResult.response.missing_prerequisites,
           memory_candidates: workerResult.response.memory_candidates,
