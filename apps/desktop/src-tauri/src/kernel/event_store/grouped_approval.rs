@@ -16,8 +16,9 @@ use crate::kernel::task_grouped_approval::{
     capability_request_event_id_for, event_id_for, item_event_id_for, legacy_consumption_id_for,
     permission_resolution_event_id_for, permission_resolution_id_for, TaskGroupedApproval,
     TaskGroupedApprovalActor, TaskGroupedApprovalError, TaskGroupedApprovalResolutionClaim,
-    TaskGroupedApprovalStatus, TaskGroupedCapabilityAudit, TaskGroupedCapabilityClaim,
-    TaskGroupedCapabilityGrant, TASK_GROUPED_APPROVAL_VERSION,
+    TaskGroupedApprovalStatus, TaskGroupedAuthorizationIntent, TaskGroupedAuthorizationView,
+    TaskGroupedCapabilityAudit, TaskGroupedCapabilityClaim, TaskGroupedCapabilityGrant,
+    TASK_GROUPED_APPROVAL_VERSION,
 };
 
 const TASK_GROUPED_APPROVAL_PREPARED_EVENT: &str = "task_grouped_approval.prepared";
@@ -188,6 +189,114 @@ impl EventStore {
             validate_audit_history(self, group)?;
         }
         Ok(group)
+    }
+
+    pub fn list_task_grouped_authorizations(
+        &self,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<Vec<TaskGroupedAuthorizationView>> {
+        let group_ids = {
+            let mut statement = self.conn.prepare(
+                r#"SELECT group_id FROM task_grouped_approval_state
+                   ORDER BY updated_at DESC, group_id ASC"#,
+            )?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids
+        };
+        let mut views = Vec::with_capacity(group_ids.len());
+        for group_id in group_ids {
+            let group_id = Uuid::parse_str(&group_id)?;
+            let group = self.refresh_task_grouped_approval_state(group_id, None, now)?;
+            let goal = self
+                .goal_envelope_projection(group.task_id)?
+                .ok_or_else(|| invalid("task grouped authorization lost its frozen goal"))?;
+            views.push(group.authorization_view(&goal).map_err(group_error)?);
+        }
+        Ok(views)
+    }
+
+    pub fn resolve_task_grouped_authorization(
+        &self,
+        intent: &TaskGroupedAuthorizationIntent,
+        approved: bool,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<TaskGroupedAuthorizationView> {
+        self.refresh_task_grouped_approval_state(intent.group_id, Some(intent.task_id), now)?;
+        let resolved =
+            self.resolve_task_grouped_approval(&intent.resolution_claim(), approved, now)?;
+        let goal = self
+            .goal_envelope_projection(resolved.task_id)?
+            .ok_or_else(|| invalid("task grouped authorization lost its frozen goal"))?;
+        resolved.authorization_view(&goal).map_err(group_error)
+    }
+
+    pub fn revoke_task_grouped_authorization(
+        &self,
+        intent: &TaskGroupedAuthorizationIntent,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<TaskGroupedAuthorizationView> {
+        self.refresh_task_grouped_approval_state(intent.group_id, Some(intent.task_id), now)?;
+        let revoked = self.revoke_task_grouped_approval(&intent.resolution_claim(), now)?;
+        let goal = self
+            .goal_envelope_projection(revoked.task_id)?
+            .ok_or_else(|| invalid("task grouped authorization lost its frozen goal"))?;
+        revoked.authorization_view(&goal).map_err(group_error)
+    }
+
+    fn refresh_task_grouped_approval_state(
+        &self,
+        group_id: Uuid,
+        expected_task_id: Option<Uuid>,
+        now: DateTime<Utc>,
+    ) -> EventStoreResult<TaskGroupedApproval> {
+        let current = self
+            .task_grouped_approval(group_id)?
+            .ok_or_else(|| EventStoreError::NotFound("task grouped approval".to_string()))?;
+        if expected_task_id.is_some_and(|task_id| task_id != current.task_id) {
+            return Err(invalid("task grouped authorization task binding changed"));
+        }
+        if !matches!(
+            current.status,
+            TaskGroupedApprovalStatus::Pending | TaskGroupedApprovalStatus::Approved
+        ) {
+            return Ok(current);
+        }
+        if now >= current.manifest.expires_at {
+            return self.expire_task_grouped_approval(group_id, current.task_id, now);
+        }
+        let goal_is_current = self
+            .goal_envelope_projection(current.task_id)?
+            .as_ref()
+            .is_some_and(|goal| current.manifest.validate_for_goal(goal).is_ok());
+        if goal_is_current {
+            return Ok(current);
+        }
+
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current = load_group(&transaction, group_id)?
+            .ok_or_else(|| EventStoreError::NotFound("task grouped approval".to_string()))?;
+        if !matches!(
+            current.status,
+            TaskGroupedApprovalStatus::Pending | TaskGroupedApprovalStatus::Approved
+        ) {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        if current.status == TaskGroupedApprovalStatus::Pending {
+            resolve_item_requests(
+                &transaction,
+                &current,
+                false,
+                "Task grouped approval invalidated because the frozen goal changed.",
+                now,
+            )?;
+        }
+        let changed = current.scope_changed(now).map_err(group_error)?;
+        persist_transition(&transaction, &current, &changed)?;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn resolve_task_grouped_approval(
@@ -993,6 +1102,7 @@ mod tests {
         TaskCapabilityManifestContext, TaskCapabilityManifestProposal, TaskCapabilityNeedProposal,
         TASK_CAPABILITY_MANIFEST_VERSION,
     };
+    use crate::kernel::task_grouped_approval::TaskGroupedCapabilityAuditStatus;
     use crate::kernel::tool_runtime::{CONNECTOR_MUTATE_TOOL_ID, FILE_WRITE_TOOL_ID};
     use rusqlite::Connection;
     use tempfile::tempdir;
@@ -1611,6 +1721,16 @@ mod tests {
                 .status,
             TaskGroupedApprovalStatus::ScopeChanged
         );
+        assert_eq!(
+            store
+                .list_task_grouped_authorizations(fixed_now() + chrono::Duration::minutes(3))
+                .unwrap()
+                .into_iter()
+                .find(|view| view.intent.group_id == approved.id)
+                .unwrap()
+                .status,
+            TaskGroupedApprovalStatus::ScopeChanged
+        );
         assert!(store
             .authorize_task_grouped_capability(
                 &old_claim,
@@ -1811,6 +1931,250 @@ mod tests {
             .unwrap();
         drop(connection);
         assert!(EventStore::open(&audit_path).is_err());
+    }
+
+    #[test]
+    fn c3c_ui_projection_is_exact_redacted_and_keeps_per_capability_audit_visible() {
+        let store = EventStore::open_memory().unwrap();
+        let pending = prepare(&store);
+        let views = store
+            .list_task_grouped_authorizations(fixed_now())
+            .expect("authorization views load");
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert_eq!(view.status, TaskGroupedApprovalStatus::Pending);
+        assert_eq!(view.intent.group_id, pending.id);
+        assert_eq!(view.intent.task_id, TASK_ID);
+        assert_eq!(view.intent.expected_projection_revision, 0);
+        assert_eq!(
+            view.goal,
+            "Create a verified report and send one approved external update."
+        );
+        assert_eq!(
+            view.applications,
+            vec!["Microsoft Excel", "Microsoft Outlook"]
+        );
+        assert_eq!(view.paths, vec!["Workspace / reports"]);
+        assert_eq!(view.accounts, vec!["Work mailbox account"]);
+        assert_eq!(view.recipients, vec!["finance-test@example.com"]);
+        assert_eq!(
+            view.time_windows,
+            vec!["Weekdays 09:00-17:00 Asia/Shanghai"]
+        );
+        assert_eq!(view.verifiers.len(), 2);
+        assert_eq!(view.capability_audits.len(), 2);
+        assert!(view
+            .capability_audits
+            .iter()
+            .all(|audit| audit.status == TaskGroupedCapabilityAuditStatus::Pending));
+
+        let json = serde_json::to_string(view).unwrap().to_ascii_lowercase();
+        for forbidden in [
+            "approval_request_id",
+            "request_fingerprint",
+            "authority_fingerprint",
+            "exact_preview",
+            "tool_id",
+            "credential",
+            "provider_ref",
+            "claim",
+            "token",
+            "c:\\users\\private\\appdata",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "UI projection leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn c3c_exact_ui_intent_rejects_tamper_replay_and_frontend_authority_fields() {
+        let store = EventStore::open_memory().unwrap();
+        let pending = prepare(&store);
+        let goal = store.goal_envelope_projection(TASK_ID).unwrap().unwrap();
+        let intent = pending.authorization_view(&goal).unwrap().intent;
+
+        let mut tampered = Vec::new();
+        let mut wrong_group = intent.clone();
+        wrong_group.group_id = Uuid::from_u128(0xdead);
+        tampered.push(wrong_group);
+        let mut wrong_task = intent.clone();
+        wrong_task.task_id = OTHER_TASK_ID;
+        tampered.push(wrong_task);
+        let mut wrong_projection_revision = intent.clone();
+        wrong_projection_revision.expected_projection_revision += 1;
+        tampered.push(wrong_projection_revision);
+        let mut wrong_manifest_revision = intent.clone();
+        wrong_manifest_revision.manifest_revision = "0".repeat(64);
+        tampered.push(wrong_manifest_revision);
+        let mut wrong_manifest_fingerprint = intent.clone();
+        wrong_manifest_fingerprint.manifest_fingerprint = "1".repeat(64);
+        tampered.push(wrong_manifest_fingerprint);
+        let mut wrong_preview_schema = intent.clone();
+        wrong_preview_schema.preview_schema_revision += 1;
+        tampered.push(wrong_preview_schema);
+        let mut wrong_preview_renderer = intent.clone();
+        wrong_preview_renderer.preview_renderer_revision += 1;
+        tampered.push(wrong_preview_renderer);
+        let mut wrong_preview_hash = intent.clone();
+        wrong_preview_hash.preview_hash = "2".repeat(64);
+        tampered.push(wrong_preview_hash);
+
+        for tampered_intent in tampered {
+            assert!(store
+                .resolve_task_grouped_authorization(
+                    &tampered_intent,
+                    true,
+                    fixed_now() + chrono::Duration::minutes(1),
+                )
+                .is_err());
+            assert_eq!(
+                store
+                    .task_grouped_approval(pending.id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskGroupedApprovalStatus::Pending
+            );
+        }
+
+        let base_value = serde_json::to_value(&intent).unwrap();
+        for forbidden in [
+            "capability",
+            "risk",
+            "scope",
+            "target",
+            "authority",
+            "preview",
+            "grant",
+            "actor",
+            "claim",
+            "token",
+        ] {
+            let mut forged = base_value.clone();
+            forged.as_object_mut().unwrap().insert(
+                forbidden.to_string(),
+                serde_json::Value::String("frontend-forgery".to_string()),
+            );
+            assert!(serde_json::from_value::<TaskGroupedAuthorizationIntent>(forged).is_err());
+        }
+
+        let approved = store
+            .resolve_task_grouped_authorization(
+                &intent,
+                true,
+                fixed_now() + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        assert!(approved
+            .capability_audits
+            .iter()
+            .all(|audit| audit.status == TaskGroupedCapabilityAuditStatus::Approved));
+        assert_eq!(event_count(&store, TASK_GROUPED_APPROVAL_RESOLVED_EVENT), 1);
+        let duplicate = store
+            .resolve_task_grouped_authorization(
+                &intent,
+                true,
+                fixed_now() + chrono::Duration::minutes(2),
+            )
+            .unwrap();
+        assert_eq!(approved, duplicate);
+        assert!(store
+            .resolve_task_grouped_authorization(
+                &intent,
+                false,
+                fixed_now() + chrono::Duration::minutes(2),
+            )
+            .is_err());
+        for item in &pending.capability_audits {
+            assert!(store
+                .resolve_capability_access_request(
+                    item.approval_request_id,
+                    true,
+                    "forged per-item approval".to_string(),
+                )
+                .is_err());
+        }
+
+        let revoked = store
+            .revoke_task_grouped_authorization(
+                &approved.intent,
+                fixed_now() + chrono::Duration::minutes(3),
+            )
+            .unwrap();
+        let duplicate_revoke = store
+            .revoke_task_grouped_authorization(
+                &approved.intent,
+                fixed_now() + chrono::Duration::minutes(4),
+            )
+            .unwrap();
+        assert_eq!(revoked, duplicate_revoke);
+        assert_eq!(revoked.status, TaskGroupedApprovalStatus::Revoked);
+
+        let reject_store = EventStore::open_memory().unwrap();
+        let reject_pending = prepare(&reject_store);
+        let reject_goal = reject_store
+            .goal_envelope_projection(TASK_ID)
+            .unwrap()
+            .unwrap();
+        let rejected = reject_store
+            .resolve_task_grouped_authorization(
+                &reject_pending
+                    .authorization_view(&reject_goal)
+                    .unwrap()
+                    .intent,
+                false,
+                fixed_now() + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        assert_eq!(rejected.status, TaskGroupedApprovalStatus::Rejected);
+        assert!(rejected
+            .capability_audits
+            .iter()
+            .all(|audit| audit.status == TaskGroupedCapabilityAuditStatus::Rejected));
+        assert_eq!(
+            event_count(&reject_store, TASK_GROUPED_APPROVAL_RESOLVED_EVENT),
+            1
+        );
+    }
+
+    #[test]
+    fn c3c_ui_read_refreshes_expiry_and_survives_restart_without_new_authority() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("c3c-ui.db");
+        let store = EventStore::open(&path).unwrap();
+        let expiry = fixed_now() + chrono::Duration::minutes(1);
+        let (manifest, preview) = compiled_fixture_for(
+            &store,
+            TASK_ID,
+            b"path-authority-v1",
+            "Workspace / reports",
+            expiry,
+        );
+        let group = store
+            .prepare_task_grouped_approval(TASK_ID, &manifest, &preview, fixed_now())
+            .unwrap();
+        drop(store);
+
+        let reopened = EventStore::open(&path).unwrap();
+        let views = reopened
+            .list_task_grouped_authorizations(expiry + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].intent.group_id, group.id);
+        assert_eq!(views[0].status, TaskGroupedApprovalStatus::Expired);
+        assert!(reopened
+            .resolve_task_grouped_authorization(
+                &views[0].intent,
+                true,
+                expiry + chrono::Duration::seconds(2),
+            )
+            .is_err());
+        assert_eq!(
+            event_count(&reopened, TASK_GROUPED_APPROVAL_RESOLVED_EVENT),
+            0
+        );
     }
 
     #[test]

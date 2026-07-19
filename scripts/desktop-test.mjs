@@ -37,6 +37,7 @@ run(["node", "scripts/agent-attachments.test.mjs"]);
 run(["node", "scripts/agent-chat-pending.test.mjs"]);
 run(["node", "scripts/agent-context-receipt.test.mjs"]);
 run(["node", "scripts/goal-envelope-ui.test.mjs"]);
+run(["node", "scripts/task-grouped-authorization-ui.test.mjs"]);
 run(["node", "scripts/settings-panel.test.mjs"]);
 run(["node", "scripts/onboarding-readiness.test.mjs"]);
 run(["node", "scripts/plugin-catalog.test.mjs"]);

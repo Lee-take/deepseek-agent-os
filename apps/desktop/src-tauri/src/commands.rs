@@ -158,6 +158,9 @@ use crate::kernel::skill_source::{
 use crate::kernel::soul::{
     AgentSoulProfileUpdateAudit, AgentSoulProfileUpdateProposal, AgentSoulProfileUpdateReceipt,
 };
+use crate::kernel::task_grouped_approval::{
+    TaskGroupedAuthorizationIntent, TaskGroupedAuthorizationView,
+};
 use crate::kernel::tool_runtime::{
     builtin_tool_catalog, prepare_tool_execution, tool_approval_preview, tool_request_fingerprint,
     AgentToolExecutor, ToolEvidence, ToolExecutionOutput, ToolExecutionPlan, ToolExecutionRequest,
@@ -16508,6 +16511,39 @@ pub fn list_pending_capability_access_records(
     let store = state.event_store.lock().map_err(|_| lock_error())?;
     store
         .list_pending_capability_access_records()
+        .map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn list_task_grouped_authorizations(
+    state: State<'_, AppState>,
+) -> Result<Vec<TaskGroupedAuthorizationView>, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .list_task_grouped_authorizations(Utc::now())
+        .map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn resolve_task_grouped_authorization(
+    intent: TaskGroupedAuthorizationIntent,
+    approved: bool,
+    state: State<'_, AppState>,
+) -> Result<TaskGroupedAuthorizationView, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .resolve_task_grouped_authorization(&intent, approved, Utc::now())
+        .map_err(event_store_error)
+}
+
+#[tauri::command]
+pub fn revoke_task_grouped_authorization(
+    intent: TaskGroupedAuthorizationIntent,
+    state: State<'_, AppState>,
+) -> Result<TaskGroupedAuthorizationView, String> {
+    let store = state.event_store.lock().map_err(|_| lock_error())?;
+    store
+        .revoke_task_grouped_authorization(&intent, Utc::now())
         .map_err(event_store_error)
 }
 

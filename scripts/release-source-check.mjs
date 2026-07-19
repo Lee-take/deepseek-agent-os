@@ -4753,6 +4753,9 @@ function checkStepThreeGroupedApprovalKernelBoundary() {
   const commands = readText("apps/desktop/src-tauri/src/commands.rs");
   const publicTypes = readText("apps/desktop/src/types.ts");
   const app = readText("apps/desktop/src/App.tsx");
+  const desktopTest = readText("scripts/desktop-test.mjs");
+  const uiTestPath = "scripts/task-grouped-authorization-ui.test.mjs";
+  const uiTest = readText(uiTestPath);
 
   for (const [filePath, content, phrase, label] of [
     [domainPath, domain, "ds-agent.task-grouped-approval/v1", "task grouped approval version"],
@@ -4777,17 +4780,46 @@ function checkStepThreeGroupedApprovalKernelBoundary() {
     [storePath, groupedStore, "additive_migration_is_idempotent_and_preserves_legacy_exact_tool_approval", "legacy exact-tool migration regression"],
     ["apps/desktop/src-tauri/src/kernel/event_store.rs", eventStore, "grouped_approval::migrate(self)?", "Event Store grouped approval migration registration"],
     ["apps/desktop/src-tauri/src/kernel/mod.rs", kernelModules, "pub mod task_grouped_approval;", "Kernel grouped approval module registration"],
+    [domainPath, domain, "ds-agent.task-grouped-authorization-ui/v1", "secret-free grouped authorization UI projection version"],
+    [domainPath, domain, "TaskGroupedAuthorizationIntent", "exact grouped authorization UI intent"],
+    [domainPath, domain, "authorization_view", "Kernel-owned grouped authorization read projection"],
+    [storePath, groupedStore, "list_task_grouped_authorizations", "Kernel authoritative grouped authorization list"],
+    [storePath, groupedStore, "resolve_task_grouped_authorization", "single grouped authorization UI resolver"],
+    [storePath, groupedStore, "revoke_task_grouped_authorization", "user-visible grouped authorization revoke"],
+    [storePath, groupedStore, "refresh_task_grouped_approval_state", "stale grouped authorization refresh"],
+    [storePath, groupedStore, "c3c_exact_ui_intent_rejects_tamper_replay_and_frontend_authority_fields", "C3C adversarial IPC intent regression"],
+    [storePath, groupedStore, "c3c_ui_read_refreshes_expiry_and_survives_restart_without_new_authority", "C3C restart and expiry UI regression"],
+    ["apps/desktop/src-tauri/src/commands.rs", commands, "pub fn list_task_grouped_authorizations", "thin grouped authorization list command"],
+    ["apps/desktop/src-tauri/src/commands.rs", commands, "pub fn resolve_task_grouped_authorization", "thin grouped authorization resolve command"],
+    ["apps/desktop/src-tauri/src/commands.rs", commands, "pub fn revoke_task_grouped_authorization", "thin grouped authorization revoke command"],
+    ["apps/desktop/src/types.ts", publicTypes, "TaskGroupedAuthorizationView", "public secret-free grouped authorization DTO"],
+    ["apps/desktop/src/App.tsx", app, "TaskGroupedAuthorizationCard", "ordinary-language grouped authorization card"],
+    ["apps/desktop/src/App.tsx", app, '"resolve_task_grouped_authorization"', "grouped authorization UI intent invocation"],
+    ["apps/desktop/src/App.tsx", app, '"revoke_task_grouped_authorization"', "grouped authorization revoke invocation"],
+    ["scripts/desktop-test.mjs", desktopTest, uiTestPath, "full test runs grouped authorization UI boundary"],
+    [uiTestPath, uiTest, "Grouped authorization UI and IPC authority boundary checks passed", "focused grouped authorization UI boundary test"],
   ]) {
     checkTextIncludes(filePath, content, phrase, label);
   }
 
-  for (const [filePath, content, label] of [
-    ["apps/desktop/src-tauri/src/commands.rs", commands, "C3B adds no grouped authorization command"],
-    ["apps/desktop/src/types.ts", publicTypes, "C3B adds no public grouped authorization DTO"],
-    ["apps/desktop/src/App.tsx", app, "C3B adds no authorization UI"],
-  ]) {
-    checkTextDoesNotInclude(filePath, content, "task_grouped_approval", label);
-  }
+  checkTextDoesNotInclude(
+    domainPath,
+    domain.slice(
+      domain.indexOf("pub struct TaskGroupedAuthorizationIntent"),
+      domain.indexOf("impl TaskGroupedAuthorizationIntent"),
+    ),
+    "pub capability",
+    "frontend intent cannot submit a capability",
+  );
+  checkTextDoesNotInclude(
+    domainPath,
+    domain.slice(
+      domain.indexOf("pub struct TaskGroupedAuthorizationIntent"),
+      domain.indexOf("impl TaskGroupedAuthorizationIntent"),
+    ),
+    "pub actor",
+    "frontend intent cannot submit an authority actor",
+  );
 
   for (const forbidden of [
     "apply_mutation(",

@@ -1300,6 +1300,48 @@ export type CapabilityFamily =
 
 export type RiskLevel = "low" | "medium" | "high" | "critical";
 
+export type TaskGroupedAuthorizationStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "revoked"
+  | "expired"
+  | "scope_changed";
+
+export type TaskGroupedAuthorizationIntent = {
+  group_id: string;
+  task_id: string;
+  expected_projection_revision: number;
+  manifest_revision: string;
+  manifest_fingerprint: string;
+  preview_schema_revision: number;
+  preview_renderer_revision: number;
+  preview_hash: string;
+};
+
+export type TaskGroupedCapabilityAuditView = {
+  capability: CapabilityKind;
+  risk_level: RiskLevel;
+  status: TaskGroupedAuthorizationStatus;
+};
+
+export type TaskGroupedAuthorizationView = {
+  version: "ds-agent.task-grouped-authorization-ui/v1";
+  intent: TaskGroupedAuthorizationIntent;
+  status: TaskGroupedAuthorizationStatus;
+  goal: string;
+  applications: string[];
+  paths: string[];
+  accounts: string[];
+  recipients: string[];
+  time_windows: string[];
+  external_targets: string[];
+  expires_at: string;
+  risk_level: RiskLevel;
+  verifiers: string[];
+  capability_audits: TaskGroupedCapabilityAuditView[];
+};
+
 export type PolicyDecision = "allow" | "ask" | "deny";
 
 export type CapabilityAccessStatus =

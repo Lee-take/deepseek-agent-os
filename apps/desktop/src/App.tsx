@@ -143,6 +143,8 @@ import type {
   SkillRecord,
   SkillUpdateSweepResult,
   TaskRecord,
+  TaskGroupedAuthorizationIntent,
+  TaskGroupedAuthorizationView,
   TerminalReadCommand,
   ThemeStyle,
   ThinkingLevel,
@@ -880,6 +882,154 @@ function agentChatRunFromRecord(record: AgentRunRecord, displayPrompt?: string):
   };
 }
 
+function taskGroupedAuthorizationStatusLabel(
+  status: TaskGroupedAuthorizationView["status"],
+  language: Language,
+) {
+  const labels = language === "zh"
+    ? {
+        pending: "等待确认",
+        approved: "已授权",
+        rejected: "已拒绝",
+        revoked: "已撤销",
+        expired: "已过期",
+        scope_changed: "范围已变化",
+      }
+    : {
+        pending: "Pending",
+        approved: "Approved",
+        rejected: "Rejected",
+        revoked: "Revoked",
+        expired: "Expired",
+        scope_changed: "Scope changed",
+      };
+  return labels[status];
+}
+
+function TaskGroupedAuthorizationCard({
+  authorization,
+  language,
+  capabilityLabels,
+  riskLabels,
+  pending,
+  onResolve,
+  onRevoke,
+}: {
+  authorization: TaskGroupedAuthorizationView;
+  language: Language;
+  capabilityLabels: Record<CapabilityKind, string>;
+  riskLabels: Record<TaskGroupedAuthorizationView["risk_level"], string>;
+  pending: boolean;
+  onResolve: (intent: TaskGroupedAuthorizationIntent, approved: boolean) => void;
+  onRevoke: (intent: TaskGroupedAuthorizationIntent) => void;
+}) {
+  const field = (values: string[]) => values.join(language === "zh" ? "、" : ", ") || "—";
+  const labels = language === "zh"
+    ? {
+        title: "本次任务授权",
+        applications: "应用",
+        paths: "路径",
+        accounts: "账户",
+        recipients: "收件人",
+        timeWindows: "时间范围",
+        externalTargets: "外部目标",
+        expiry: "有效期",
+        verifiers: "验证方式",
+        audits: "逐能力审计",
+        approve: "确认授权",
+        reject: "拒绝",
+        revoke: "撤销授权",
+        updating: "正在核对…",
+      }
+    : {
+        title: "Task authorization",
+        applications: "Applications",
+        paths: "Paths",
+        accounts: "Accounts",
+        recipients: "Recipients",
+        timeWindows: "Time range",
+        externalTargets: "External targets",
+        expiry: "Expires",
+        verifiers: "Verification",
+        audits: "Capability audit",
+        approve: "Approve task",
+        reject: "Reject",
+        revoke: "Revoke authorization",
+        updating: "Checking…",
+      };
+
+  return (
+    <article
+      className="capability-card"
+      data-task-grouped-authorization={authorization.status}
+    >
+      <div className="capability-card-header">
+        <ShieldCheck size={16} aria-hidden="true" />
+        <div>
+          <strong>{labels.title}</strong>
+          <span>{taskGroupedAuthorizationStatusLabel(authorization.status, language)}</span>
+        </div>
+      </div>
+      <p>{authorization.goal}</p>
+      <div className="capability-meta">
+        <span className={`risk ${authorization.risk_level}`}>
+          {riskLabels[authorization.risk_level]}
+        </span>
+        <span className={`access-status ${authorization.status}`}>
+          {taskGroupedAuthorizationStatusLabel(authorization.status, language)}
+        </span>
+      </div>
+      <div className="agent-action-list">
+        <ul>
+          <li><span>{labels.applications}</span><p>{field(authorization.applications)}</p></li>
+          <li><span>{labels.paths}</span><p>{field(authorization.paths)}</p></li>
+          <li><span>{labels.accounts}</span><p>{field(authorization.accounts)}</p></li>
+          <li><span>{labels.recipients}</span><p>{field(authorization.recipients)}</p></li>
+          <li><span>{labels.timeWindows}</span><p>{field(authorization.time_windows)}</p></li>
+          <li><span>{labels.externalTargets}</span><p>{field(authorization.external_targets)}</p></li>
+          <li><span>{labels.expiry}</span><p>{formatTaskDate(authorization.expires_at, language)}</p></li>
+          <li><span>{labels.verifiers}</span><p>{field(authorization.verifiers)}</p></li>
+        </ul>
+      </div>
+      <div className="tool-output">
+        <div className="recent-audit-heading">{labels.audits}</div>
+        <div className="tool-output-list">
+          {authorization.capability_audits.map((audit, index) => (
+            <article className="tool-output-row" key={`${audit.capability}-${index}`}>
+              <div>
+                <strong>{capabilityLabels[audit.capability]}</strong>
+                <span className={`risk ${audit.risk_level}`}>{riskLabels[audit.risk_level]}</span>
+              </div>
+              <span className={`access-status ${audit.status}`}>
+                {taskGroupedAuthorizationStatusLabel(audit.status, language)}
+              </span>
+            </article>
+          ))}
+        </div>
+      </div>
+      {authorization.status === "pending" ? (
+        <div className="capability-card-approval">
+          <button type="button" disabled={pending} onClick={() => onResolve(authorization.intent, true)}>
+            <Check size={14} aria-hidden="true" />
+            {pending ? labels.updating : labels.approve}
+          </button>
+          <button type="button" disabled={pending} onClick={() => onResolve(authorization.intent, false)}>
+            <X size={14} aria-hidden="true" />
+            {labels.reject}
+          </button>
+        </div>
+      ) : authorization.status === "approved" ? (
+        <div className="capability-card-approval">
+          <button type="button" disabled={pending} onClick={() => onRevoke(authorization.intent)}>
+            <X size={14} aria-hidden="true" />
+            {pending ? labels.updating : labels.revoke}
+          </button>
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
 function capabilityFamilyIcon(family: CapabilityFamily) {
   switch (family) {
     case "file":
@@ -948,6 +1098,14 @@ export function App() {
   const [capabilityCatalog, setCapabilityCatalog] = useState<CapabilityDescriptor[]>([]);
   const [capabilityRecords, setCapabilityRecords] = useState<CapabilityAccessRecord[]>([]);
   const [capabilityInvocations, setCapabilityInvocations] = useState<CapabilityInvocation[]>([]);
+  const [taskGroupedAuthorizations, setTaskGroupedAuthorizations] = useState<
+    TaskGroupedAuthorizationView[]
+  >([]);
+  const [taskGroupedAuthorizationPending, setTaskGroupedAuthorizationPending] = useState<
+    string | null
+  >(null);
+  const [taskGroupedAuthorizationNotice, setTaskGroupedAuthorizationNotice] = useState("");
+  const [taskGroupedAuthorizationError, setTaskGroupedAuthorizationError] = useState("");
   const [agentToolContracts, setAgentToolContracts] = useState<AgentToolContract[]>([]);
   const [toolInvocations, setToolInvocations] = useState<ToolInvocationRecord[]>([]);
   const [agentContextReceipts, setAgentContextReceipts] = useState<AgentContextReceipt[]>([]);
@@ -2122,6 +2280,7 @@ export function App() {
       setCapabilityCatalog([]);
       setCapabilityRecords([]);
       setCapabilityInvocations([]);
+      setTaskGroupedAuthorizations([]);
       setAgentToolContracts([]);
       setToolInvocations([]);
       setAgentContextReceipts([]);
@@ -2141,6 +2300,7 @@ export function App() {
       invoke<PermissionAuditEntry[]>("list_permission_audit_entries"),
       invoke<CapabilityDescriptor[]>("list_capability_catalog"),
       invoke<CapabilityAccessRecord[]>("list_capability_access_records"),
+      invoke<TaskGroupedAuthorizationView[]>("list_task_grouped_authorizations"),
       invoke<CapabilityInvocation[]>("list_capability_invocations"),
       invoke<AgentToolContract[]>("list_agent_tool_contracts"),
       invoke<ToolInvocationRecord[]>("list_agent_tool_invocations"),
@@ -2158,6 +2318,7 @@ export function App() {
         audits,
         catalog,
         capabilityAccessRecords,
+        groupedAuthorizations,
         invocations,
         toolContracts,
         recordedToolInvocations,
@@ -2174,6 +2335,7 @@ export function App() {
         setPermissionAudits(audits);
         setCapabilityCatalog(catalog);
         setCapabilityRecords(capabilityAccessRecords);
+        setTaskGroupedAuthorizations(groupedAuthorizations);
         setCapabilityInvocations(invocations);
         setAgentToolContracts(toolContracts);
         setToolInvocations(recordedToolInvocations);
@@ -2204,6 +2366,9 @@ export function App() {
         setMemoryCandidateError(copy.memory.loadFailed);
         setAuditError(copy.audit.loadFailed);
         setCapabilityError(copy.capabilities.loadFailed);
+        setTaskGroupedAuthorizationError(
+          language === "zh" ? "无法读取任务授权状态。" : "Could not load task authorization state.",
+        );
         setBriefingError(copy.operationsBriefing.loadFailed);
       });
   }, [
@@ -2213,6 +2378,7 @@ export function App() {
     copy.operationsBriefing.loadFailed,
     copy.package.loadFailed,
     copy.skills.updateFailed,
+    language,
   ]);
 
   const setLocalSkillEnabled = async (record: SkillRecord, enabled: boolean) => {
@@ -2580,18 +2746,28 @@ export function App() {
   };
 
   async function refreshCapabilityState() {
-    const [records, audits, invocations, contextReceipts, tools] = await Promise.all([
+    const [records, groupedAuthorizations, audits, invocations, contextReceipts, tools] =
+      await Promise.all([
       invoke<CapabilityAccessRecord[]>("list_capability_access_records"),
+      invoke<TaskGroupedAuthorizationView[]>("list_task_grouped_authorizations"),
       invoke<PermissionAuditEntry[]>("list_permission_audit_entries"),
       invoke<CapabilityInvocation[]>("list_capability_invocations"),
       invoke<AgentContextReceipt[]>("list_agent_context_receipts"),
       invoke<ToolInvocationRecord[]>("list_agent_tool_invocations"),
-    ]);
+      ]);
     setCapabilityRecords(records);
+    setTaskGroupedAuthorizations(groupedAuthorizations);
     setPermissionAudits(audits);
     setCapabilityInvocations(invocations);
     setAgentContextReceipts(contextReceipts);
     setToolInvocations(tools);
+  }
+
+  async function refreshTaskGroupedAuthorizationState() {
+    const groupedAuthorizations = await invoke<TaskGroupedAuthorizationView[]>(
+      "list_task_grouped_authorizations",
+    );
+    setTaskGroupedAuthorizations(groupedAuthorizations);
   }
 
   async function refreshDurableComputerUseState() {
@@ -3943,6 +4119,92 @@ export function App() {
       return false;
     } finally {
       setResolutionPending(null);
+    }
+  };
+
+  const resolveTaskGroupedAuthorization = async (
+    intent: TaskGroupedAuthorizationIntent,
+    approved: boolean,
+  ) => {
+    setTaskGroupedAuthorizationPending(intent.group_id);
+    setTaskGroupedAuthorizationNotice("");
+    setTaskGroupedAuthorizationError("");
+    let rejectedByKernel = false;
+    try {
+      await invoke<TaskGroupedAuthorizationView>("resolve_task_grouped_authorization", {
+        intent,
+        approved,
+      });
+      setTaskGroupedAuthorizationNotice(
+        language === "zh"
+          ? approved
+            ? "已按 Kernel 中的精确任务范围完成授权。"
+            : "已拒绝本次任务授权。"
+          : approved
+            ? "The exact Kernel-owned task scope is approved."
+            : "The task authorization was rejected.",
+      );
+    } catch {
+      rejectedByKernel = true;
+    } finally {
+      try {
+        await refreshTaskGroupedAuthorizationState();
+        if (rejectedByKernel) {
+          setTaskGroupedAuthorizationError(
+            language === "zh"
+              ? "授权意图已过期或与当前范围冲突；已刷新为 Kernel 权威状态。"
+              : "The intent was stale or conflicted with the current scope; Kernel state was refreshed.",
+          );
+        }
+      } catch {
+        setTaskGroupedAuthorizations([]);
+        setTaskGroupedAuthorizationNotice("");
+        setTaskGroupedAuthorizationError(
+          language === "zh"
+            ? "无法重读 Kernel 权威状态；旧授权操作已隐藏，未授予任何新权限。"
+            : "Kernel authority could not be re-read; stale actions were hidden and no new authority was granted.",
+        );
+      }
+      setTaskGroupedAuthorizationPending(null);
+    }
+  };
+
+  const revokeTaskGroupedAuthorization = async (intent: TaskGroupedAuthorizationIntent) => {
+    setTaskGroupedAuthorizationPending(intent.group_id);
+    setTaskGroupedAuthorizationNotice("");
+    setTaskGroupedAuthorizationError("");
+    let rejectedByKernel = false;
+    try {
+      await invoke<TaskGroupedAuthorizationView>("revoke_task_grouped_authorization", {
+        intent,
+      });
+      setTaskGroupedAuthorizationNotice(
+        language === "zh"
+          ? "已撤销本次任务授权。"
+          : "The task authorization was revoked.",
+      );
+    } catch {
+      rejectedByKernel = true;
+    } finally {
+      try {
+        await refreshTaskGroupedAuthorizationState();
+        if (rejectedByKernel) {
+          setTaskGroupedAuthorizationError(
+            language === "zh"
+              ? "撤销意图已过期或与当前范围冲突；已刷新为 Kernel 权威状态。"
+              : "The revoke intent was stale or conflicted with the current scope; Kernel state was refreshed.",
+          );
+        }
+      } catch {
+        setTaskGroupedAuthorizations([]);
+        setTaskGroupedAuthorizationNotice("");
+        setTaskGroupedAuthorizationError(
+          language === "zh"
+            ? "无法重读 Kernel 权威状态；旧授权操作已隐藏，未授予任何新权限。"
+            : "Kernel authority could not be re-read; stale actions were hidden and no new authority was granted.",
+        );
+      }
+      setTaskGroupedAuthorizationPending(null);
     }
   };
 
@@ -6036,7 +6298,14 @@ export function App() {
                         )
                       : null,
                   );
+                  const taskGroupedAuthorization = message.goal_projection
+                    ? taskGroupedAuthorizations.find(
+                        (authorization) =>
+                          authorization.intent.task_id === message.goal_projection?.goal_id,
+                      )
+                    : undefined;
                   const taskApprovalReady =
+                    !taskGroupedAuthorization &&
                     messageApprovalActions.length > 0 &&
                     messageApprovalActions.every(({ action }, index) => {
                       if (!action.permission_request_id) {
@@ -6142,6 +6411,22 @@ export function App() {
                             </small>
                           ) : null}
                         </div>
+                      ) : null}
+                      {message.role === "assistant" && taskGroupedAuthorization ? (
+                        <TaskGroupedAuthorizationCard
+                          authorization={taskGroupedAuthorization}
+                          language={language}
+                          capabilityLabels={copy.capabilityOptions}
+                          riskLabels={copy.riskOptions}
+                          pending={
+                            taskGroupedAuthorizationPending ===
+                            taskGroupedAuthorization.intent.group_id
+                          }
+                          onResolve={(intent, approved) =>
+                            void resolveTaskGroupedAuthorization(intent, approved)
+                          }
+                          onRevoke={(intent) => void revokeTaskGroupedAuthorization(intent)}
+                        />
                       ) : null}
                       {message.role === "assistant" && message.missing_prerequisites?.length ? (
                         <div className="agent-action-list">
@@ -7822,6 +8107,32 @@ export function App() {
                 <strong id="audit-panel-title">{copy.capabilities.title}</strong>
               </div>
               {capabilityError ? <p className="package-error">{capabilityError}</p> : null}
+              {taskGroupedAuthorizationNotice ? (
+                <p className="package-message">{taskGroupedAuthorizationNotice}</p>
+              ) : null}
+              {taskGroupedAuthorizationError ? (
+                <p className="package-error">{taskGroupedAuthorizationError}</p>
+              ) : null}
+              {taskGroupedAuthorizations.length > 0 ? (
+                <div className="capability-grid">
+                  {taskGroupedAuthorizations.map((authorization) => (
+                    <TaskGroupedAuthorizationCard
+                      key={authorization.intent.group_id}
+                      authorization={authorization}
+                      language={language}
+                      capabilityLabels={copy.capabilityOptions}
+                      riskLabels={copy.riskOptions}
+                      pending={
+                        taskGroupedAuthorizationPending === authorization.intent.group_id
+                      }
+                      onResolve={(intent, approved) =>
+                        void resolveTaskGroupedAuthorization(intent, approved)
+                      }
+                      onRevoke={(intent) => void revokeTaskGroupedAuthorization(intent)}
+                    />
+                  ))}
+                </div>
+              ) : null}
               <form className="browser-tool" onSubmit={browseBrowserUrl}>
                 <div className="tool-heading">
                   <Globe2 size={16} aria-hidden="true" />

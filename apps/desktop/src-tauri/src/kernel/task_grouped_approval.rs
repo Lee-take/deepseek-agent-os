@@ -1,8 +1,11 @@
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::kernel::goal_lifecycle::GoalLifecycleProjection;
 use crate::kernel::policy::{
     exact_tool_preview_hash, CapabilityKind, RiskLevel, TOOL_APPROVAL_PREVIEW_REVISION,
 };
@@ -12,6 +15,7 @@ use crate::kernel::task_capability_manifest::{
 
 pub const TASK_GROUPED_APPROVAL_VERSION: &str = "ds-agent.task-grouped-approval/v1";
 pub const TASK_GROUPED_APPROVAL_EVENT_VERSION: &str = "ds-agent.task-grouped-approval-event/v1";
+pub const TASK_GROUPED_AUTHORIZATION_UI_VERSION: &str = "ds-agent.task-grouped-authorization-ui/v1";
 
 const GROUP_ID_DOMAIN: &[u8] = b"ds-agent.task-grouped-approval-id.v1\0";
 const GROUP_INTEGRITY_DOMAIN: &[u8] = b"ds-agent.task-grouped-approval-integrity.v1\0";
@@ -234,6 +238,60 @@ pub struct TaskGroupedApprovalEventReceipt {
     pub preview_hash: String,
     pub capability_audit_ids: Vec<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskGroupedAuthorizationIntent {
+    pub group_id: Uuid,
+    pub task_id: Uuid,
+    pub expected_projection_revision: u64,
+    pub manifest_revision: String,
+    pub manifest_fingerprint: String,
+    pub preview_schema_revision: u32,
+    pub preview_renderer_revision: u32,
+    pub preview_hash: String,
+}
+
+impl TaskGroupedAuthorizationIntent {
+    pub fn resolution_claim(&self) -> TaskGroupedApprovalResolutionClaim {
+        TaskGroupedApprovalResolutionClaim {
+            group_id: self.group_id,
+            task_id: self.task_id,
+            expected_projection_revision: self.expected_projection_revision,
+            manifest_revision: self.manifest_revision.clone(),
+            manifest_fingerprint: self.manifest_fingerprint.clone(),
+            preview_schema_revision: self.preview_schema_revision,
+            preview_renderer_revision: self.preview_renderer_revision,
+            preview_hash: self.preview_hash.clone(),
+            actor: TaskGroupedApprovalActor::User,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TaskGroupedCapabilityAuditView {
+    pub capability: CapabilityKind,
+    pub risk_level: RiskLevel,
+    pub status: TaskGroupedCapabilityAuditStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TaskGroupedAuthorizationView {
+    pub version: String,
+    pub intent: TaskGroupedAuthorizationIntent,
+    pub status: TaskGroupedApprovalStatus,
+    pub goal: String,
+    pub applications: Vec<String>,
+    pub paths: Vec<String>,
+    pub accounts: Vec<String>,
+    pub recipients: Vec<String>,
+    pub time_windows: Vec<String>,
+    pub external_targets: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+    pub risk_level: RiskLevel,
+    pub verifiers: Vec<String>,
+    pub capability_audits: Vec<TaskGroupedCapabilityAuditView>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -583,6 +641,113 @@ impl TaskGroupedApproval {
                     && item.request_fingerprint == claim.request_fingerprint
             })
             .ok_or(TaskGroupedApprovalError::BindingMismatch)
+    }
+
+    pub fn authorization_view(
+        &self,
+        goal: &GoalLifecycleProjection,
+    ) -> Result<TaskGroupedAuthorizationView, TaskGroupedApprovalError> {
+        self.validate_integrity()?;
+        let frozen = goal
+            .frozen()
+            .ok_or(TaskGroupedApprovalError::BindingMismatch)?;
+        if goal.goal_id != self.task_id {
+            return Err(TaskGroupedApprovalError::BindingMismatch);
+        }
+        if matches!(
+            self.status,
+            TaskGroupedApprovalStatus::Pending | TaskGroupedApprovalStatus::Approved
+        ) {
+            self.manifest
+                .validate_for_goal(goal)
+                .map_err(|_| TaskGroupedApprovalError::BindingMismatch)?;
+        }
+
+        let mut applications = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        let mut accounts = BTreeSet::new();
+        let mut recipients = BTreeSet::new();
+        let mut time_windows = BTreeSet::new();
+        let mut external_targets = BTreeSet::new();
+        let mut verifiers = BTreeSet::new();
+        for capability in &self.preview.capabilities {
+            applications.extend(
+                capability
+                    .applications
+                    .iter()
+                    .map(|value| value.display_label.clone()),
+            );
+            paths.extend(
+                capability
+                    .path_scopes
+                    .iter()
+                    .map(|value| value.display_label.clone()),
+            );
+            accounts.extend(
+                capability
+                    .account_scopes
+                    .iter()
+                    .map(|value| value.display_label.clone()),
+            );
+            recipients.extend(
+                capability
+                    .recipient_scopes
+                    .iter()
+                    .map(|value| value.display_label.clone()),
+            );
+            time_windows.extend(
+                capability
+                    .time_windows
+                    .iter()
+                    .map(|value| value.display_label.clone()),
+            );
+            external_targets.extend(
+                capability
+                    .external_targets
+                    .iter()
+                    .map(|value| value.display_label.clone()),
+            );
+            verifiers.extend(
+                capability
+                    .verifiers
+                    .iter()
+                    .map(|value| value.summary.clone()),
+            );
+        }
+
+        Ok(TaskGroupedAuthorizationView {
+            version: TASK_GROUPED_AUTHORIZATION_UI_VERSION.to_string(),
+            intent: TaskGroupedAuthorizationIntent {
+                group_id: self.id,
+                task_id: self.task_id,
+                expected_projection_revision: self.projection_revision,
+                manifest_revision: self.manifest.revision.clone(),
+                manifest_fingerprint: self.manifest.fingerprint.clone(),
+                preview_schema_revision: self.preview.schema_revision,
+                preview_renderer_revision: self.preview.renderer_revision,
+                preview_hash: self.preview.preview_hash.clone(),
+            },
+            status: self.status,
+            goal: frozen.envelope.user_goal.clone(),
+            applications: applications.into_iter().collect(),
+            paths: paths.into_iter().collect(),
+            accounts: accounts.into_iter().collect(),
+            recipients: recipients.into_iter().collect(),
+            time_windows: time_windows.into_iter().collect(),
+            external_targets: external_targets.into_iter().collect(),
+            expires_at: self.manifest.expires_at,
+            risk_level: self.manifest.aggregate_risk,
+            verifiers: verifiers.into_iter().collect(),
+            capability_audits: self
+                .capability_audits
+                .iter()
+                .map(|audit| TaskGroupedCapabilityAuditView {
+                    capability: audit.capability,
+                    risk_level: audit.risk_level,
+                    status: audit.status,
+                })
+                .collect(),
+        })
     }
 
     pub(crate) fn resolve(
