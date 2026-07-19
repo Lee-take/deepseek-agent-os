@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+mod app_paths;
 mod app_update_commands;
 mod artifact_commands;
 mod automation_commands;
@@ -10,6 +11,7 @@ mod kernel;
 mod lifecycle_commands;
 mod workspace_undo_commands;
 
+use app_paths::resolve_app_data_dir;
 use app_update_commands::{check_app_update, download_app_update, install_app_update};
 use artifact_commands::{
     get_artifact_visual_preview, list_artifact_deliveries, spawn_artifact_recovery_worker,
@@ -262,7 +264,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let app_data_dir = app.path().app_data_dir()?;
+            let app_data_dir = resolve_app_data_dir(app.handle()).map_err(std::io::Error::other)?;
             std::fs::create_dir_all(&app_data_dir)?;
             #[cfg(windows)]
             app.manage(

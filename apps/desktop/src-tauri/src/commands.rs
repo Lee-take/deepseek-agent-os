@@ -11,6 +11,7 @@ use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::app_paths::AppDataDirExt;
 use crate::connected_work_commands::{
     dispatch_connected_work_agent_action, is_connected_work_agent_action,
 };
@@ -4476,14 +4477,14 @@ fn link_existing_memory_records(
 fn current_local_directory_readiness(
     app: &AppHandle,
 ) -> Result<LocalDirectoryReadinessStatus, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(app_data_dir).map_err(event_store_error)?;
     Ok(local_directory_readiness_from_state(&directory_state))
 }
 
 #[cfg(windows)]
 fn current_workspace_readiness(app: &AppHandle) -> WorkspaceReadinessProjection {
-    let app_data_dir = match app.path().app_data_dir() {
+    let app_data_dir = match app.resolved_app_data_dir() {
         Ok(path) => path,
         Err(_) => return WorkspaceReadinessProjection::settings_invalid(),
     };
@@ -13584,7 +13585,7 @@ fn agent_chat_runtime_context(
     network_search_source_model: Option<NetworkSearchSourceModel>,
     deepseek_chat_ready: bool,
 ) -> AgentChatRuntimeContext {
-    let app_data_dir = app.path().app_data_dir().ok();
+    let app_data_dir = app.resolved_app_data_dir().ok();
     let soul_profile = app_data_dir
         .as_deref()
         .and_then(|app_data_dir| load_agent_soul_profile_context(app_data_dir).ok())
@@ -13763,7 +13764,7 @@ pub fn execute_agent_tool(
         }
     }
     let file_write_client = if request.tool_id.trim() == FILE_WRITE_TOOL_ID {
-        let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+        let app_data_dir = app.resolved_app_data_dir()?;
         let directory_state =
             load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
         Some(agent_file_write_client(
@@ -13794,7 +13795,7 @@ pub fn execute_agent_tool(
         request.tool_id.trim(),
         COMPUTER_SCREENSHOT_TOOL_ID | COMPUTER_CONTROL_TOOL_ID
     ) {
-        let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+        let app_data_dir = app.resolved_app_data_dir()?;
         let directory_state =
             load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
         let strategy = computer_tool_strategy_for_command(LargeModelProvider::DeepSeek, None);
@@ -13964,8 +13965,7 @@ pub fn run_agent_chat(
         .map_err(|code| code.as_str().to_string())?;
     let api_keys = Zeroizing::new(vec![api_key.expose().to_string()]);
     let pricing_settings = app
-        .path()
-        .app_data_dir()
+        .resolved_app_data_dir()
         .ok()
         .and_then(|app_data_dir| load_deepseek_pricing_state(app_data_dir).ok())
         .map(|pricing_state| pricing_state.settings);
@@ -13976,7 +13976,7 @@ pub fn run_agent_chat(
         true,
     );
     let transport = HttpDeepSeekChatCompletionTransport::new()?;
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let desktop_dir = runtime_context.desktop_dir.clone();
     let file_client = LocalFileContentClient::new(512 * 1024);
@@ -14034,8 +14034,7 @@ pub async fn run_next_queued_agent_chat_worker(
             .map_err(|code| code.as_str().to_string())?;
         let api_keys = Zeroizing::new(vec![api_key.expose().to_string()]);
         let pricing_settings = app
-            .path()
-            .app_data_dir()
+            .resolved_app_data_dir()
             .ok()
             .and_then(|app_data_dir| load_deepseek_pricing_state(app_data_dir).ok())
             .map(|pricing_state| pricing_state.settings);
@@ -14046,7 +14045,7 @@ pub async fn run_next_queued_agent_chat_worker(
             true,
         );
         let transport = HttpDeepSeekChatCompletionTransport::new()?;
-        let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+        let app_data_dir = app.resolved_app_data_dir()?;
         runtime_context.expert_staging_root = Some(app_data_dir.join("expert-team-staging"));
         let directory_state =
             load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
@@ -14097,7 +14096,7 @@ pub fn resume_agent_chat_action(
     action: AgentChatActionProposal,
     state: State<'_, AppState>,
 ) -> Result<AgentChatActionProposal, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let desktop_dir = app.path().desktop_dir().ok();
     let normalized_action = normalize_agent_action_proposal(action, access_mode);
@@ -14259,7 +14258,7 @@ pub fn clear_deepseek_chat_cache(state: State<'_, AppState>) -> usize {
 
 #[tauri::command]
 pub fn get_deepseek_pricing_state(app: AppHandle) -> Result<DeepSeekPricingState, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     load_deepseek_pricing_state(app_data_dir).map_err(event_store_error)
 }
 
@@ -14272,7 +14271,7 @@ pub fn save_deepseek_pricing_settings(
     pro_prompt_usd_per_million_tokens: String,
     pro_completion_usd_per_million_tokens: String,
 ) -> Result<DeepSeekPricingState, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     persist_deepseek_pricing_settings(
         app_data_dir,
         DeepSeekPricingSettings {
@@ -14603,7 +14602,7 @@ pub fn run_durable_computer_use_step(
             .map_err(event_store_error)?;
     }
 
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let screenshot_client = LocalComputerScreenshotClient::new(
         computer_screenshot_evidence_base_dir(&app_data_dir, &directory_state),
@@ -14780,7 +14779,7 @@ pub fn get_local_directory_state(app: AppHandle) -> WorkspaceReadinessProjection
 
 #[tauri::command]
 pub fn get_agent_soul_profile(app: AppHandle) -> Result<AgentSoulProfileState, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     agent_soul_profile_state_from_app_data_dir(&app_data_dir)
 }
 
@@ -14789,7 +14788,7 @@ pub fn save_agent_soul_profile(
     app: AppHandle,
     content: String,
 ) -> Result<AgentSoulProfileState, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     save_agent_soul_profile_content(&app_data_dir, &content)
 }
 
@@ -14800,7 +14799,7 @@ pub fn save_local_directory_settings(
     workspace_name: String,
     state: State<'_, AppState>,
 ) -> Result<OnboardingReadinessProjection, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let workspace =
         match LocalDirectorySettings::from_workspace_dir_and_name(workspace_dir, workspace_name) {
             Ok(settings) => match persist_local_directory_settings(app_data_dir, settings) {
@@ -15077,7 +15076,7 @@ pub fn queue_parent_agent_synthesis(
                 .expert_contract
                 .as_ref()
                 .ok_or_else(|| "Expert production contract is missing.".to_string())?;
-            let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+            let app_data_dir = app.resolved_app_data_dir()?;
             let staging_root = app_data_dir
                 .join("expert-team-staging")
                 .join(parent_run_id.to_string())
@@ -15400,7 +15399,7 @@ pub fn run_memory_background_maintenance(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<MemoryBackgroundMaintenanceSummary, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let store =
         EventStore::open(app_data_dir.join("kernel-events.sqlite3")).map_err(event_store_error)?;
     if let Ok(api_key) = state
@@ -16588,7 +16587,7 @@ pub fn write_file_boundary(
     content: String,
     state: State<'_, AppState>,
 ) -> Result<CapabilityInvocation, String> {
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let client = agent_file_write_client(&directory_state, app.path().desktop_dir().ok())?;
     if let AgentFileWriteClient::Unavailable(reason) = &client {
@@ -16743,7 +16742,7 @@ pub fn capture_computer_screenshot(
 ) -> Result<CapabilityInvocation, String> {
     let strategy =
         computer_tool_strategy_for_command(large_model_provider, network_search_source_model);
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let client = agent_computer_use_client(
         &strategy,
@@ -17125,8 +17124,7 @@ pub fn run_operations_briefing(
         build_operations_briefing_run(request, &client)?
     };
     let pricing_settings = app
-        .path()
-        .app_data_dir()
+        .resolved_app_data_dir()
         .ok()
         .and_then(|app_data_dir| load_deepseek_pricing_state(app_data_dir).ok())
         .map(|pricing_state| pricing_state.settings);
@@ -17188,7 +17186,7 @@ pub fn export_operations_briefing_report(
             .find(|run| run.id == run_id)
             .ok_or_else(|| "operations briefing run was not found".to_string())?
     };
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let export_dir = operations_briefing_report_export_dir(&app_data_dir, &directory_state);
     let report_markdown = render_operations_briefing_report(&run);
@@ -17249,7 +17247,7 @@ pub fn export_operations_briefing_html_report(
             .find(|run| run.id == run_id)
             .ok_or_else(|| "operations briefing run was not found".to_string())?
     };
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let export_dir = operations_briefing_report_export_dir(&app_data_dir, &directory_state);
     let report_html = render_operations_briefing_html_report(&run);
@@ -17310,7 +17308,7 @@ pub fn export_operations_briefing_pdf_report(
             .find(|run| run.id == run_id)
             .ok_or_else(|| "operations briefing run was not found".to_string())?
     };
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let export_dir = operations_briefing_report_export_dir(&app_data_dir, &directory_state);
     let report_pdf = render_operations_briefing_pdf_report(&run);
@@ -17387,7 +17385,7 @@ pub fn seed_operations_briefing_evidence_templates(
             .has_user_approved_capability(CapabilityKind::FileWrite)
             .map_err(event_store_error)?
     };
-    let app_data_dir = app.path().app_data_dir().map_err(event_store_error)?;
+    let app_data_dir = app.resolved_app_data_dir()?;
     let directory_state = load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
     let seed_dir = operations_briefing_template_seed_dir(&app_data_dir, &directory_state);
     let outcome = build_operations_briefing_template_seed(

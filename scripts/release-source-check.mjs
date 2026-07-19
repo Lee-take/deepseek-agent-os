@@ -4549,6 +4549,7 @@ function checkStepOneOnboardingReadinessContract() {
     "verifyIsolatedProfileRoot",
     "APPDATA: profile.appDataDir",
     "LOCALAPPDATA: profile.localAppDataDir",
+    "DS_AGENT_UI_SMOKE_APP_DATA_DIR: profile.appDataDir",
     "removeIsolatedProfile",
     "verifyIsolatedLocalFilePath",
     "runInstalledOnboardingSmoke",
@@ -4560,6 +4561,39 @@ function checkStepOneOnboardingReadinessContract() {
       `installed UI smoke includes ${required}`,
     );
   }
+
+  const appPaths = readText("apps/desktop/src-tauri/src/app_paths.rs");
+  for (const required of [
+    "DS_AGENT_UI_SMOKE_PROFILE_MODE",
+    "DS_AGENT_UI_SMOKE_APP_DATA_DIR",
+    "std::env::temp_dir()",
+    "isolated app-data override escaped the verified temp profile",
+  ]) {
+    checkTextIncludes(
+      "apps/desktop/src-tauri/src/app_paths.rs",
+      appPaths,
+      required,
+      `isolated app-data resolver includes ${required}`,
+    );
+  }
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/main.rs",
+    readText("apps/desktop/src-tauri/src/main.rs"),
+    "resolve_app_data_dir(app.handle())",
+    "desktop startup uses the isolated app-data resolver",
+  );
+  checkTextIncludes(
+    "apps/desktop/src-tauri/src/commands.rs",
+    readText("apps/desktop/src-tauri/src/commands.rs"),
+    "resolved_app_data_dir()",
+    "desktop commands use the isolated app-data resolver",
+  );
+  checkTextDoesNotInclude(
+    "apps/desktop/src-tauri/src/commands.rs",
+    readText("apps/desktop/src-tauri/src/commands.rs"),
+    ".app_data_dir()",
+    "desktop commands do not bypass the isolated app-data resolver",
+  );
 
   const publicTypes = readText("apps/desktop/src/types.ts");
   const projectionStart = publicTypes.indexOf("export type DeepSeekReadinessProjection");
