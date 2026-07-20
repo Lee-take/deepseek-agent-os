@@ -551,10 +551,13 @@ pub struct AgentRunWorkerResult {
 pub type AgentSubtaskPlanItem = ExpertTeamPlanItem;
 
 fn validated_subagent_plan(items: &[AgentSubtaskPlanItem]) -> Vec<AgentSubtaskPlanItem> {
-    crate::kernel::expert_team::validate_team_plan(Uuid::new_v4(), "model proposal", items)
+    if crate::kernel::expert_team::validate_team_plan(Uuid::new_v4(), "model proposal", items)
         .is_ok()
-        .then(|| items.to_vec())
-        .unwrap_or_default()
+    {
+        items.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 fn block_subagent_mutating_actions(
@@ -1935,9 +1938,9 @@ impl<T: ComputerControlClient + ?Sized> AgentToolExecutor
                 reference: "computer://foreground_desktop".to_string(),
                 summary: format!("{purpose} Executor acknowledged: {action_summary}."),
             }],
-            verification: ToolVerificationResult::passed(format!(
-                "computer.control verified the structured action and execution receipt; visible task state still requires a screenshot"
-            )),
+            verification: ToolVerificationResult::passed(
+                "computer.control verified the structured action and execution receipt; visible task state still requires a screenshot",
+            ),
         })
     }
 }
@@ -6090,7 +6093,7 @@ fn agent_soul_latest_prior_role_line(full_prompt: &str) -> Option<(&str, &str)> 
     prior_context
         .lines()
         .filter_map(agent_soul_role_line)
-        .last()
+        .next_back()
 }
 
 fn agent_soul_role_line(line: &str) -> Option<(&str, &str)> {
@@ -6139,14 +6142,14 @@ fn repair_agent_soul_cross_role_name(
         .get("preferred_name")
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
-        .map(|name| agent_names.iter().any(|agent_name| *agent_name == name))
+        .map(|name| agent_names.contains(&name))
         .unwrap_or(false);
     let current_preferred_conflicts = updates.contains_key("address_as")
         && current_fields
             .get("preferred_name")
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
-            .map(|name| agent_names.iter().any(|agent_name| *agent_name == name))
+            .map(|name| agent_names.contains(&name))
             .unwrap_or(false);
     if proposed_preferred_conflicts || current_preferred_conflicts {
         updates.insert("preferred_name".to_string(), String::new());
@@ -7054,7 +7057,7 @@ impl<T: DeepSeekChatCompletionTransport> MemoryMaintenanceModelRewriter
 
 fn memory_maintenance_recent_task_context(store: &EventStore) -> Result<String, String> {
     let mut tasks = store.list_task_records().map_err(event_store_error)?;
-    tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at));
     let lines = tasks
         .into_iter()
         .take(3)
@@ -7921,7 +7924,7 @@ fn load_agent_memory_runtime_context(
 
 fn load_agent_skill_catalog(store: &EventStore) -> Result<Vec<AgentSkillCatalogItem>, String> {
     let mut records = store.list_skill_records().map_err(event_store_error)?;
-    records.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
     Ok(records
         .into_iter()
         .filter(|record| {
@@ -7982,9 +7985,11 @@ fn select_agent_memory_runtime_context_with_feedback(
     feedback: &[MemorySelectedFeedback],
 ) -> AgentMemoryRuntimeContext {
     let query_terms = agent_memory_query_terms(prompt);
-    let mut context = AgentMemoryRuntimeContext::default();
-    context.query_terms_count = query_terms.len();
-    context.considered_records = memories.len();
+    let mut context = AgentMemoryRuntimeContext {
+        query_terms_count: query_terms.len(),
+        considered_records: memories.len(),
+        ..Default::default()
+    };
     let mut sensitive_omitted = 0usize;
     let mut archived_omitted = 0usize;
     let mut candidates = Vec::new();
@@ -12469,7 +12474,7 @@ fn mark_office_open_actions_waiting_for_pending_create(response: &mut AgentChatR
                 "proposed" | "needs_confirmation" | "waiting_prerequisite" | "blocked" | "failed"
             )
         })
-        .filter_map(|action| normalized_agent_action_target(action))
+        .filter_map(normalized_agent_action_target)
         .collect::<Vec<_>>();
 
     if pending_create_targets.is_empty() {
@@ -13829,7 +13834,7 @@ fn agent_chat_runtime_context(
                 let readiness = local_directory_readiness_from_state(&state);
                 let projection = workspace_readiness_projection_from_state(&state);
                 let authority_material = (projection.code == WorkspaceReadinessCode::Ready)
-                    .then(|| state.settings.as_ref())
+                    .then_some(state.settings.as_ref())
                     .flatten()
                     .map(|settings| {
                         format!("{}\0{}", settings.workspace_dir, settings.workspace_name)
