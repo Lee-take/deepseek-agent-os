@@ -81,8 +81,9 @@ use crate::kernel::goal_lifecycle::{
     completion_event, completion_evidence_from_tool_invocation, completion_projection,
     frozen_projection, goal_ui_projection as build_goal_ui_projection, projection_event,
     proposal_received_projection, validated_projection, GoalCompletionProjection,
-    GoalEnvelopeUiProjection, GoalLifecycleProjection, GoalLifecycleState, GoalLifecycleStatus,
-    GoalValidationContext, GOAL_COMPLETION_SCHEMA_VERSION, GOAL_LIFECYCLE_SCHEMA_VERSION,
+    GoalCompletionReceipt, GoalCompletionStatus, GoalEnvelopeUiProjection, GoalLifecycleProjection,
+    GoalLifecycleState, GoalLifecycleStatus, GoalValidationContext, GOAL_COMPLETION_SCHEMA_VERSION,
+    GOAL_LIFECYCLE_SCHEMA_VERSION,
 };
 use crate::kernel::models::{
     AccessMode, KernelEvent, MemoryCandidate, MemoryCandidateMergePreview, MemoryCandidateRecord,
@@ -163,6 +164,10 @@ pub const TASK_RECORD_CREATED_EVENT: &str = "task_record.created";
 pub const TOOL_INVOCATION_RECORDED_EVENT: &str = "tool_invocation.recorded";
 pub const CONNECTOR_ATTACHMENT_LANDED_EVENT: &str = "connector.attachment.landed";
 pub const CONNECTOR_RECOVERY_RETRY_QUEUED_EVENT: &str = "connector.recovery.retry_queued";
+pub(crate) const AGENT_RUN_GOAL_COMPLETION_BLOCKED_REASON: &str =
+    "goal_completion_verification_blocked";
+const AGENT_RUN_LEGACY_GOAL_COMPLETION_UNVERIFIED_REASON: &str =
+    "legacy_goal_completion_unverified";
 const CONNECTOR_ATTACHMENT_RETENTION_DAYS: i64 = 30;
 const CONNECTOR_ATTACHMENT_RECOVERY_LEASE_SECONDS: i64 = 300;
 const CONNECTOR_RECONCILIATION_LEASE_SECONDS: i64 = 300;
@@ -194,6 +199,13 @@ pub enum EventStoreError {
 }
 
 pub type EventStoreResult<T> = Result<T, EventStoreError>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AgentRunCompletionClassification {
+    GoalLess,
+    ExactComplete(GoalCompletionReceipt),
+    VerificationBlocked(String),
+}
 
 fn expert_attempt_ready(record: &AgentRunRecord, records: &[AgentRunRecord]) -> bool {
     let Some(contract) = record.expert_contract.as_ref() else {
@@ -1363,6 +1375,18 @@ impl EventStore {
 
             CREATE INDEX IF NOT EXISTS idx_tool_invocation_state_approval
                 ON tool_invocation_state (approval_request_id, status);
+
+            CREATE TABLE IF NOT EXISTS tool_invocation_goal_binding (
+                invocation_id TEXT PRIMARY KEY NOT NULL,
+                goal_id TEXT NOT NULL,
+                goal_revision TEXT NOT NULL,
+                frozen_fingerprint TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                bound_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_invocation_goal_binding_goal
+                ON tool_invocation_goal_binding (goal_id, goal_revision);
 
             CREATE TABLE IF NOT EXISTS execution_projection_cursor (
                 projection_name TEXT PRIMARY KEY NOT NULL,
@@ -10332,6 +10356,11 @@ impl EventStore {
     }
 
     pub fn append(&self, event: &KernelEvent) -> EventStoreResult<()> {
+        if event.event_type == AGENT_RUN_FINISHED_EVENT {
+            return Err(EventStoreError::InvalidState(
+                "agent run finish events require the dedicated completion guard".to_string(),
+            ));
+        }
         if event.event_type.starts_with("task_grouped_approval.") {
             return Err(EventStoreError::InvalidState(
                 "task grouped approval events require the dedicated transactional state machine"
@@ -10393,8 +10422,14 @@ impl EventStore {
         &self,
         goal_id: Uuid,
     ) -> EventStoreResult<Option<GoalLifecycleProjection>> {
-        let row = self
-            .conn
+        Self::goal_envelope_projection_from_connection(&self.conn, goal_id)
+    }
+
+    fn goal_envelope_projection_from_connection(
+        connection: &Connection,
+        goal_id: Uuid,
+    ) -> EventStoreResult<Option<GoalLifecycleProjection>> {
+        let row = connection
             .query_row(
                 r#"SELECT schema_version, status, proposal_fingerprint, revision, projection_json
                    FROM goal_envelope_projection WHERE goal_id = ?1"#,
@@ -10571,16 +10606,54 @@ impl EventStore {
         &self,
         invocation: &ToolInvocationRecord,
     ) -> EventStoreResult<Option<GoalCompletionProjection>> {
-        let Some(goal_id) = invocation.run_id else {
+        let canonical = self.tool_invocation_by_id(invocation.id).map_err(|_| {
+            EventStoreError::InvalidState("goal_completion_invocation_not_canonical".to_string())
+        })?;
+        if canonical != *invocation {
+            return Err(EventStoreError::InvalidState(
+                "goal_completion_invocation_not_canonical".to_string(),
+            ));
+        }
+        let Some(goal_id) = canonical.run_id else {
             return Ok(None);
         };
         let Some(lifecycle) = self.goal_envelope_projection(goal_id)? else {
             return Ok(None);
         };
-        if lifecycle.frozen().is_none() {
-            return Ok(None);
+        let frozen = lifecycle.frozen().ok_or_else(|| {
+            EventStoreError::InvalidState("goal_completion_goal_not_frozen".to_string())
+        })?;
+        let binding = self
+            .conn
+            .query_row(
+                r#"SELECT goal_id, goal_revision, frozen_fingerprint, request_fingerprint
+                   FROM tool_invocation_goal_binding WHERE invocation_id = ?1"#,
+                params![canonical.id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                EventStoreError::InvalidState(
+                    "goal_completion_invocation_binding_missing".to_string(),
+                )
+            })?;
+        if binding.0 != goal_id.to_string()
+            || binding.1 != frozen.revision
+            || binding.2 != frozen.fingerprint
+            || binding.3 != canonical.request_fingerprint
+        {
+            return Err(EventStoreError::InvalidState(
+                "goal_completion_invocation_binding_stale".to_string(),
+            ));
         }
-        let receipts = completion_evidence_from_tool_invocation(&lifecycle, invocation)
+        let receipts = completion_evidence_from_tool_invocation(&lifecycle, &canonical)
             .map_err(|code| EventStoreError::InvalidState(code.to_string()))?;
         let mut evidence = self
             .goal_completion_projection(goal_id)?
@@ -10610,8 +10683,14 @@ impl EventStore {
         &self,
         goal_id: Uuid,
     ) -> EventStoreResult<Option<GoalCompletionProjection>> {
-        let row = self
-            .conn
+        Self::goal_completion_projection_from_connection(&self.conn, goal_id)
+    }
+
+    fn goal_completion_projection_from_connection(
+        connection: &Connection,
+        goal_id: Uuid,
+    ) -> EventStoreResult<Option<GoalCompletionProjection>> {
+        let row = connection
             .query_row(
                 r#"SELECT schema_version, revision, frozen_fingerprint, status, projection_json
                    FROM goal_completion_projection WHERE goal_id = ?1"#,
@@ -10631,7 +10710,8 @@ impl EventStore {
             return Ok(None);
         };
         let projection = Self::decode_goal_completion_projection(goal_id, row)?;
-        let Some(lifecycle) = self.goal_envelope_projection(goal_id)? else {
+        let Some(lifecycle) = Self::goal_envelope_projection_from_connection(connection, goal_id)?
+        else {
             return Ok(None);
         };
         let Some(frozen) = lifecycle.frozen() else {
@@ -10646,6 +10726,45 @@ impl EventStore {
             .validate_against(&lifecycle)
             .map_err(|code| EventStoreError::InvalidState(code.to_string()))?;
         Ok(Some(projection))
+    }
+
+    fn classify_agent_run_completion_from_connection(
+        connection: &Connection,
+        run_id: Uuid,
+    ) -> EventStoreResult<AgentRunCompletionClassification> {
+        let Some(lifecycle) = Self::goal_envelope_projection_from_connection(connection, run_id)?
+        else {
+            return Ok(AgentRunCompletionClassification::GoalLess);
+        };
+        if lifecycle.frozen().is_none() {
+            return Ok(AgentRunCompletionClassification::VerificationBlocked(
+                AGENT_RUN_GOAL_COMPLETION_BLOCKED_REASON.to_string(),
+            ));
+        }
+        let Some(projection) =
+            Self::goal_completion_projection_from_connection(connection, run_id)?
+        else {
+            return Ok(AgentRunCompletionClassification::VerificationBlocked(
+                AGENT_RUN_GOAL_COMPLETION_BLOCKED_REASON.to_string(),
+            ));
+        };
+        if projection.status != GoalCompletionStatus::Complete {
+            return Ok(AgentRunCompletionClassification::VerificationBlocked(
+                AGENT_RUN_GOAL_COMPLETION_BLOCKED_REASON.to_string(),
+            ));
+        }
+        let receipt = projection.completion_receipt.ok_or_else(|| {
+            EventStoreError::InvalidState("goal_completion_projection_missing_receipt".to_string())
+        })?;
+        Ok(AgentRunCompletionClassification::ExactComplete(receipt))
+    }
+
+    pub(crate) fn classify_agent_run_completion(
+        &self,
+        run_id: Uuid,
+    ) -> EventStoreResult<AgentRunCompletionClassification> {
+        self.ensure_agent_run_exists(run_id)?;
+        Self::classify_agent_run_completion_from_connection(&self.conn, run_id)
     }
 
     pub fn goal_envelope_ui_projection(
@@ -11810,9 +11929,37 @@ impl EventStore {
     }
 
     pub fn append_agent_run_finish(&self, finish: &AgentRunFinish) -> EventStoreResult<()> {
+        finish.validate().map_err(EventStoreError::InvalidState)?;
         self.ensure_agent_run_exists(finish.run_id)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        if finish.status == AgentRunStatus::Completed {
+            match Self::classify_agent_run_completion_from_connection(&transaction, finish.run_id)?
+            {
+                AgentRunCompletionClassification::GoalLess => {
+                    if finish.goal_completion_receipt.is_some() {
+                        return Err(EventStoreError::InvalidState(
+                            "goal-less agent run completion cannot carry a goal receipt"
+                                .to_string(),
+                        ));
+                    }
+                }
+                AgentRunCompletionClassification::ExactComplete(receipt) => {
+                    if finish.goal_completion_receipt.as_ref() != Some(&receipt) {
+                        return Err(EventStoreError::InvalidState(
+                            "agent run completion receipt does not match the current goal"
+                                .to_string(),
+                        ));
+                    }
+                }
+                AgentRunCompletionClassification::VerificationBlocked(reason) => {
+                    return Err(EventStoreError::InvalidState(reason));
+                }
+            }
+        }
         let event = KernelEvent::new(AGENT_RUN_FINISHED_EVENT, finish)?;
-        self.append(&event)
+        Self::insert_kernel_event(&transaction, &event)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn list_agent_run_finishes(&self) -> EventStoreResult<Vec<AgentRunFinish>> {
@@ -11823,6 +11970,33 @@ impl EventStore {
                 serde_json::from_str::<AgentRunFinish>(&event.payload_json).map_err(Into::into)
             })
             .collect()
+    }
+
+    fn agent_run_finish_restart_block_reason(
+        &self,
+        finish: &AgentRunFinish,
+    ) -> EventStoreResult<Option<String>> {
+        if finish.status != AgentRunStatus::Completed {
+            return Ok(None);
+        }
+        let classification =
+            match Self::classify_agent_run_completion_from_connection(&self.conn, finish.run_id) {
+                Ok(classification) => classification,
+                Err(EventStoreError::InvalidState(_) | EventStoreError::Json(_)) => {
+                    return Ok(Some(
+                        AGENT_RUN_LEGACY_GOAL_COMPLETION_UNVERIFIED_REASON.to_string(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+        let valid = match classification {
+            AgentRunCompletionClassification::GoalLess => finish.goal_completion_receipt.is_none(),
+            AgentRunCompletionClassification::ExactComplete(receipt) => {
+                finish.goal_completion_receipt.as_ref() == Some(&receipt)
+            }
+            AgentRunCompletionClassification::VerificationBlocked(_) => false,
+        };
+        Ok((!valid).then(|| AGENT_RUN_LEGACY_GOAL_COMPLETION_UNVERIFIED_REASON.to_string()))
     }
 
     pub fn append_agent_run_step(&self, step: &AgentRunStepRecord) -> EventStoreResult<()> {
@@ -12133,6 +12307,14 @@ impl EventStore {
                     continuation_count_by_run_id.remove(&start.id).unwrap_or(0);
                 let latest_transition = transition_by_run_id.remove(&start.id);
                 let latest_finish = finish_by_run_id.remove(&start.id);
+                let finish_block_reason = latest_finish
+                    .as_ref()
+                    .map(|finish| self.agent_run_finish_restart_block_reason(finish))
+                    .transpose()?
+                    .flatten();
+                let effective_finish = latest_finish
+                    .as_ref()
+                    .filter(|_| finish_block_reason.is_none());
                 let steps = steps_by_run_id.remove(&start.id).unwrap_or_default();
                 let artifacts = artifacts_by_run_id.remove(&start.id).unwrap_or_default();
                 let expert_result = expert_result_by_run_id.remove(&start.id);
@@ -12165,35 +12347,35 @@ impl EventStore {
                         && latest_transition_at
                             .is_none_or(|transitioned_at| queued_at > transitioned_at)
                 });
-                let mut status = latest_finish
-                    .as_ref()
-                    .map(|finish| finish.status)
-                    .unwrap_or_else(|| {
-                        if transition_is_latest {
-                            latest_transition
-                                .as_ref()
-                                .map(|transition| transition.status)
-                                .unwrap_or(start.initial_status)
-                        } else if queue_is_latest {
-                            AgentRunStatus::Queued
-                        } else if latest_claim.is_some() {
-                            AgentRunStatus::Running
-                        } else {
-                            start.initial_status
-                        }
-                    });
-                let finished_at = latest_finish.as_ref().map(|finish| finish.finished_at);
-                let finish_summary = latest_finish
-                    .as_ref()
-                    .and_then(|finish| finish.summary.clone());
-                let finish_error = latest_finish
-                    .as_ref()
-                    .and_then(|finish| finish.error.clone());
-                let mut status_reason = if latest_finish.is_none() && transition_is_latest {
+                let mut status =
+                    effective_finish
+                        .map(|finish| finish.status)
+                        .unwrap_or_else(|| {
+                            if finish_block_reason.is_some() {
+                                AgentRunStatus::Blocked
+                            } else if transition_is_latest {
+                                latest_transition
+                                    .as_ref()
+                                    .map(|transition| transition.status)
+                                    .unwrap_or(start.initial_status)
+                            } else if queue_is_latest {
+                                AgentRunStatus::Queued
+                            } else if latest_claim.is_some() {
+                                AgentRunStatus::Running
+                            } else {
+                                start.initial_status
+                            }
+                        });
+                let finished_at = effective_finish.map(|finish| finish.finished_at);
+                let finish_summary = effective_finish.and_then(|finish| finish.summary.clone());
+                let finish_error = effective_finish.and_then(|finish| finish.error.clone());
+                let mut status_reason = if let Some(reason) = finish_block_reason.clone() {
+                    Some(reason)
+                } else if effective_finish.is_none() && transition_is_latest {
                     latest_transition
                         .as_ref()
                         .map(|transition| transition.reason.clone())
-                } else if latest_finish.is_none() && queue_is_latest {
+                } else if effective_finish.is_none() && queue_is_latest {
                     match (&latest_recovery, &latest_continuation) {
                         (Some(recovery), Some(continuation))
                             if recovery.recovered_at >= continuation.queued_at =>
@@ -12207,17 +12389,23 @@ impl EventStore {
                 } else {
                     None
                 };
-                let mut waiting_tool_invocation_id =
-                    if latest_finish.is_none() && transition_is_latest {
-                        latest_transition
-                            .as_ref()
-                            .and_then(|transition| transition.tool_invocation_id)
-                    } else {
-                        None
-                    };
+                let mut waiting_tool_invocation_id = if effective_finish.is_none()
+                    && finish_block_reason.is_none()
+                    && transition_is_latest
+                {
+                    latest_transition
+                        .as_ref()
+                        .and_then(|transition| transition.tool_invocation_id)
+                } else {
+                    None
+                };
 
                 if let Some(finished_at) = finished_at {
                     updated_at = updated_at.max(finished_at);
+                } else if finish_block_reason.is_some() {
+                    if let Some(finish) = latest_finish.as_ref() {
+                        updated_at = updated_at.max(finish.finished_at);
+                    }
                 }
                 for guidance in &queued_guidance {
                     updated_at = updated_at.max(guidance.queued_at);
@@ -12263,7 +12451,7 @@ impl EventStore {
                 if let Some(cancel) = &latest_cancel {
                     updated_at = updated_at.max(cancel.requested_at);
                     if !matches!(
-                        latest_finish.as_ref().map(|finish| finish.status),
+                        effective_finish.map(|finish| finish.status),
                         Some(AgentRunStatus::Cancelled | AgentRunStatus::Failed)
                     ) {
                         status = AgentRunStatus::CancelRequested;
@@ -14276,7 +14464,73 @@ impl EventStore {
         invocation: &ToolInvocationRecord,
     ) -> EventStoreResult<()> {
         let event = KernelEvent::new(TOOL_INVOCATION_RECORDED_EVENT, invocation)?;
-        self.append(&event)
+        let transaction = self.conn.unchecked_transaction()?;
+        if invocation.status == ToolExecutionStatus::Running {
+            if let Some(run_id) = invocation.run_id {
+                if let Some(lifecycle) =
+                    Self::goal_envelope_projection_from_connection(&transaction, run_id)?
+                {
+                    let frozen = lifecycle.frozen().ok_or_else(|| {
+                        EventStoreError::InvalidState(
+                            "tool invocation goal binding requires a frozen goal".to_string(),
+                        )
+                    })?;
+                    if invocation.request_fingerprint.is_empty() {
+                        return Err(EventStoreError::InvalidState(
+                            "tool invocation goal binding requires a request fingerprint"
+                                .to_string(),
+                        ));
+                    }
+                    let existing = transaction
+                        .query_row(
+                            r#"SELECT goal_id, goal_revision, frozen_fingerprint,
+                                      request_fingerprint
+                               FROM tool_invocation_goal_binding WHERE invocation_id = ?1"#,
+                            params![invocation.id.to_string()],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, String>(3)?,
+                                ))
+                            },
+                        )
+                        .optional()?;
+                    let binding = (
+                        run_id.to_string(),
+                        frozen.revision.clone(),
+                        frozen.fingerprint.clone(),
+                        invocation.request_fingerprint.clone(),
+                    );
+                    if let Some(existing) = existing {
+                        if existing != binding {
+                            return Err(EventStoreError::InvalidState(
+                                "tool invocation goal binding changed".to_string(),
+                            ));
+                        }
+                    } else {
+                        transaction.execute(
+                            r#"INSERT INTO tool_invocation_goal_binding
+                               (invocation_id, goal_id, goal_revision, frozen_fingerprint,
+                                request_fingerprint, bound_at)
+                               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                            params![
+                                invocation.id.to_string(),
+                                binding.0,
+                                binding.1,
+                                binding.2,
+                                binding.3,
+                                event.created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                            ],
+                        )?;
+                    }
+                }
+            }
+        }
+        Self::insert_kernel_event(&transaction, &event)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn list_tool_invocations(&self) -> EventStoreResult<Vec<ToolInvocationRecord>> {
@@ -14663,7 +14917,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ConnectorAttachmentCleanupClaim, EventStore, EventStoreError,
+        ConnectorAttachmentCleanupClaim, EventStore, EventStoreError, AGENT_RUN_FINISHED_EVENT,
         CONNECTOR_RECOVERY_RETRY_QUEUED_EVENT, MEMORY_RECORD_LINKED_EVENT,
     };
     use crate::kernel::automation::{
@@ -15292,6 +15546,11 @@ mod tests {
         ExpertResourceAccess, ExpertResourceRequirement, ExpertRetryPolicy, ExpertReviewDecision,
         ExpertReviewVerdict, ExpertRole, ExpertTeamPlanItem,
     };
+    use crate::kernel::goal_envelope::{GoalEnvelopeProposal, GOAL_ENVELOPE_PROPOSAL_VERSION};
+    use crate::kernel::goal_lifecycle::{
+        GoalCompletionReceipt, GoalCompletionStatus, GoalValidationContext,
+    };
+    use crate::kernel::local_directory::WorkspaceReadinessCode;
 
     #[test]
     fn connector_account_and_idempotent_invocation_survive_restart() {
@@ -15488,7 +15747,7 @@ mod tests {
     use crate::kernel::tool_runtime::{
         prepare_tool_execution, ToolEvidence, ToolExecutionRequest, ToolExecutionStatus,
         ToolInvocationRecord, ToolVerificationResult, APP_UPDATE_CHECK_TOOL_ID,
-        CONNECTOR_MUTATE_TOOL_ID,
+        CONNECTOR_MUTATE_TOOL_ID, FILE_READ_TOOL_ID,
     };
     use crate::kernel::work_package::export_work_package;
     use crate::kernel::workflow::WorkflowTemplatePackage;
@@ -15496,6 +15755,117 @@ mod tests {
         OperationsBriefingAction, OperationsBriefingAnomaly, OperationsBriefingRun,
         OperationsBriefingRunStatus, OPERATIONS_BRIEFING_WORKFLOW_ID,
     };
+
+    fn goal_bound_run_proposal(extra_constraint: Option<&str>) -> GoalEnvelopeProposal {
+        let mut constraints = vec!["Use only the exact locally verified evidence.".to_string()];
+        if let Some(extra_constraint) = extra_constraint {
+            constraints.push(extra_constraint.to_string());
+        }
+        GoalEnvelopeProposal::parse_value(json!({
+            "version": GOAL_ENVELOPE_PROPOSAL_VERSION,
+            "user_goal": "Read one local source and verify its exact evidence.",
+            "assumptions": [],
+            "constraints": constraints,
+            "done_when": [{
+                "done_when_id": "source-verified",
+                "description": "The local source has exact verified content evidence."
+            }],
+            "required_artifacts": [],
+            "verifiers": [{
+                "verifier_id": "file-content-verifier-v1",
+                "done_when_id": "source-verified",
+                "description": "Verify the exact bounded UTF-8 file content receipt.",
+                "evidence_kind": "file_content"
+            }],
+            "proposed_capabilities": [FILE_READ_TOOL_ID],
+            "external_targets": [],
+            "stop_conditions": ["Stop if exact local evidence is unavailable."]
+        }))
+        .expect("goal proposal is valid")
+    }
+
+    fn goal_bound_run_context() -> GoalValidationContext {
+        GoalValidationContext::new(AccessMode::FullAccess, WorkspaceReadinessCode::Ready)
+            .with_enabled_tool(FILE_READ_TOOL_ID, true)
+            .with_verifier_kind("file_content")
+    }
+
+    fn append_frozen_goal_run(store: &EventStore, label: &str) -> AgentRunStart {
+        let start = AgentRunStart::new(
+            format!("goal-bound-{label}"),
+            "Read and verify one exact local source.".to_string(),
+            0,
+        )
+        .expect("goal-bound run is valid");
+        store
+            .append_agent_run_start(&start)
+            .expect("goal-bound run appends");
+        let validated = store
+            .submit_goal_proposal(
+                start.id,
+                &goal_bound_run_proposal(None),
+                &goal_bound_run_context(),
+            )
+            .expect("goal validates");
+        store
+            .freeze_goal_envelope(start.id, validated.revision().expect("goal revision"))
+            .expect("goal freezes");
+        start
+    }
+
+    fn goal_bound_file_read_plan(run_id: Uuid) -> crate::kernel::tool_runtime::ToolExecutionPlan {
+        prepare_tool_execution(&ToolExecutionRequest {
+            tool_id: FILE_READ_TOOL_ID.to_string(),
+            input: json!({
+                "path": "D:/isolated/evidence.txt",
+                "summary": "Read exact isolated evidence."
+            }),
+            access_mode: AccessMode::FullAccess,
+            run_id: Some(run_id),
+        })
+        .expect("file-read plan prepares")
+    }
+
+    fn goal_bound_file_read_success(
+        store: &EventStore,
+        run_id: Uuid,
+    ) -> (ToolInvocationRecord, GoalCompletionReceipt) {
+        let plan = goal_bound_file_read_plan(run_id);
+        store
+            .append_tool_invocation(&ToolInvocationRecord::running(&plan, None))
+            .expect("running invocation captures the frozen goal binding");
+        let invocation = ToolInvocationRecord::succeeded(
+            &plan,
+            json!({
+                "path": "D:/isolated/evidence.txt",
+                "title": "evidence.txt",
+                "text": "verified evidence",
+                "bytes": 17,
+                "encoding": "utf-8"
+            }),
+            vec![ToolEvidence {
+                kind: "file_content".to_string(),
+                reference: "evidence://exact-file-content".to_string(),
+                summary: "Exact bounded UTF-8 content verified.".to_string(),
+            }],
+            ToolVerificationResult::passed("Exact local file content verified."),
+            None,
+            1,
+        )
+        .expect("successful invocation is valid");
+        store
+            .append_tool_invocation(&invocation)
+            .expect("successful invocation becomes canonical");
+        let projection = store
+            .record_goal_completion_for_tool_invocation(&invocation)
+            .expect("canonical invocation records goal evidence")
+            .expect("goal completion projection exists");
+        assert_eq!(projection.status, GoalCompletionStatus::Complete);
+        let receipt = projection
+            .completion_receipt
+            .expect("complete projection has a receipt");
+        (invocation, receipt)
+    }
 
     fn sample_operations_briefing_run() -> OperationsBriefingRun {
         OperationsBriefingRun {
@@ -15538,6 +15908,33 @@ mod tests {
         assert_eq!(events[0].id, event.id);
         assert_eq!(events[0].event_type, event.event_type);
         assert_eq!(events[0].payload_json, event.payload_json);
+    }
+
+    #[test]
+    fn generic_event_path_rejects_agent_run_finish() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let start = AgentRunStart::new(
+            "finish-boundary".to_string(),
+            "Keep terminal authority inside the dedicated finish path.".to_string(),
+            0,
+        )
+        .expect("run start is valid");
+        store
+            .append_agent_run_start(&start)
+            .expect("run start appends");
+        let finish = AgentRunFinish::completed(start.id, "forged completion".to_string())
+            .expect("finish shape is valid");
+        let event =
+            KernelEvent::new(AGENT_RUN_FINISHED_EVENT, &finish).expect("finish event serializes");
+
+        assert!(matches!(
+            store.append(&event),
+            Err(EventStoreError::InvalidState(_))
+        ));
+        assert_eq!(
+            store.list_agent_run_records().expect("run records load")[0].status,
+            AgentRunStatus::Running
+        );
     }
 
     #[test]
@@ -15608,6 +16005,293 @@ mod tests {
             records[0].finish_summary.as_deref(),
             Some("Worker returned after the cancellation request.")
         );
+    }
+
+    #[test]
+    fn goal_bound_completion_requires_the_exact_receipt_and_survives_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("goal-bound-finish.sqlite3");
+        let run_id;
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            let start = append_frozen_goal_run(&store, "exact-finish");
+            run_id = start.id;
+            let (_, receipt) = goal_bound_file_read_success(&store, run_id);
+
+            let missing = AgentRunFinish::completed(run_id, "missing receipt".to_string())
+                .expect("legacy finish shape remains readable");
+            assert!(matches!(
+                store.append_agent_run_finish(&missing),
+                Err(EventStoreError::InvalidState(_))
+            ));
+
+            let mut forged_receipt = receipt.clone();
+            forged_receipt.fingerprint = "f".repeat(64);
+            let forged = AgentRunFinish::completed_with_goal_receipt(
+                run_id,
+                Some("forged receipt".to_string()),
+                forged_receipt,
+            )
+            .expect("forged receipt has a serializable shape");
+            assert!(matches!(
+                store.append_agent_run_finish(&forged),
+                Err(EventStoreError::InvalidState(_))
+            ));
+
+            let exact = AgentRunFinish::completed_with_goal_receipt(
+                run_id,
+                Some("exact receipt".to_string()),
+                receipt,
+            )
+            .expect("exact receipt-bound finish is valid");
+            store
+                .append_agent_run_finish(&exact)
+                .expect("exact receipt-bound finish appends");
+            let record = store
+                .list_agent_run_records()
+                .expect("records project")
+                .into_iter()
+                .find(|record| record.id == run_id)
+                .expect("run projects");
+            assert_eq!(record.status, AgentRunStatus::Completed);
+            assert_eq!(record.finish_summary.as_deref(), Some("exact receipt"));
+        }
+
+        let reopened = EventStore::open(&path).expect("store reopens");
+        let record = reopened
+            .list_agent_run_records()
+            .expect("records replay")
+            .into_iter()
+            .find(|record| record.id == run_id)
+            .expect("run replays");
+        assert_eq!(record.status, AgentRunStatus::Completed);
+        let finish_event = reopened
+            .list_recent(500)
+            .expect("events load")
+            .into_iter()
+            .find(|event| event.event_type == AGENT_RUN_FINISHED_EVENT)
+            .expect("finish event exists");
+        let finish: AgentRunFinish =
+            serde_json::from_str(&finish_event.payload_json).expect("finish decodes");
+        assert!(finish.goal_completion_receipt.is_some());
+    }
+
+    #[test]
+    fn legacy_goal_bound_finish_stays_blocked_even_after_later_evidence() {
+        let store = EventStore::open_memory().expect("memory store opens");
+        let start = append_frozen_goal_run(&store, "legacy-finish");
+        let legacy_finish =
+            AgentRunFinish::completed(start.id, "legacy completion without receipt".to_string())
+                .expect("legacy finish shape remains readable");
+        let legacy_event = KernelEvent::new(AGENT_RUN_FINISHED_EVENT, &legacy_finish)
+            .expect("legacy finish serializes");
+        let transaction = store
+            .conn
+            .unchecked_transaction()
+            .expect("transaction opens");
+        EventStore::insert_kernel_event(&transaction, &legacy_event)
+            .expect("legacy event fixture inserts below the new public guard");
+        transaction.commit().expect("legacy event commits");
+
+        let before_evidence = store
+            .list_agent_run_records()
+            .expect("legacy finish projects")
+            .into_iter()
+            .find(|record| record.id == start.id)
+            .expect("run exists");
+        assert_eq!(before_evidence.status, AgentRunStatus::Blocked);
+        assert_eq!(
+            before_evidence.status_reason.as_deref(),
+            Some("legacy_goal_completion_unverified")
+        );
+        assert!(before_evidence.finished_at.is_none());
+
+        goal_bound_file_read_success(&store, start.id);
+        let after_evidence = store
+            .list_agent_run_records()
+            .expect("later evidence does not backfill finish authority")
+            .into_iter()
+            .find(|record| record.id == start.id)
+            .expect("run exists");
+        assert_eq!(after_evidence.status, AgentRunStatus::Blocked);
+        assert_eq!(
+            after_evidence.status_reason.as_deref(),
+            Some("legacy_goal_completion_unverified")
+        );
+        assert!(after_evidence.finished_at.is_none());
+    }
+
+    #[test]
+    fn receipt_drift_projects_completed_run_blocked_on_replay() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("goal-receipt-drift.sqlite3");
+        let run_id;
+        {
+            let store = EventStore::open(&path).expect("store opens");
+            let start = append_frozen_goal_run(&store, "receipt-drift");
+            run_id = start.id;
+            let (_, receipt) = goal_bound_file_read_success(&store, run_id);
+            store
+                .append_agent_run_finish(
+                    &AgentRunFinish::completed_with_goal_receipt(
+                        run_id,
+                        Some("completed before drift".to_string()),
+                        receipt,
+                    )
+                    .expect("receipt-bound finish is valid"),
+                )
+                .expect("receipt-bound finish appends");
+
+            let changed = store
+                .submit_goal_proposal(
+                    run_id,
+                    &goal_bound_run_proposal(Some("Use the reviewed revision only.")),
+                    &goal_bound_run_context(),
+                )
+                .expect("changed goal validates");
+            store
+                .freeze_goal_envelope(run_id, changed.revision().expect("changed revision"))
+                .expect("changed goal freezes");
+        }
+
+        let reopened = EventStore::open(&path).expect("store reopens");
+        let record = reopened
+            .list_agent_run_records()
+            .expect("drifted run projects")
+            .into_iter()
+            .find(|record| record.id == run_id)
+            .expect("run exists");
+        assert_eq!(record.status, AgentRunStatus::Blocked);
+        assert_eq!(
+            record.status_reason.as_deref(),
+            Some("legacy_goal_completion_unverified")
+        );
+        assert!(record.finished_at.is_none());
+    }
+
+    #[test]
+    fn goal_evidence_requires_canonical_bound_invocation_and_rejects_late_revision() {
+        let store = EventStore::open_memory().expect("memory store opens");
+
+        let missing = append_frozen_goal_run(&store, "missing-binding");
+        let missing_plan = goal_bound_file_read_plan(missing.id);
+        let missing_invocation = ToolInvocationRecord::succeeded(
+            &missing_plan,
+            json!({
+                "path": "D:/isolated/evidence.txt",
+                "title": "evidence.txt",
+                "text": "verified evidence",
+                "bytes": 17,
+                "encoding": "utf-8"
+            }),
+            vec![ToolEvidence {
+                kind: "file_content".to_string(),
+                reference: "evidence://missing-binding".to_string(),
+                summary: "Unbound evidence must not count.".to_string(),
+            }],
+            ToolVerificationResult::passed("Unbound caller claims verification."),
+            None,
+            1,
+        )
+        .expect("terminal invocation shape is valid");
+        store
+            .append_tool_invocation(&missing_invocation)
+            .expect("terminal invocation persists without inventing a binding");
+        assert!(matches!(
+            store.record_goal_completion_for_tool_invocation(&missing_invocation),
+            Err(EventStoreError::InvalidState(reason))
+                if reason == "goal_completion_invocation_binding_missing"
+        ));
+
+        let canonical = append_frozen_goal_run(&store, "canonical");
+        let canonical_plan = goal_bound_file_read_plan(canonical.id);
+        store
+            .append_tool_invocation(&ToolInvocationRecord::running(&canonical_plan, None))
+            .expect("running invocation captures binding");
+        let canonical_invocation = ToolInvocationRecord::succeeded(
+            &canonical_plan,
+            json!({
+                "path": "D:/isolated/evidence.txt",
+                "title": "evidence.txt",
+                "text": "verified evidence",
+                "bytes": 17,
+                "encoding": "utf-8"
+            }),
+            vec![ToolEvidence {
+                kind: "file_content".to_string(),
+                reference: "evidence://canonical".to_string(),
+                summary: "Canonical evidence.".to_string(),
+            }],
+            ToolVerificationResult::passed("Canonical evidence verified."),
+            None,
+            1,
+        )
+        .expect("canonical invocation is valid");
+        store
+            .append_tool_invocation(&canonical_invocation)
+            .expect("canonical invocation persists");
+        let mut forged = canonical_invocation.clone();
+        forged.evidence[0].summary = "Caller-forged evidence.".to_string();
+        assert!(matches!(
+            store.record_goal_completion_for_tool_invocation(&forged),
+            Err(EventStoreError::InvalidState(reason))
+                if reason == "goal_completion_invocation_not_canonical"
+        ));
+        assert_eq!(
+            store
+                .record_goal_completion_for_tool_invocation(&canonical_invocation)
+                .expect("canonical evidence records")
+                .expect("completion projects")
+                .status,
+            GoalCompletionStatus::Complete
+        );
+
+        let late = append_frozen_goal_run(&store, "late-revision");
+        let late_plan = goal_bound_file_read_plan(late.id);
+        store
+            .append_tool_invocation(&ToolInvocationRecord::running(&late_plan, None))
+            .expect("old revision binding captures");
+        let late_invocation = ToolInvocationRecord::succeeded(
+            &late_plan,
+            json!({
+                "path": "D:/isolated/evidence.txt",
+                "title": "evidence.txt",
+                "text": "verified evidence",
+                "bytes": 17,
+                "encoding": "utf-8"
+            }),
+            vec![ToolEvidence {
+                kind: "file_content".to_string(),
+                reference: "evidence://late".to_string(),
+                summary: "Old revision evidence.".to_string(),
+            }],
+            ToolVerificationResult::passed("Old revision evidence verified."),
+            None,
+            1,
+        )
+        .expect("late invocation is valid");
+        store
+            .append_tool_invocation(&late_invocation)
+            .expect("late invocation becomes canonical");
+        let changed = store
+            .submit_goal_proposal(
+                late.id,
+                &goal_bound_run_proposal(Some("Bind only the new revision.")),
+                &goal_bound_run_context(),
+            )
+            .expect("new revision validates");
+        store
+            .freeze_goal_envelope(late.id, changed.revision().expect("new revision"))
+            .expect("new revision freezes");
+        assert!(matches!(
+            store.record_goal_completion_for_tool_invocation(&late_invocation),
+            Err(EventStoreError::InvalidState(reason))
+                if reason == "goal_completion_invocation_binding_stale"
+        ));
+        assert!(store
+            .goal_completion_projection(late.id)
+            .expect("completion projection reads")
+            .is_none());
     }
 
     #[test]
