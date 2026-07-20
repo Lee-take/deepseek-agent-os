@@ -1741,6 +1741,23 @@ mod tests {
         }
     }
 
+    fn persist_bound_verifier_invocation(store: &EventStore, invocation: &ToolInvocationRecord) {
+        let mut running = invocation.clone();
+        running.status = ToolExecutionStatus::Running;
+        running.output = None;
+        running.evidence.clear();
+        running.verification = ToolVerificationResult::failed("verification is in progress");
+        running.error = None;
+        running.elapsed_ms = 0;
+        running.finished_at = None;
+        store
+            .append_tool_invocation(&running)
+            .expect("running invocation captures the frozen goal binding");
+        store
+            .append_tool_invocation(invocation)
+            .expect("terminal invocation becomes canonical");
+    }
+
     #[test]
     fn valid_proposal_is_validated_frozen_and_restart_safe() {
         let directory = tempdir().unwrap();
@@ -2054,6 +2071,7 @@ mod tests {
         {
             let store = EventStore::open(&database).unwrap();
             frozen_goal(&store, goal_id);
+            persist_bound_verifier_invocation(&store, &invocation);
             completed = store
                 .record_goal_completion_for_tool_invocation(&invocation)
                 .unwrap()
@@ -2270,6 +2288,7 @@ mod tests {
             "rendered-brief",
             "operating-brief",
         );
+        persist_bound_verifier_invocation(&store, &invocation);
         assert_eq!(
             store
                 .record_goal_completion_for_tool_invocation(&invocation)

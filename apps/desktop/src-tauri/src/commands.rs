@@ -89,7 +89,9 @@ use crate::kernel::deepseek_pricing::{
     save_deepseek_pricing_settings as persist_deepseek_pricing_settings, DeepSeekPricingSettings,
     DeepSeekPricingState,
 };
-use crate::kernel::event_store::{EventStore, EventStoreError, EventStoreResult};
+use crate::kernel::event_store::{
+    AgentRunCompletionClassification, EventStore, EventStoreError, EventStoreResult,
+};
 use crate::kernel::expert_team::{
     deduplicate_evidence, parent_input_revision, sha256_text, stage_expert_output,
     unresolved_claim_conflicts, verify_staging_manifest, ExpertAttemptResult, ExpertAttemptUsage,
@@ -9939,12 +9941,46 @@ fn finish_agent_run_from_worker(
     summary: Option<String>,
     error: Option<String>,
 ) -> Result<AgentRunRecord, String> {
-    let finish = AgentRunFinish::new(run_id, status, summary, error).map_err(event_store_error)?;
     let store = store.lock().map_err(|_| lock_error())?;
+    finish_agent_run_with_completion_guard(&store, run_id, status, summary, error)
+}
+
+fn finish_agent_run_with_completion_guard(
+    store: &EventStore,
+    run_id: Uuid,
+    status: AgentRunStatus,
+    summary: Option<String>,
+    error: Option<String>,
+) -> Result<AgentRunRecord, String> {
+    let finish = if status == AgentRunStatus::Completed {
+        match store
+            .classify_agent_run_completion(run_id)
+            .map_err(event_store_error)?
+        {
+            AgentRunCompletionClassification::GoalLess => {
+                AgentRunFinish::new(run_id, status, summary, error).map_err(event_store_error)?
+            }
+            AgentRunCompletionClassification::ExactComplete(receipt) => {
+                AgentRunFinish::completed_with_goal_receipt(run_id, summary, receipt)
+                    .map_err(event_store_error)?
+            }
+            AgentRunCompletionClassification::VerificationBlocked(reason) => {
+                let transition =
+                    AgentRunTransition::new(run_id, AgentRunStatus::Blocked, reason, None)
+                        .map_err(event_store_error)?;
+                store
+                    .append_agent_run_transition(&transition)
+                    .map_err(event_store_error)?;
+                return read_agent_run_record(store, run_id);
+            }
+        }
+    } else {
+        AgentRunFinish::new(run_id, status, summary, error).map_err(event_store_error)?
+    };
     store
         .append_agent_run_finish(&finish)
         .map_err(event_store_error)?;
-    read_agent_run_record(&store, run_id)
+    read_agent_run_record(store, run_id)
 }
 
 fn build_agent_tool_evidence_followup_prompt(
@@ -15547,12 +15583,8 @@ pub fn finish_agent_run_record(
     error: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<AgentRunRecord, String> {
-    let finish = AgentRunFinish::new(run_id, status, summary, error).map_err(event_store_error)?;
     let store = state.event_store.lock().map_err(|_| lock_error())?;
-    store
-        .append_agent_run_finish(&finish)
-        .map_err(event_store_error)?;
-    read_agent_run_record(&store, run_id)
+    finish_agent_run_with_completion_guard(&store, run_id, status, summary, error)
 }
 
 fn read_agent_run_record(store: &EventStore, run_id: Uuid) -> Result<AgentRunRecord, String> {
@@ -17834,7 +17866,7 @@ mod tests {
     };
     use crate::kernel::deepseek_pricing::DeepSeekPricingSettings;
     use crate::kernel::event_store::EventStore;
-    use crate::kernel::goal_lifecycle::GoalEnvelopeUiStatus;
+    use crate::kernel::goal_lifecycle::{GoalCompletionStatus, GoalEnvelopeUiStatus};
     use crate::kernel::local_directory::{
         LocalDirectorySettings, LocalDirectoryState, WorkspaceReadinessCode,
         LOCAL_DIRECTORY_SETTINGS_FILE,
@@ -24505,7 +24537,29 @@ mod tests {
         .expect("ordinary queued production chat seam succeeds")
         .expect("queued run exists");
         assert_eq!(outcome.record.id, start.id);
-        assert_eq!(outcome.record.status, AgentRunStatus::Completed);
+        assert_eq!(outcome.record.status, AgentRunStatus::Blocked);
+        assert_eq!(
+            outcome.record.status_reason.as_deref(),
+            Some("goal_completion_verification_blocked")
+        );
+        assert!(outcome.record.finished_at.is_none());
+        let forged_frontend_finish = {
+            let store = store.lock().expect("store lock");
+            super::finish_agent_run_with_completion_guard(
+                &store,
+                start.id,
+                AgentRunStatus::Completed,
+                Some("frontend claimed completion".to_string()),
+                None,
+            )
+            .expect("frontend completion proposal is safely downgraded")
+        };
+        assert_eq!(forged_frontend_finish.status, AgentRunStatus::Blocked);
+        assert_eq!(
+            forged_frontend_finish.status_reason.as_deref(),
+            Some("goal_completion_verification_blocked")
+        );
+        assert!(forged_frontend_finish.finished_at.is_none());
         let mut response = outcome.response;
 
         let projection = response
@@ -24551,6 +24605,122 @@ mod tests {
         assert!(file_write_client.recorded_calls().is_empty());
         assert!(search_client.recorded_calls().is_empty());
         assert!(browser_client.recorded_calls().is_empty());
+    }
+
+    #[test]
+    fn frozen_goal_worker_finishes_only_after_exact_verified_receipt() {
+        let evidence_kind = builtin_tool_catalog()
+            .into_iter()
+            .find(|contract| contract.id == FILE_READ_TOOL_ID)
+            .and_then(|contract| {
+                contract
+                    .verification
+                    .required_evidence_kinds
+                    .into_iter()
+                    .next()
+            })
+            .expect("file read verifier kind");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let source_path = temp_dir.path().join("verified-source.md");
+        fs::write(&source_path, "verified production evidence").expect("fixture writes");
+        let transport = SequencedDeepSeekTransport::new(vec![
+            serde_json::json!({
+                "protocol_version": "ds-agent-envelope/v1",
+                "reply_to_user": "I will read the bound source before completing.",
+                "goal_envelope": {
+                    "version": "ds-agent.goal-envelope-proposal/v1",
+                    "user_goal": "Read the selected source and verify its receipt.",
+                    "assumptions": [],
+                    "constraints": ["Use only the selected workspace."],
+                    "done_when": [{
+                        "done_when_id": "source-verified",
+                        "description": "The selected source has a verified local read receipt."
+                    }],
+                    "required_artifacts": [],
+                    "verifiers": [{
+                        "verifier_id": "source-verifier-v1",
+                        "done_when_id": "source-verified",
+                        "description": "Verify the local file read receipt.",
+                        "evidence_kind": evidence_kind
+                    }],
+                    "proposed_capabilities": [FILE_READ_TOOL_ID],
+                    "external_targets": [{
+                        "target_id": "workspace",
+                        "description": "The locally selected workspace."
+                    }],
+                    "stop_conditions": ["Stop if the workspace binding changes."]
+                },
+                "agent_actions": [{
+                    "action_type": "file_read",
+                    "title": "Read verified source",
+                    "reason": "Produce the required authoritative local evidence.",
+                    "risk": "low",
+                    "requires_confirmation": false,
+                    "target": source_path.to_string_lossy()
+                }],
+                "missing_prerequisites": []
+            })
+            .to_string(),
+            "The bound source was read and verified.".to_string(),
+        ]);
+        let cache = DeepSeekMemoryChatCompletionCache::default();
+        let store = Mutex::new(EventStore::open_memory().expect("memory store opens"));
+        let start = AgentRunStart::queued(
+            "g0b-exact-complete-conversation".to_string(),
+            "Read the selected source and verify its receipt.".to_string(),
+            0,
+        )
+        .expect("queued run start");
+        store
+            .lock()
+            .expect("store lock")
+            .append_agent_run_start(&start)
+            .expect("queued run appends");
+        let runtime_context = AgentChatRuntimeContext {
+            workspace_ready: AgentChatReadiness::Ready,
+            workspace_readiness_code: WorkspaceReadinessCode::Ready,
+            workspace_authority_material: Some(b"g0b-workspace-authority".to_vec()),
+            ..AgentChatRuntimeContext::default()
+        };
+        let file_client = LocalFileContentClient::new(512 * 1024);
+        let file_write_client = RecordingFileWriteClient::new();
+        let search_client = RecordingNetworkSearchClient::new();
+        let browser_client = RecordingBrowserPageClient::new();
+
+        let outcome = run_next_queued_agent_chat_with_clients_and_api_keys(
+            &store,
+            &transport,
+            &cache,
+            &["test-secret".to_string()],
+            "g0b-production-worker".to_string(),
+            ModelRoute::Flash,
+            ThinkingLevel::Fast,
+            AccessMode::FullAccess,
+            runtime_context,
+            None,
+            &file_client,
+            &file_write_client,
+            &search_client,
+            &browser_client,
+        )
+        .expect("ordinary queued production chat seam succeeds")
+        .expect("queued run exists");
+
+        assert_eq!(outcome.record.id, start.id);
+        assert_eq!(outcome.record.status, AgentRunStatus::Completed);
+        assert!(outcome.record.finished_at.is_some());
+        assert_eq!(
+            outcome.response.proposed_actions[0].execution_state,
+            "succeeded"
+        );
+        let completion = store
+            .lock()
+            .expect("store lock")
+            .goal_completion_projection(start.id)
+            .expect("goal completion projects")
+            .expect("goal completion exists");
+        assert_eq!(completion.status, GoalCompletionStatus::Complete);
+        assert!(completion.completion_receipt.is_some());
     }
 
     #[test]

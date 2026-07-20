@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::kernel::expert_team::{ExpertAttemptContract, ExpertAttemptResult, ExpertMergeReceipt};
+use crate::kernel::goal_lifecycle::GoalCompletionReceipt;
 
 pub const AGENT_RUN_GUIDANCE_MAX_CHARS: usize = 4_000;
 pub const AGENT_RUN_MAX_PARALLEL_SUBAGENTS: usize = 3;
@@ -163,6 +164,8 @@ pub struct AgentRunFinish {
     pub status: AgentRunStatus,
     pub summary: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_completion_receipt: Option<GoalCompletionReceipt>,
     pub finished_at: DateTime<Utc>,
 }
 
@@ -483,8 +486,39 @@ impl AgentRunFinish {
         summary: Option<String>,
         error: Option<String>,
     ) -> Result<Self, String> {
-        if matches!(
+        let summary = normalize_optional_text(summary);
+        let error = normalize_optional_text(error);
+        let finish = Self {
+            id: Uuid::new_v4(),
+            run_id,
             status,
+            summary,
+            error,
+            goal_completion_receipt: None,
+            finished_at: Utc::now(),
+        };
+        finish.validate()?;
+        Ok(finish)
+    }
+
+    pub fn completed(run_id: Uuid, summary: String) -> Result<Self, String> {
+        Self::new(run_id, AgentRunStatus::Completed, Some(summary), None)
+    }
+
+    pub(crate) fn completed_with_goal_receipt(
+        run_id: Uuid,
+        summary: Option<String>,
+        receipt: GoalCompletionReceipt,
+    ) -> Result<Self, String> {
+        let mut finish = Self::new(run_id, AgentRunStatus::Completed, summary, None)?;
+        finish.goal_completion_receipt = Some(receipt);
+        finish.validate()?;
+        Ok(finish)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if matches!(
+            self.status,
             AgentRunStatus::Queued
                 | AgentRunStatus::Running
                 | AgentRunStatus::WaitingForPrerequisite
@@ -494,23 +528,15 @@ impl AgentRunFinish {
         ) {
             return Err("agent run finish status must be terminal".to_string());
         }
-        let summary = normalize_optional_text(summary);
-        let error = normalize_optional_text(error);
-        if status == AgentRunStatus::Failed && error.is_none() {
+        if self.status == AgentRunStatus::Failed && self.error.is_none() {
             return Err("agent run failure requires an error".to_string());
         }
-        Ok(Self {
-            id: Uuid::new_v4(),
-            run_id,
-            status,
-            summary,
-            error,
-            finished_at: Utc::now(),
-        })
-    }
-
-    pub fn completed(run_id: Uuid, summary: String) -> Result<Self, String> {
-        Self::new(run_id, AgentRunStatus::Completed, Some(summary), None)
+        if self.status != AgentRunStatus::Completed && self.goal_completion_receipt.is_some() {
+            return Err(
+                "agent run goal completion receipt is only valid for completed status".to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -563,4 +589,60 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{AgentRunFinish, AgentRunStatus};
+    use crate::kernel::goal_lifecycle::{GoalCompletionReceipt, GOAL_COMPLETION_SCHEMA_VERSION};
+
+    fn receipt(run_id: Uuid) -> GoalCompletionReceipt {
+        GoalCompletionReceipt {
+            version: GOAL_COMPLETION_SCHEMA_VERSION.to_string(),
+            goal_id: run_id,
+            revision: "1".repeat(64),
+            frozen_fingerprint: "2".repeat(64),
+            evidence_fingerprints: vec!["3".repeat(64)],
+            fingerprint: "4".repeat(64),
+        }
+    }
+
+    #[test]
+    fn legacy_finish_json_defaults_to_no_goal_receipt() {
+        let run_id = Uuid::new_v4();
+        let finish: AgentRunFinish = serde_json::from_value(json!({
+            "id": Uuid::new_v4(),
+            "run_id": run_id,
+            "status": "completed",
+            "summary": "legacy completion",
+            "error": null,
+            "finished_at": Utc::now()
+        }))
+        .expect("legacy finish decodes");
+
+        assert!(finish.goal_completion_receipt.is_none());
+        assert!(!serde_json::to_string(&finish)
+            .expect("legacy finish serializes")
+            .contains("goal_completion_receipt"));
+    }
+
+    #[test]
+    fn goal_receipt_is_exact_and_completed_only() {
+        let run_id = Uuid::new_v4();
+        let receipt = receipt(run_id);
+        let mut finish = AgentRunFinish::completed_with_goal_receipt(
+            run_id,
+            Some("verified completion".to_string()),
+            receipt.clone(),
+        )
+        .expect("receipt-bound completion is valid");
+        assert_eq!(finish.goal_completion_receipt, Some(receipt));
+
+        finish.status = AgentRunStatus::Cancelled;
+        assert!(finish.validate().is_err());
+    }
 }
