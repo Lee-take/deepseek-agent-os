@@ -98,12 +98,11 @@ impl SkillRepositorySource {
         Ok(Self {
             provider,
             canonical_url: format!(
-                "https://{}/{}/{}",
+                "https://{}/{hugging_face_prefix}{owner}/{}",
                 match provider {
                     SkillRepositoryProvider::Github => "github.com",
                     SkillRepositoryProvider::HuggingFace => "huggingface.co",
                 },
-                format!("{hugging_face_prefix}{owner}"),
                 repository
             ),
             owner,
@@ -501,7 +500,7 @@ pub fn build_repository_skill_installation(
     let plugin_metadata = scoped_files
         .iter()
         .find(|file| file.path.eq_ignore_ascii_case(".claude-plugin/plugin.json"))
-        .and_then(|file| serde_json::from_str::<Value>(&file.content).ok());
+        .and_then(|file| serde_json::from_str::<Value>(file.content).ok());
     let mut skill_files = scoped_files
         .iter()
         .filter(|file| {
@@ -527,7 +526,7 @@ pub fn build_repository_skill_installation(
 
     let first_metadata = skill_files
         .first()
-        .map(|file| markdown_frontmatter(&file.content))
+        .map(|file| markdown_frontmatter(file.content))
         .unwrap_or_default();
     let name = plugin_metadata
         .as_ref()
@@ -624,15 +623,14 @@ fn build_native_manifest_installation(
         ) {
             continue;
         }
-        let value = match serde_json::from_str::<Value>(&file.content) {
+        let value = match serde_json::from_str::<Value>(file.content) {
             Ok(value) => value,
             Err(_) => continue,
         };
         if value.get("schema_version").and_then(Value::as_str) != Some("ds-agent.skill.v1") {
             continue;
         }
-        let manifest =
-            SkillManifest::from_json(&file.content).map_err(|error| error.to_string())?;
+        let manifest = SkillManifest::from_json(file.content).map_err(|error| error.to_string())?;
         let manifest_dir = file.path.rsplit_once('/').map(|(directory, _)| directory);
         let entry_path = manifest_dir
             .map(|directory| format!("{directory}/{}", manifest.entry.path))
