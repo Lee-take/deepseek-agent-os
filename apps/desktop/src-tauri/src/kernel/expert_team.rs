@@ -67,7 +67,7 @@ impl Default for ExpertBudget {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExpertOutputContract {
     #[serde(default)]
     pub min_evidence_sources: usize,
@@ -79,18 +79,6 @@ pub struct ExpertOutputContract {
     pub require_review: bool,
     #[serde(default)]
     pub fail_on_unresolved_conflict: bool,
-}
-
-impl Default for ExpertOutputContract {
-    fn default() -> Self {
-        Self {
-            min_evidence_sources: 0,
-            require_claims: false,
-            require_staged_output: false,
-            require_review: false,
-            fail_on_unresolved_conflict: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -763,6 +751,39 @@ fn validate_text(value: &str, field: &str, max_chars: usize) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expert_output_contract_default_matches_field_json_and_serde_contract() {
+        let derived = ExpertOutputContract::default();
+        let manual_fixture = ExpertOutputContract {
+            min_evidence_sources: 0,
+            require_claims: false,
+            require_staged_output: false,
+            require_review: false,
+            fail_on_unresolved_conflict: false,
+        };
+
+        assert_eq!(derived, manual_fixture);
+        let derived_json = serde_json::to_value(&derived).expect("derived default serializes");
+        let manual_json =
+            serde_json::to_value(&manual_fixture).expect("manual default fixture serializes");
+        assert_eq!(derived_json, manual_json);
+        assert_eq!(
+            derived_json,
+            serde_json::json!({
+                "min_evidence_sources": 0,
+                "require_claims": false,
+                "require_staged_output": false,
+                "require_review": false,
+                "fail_on_unresolved_conflict": false,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ExpertOutputContract>(serde_json::json!({}))
+                .expect("empty object uses field defaults"),
+            manual_fixture
+        );
+    }
 
     fn item(key: &str, role: ExpertRole, depends_on: &[&str]) -> ExpertTeamPlanItem {
         let production = role == ExpertRole::Production;
