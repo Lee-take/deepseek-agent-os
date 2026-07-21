@@ -33,6 +33,7 @@ pub enum CapabilityInvocationStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct BrowserBrowseRequest {
     pub access_mode: AccessMode,
     pub url: String,
@@ -59,6 +60,7 @@ pub trait BrowserPageClient {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct NetworkSearchRequest {
     pub access_mode: AccessMode,
     pub query: String,
@@ -87,6 +89,7 @@ pub trait NetworkSearchClient {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct FileReadRequest {
     pub access_mode: AccessMode,
     pub path: String,
@@ -94,6 +97,7 @@ pub struct FileReadRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct FileWriteRequest {
     pub access_mode: AccessMode,
     pub path: String,
@@ -115,6 +119,7 @@ pub enum FileSystemMutationOperation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct FileSystemMutationRequest {
     pub access_mode: AccessMode,
     pub operation: FileSystemMutationOperation,
@@ -195,6 +200,7 @@ pub trait EvidenceFolderClient {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct TerminalReadRequest {
     pub access_mode: AccessMode,
     pub command: String,
@@ -316,12 +322,14 @@ pub trait TerminalReadClient {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct ComputerScreenshotRequest {
     pub access_mode: AccessMode,
     pub approval_granted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct ComputerControlRequest {
     pub access_mode: AccessMode,
     pub target: String,
@@ -1758,6 +1766,7 @@ pub struct CapabilityInvocation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct BrowserBrowseOutcome {
     pub access_request: CapabilityAccessRequest,
     pub invocation: CapabilityInvocation,
@@ -1770,12 +1779,14 @@ pub struct BrowserSubmitOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct NetworkSearchOutcome {
     pub access_request: CapabilityAccessRequest,
     pub invocation: CapabilityInvocation,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct FileReadOutcome {
     pub access_request: CapabilityAccessRequest,
     pub invocation: CapabilityInvocation,
@@ -1788,6 +1799,7 @@ pub struct EvidenceFolderOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct TerminalReadOutcome {
     pub access_request: CapabilityAccessRequest,
     pub invocation: CapabilityInvocation,
@@ -1800,12 +1812,14 @@ pub struct TerminalWriteOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct ComputerScreenshotOutcome {
     pub access_request: CapabilityAccessRequest,
     pub invocation: CapabilityInvocation,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct ComputerControlOutcome {
     pub access_request: CapabilityAccessRequest,
     pub invocation: CapabilityInvocation,
@@ -1842,11 +1856,13 @@ pub struct DriveWriteOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct FileWriteOutcome {
     pub access_request: CapabilityAccessRequest,
     pub invocation: CapabilityInvocation,
 }
 
+#[cfg(test)]
 pub fn run_browser_browse(
     request: BrowserBrowseRequest,
     client: &impl BrowserPageClient,
@@ -1983,6 +1999,7 @@ pub fn run_browser_submit_boundary(
     })
 }
 
+#[cfg(test)]
 pub fn run_network_search_boundary(
     request: NetworkSearchRequest,
     client: &impl NetworkSearchClient,
@@ -2092,6 +2109,7 @@ pub fn run_network_search_boundary(
     })
 }
 
+#[cfg(test)]
 fn network_search_provider_label(result: &NetworkSearchResult) -> &str {
     let provider = result.provider.trim();
     if provider.is_empty() {
@@ -2101,6 +2119,7 @@ fn network_search_provider_label(result: &NetworkSearchResult) -> &str {
     }
 }
 
+#[cfg(test)]
 pub fn run_file_read(
     request: FileReadRequest,
     client: &impl FileContentClient,
@@ -2179,6 +2198,7 @@ pub fn run_file_read(
     })
 }
 
+#[cfg(test)]
 pub fn run_file_write_boundary(
     request: FileWriteRequest,
     client: &impl FileWriteClient,
@@ -2264,6 +2284,7 @@ pub fn run_file_write_boundary(
     })
 }
 
+#[cfg(test)]
 pub fn run_filesystem_mutation_boundary(
     request: FileSystemMutationRequest,
     client: &impl FileSystemMutationClient,
@@ -2369,6 +2390,7 @@ pub fn run_filesystem_mutation_boundary(
     })
 }
 
+#[cfg(test)]
 fn file_write_result_encoding(result: &FileWriteResult) -> &str {
     let encoding = result.encoding.trim();
     if encoding.is_empty() {
@@ -2489,6 +2511,7 @@ fn evidence_folder_file_encoding(file: &EvidenceFolderFile) -> &str {
     }
 }
 
+#[cfg(test)]
 pub fn run_terminal_read(
     request: TerminalReadRequest,
     client: &impl TerminalReadClient,
@@ -2639,6 +2662,7 @@ pub fn run_terminal_write_boundary(
     })
 }
 
+#[cfg(test)]
 pub fn run_computer_screenshot(
     request: ComputerScreenshotRequest,
     client: &impl ComputerScreenshotClient,
@@ -2726,6 +2750,7 @@ pub fn run_computer_screenshot(
     })
 }
 
+#[cfg(test)]
 pub fn run_computer_control_boundary(
     request: ComputerControlRequest,
     client: &impl ComputerControlClient,
@@ -3220,6 +3245,7 @@ fn decode_drive_export_file_content(export_file: &DriveWriteExportFile) -> Resul
     }
 }
 
+#[cfg(test)]
 fn normalize_network_search_query(query: &str) -> Result<String, String> {
     let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -3238,6 +3264,7 @@ fn normalize_browser_submit_summary(summary: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+#[cfg(test)]
 fn normalize_network_search_scope(scope: &str) -> String {
     let normalized = scope.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -3247,6 +3274,7 @@ fn normalize_network_search_scope(scope: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn normalize_computer_control_field(value: &str, label: &str) -> Result<String, String> {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -3558,6 +3586,7 @@ fn normalize_drive_field(value: &str, label: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+#[cfg(test)]
 fn normalize_file_write_field(value: &str, label: &str) -> Result<String, String> {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -3567,6 +3596,7 @@ fn normalize_file_write_field(value: &str, label: &str) -> Result<String, String
     Ok(normalized)
 }
 
+#[cfg(test)]
 fn validate_file_write_content(content: &str) -> Result<String, String> {
     if content.trim().is_empty() {
         return Err("file write content is required".to_string());
@@ -3575,6 +3605,7 @@ fn validate_file_write_content(content: &str) -> Result<String, String> {
     Ok(content.to_string())
 }
 
+#[cfg(test)]
 fn normalize_filesystem_path_field(value: &str, label: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -3587,12 +3618,14 @@ fn normalize_filesystem_path_field(value: &str, label: &str) -> Result<String, S
     Ok(trimmed.to_string())
 }
 
+#[cfg(test)]
 fn validate_filesystem_mutation_content(content: Option<&str>) -> Result<String, String> {
     content
         .map(ToString::to_string)
         .ok_or_else(|| "filesystem file content is required".to_string())
 }
 
+#[cfg(test)]
 fn validate_filesystem_mutation_request(
     operation: FileSystemMutationOperation,
     path: &str,
@@ -3619,6 +3652,7 @@ fn reject_root_mutation_path(path: &Path) -> Result<(), String> {
     enforce_local_mutation_path(path)
 }
 
+#[cfg(test)]
 fn filesystem_mutation_operation_label(operation: FileSystemMutationOperation) -> &'static str {
     match operation {
         FileSystemMutationOperation::CreateFile => "create_file",
@@ -3631,6 +3665,7 @@ fn filesystem_mutation_operation_label(operation: FileSystemMutationOperation) -
     }
 }
 
+#[cfg(test)]
 fn filesystem_mutation_target_summary(path: &str, destination: Option<&str>) -> String {
     match destination {
         Some(destination) => format!("{path} -> {destination}"),
@@ -3821,6 +3856,7 @@ fn normalize_email_field(value: &str, label: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+#[cfg(test)]
 fn terminal_output_excerpt(output: &TerminalCommandOutput) -> String {
     let mut parts = Vec::new();
     if !output.stdout.trim().is_empty() {
@@ -3873,6 +3909,7 @@ fn drive_folder_entry_encoding(entry: &DriveFolderEntry) -> &str {
     }
 }
 
+#[cfg(test)]
 fn network_search_excerpt(result: &NetworkSearchResult) -> String {
     result
         .items
@@ -4006,6 +4043,7 @@ fn excerpt_text(text: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn file_read_metadata_warning(file: &FileContent) -> String {
     let bytes = if file.bytes == 0 {
         file.text.len() as u64

@@ -31,6 +31,13 @@ const LEGACY_CONSUMPTION_ID_DOMAIN: &[u8] =
 const MAX_GROUPED_APPROVAL_JSON_BYTES: usize = 192 * 1024;
 const MAX_AUDIT_ITEMS: usize = 2048;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "non-user actor variants preserve explicit lifecycle and denied model/frontend authority domains; remove only after typed claim paths retain equivalent lifecycle and rejection coverage"
+    )
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskGroupedApprovalActor {
     User,
@@ -62,6 +69,7 @@ impl TaskGroupedApprovalStatus {
         }
     }
 
+    #[cfg(test)]
     pub const fn carries_authority(self) -> bool {
         matches!(self, Self::Approved)
     }
@@ -143,6 +151,7 @@ pub struct TaskGroupedApprovalResolutionClaim {
 }
 
 impl TaskGroupedApprovalResolutionClaim {
+    #[cfg(test)]
     pub fn from_group(group: &TaskGroupedApproval, actor: TaskGroupedApprovalActor) -> Self {
         Self {
             group_id: group.id,
@@ -174,6 +183,7 @@ pub struct TaskGroupedCapabilityClaim {
 }
 
 impl TaskGroupedCapabilityClaim {
+    #[cfg(test)]
     pub fn from_group_item(group: &TaskGroupedApproval, item: &TaskGroupedCapabilityAudit) -> Self {
         Self {
             group_id: group.id,
