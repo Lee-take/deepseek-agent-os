@@ -237,7 +237,7 @@ fn select_ico_resource(icon_bytes: &[u8], desired_size: u32) -> Option<&[u8]> {
         let distance = width.abs_diff(desired_size);
         let is_downscale = u32::from(width < desired_size);
         let candidate = (distance, is_downscale, resource_offset, resource_size);
-        if best.map_or(true, |current| candidate < current) {
+        if best.is_none_or(|current| candidate < current) {
             best = Some(candidate);
         }
     }

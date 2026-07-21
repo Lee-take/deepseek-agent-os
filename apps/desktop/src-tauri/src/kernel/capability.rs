@@ -4008,7 +4008,7 @@ fn excerpt_text(text: &str) -> String {
 
 fn file_read_metadata_warning(file: &FileContent) -> String {
     let bytes = if file.bytes == 0 {
-        file.text.as_bytes().len() as u64
+        file.text.len() as u64
     } else {
         file.bytes
     };
