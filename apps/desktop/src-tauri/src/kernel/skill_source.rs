@@ -113,6 +113,7 @@ impl SkillRepositorySource {
         })
     }
 
+    #[cfg(test)]
     pub fn repository_id(&self) -> String {
         format!("{}/{}", self.owner, self.repository)
     }

@@ -11,9 +11,10 @@ use zip::write::FileOptions;
 
 use crate::kernel::capability::{CapabilityInvocation, CapabilityInvocationStatus};
 use crate::kernel::models::AccessMode;
+#[cfg(test)]
+use crate::kernel::policy::CapabilityAccessStatus;
 use crate::kernel::policy::{
-    request_capability_access, CapabilityAccessRequest, CapabilityAccessStatus, CapabilityKind,
-    PolicyDecision,
+    request_capability_access, CapabilityAccessRequest, CapabilityKind, PolicyDecision,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -93,6 +94,7 @@ struct OfficeCreateSlideContent {
     body: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OfficeCreateRequest {
     pub access_mode: AccessMode,
@@ -140,6 +142,7 @@ pub struct OfficeUpdateResult {
     pub summary: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OfficeCreateOutcome {
     pub access_request: CapabilityAccessRequest,
@@ -526,6 +529,7 @@ impl OfficeUpdateClient for LocalOfficeArtifactClient {
     }
 }
 
+#[cfg(test)]
 pub fn run_office_create_boundary(
     request: OfficeCreateRequest,
     client: &impl OfficeArtifactClient,
@@ -617,6 +621,7 @@ pub fn run_office_create_boundary(
     }
 }
 
+#[cfg(test)]
 fn office_create_access_request(
     access_mode: AccessMode,
 ) -> Result<CapabilityAccessRequest, String> {
