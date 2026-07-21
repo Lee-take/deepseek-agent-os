@@ -1961,7 +1961,7 @@ fn canonical_json_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
             let mut fields = object.iter().collect::<Vec<_>>();
-            fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+            fields.sort_by_key(|(left, _)| *left);
             Value::Object(
                 fields
                     .into_iter()

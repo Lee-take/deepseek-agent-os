@@ -510,9 +510,7 @@ impl TaskGroupedApproval {
             return Err(TaskGroupedApprovalError::BindingMismatch);
         }
         let expected_status = TaskGroupedCapabilityAuditStatus::from(self.status);
-        for (audit, (capability, risk_level, tool)) in
-            self.capability_audits.iter().zip(expected.into_iter())
-        {
+        for (audit, (capability, risk_level, tool)) in self.capability_audits.iter().zip(expected) {
             let item_id = item_id_for(self.id, capability, &tool.tool_id, &tool.tool_version);
             let request_fingerprint = request_fingerprint_for(
                 self.id,
