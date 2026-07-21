@@ -131,12 +131,13 @@ use crate::kernel::network_search::{
     network_search_route_status_for_strategy, NetworkSearchRouteStatus,
 };
 use crate::kernel::office::{
-    office_create_spec_from_action, office_update_spec_from_action, run_office_create_boundary,
-    run_office_open_boundary, run_office_update_boundary, LocalOfficeArtifactClient, OfficeApp,
-    OfficeArtifactClient, OfficeCreateRequest, OfficeCreateResult, OfficeCreateSpec,
-    OfficeOpenClient, OfficeOpenRequest, OfficeOpenResult, OfficeUpdateClient, OfficeUpdateRequest,
-    OfficeUpdateResult, OfficeUpdateSpec,
+    office_create_spec_from_action, office_update_spec_from_action, run_office_open_boundary,
+    run_office_update_boundary, LocalOfficeArtifactClient, OfficeApp, OfficeArtifactClient,
+    OfficeCreateResult, OfficeCreateSpec, OfficeOpenClient, OfficeOpenRequest, OfficeOpenResult,
+    OfficeUpdateClient, OfficeUpdateRequest, OfficeUpdateResult, OfficeUpdateSpec,
 };
+#[cfg(test)]
+use crate::kernel::office::{run_office_create_boundary, OfficeCreateRequest};
 use crate::kernel::policy::{
     builtin_capability_catalog, decide as decide_capability_policy,
     request_capability_access as build_capability_access_request, CapabilityAccessRecord,
@@ -324,6 +325,7 @@ const AGENT_RUN_GUIDANCE_PROMPT_CHAR_LIMIT: usize = 12_000;
 const AGENT_SKILL_CATALOG_MAX_ITEMS: usize = 24;
 const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user, goal_envelope, agent_actions, missing_prerequisites, required_confirmations, artifact_targets, memory_candidates, soul_profile_update, subagent_plan, and expert_output. When proposing a goal_envelope, use version ds-agent.goal-envelope-proposal/v1 and include user_goal, assumptions, constraints, done_when, required_artifacts, verifiers, proposed_capabilities, external_targets, and stop_conditions. assumptions, constraints, proposed_capabilities, and stop_conditions are string arrays. Each done_when item has done_when_id and description; each required_artifact has artifact_id and description; each verifier has verifier_id, done_when_id, description, and evidence_kind; each external_target has target_id and description. The goal_envelope is only a proposal: it cannot approve execution, trust a path or external target, handle a secret, or declare completion. Soul is the durable cross-conversation identity and collaboration profile, not an ordinary memory candidate. Whenever the current user message explicitly defines, changes, or confirms any Soul setting, soul_profile_update must contain fields, clear_fields, current_message_evidence, and optional confirmation_context. This includes short confirmations such as yes when the immediately preceding context proposed a Soul setting. current_message_evidence must be an exact non-empty excerpt of the current user message; confirmation_context, when needed, must be an exact excerpt of the supplied conversation context. Use only the allowed Soul field names supplied by DS Agent. Keep identity roles exact: preferred_name is the user's own name, address_as is how DS Agent addresses the user, user_calls_ds_agent is the user's name for DS Agent, and ds_agent_should_refer_to_itself_as is DS Agent's self-reference. Never put DS Agent's name into preferred_name. Do not propose Soul updates for guesses, third-party statements, transient one-turn instructions, or sensitive values. Do not tell the user the setting was saved; DS Agent appends a persistence receipt only after the update is validated and written. For a complex task that materially benefits from specialists, subagent_plan may contain 2-4 unique roles chosen from research, analysis, production, review. Every item requires key, role, prompt, depends_on, capabilities, resources, budget, output_contract, and retry_policy. Use an acyclic flow: research and analysis may run in parallel when independent; production depends on relevant evidence/analysis; review depends on production. Only production may request managed_staging_write and a logical write resource. A child never writes an approved destination. Review cannot mutate staged output and must bind its decision to the exact production revision. Never create nested subagents or desktop-control subtasks. Leave subagent_plan empty for simple work. When executing an expert attempt, return expert_output with summary, evidence-linked claims, optional staged_content/staged_relative_path for production, and an exact-revision review verdict for review; never return another subagent_plan. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
 const AGENT_TASK_CAPABILITY_PROPOSAL_PROMPT: &str = "When a goal proposes one or more local capabilities, also return task_capability_proposal using version ds-agent.task-capability-proposal/v1. It contains expires_at and a canonically sorted capabilities array. Each capability entry contains capability, application_ids, path_target_ids, account_target_ids, recipient_target_ids, time_window_target_ids, external_target_ids, and verifier_ids. Cover every proposed capability, external target, and verifier from the same goal exactly once across the entries. Sort the capability entries and every ID array lexically. Use application_ids=[\"ds-agent\"] for work performed by DS Agent, and use only target and verifier IDs from the same goal_envelope. This is descriptive-only: never include task IDs, goal revisions or fingerprints, internal tool IDs, risk, grants, authority, actors, approvals, resolutions, claims, tokens, permission state, manifest revisions or fingerprints, or any preview/hash/schema/renderer fields. DS Agent Kernel derives and validates all authority-bearing values after it freezes the goal.";
+#[cfg(test)]
 const AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT: usize = 1200;
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
@@ -7972,6 +7974,7 @@ fn build_agent_skill_catalog_prompt(catalog: &[AgentSkillCatalogItem]) -> String
     )
 }
 
+#[cfg(test)]
 fn select_agent_memory_runtime_context(
     prompt: &str,
     memories: &[MemoryRecord],
@@ -8393,6 +8396,7 @@ fn agent_selected_memory_receipt_line(memory: &AgentSelectedMemory) -> String {
     )
 }
 
+#[cfg(test)]
 pub fn agent_chat_with_transport(
     transport: &impl DeepSeekChatCompletionTransport,
     cache: &DeepSeekMemoryChatCompletionCache,
@@ -8451,6 +8455,7 @@ fn agent_chat_with_transport_and_runtime_context(
     Ok((response, telemetry))
 }
 
+#[cfg(test)]
 fn agent_chat_with_dispatch_and_tool_followup(
     transport: &impl DeepSeekChatCompletionTransport,
     cache: &DeepSeekMemoryChatCompletionCache,
@@ -8766,6 +8771,7 @@ fn reconcile_agent_goal_projection(
     Ok(())
 }
 
+#[cfg(test)]
 fn run_agent_chat_with_clients(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -8794,6 +8800,7 @@ fn run_agent_chat_with_clients(
     )
 }
 
+#[cfg(test)]
 fn run_agent_chat_with_clients_and_api_keys(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -9109,6 +9116,7 @@ fn record_agent_tool_loop_limit_step(
         .map_err(event_store_error)
 }
 
+#[cfg(test)]
 fn run_next_queued_agent_chat_with_clients_and_api_keys(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -9145,6 +9153,7 @@ fn run_next_queued_agent_chat_with_clients_and_api_keys(
     )
 }
 
+#[cfg(test)]
 fn run_queued_agent_chat_with_clients_and_api_keys(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -10893,6 +10902,7 @@ fn record_agent_memory_candidates(
     Ok(())
 }
 
+#[cfg(test)]
 fn record_agent_action_permission_requests(
     store: &EventStore,
     access_mode: AccessMode,
@@ -11144,6 +11154,7 @@ fn dispatch_agent_skill_uninstall_action_with_store_mutex(
     apply_skill_uninstall_result(action, result);
 }
 
+#[cfg(test)]
 fn dispatch_agent_action_proposals(
     store: &EventStore,
     access_mode: AccessMode,
@@ -12322,6 +12333,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
     Ok(())
 }
 
+#[cfg(test)]
 fn resume_agent_chat_action_with_clients(
     store: &EventStore,
     access_mode: AccessMode,
@@ -12705,6 +12717,7 @@ fn dispatch_agent_operations_briefing_action(
     Ok(())
 }
 
+#[cfg(test)]
 fn dispatch_agent_office_create_action(
     store: &EventStore,
     access_mode: AccessMode,
@@ -13277,6 +13290,7 @@ fn agent_office_open_dispatch_note(
     }
 }
 
+#[cfg(test)]
 fn agent_office_create_dispatch_note(
     invocation: &CapabilityInvocation,
     result: Option<OfficeCreateResult>,
@@ -13305,6 +13319,7 @@ fn agent_office_create_dispatch_note(
     }
 }
 
+#[cfg(test)]
 fn agent_office_create_content_evidence(spec: &OfficeCreateSpec) -> Option<String> {
     let evidence = match spec.app {
         OfficeApp::Word => spec.body.trim().to_string(),
@@ -13341,6 +13356,7 @@ fn agent_office_create_content_evidence(spec: &OfficeCreateSpec) -> Option<Strin
     compact_agent_tool_evidence_text(&evidence, AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT)
 }
 
+#[cfg(test)]
 fn compact_agent_tool_evidence_text(text: &str, limit: usize) -> Option<String> {
     let compact = text
         .lines()

@@ -306,6 +306,7 @@ impl GoalValidationContext {
         self
     }
 
+    #[cfg(test)]
     pub fn allowing_external_effects(mut self) -> Self {
         self.allow_external_effects = true;
         self
