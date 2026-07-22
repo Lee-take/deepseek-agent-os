@@ -24,6 +24,7 @@ pub const OFFICE_CREATE_TOOL_ID: &str = "office.create";
 pub const OFFICE_OPEN_TOOL_ID: &str = "office.open";
 pub const OFFICE_UPDATE_TOOL_ID: &str = "office.update";
 pub const OPERATIONS_BRIEFING_TOOL_ID: &str = "operations.briefing";
+pub const T1_RECONCILIATION_TOOL_ID: &str = "operations.reconcile_excel";
 pub const SKILL_ACTIVATE_TOOL_ID: &str = "skill.activate";
 pub const TERMINAL_READ_TOOL_ID: &str = "terminal.read";
 
@@ -756,6 +757,95 @@ pub fn builtin_tool_catalog() -> Vec<ToolContract> {
             },
             recovery_hint:
                 "Choose an existing unprotected managed artifact, review local permission, and retry one update."
+                    .to_string(),
+        },
+        ToolContract {
+            id: T1_RECONCILIATION_TOOL_ID.to_string(),
+            version: "1.0.0".to_string(),
+            title: "Reconcile verified T1 sources into Excel".to_string(),
+            description:
+                "Scan one authorized workspace folder for the exact T1 XLSX, DOCX, and PDF source set; reject period, numeric, formula, path, or identity conflicts; and create one re-read formula-backed Excel reconciliation artifact."
+                    .to_string(),
+            capability: CapabilityKind::FileWrite,
+            risk_level: RiskLevel::High,
+            executor_id: "kernel.operations.reconcile_excel.v1".to_string(),
+            input_schema: object_schema(
+                vec![
+                    field(
+                        "source_directory",
+                        ToolValueType::String,
+                        "Workspace-relative directory containing exactly one XLSX, DOCX, and PDF source.",
+                    ),
+                    field(
+                        "output_relative_path",
+                        ToolValueType::String,
+                        "Workspace-relative new XLSX output path inside an existing authorized directory.",
+                    ),
+                ],
+                &["source_directory", "output_relative_path"],
+            ),
+            output_schema: object_schema(
+                vec![
+                    field(
+                        "source_manifest",
+                        ToolValueType::Object,
+                        "Exact source paths, byte counts, media types, and SHA-256 identities.",
+                    ),
+                    field(
+                        "provenance",
+                        ToolValueType::Object,
+                        "Source and derived fact provenance with independent reconciliation.",
+                    ),
+                    field(
+                        "artifact",
+                        ToolValueType::Object,
+                        "Verified XLSX artifact identity receipt.",
+                    ),
+                    field(
+                        "key_figures",
+                        ToolValueType::Object,
+                        "Reconciled key-number projection.",
+                    ),
+                    field(
+                        "completion_evidence",
+                        ToolValueType::Array,
+                        "Kernel-issued evidence created only after persisted re-read verification.",
+                    ),
+                ],
+                &[
+                    "source_manifest",
+                    "provenance",
+                    "artifact",
+                    "key_figures",
+                    "completion_evidence",
+                ],
+            ),
+            constraints: ToolConstraints {
+                allowed_network_hosts: Vec::new(),
+                path_scope: ToolPathScope::Workspace,
+                mutates_machine_state: true,
+                protected_path_policy:
+                    "exact workspace-relative source directory and new XLSX output; no overwrite, link traversal, protected path, or boundary escape"
+                        .to_string(),
+                resource: Some(ToolResourceRequirement {
+                    key: "local_filesystem://mutation".to_string(),
+                    access: ToolResourceAccess::Write,
+                    lease_seconds: 30 * 60,
+                }),
+            },
+            verification: ToolVerificationContract {
+                recipe_id: "operations.reconcile_excel.t1.v1".to_string(),
+                description:
+                    "Require exact source identity, per-fact provenance, independent numeric reconciliation, formula verification, persisted artifact identity, and post-write re-read evidence."
+                        .to_string(),
+                required_evidence_kinds: vec![
+                    "t1_source_manifest".to_string(),
+                    "t1_fact_provenance".to_string(),
+                    "t1_reconciliation_xlsx".to_string(),
+                ],
+            },
+            recovery_hint:
+                "Restore the exact three-source T1 set or choose a new authorized XLSX path, then retry one reconciliation without overwriting an existing artifact."
                     .to_string(),
         },
         ToolContract {
@@ -1631,6 +1721,30 @@ fn validate_tool_semantics(contract: &ToolContract, input: &Value) -> Result<(),
             }
         }
     }
+    if contract.id == T1_RECONCILIATION_TOOL_ID {
+        for field in ["source_directory", "output_relative_path"] {
+            let value = input
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if value.is_empty() {
+                return Err(format!(
+                    "operations.reconcile_excel input field `{field}` cannot be blank"
+                ));
+            }
+        }
+        if !input["output_relative_path"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .ends_with(".xlsx")
+        {
+            return Err(
+                "operations.reconcile_excel output_relative_path must end in .xlsx".to_string(),
+            );
+        }
+    }
     if contract.id == FILESYSTEM_MUTATE_TOOL_ID {
         validate_filesystem_mutation_semantics(input)?;
     }
@@ -1987,7 +2101,7 @@ mod tests {
         BROWSER_OPEN_TOOL_ID, CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID, CONNECTOR_MUTATE_TOOL_ID,
         FILESYSTEM_MUTATE_TOOL_ID, FILE_READ_TOOL_ID, FILE_WRITE_TOOL_ID, OFFICE_CREATE_TOOL_ID,
         OFFICE_OPEN_TOOL_ID, OFFICE_UPDATE_TOOL_ID, OPERATIONS_BRIEFING_TOOL_ID,
-        SKILL_ACTIVATE_TOOL_ID, TERMINAL_READ_TOOL_ID,
+        SKILL_ACTIVATE_TOOL_ID, T1_RECONCILIATION_TOOL_ID, TERMINAL_READ_TOOL_ID,
     };
     use crate::kernel::models::AccessMode;
     use crate::kernel::policy::{CapabilityKind, PolicyDecision, RiskLevel};
@@ -2134,6 +2248,41 @@ mod tests {
             .verification
             .required_evidence_kinds
             .contains(&"office_artifact_update".to_string()));
+    }
+
+    #[test]
+    fn builtin_catalog_declares_t1_reconciliation_as_verified_workspace_write() {
+        let contract = builtin_tool_catalog()
+            .into_iter()
+            .find(|contract| contract.id == T1_RECONCILIATION_TOOL_ID)
+            .expect("T1 reconciliation contract");
+
+        assert_eq!(contract.version, "1.0.0");
+        assert_eq!(contract.capability, CapabilityKind::FileWrite);
+        assert_eq!(contract.risk_level, RiskLevel::High);
+        assert_eq!(contract.constraints.path_scope, ToolPathScope::Workspace);
+        assert!(contract.constraints.mutates_machine_state);
+        let resource = contract.constraints.resource.expect("write resource");
+        assert_eq!(resource.key, "local_filesystem://mutation");
+        assert_eq!(resource.access, ToolResourceAccess::Write);
+        assert_eq!(
+            contract.verification.required_evidence_kinds,
+            [
+                "t1_source_manifest",
+                "t1_fact_provenance",
+                "t1_reconciliation_xlsx",
+            ]
+        );
+        assert!(prepare_tool_execution(&ToolExecutionRequest {
+            tool_id: T1_RECONCILIATION_TOOL_ID.to_string(),
+            input: json!({
+                "source_directory": "inputs",
+                "output_relative_path": "outputs/reconciliation.txt",
+            }),
+            access_mode: AccessMode::FullAccess,
+            run_id: None,
+        })
+        .is_err());
     }
 
     #[test]
