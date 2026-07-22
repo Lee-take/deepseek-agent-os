@@ -76,7 +76,7 @@ const FOREGROUND_CONNECTED_CALENDAR_GOAL: &str =
 const MAX_FOREGROUND_CONNECTED_WORK_ATTEMPTS: u32 = 8;
 
 enum ForegroundConnectedWorkReservation {
-    Replay(ConnectedWorkReviewView),
+    Replay(Box<ConnectedWorkReviewView>),
     New {
         definition_id: Uuid,
         manual_invocation_id: Uuid,
@@ -842,7 +842,7 @@ impl EventStore {
             let ForegroundConnectedWorkReservation::Replay(review) = reservation else {
                 unreachable!()
             };
-            return Ok(review);
+            return Ok(*review);
         };
         let result = (|| {
             let (run, agent_run) = self.start_foreground_connected_work_run(
@@ -889,7 +889,7 @@ impl EventStore {
             let ForegroundConnectedWorkReservation::Replay(review) = reservation else {
                 unreachable!()
             };
-            return Ok(review);
+            return Ok(*review);
         };
         let result = (|| {
             let (run, agent_run) = self.start_foreground_connected_work_run(
@@ -939,6 +939,7 @@ impl EventStore {
                     self.finish_foreground_connected_work_preparation(definition_id, now)?;
                     return self
                         .connected_work_review(review_id)
+                        .map(Box::new)
                         .map(ForegroundConnectedWorkReservation::Replay);
                 }
                 let agent_terminal = run.agent_run_id.is_some_and(|agent_run_id| {

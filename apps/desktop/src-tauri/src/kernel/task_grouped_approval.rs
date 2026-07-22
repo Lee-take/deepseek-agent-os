@@ -31,6 +31,13 @@ const LEGACY_CONSUMPTION_ID_DOMAIN: &[u8] =
 const MAX_GROUPED_APPROVAL_JSON_BYTES: usize = 192 * 1024;
 const MAX_AUDIT_ITEMS: usize = 2048;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "non-user actor variants preserve explicit lifecycle and denied model/frontend authority domains; remove only after typed claim paths retain equivalent lifecycle and rejection coverage"
+    )
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskGroupedApprovalActor {
     User,
@@ -62,6 +69,7 @@ impl TaskGroupedApprovalStatus {
         }
     }
 
+    #[cfg(test)]
     pub const fn carries_authority(self) -> bool {
         matches!(self, Self::Approved)
     }
@@ -143,6 +151,7 @@ pub struct TaskGroupedApprovalResolutionClaim {
 }
 
 impl TaskGroupedApprovalResolutionClaim {
+    #[cfg(test)]
     pub fn from_group(group: &TaskGroupedApproval, actor: TaskGroupedApprovalActor) -> Self {
         Self {
             group_id: group.id,
@@ -174,6 +183,7 @@ pub struct TaskGroupedCapabilityClaim {
 }
 
 impl TaskGroupedCapabilityClaim {
+    #[cfg(test)]
     pub fn from_group_item(group: &TaskGroupedApproval, item: &TaskGroupedCapabilityAudit) -> Self {
         Self {
             group_id: group.id,
@@ -510,9 +520,7 @@ impl TaskGroupedApproval {
             return Err(TaskGroupedApprovalError::BindingMismatch);
         }
         let expected_status = TaskGroupedCapabilityAuditStatus::from(self.status);
-        for (audit, (capability, risk_level, tool)) in
-            self.capability_audits.iter().zip(expected.into_iter())
-        {
+        for (audit, (capability, risk_level, tool)) in self.capability_audits.iter().zip(expected) {
             let item_id = item_id_for(self.id, capability, &tool.tool_id, &tool.tool_version);
             let request_fingerprint = request_fingerprint_for(
                 self.id,

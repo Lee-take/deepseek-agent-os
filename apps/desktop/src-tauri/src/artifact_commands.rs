@@ -80,7 +80,7 @@ pub(crate) fn run_artifact_recovery_sweep(state: &AppState) {
                 Ok(())
             }
             ArtifactPhase::StructureChecked => {
-                render_artifact_file(record.format, Path::new(&path)).and_then(|rendered| {
+                render_artifact_file(record.format, Path::new(&path)).map(|rendered| {
                     let preview_ref = format!(
                         "artifact-preview:{}:{}",
                         record.id, record.artifact_revision
@@ -95,7 +95,6 @@ pub(crate) fn run_artifact_recovery_sweep(state: &AppState) {
                     if visual_result.is_ok() {
                         previews = Some(rendered.pages);
                     }
-                    Ok(())
                 })
             }
             ArtifactPhase::ReadyForDelivery | ArtifactPhase::VisualChecked => {

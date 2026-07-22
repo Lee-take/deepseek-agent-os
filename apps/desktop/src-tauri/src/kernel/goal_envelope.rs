@@ -140,6 +140,7 @@ impl<'de> Deserialize<'de> for GoalEnvelopeProposal {
 }
 
 impl GoalEnvelopeProposal {
+    #[cfg(test)]
     pub fn parse_json(json: &str) -> Result<Self, GoalEnvelopeProposalError> {
         if json.len() > MAX_JSON_BYTES {
             return Err(GoalEnvelopeProposalError::JsonTooLarge);
@@ -164,6 +165,7 @@ impl GoalEnvelopeProposal {
         Ok(proposal)
     }
 
+    #[cfg(test)]
     pub fn to_json(&self) -> Result<String, GoalEnvelopeProposalError> {
         self.validate()?;
         serde_json::to_string(self).map_err(|_| GoalEnvelopeProposalError::InvalidJson)

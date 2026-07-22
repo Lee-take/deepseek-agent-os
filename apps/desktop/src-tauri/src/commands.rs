@@ -131,12 +131,13 @@ use crate::kernel::network_search::{
     network_search_route_status_for_strategy, NetworkSearchRouteStatus,
 };
 use crate::kernel::office::{
-    office_create_spec_from_action, office_update_spec_from_action, run_office_create_boundary,
-    run_office_open_boundary, run_office_update_boundary, LocalOfficeArtifactClient, OfficeApp,
-    OfficeArtifactClient, OfficeCreateRequest, OfficeCreateResult, OfficeCreateSpec,
-    OfficeOpenClient, OfficeOpenRequest, OfficeOpenResult, OfficeUpdateClient, OfficeUpdateRequest,
-    OfficeUpdateResult, OfficeUpdateSpec,
+    office_create_spec_from_action, office_update_spec_from_action, run_office_open_boundary,
+    run_office_update_boundary, LocalOfficeArtifactClient, OfficeApp, OfficeArtifactClient,
+    OfficeCreateResult, OfficeCreateSpec, OfficeOpenClient, OfficeOpenRequest, OfficeOpenResult,
+    OfficeUpdateClient, OfficeUpdateRequest, OfficeUpdateResult, OfficeUpdateSpec,
 };
+#[cfg(test)]
+use crate::kernel::office::{run_office_create_boundary, OfficeCreateRequest};
 use crate::kernel::policy::{
     builtin_capability_catalog, decide as decide_capability_policy,
     request_capability_access as build_capability_access_request, CapabilityAccessRecord,
@@ -324,6 +325,7 @@ const AGENT_RUN_GUIDANCE_PROMPT_CHAR_LIMIT: usize = 12_000;
 const AGENT_SKILL_CATALOG_MAX_ITEMS: usize = 24;
 const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are the DeepSeek reasoning layer for DS Agent. DS Agent is the local execution layer. Read the full user message and return one structured agent envelope as JSON. Separate reply_to_user, goal_envelope, agent_actions, missing_prerequisites, required_confirmations, artifact_targets, memory_candidates, soul_profile_update, subagent_plan, and expert_output. When proposing a goal_envelope, use version ds-agent.goal-envelope-proposal/v1 and include user_goal, assumptions, constraints, done_when, required_artifacts, verifiers, proposed_capabilities, external_targets, and stop_conditions. assumptions, constraints, proposed_capabilities, and stop_conditions are string arrays. Each done_when item has done_when_id and description; each required_artifact has artifact_id and description; each verifier has verifier_id, done_when_id, description, and evidence_kind; each external_target has target_id and description. The goal_envelope is only a proposal: it cannot approve execution, trust a path or external target, handle a secret, or declare completion. Soul is the durable cross-conversation identity and collaboration profile, not an ordinary memory candidate. Whenever the current user message explicitly defines, changes, or confirms any Soul setting, soul_profile_update must contain fields, clear_fields, current_message_evidence, and optional confirmation_context. This includes short confirmations such as yes when the immediately preceding context proposed a Soul setting. current_message_evidence must be an exact non-empty excerpt of the current user message; confirmation_context, when needed, must be an exact excerpt of the supplied conversation context. Use only the allowed Soul field names supplied by DS Agent. Keep identity roles exact: preferred_name is the user's own name, address_as is how DS Agent addresses the user, user_calls_ds_agent is the user's name for DS Agent, and ds_agent_should_refer_to_itself_as is DS Agent's self-reference. Never put DS Agent's name into preferred_name. Do not propose Soul updates for guesses, third-party statements, transient one-turn instructions, or sensitive values. Do not tell the user the setting was saved; DS Agent appends a persistence receipt only after the update is validated and written. For a complex task that materially benefits from specialists, subagent_plan may contain 2-4 unique roles chosen from research, analysis, production, review. Every item requires key, role, prompt, depends_on, capabilities, resources, budget, output_contract, and retry_policy. Use an acyclic flow: research and analysis may run in parallel when independent; production depends on relevant evidence/analysis; review depends on production. Only production may request managed_staging_write and a logical write resource. A child never writes an approved destination. Review cannot mutate staged output and must bind its decision to the exact production revision. Never create nested subagents or desktop-control subtasks. Leave subagent_plan empty for simple work. When executing an expert attempt, return expert_output with summary, evidence-linked claims, optional staged_content/staged_relative_path for production, and an exact-revision review verdict for review; never return another subagent_plan. Do not claim local tools ran; propose actions for DS Agent to validate and execute. Write reply_to_user for an ordinary user in the user's language. Lead with the useful conclusion or next step. Do not expose internal action types, tool IDs, protocol or schema names, policy enums, target=/evidence=/output= fields, raw JSON, or English verification receipts unless the user explicitly asks for technical details.";
 const AGENT_TASK_CAPABILITY_PROPOSAL_PROMPT: &str = "When a goal proposes one or more local capabilities, also return task_capability_proposal using version ds-agent.task-capability-proposal/v1. It contains expires_at and a canonically sorted capabilities array. Each capability entry contains capability, application_ids, path_target_ids, account_target_ids, recipient_target_ids, time_window_target_ids, external_target_ids, and verifier_ids. Cover every proposed capability, external target, and verifier from the same goal exactly once across the entries. Sort the capability entries and every ID array lexically. Use application_ids=[\"ds-agent\"] for work performed by DS Agent, and use only target and verifier IDs from the same goal_envelope. This is descriptive-only: never include task IDs, goal revisions or fingerprints, internal tool IDs, risk, grants, authority, actors, approvals, resolutions, claims, tokens, permission state, manifest revisions or fingerprints, or any preview/hash/schema/renderer fields. DS Agent Kernel derives and validates all authority-bearing values after it freezes the goal.";
+#[cfg(test)]
 const AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT: usize = 1200;
 const AGENT_SOUL_PROFILE_FILE_NAME: &str = "soul.md";
 const AGENT_SOUL_PROFILE_CONTEXT_MAX_BYTES: usize = 800;
@@ -551,10 +553,13 @@ pub struct AgentRunWorkerResult {
 pub type AgentSubtaskPlanItem = ExpertTeamPlanItem;
 
 fn validated_subagent_plan(items: &[AgentSubtaskPlanItem]) -> Vec<AgentSubtaskPlanItem> {
-    crate::kernel::expert_team::validate_team_plan(Uuid::new_v4(), "model proposal", items)
+    if crate::kernel::expert_team::validate_team_plan(Uuid::new_v4(), "model proposal", items)
         .is_ok()
-        .then(|| items.to_vec())
-        .unwrap_or_default()
+    {
+        items.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 fn block_subagent_mutating_actions(
@@ -1307,6 +1312,10 @@ struct AuthorizedAgentToolExecution {
     approval_request_id: Option<Uuid>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "both short-lived authorization variants own large execution or audit records; boxing only one leaves the lint and boxing both adds an allocation to every authorization outcome; remove when measured indirection wins or the records become shared"
+)]
 enum AgentToolAuthorization {
     Ready(AuthorizedAgentToolExecution),
     Finished(ToolInvocationRecord),
@@ -1935,9 +1944,9 @@ impl<T: ComputerControlClient + ?Sized> AgentToolExecutor
                 reference: "computer://foreground_desktop".to_string(),
                 summary: format!("{purpose} Executor acknowledged: {action_summary}."),
             }],
-            verification: ToolVerificationResult::passed(format!(
-                "computer.control verified the structured action and execution receipt; visible task state still requires a screenshot"
-            )),
+            verification: ToolVerificationResult::passed(
+                "computer.control verified the structured action and execution receipt; visible task state still requires a screenshot",
+            ),
         })
     }
 }
@@ -6090,7 +6099,7 @@ fn agent_soul_latest_prior_role_line(full_prompt: &str) -> Option<(&str, &str)> 
     prior_context
         .lines()
         .filter_map(agent_soul_role_line)
-        .last()
+        .next_back()
 }
 
 fn agent_soul_role_line(line: &str) -> Option<(&str, &str)> {
@@ -6139,14 +6148,14 @@ fn repair_agent_soul_cross_role_name(
         .get("preferred_name")
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
-        .map(|name| agent_names.iter().any(|agent_name| *agent_name == name))
+        .map(|name| agent_names.contains(&name))
         .unwrap_or(false);
     let current_preferred_conflicts = updates.contains_key("address_as")
         && current_fields
             .get("preferred_name")
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
-            .map(|name| agent_names.iter().any(|agent_name| *agent_name == name))
+            .map(|name| agent_names.contains(&name))
             .unwrap_or(false);
     if proposed_preferred_conflicts || current_preferred_conflicts {
         updates.insert("preferred_name".to_string(), String::new());
@@ -7054,7 +7063,7 @@ impl<T: DeepSeekChatCompletionTransport> MemoryMaintenanceModelRewriter
 
 fn memory_maintenance_recent_task_context(store: &EventStore) -> Result<String, String> {
     let mut tasks = store.list_task_records().map_err(event_store_error)?;
-    tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at));
     let lines = tasks
         .into_iter()
         .take(3)
@@ -7399,27 +7408,9 @@ fn memory_background_maintenance_summary_default() -> MemoryBackgroundMaintenanc
 
 fn push_memory_background_action(
     summary: &mut MemoryBackgroundMaintenanceSummary,
-    memory_id: Option<Uuid>,
-    memory_title: impl Into<String>,
-    action: impl Into<String>,
-    outcome: impl Into<String>,
-    reason: impl Into<String>,
-    feedback: Option<MemorySelectedFeedbackKind>,
-    model_used: bool,
-    audit_note: impl Into<String>,
+    action: MemoryBackgroundMaintenanceActionSummary,
 ) {
-    summary
-        .actions
-        .push(MemoryBackgroundMaintenanceActionSummary {
-            memory_id,
-            memory_title: memory_title.into(),
-            action: action.into(),
-            outcome: outcome.into(),
-            reason: reason.into(),
-            feedback,
-            model_used,
-            audit_note: audit_note.into(),
-        });
+    summary.actions.push(action);
 }
 
 fn latest_review_feedback_kind(
@@ -7479,14 +7470,16 @@ fn apply_pending_memory_candidate_background_decision(
                 summary.auto_merges_applied += 1;
                 push_memory_background_action(
                     summary,
-                    primary_memory_id,
-                    primary_memory_title.clone(),
-                    "candidate_new",
-                    "auto_merged",
-                    record.candidate.rationale.clone(),
-                    None,
-                    model_used,
-                    note.clone(),
+                    MemoryBackgroundMaintenanceActionSummary {
+                        memory_id: primary_memory_id,
+                        memory_title: primary_memory_title.clone(),
+                        action: "candidate_new".into(),
+                        outcome: "auto_merged".into(),
+                        reason: record.candidate.rationale.clone(),
+                        feedback: None,
+                        model_used,
+                        audit_note: note.clone(),
+                    },
                 );
             }
         }
@@ -7505,14 +7498,16 @@ fn apply_pending_memory_candidate_background_decision(
             summary.auto_updates_applied += 1;
             push_memory_background_action(
                 summary,
-                Some(target_memory_id),
-                primary_memory_title.clone(),
-                "candidate_update",
-                "auto_updated",
-                record.candidate.rationale.clone(),
-                None,
-                model_used,
-                note.clone(),
+                MemoryBackgroundMaintenanceActionSummary {
+                    memory_id: Some(target_memory_id),
+                    memory_title: primary_memory_title.clone(),
+                    action: "candidate_update".into(),
+                    outcome: "auto_updated".into(),
+                    reason: record.candidate.rationale.clone(),
+                    feedback: None,
+                    model_used,
+                    audit_note: note.clone(),
+                },
             );
         }
         MemoryCandidateSuggestedAction::Merge => {
@@ -7535,14 +7530,16 @@ fn apply_pending_memory_candidate_background_decision(
             summary.auto_merges_applied += 1;
             push_memory_background_action(
                 summary,
-                primary_memory_id,
-                primary_memory_title.clone(),
-                "candidate_merge",
-                "auto_merged",
-                record.candidate.rationale.clone(),
-                None,
-                model_used,
-                note.clone(),
+                MemoryBackgroundMaintenanceActionSummary {
+                    memory_id: primary_memory_id,
+                    memory_title: primary_memory_title.clone(),
+                    action: "candidate_merge".into(),
+                    outcome: "auto_merged".into(),
+                    reason: record.candidate.rationale.clone(),
+                    feedback: None,
+                    model_used,
+                    audit_note: note.clone(),
+                },
             );
         }
         MemoryCandidateSuggestedAction::Replace => {
@@ -7559,14 +7556,16 @@ fn apply_pending_memory_candidate_background_decision(
             summary.auto_updates_applied += 1;
             push_memory_background_action(
                 summary,
-                primary_memory_id,
-                primary_memory_title.clone(),
-                "candidate_replace",
-                "auto_replaced",
-                record.candidate.rationale.clone(),
-                None,
-                model_used,
-                note.clone(),
+                MemoryBackgroundMaintenanceActionSummary {
+                    memory_id: primary_memory_id,
+                    memory_title: primary_memory_title.clone(),
+                    action: "candidate_replace".into(),
+                    outcome: "auto_replaced".into(),
+                    reason: record.candidate.rationale.clone(),
+                    feedback: None,
+                    model_used,
+                    audit_note: note.clone(),
+                },
             );
         }
         MemoryCandidateSuggestedAction::Archive => {
@@ -7585,14 +7584,16 @@ fn apply_pending_memory_candidate_background_decision(
             for memory in &record.conflicting_memories {
                 push_memory_background_action(
                     summary,
-                    Some(memory.id),
-                    memory.title.clone(),
-                    "candidate_archive",
-                    "auto_archived",
-                    record.candidate.rationale.clone(),
-                    None,
-                    model_used,
-                    note.clone(),
+                    MemoryBackgroundMaintenanceActionSummary {
+                        memory_id: Some(memory.id),
+                        memory_title: memory.title.clone(),
+                        action: "candidate_archive".into(),
+                        outcome: "auto_archived".into(),
+                        reason: record.candidate.rationale.clone(),
+                        feedback: None,
+                        model_used,
+                        audit_note: note.clone(),
+                    },
                 );
             }
         }
@@ -7611,14 +7612,16 @@ fn apply_pending_memory_candidate_background_decision(
             summary.auto_updates_applied += 1;
             push_memory_background_action(
                 summary,
-                primary_memory_id,
-                primary_memory_title.clone(),
-                "candidate_link",
-                "auto_linked",
-                record.candidate.rationale.clone(),
-                None,
-                model_used,
-                note.clone(),
+                MemoryBackgroundMaintenanceActionSummary {
+                    memory_id: primary_memory_id,
+                    memory_title: primary_memory_title.clone(),
+                    action: "candidate_link".into(),
+                    outcome: "auto_linked".into(),
+                    reason: record.candidate.rationale.clone(),
+                    feedback: None,
+                    model_used,
+                    audit_note: note.clone(),
+                },
             );
         }
         MemoryCandidateSuggestedAction::RejectHint => {
@@ -7627,14 +7630,16 @@ fn apply_pending_memory_candidate_background_decision(
                 .map_err(event_store_error)?;
             push_memory_background_action(
                 summary,
-                primary_memory_id,
-                primary_memory_title,
-                "candidate_reject_hint",
-                "auto_rejected",
-                record.candidate.rationale.clone(),
-                None,
-                model_used,
-                note.clone(),
+                MemoryBackgroundMaintenanceActionSummary {
+                    memory_id: primary_memory_id,
+                    memory_title: primary_memory_title,
+                    action: "candidate_reject_hint".into(),
+                    outcome: "auto_rejected".into(),
+                    reason: record.candidate.rationale.clone(),
+                    feedback: None,
+                    model_used,
+                    audit_note: note.clone(),
+                },
             );
         }
     }
@@ -7725,14 +7730,16 @@ fn run_memory_background_maintenance_core(
             summary.auto_merges_applied += 1;
             push_memory_background_action(
                 &mut summary,
-                Some(review.memory.id),
-                review.memory.title.clone(),
-                "merge_candidate_created",
-                "auto_merged",
-                review.quality_signals.join(","),
-                latest_review_feedback_kind(&review),
-                false,
-                audit_note,
+                MemoryBackgroundMaintenanceActionSummary {
+                    memory_id: Some(review.memory.id),
+                    memory_title: review.memory.title.clone(),
+                    action: "merge_candidate_created".into(),
+                    outcome: "auto_merged".into(),
+                    reason: review.quality_signals.join(","),
+                    feedback: latest_review_feedback_kind(&review),
+                    model_used: false,
+                    audit_note,
+                },
             );
             continue;
         }
@@ -7752,14 +7759,16 @@ fn run_memory_background_maintenance_core(
             summary.retrieval_reviews_marked += 1;
             push_memory_background_action(
                 &mut summary,
-                Some(review.memory.id),
-                review.memory.title.clone(),
-                "retrieval_reviewed",
-                "retrieval_reviewed",
-                review.quality_signals.join(","),
-                latest_review_feedback_kind(&review),
-                false,
-                audit_note,
+                MemoryBackgroundMaintenanceActionSummary {
+                    memory_id: Some(review.memory.id),
+                    memory_title: review.memory.title.clone(),
+                    action: "retrieval_reviewed".into(),
+                    outcome: "retrieval_reviewed".into(),
+                    reason: review.quality_signals.join(","),
+                    feedback: latest_review_feedback_kind(&review),
+                    model_used: false,
+                    audit_note,
+                },
             );
             continue;
         }
@@ -7784,14 +7793,16 @@ fn run_memory_background_maintenance_core(
             summary.auto_archives_applied += 1;
             push_memory_background_action(
                 &mut summary,
-                Some(review.memory.id),
-                review.memory.title.clone(),
-                "archived",
-                "auto_archived",
-                review.quality_signals.join(","),
-                latest_review_feedback_kind(&review),
-                false,
-                audit_note,
+                MemoryBackgroundMaintenanceActionSummary {
+                    memory_id: Some(review.memory.id),
+                    memory_title: review.memory.title.clone(),
+                    action: "archived".into(),
+                    outcome: "auto_archived".into(),
+                    reason: review.quality_signals.join(","),
+                    feedback: latest_review_feedback_kind(&review),
+                    model_used: false,
+                    audit_note,
+                },
             );
             continue;
         }
@@ -7823,14 +7834,16 @@ fn run_memory_background_maintenance_core(
                 )? {
                     push_memory_background_action(
                         &mut summary,
-                        Some(review.memory.id),
-                        review.memory.title.clone(),
-                        "update_candidate_deferred",
-                        "deferred",
-                        "Candidate conflict projection changed before maintenance could apply it.",
-                        latest_review_feedback_kind(&review),
-                        memory_candidate_model_used(&candidate.candidate),
-                        "Background maintenance deferred a stale candidate conflict.".to_string(),
+                        MemoryBackgroundMaintenanceActionSummary {
+                            memory_id: Some(review.memory.id),
+                            memory_title: review.memory.title.clone(),
+                            action: "update_candidate_deferred".into(),
+                            outcome: "deferred".into(),
+                            reason: "Candidate conflict projection changed before maintenance could apply it.".into(),
+                            feedback: latest_review_feedback_kind(&review),
+                            model_used: memory_candidate_model_used(&candidate.candidate),
+                            audit_note: "Background maintenance deferred a stale candidate conflict.".into(),
+                        },
                     );
                     continue;
                 }
@@ -7838,14 +7851,16 @@ fn run_memory_background_maintenance_core(
                 summary.auto_updates_applied += 1;
                 push_memory_background_action(
                     &mut summary,
-                    Some(review.memory.id),
-                    review.memory.title.clone(),
-                    "update_candidate_created",
-                    "auto_updated",
-                    candidate.candidate.rationale.clone(),
-                    latest_review_feedback_kind(&review),
-                    memory_candidate_model_used(&candidate.candidate),
-                    audit_note,
+                    MemoryBackgroundMaintenanceActionSummary {
+                        memory_id: Some(review.memory.id),
+                        memory_title: review.memory.title.clone(),
+                        action: "update_candidate_created".into(),
+                        outcome: "auto_updated".into(),
+                        reason: candidate.candidate.rationale.clone(),
+                        feedback: latest_review_feedback_kind(&review),
+                        model_used: memory_candidate_model_used(&candidate.candidate),
+                        audit_note,
+                    },
                 );
                 continue;
             }
@@ -7876,14 +7891,16 @@ fn run_memory_background_maintenance_core(
             )? {
                 push_memory_background_action(
                     &mut summary,
-                    Some(review.memory.id),
-                    review.memory.title.clone(),
-                    "update_candidate_deferred",
-                    "deferred",
-                    "Candidate conflict projection changed before maintenance could apply it.",
-                    latest_review_feedback_kind(&review),
-                    model_used,
-                    "Background maintenance deferred a stale candidate conflict.".to_string(),
+                    MemoryBackgroundMaintenanceActionSummary {
+                        memory_id: Some(review.memory.id),
+                        memory_title: review.memory.title.clone(),
+                        action: "update_candidate_deferred".into(),
+                        outcome: "deferred".into(),
+                        reason: "Candidate conflict projection changed before maintenance could apply it.".into(),
+                        feedback: latest_review_feedback_kind(&review),
+                        model_used,
+                        audit_note: "Background maintenance deferred a stale candidate conflict.".into(),
+                    },
                 );
                 continue;
             }
@@ -7891,14 +7908,16 @@ fn run_memory_background_maintenance_core(
             summary.auto_updates_applied += 1;
             push_memory_background_action(
                 &mut summary,
-                Some(review.memory.id),
-                review.memory.title.clone(),
-                "update_candidate_created",
-                "auto_updated",
-                review.quality_signals.join(","),
-                latest_review_feedback_kind(&review),
-                model_used,
-                audit_note,
+                MemoryBackgroundMaintenanceActionSummary {
+                    memory_id: Some(review.memory.id),
+                    memory_title: review.memory.title.clone(),
+                    action: "update_candidate_created".into(),
+                    outcome: "auto_updated".into(),
+                    reason: review.quality_signals.join(","),
+                    feedback: latest_review_feedback_kind(&review),
+                    model_used,
+                    audit_note,
+                },
             );
         }
     }
@@ -7921,7 +7940,7 @@ fn load_agent_memory_runtime_context(
 
 fn load_agent_skill_catalog(store: &EventStore) -> Result<Vec<AgentSkillCatalogItem>, String> {
     let mut records = store.list_skill_records().map_err(event_store_error)?;
-    records.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
     Ok(records
         .into_iter()
         .filter(|record| {
@@ -7969,6 +7988,7 @@ fn build_agent_skill_catalog_prompt(catalog: &[AgentSkillCatalogItem]) -> String
     )
 }
 
+#[cfg(test)]
 fn select_agent_memory_runtime_context(
     prompt: &str,
     memories: &[MemoryRecord],
@@ -7982,9 +8002,11 @@ fn select_agent_memory_runtime_context_with_feedback(
     feedback: &[MemorySelectedFeedback],
 ) -> AgentMemoryRuntimeContext {
     let query_terms = agent_memory_query_terms(prompt);
-    let mut context = AgentMemoryRuntimeContext::default();
-    context.query_terms_count = query_terms.len();
-    context.considered_records = memories.len();
+    let mut context = AgentMemoryRuntimeContext {
+        query_terms_count: query_terms.len(),
+        considered_records: memories.len(),
+        ..Default::default()
+    };
     let mut sensitive_omitted = 0usize;
     let mut archived_omitted = 0usize;
     let mut candidates = Vec::new();
@@ -8388,6 +8410,7 @@ fn agent_selected_memory_receipt_line(memory: &AgentSelectedMemory) -> String {
     )
 }
 
+#[cfg(test)]
 pub fn agent_chat_with_transport(
     transport: &impl DeepSeekChatCompletionTransport,
     cache: &DeepSeekMemoryChatCompletionCache,
@@ -8446,6 +8469,7 @@ fn agent_chat_with_transport_and_runtime_context(
     Ok((response, telemetry))
 }
 
+#[cfg(test)]
 fn agent_chat_with_dispatch_and_tool_followup(
     transport: &impl DeepSeekChatCompletionTransport,
     cache: &DeepSeekMemoryChatCompletionCache,
@@ -8761,6 +8785,7 @@ fn reconcile_agent_goal_projection(
     Ok(())
 }
 
+#[cfg(test)]
 fn run_agent_chat_with_clients(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -8789,6 +8814,7 @@ fn run_agent_chat_with_clients(
     )
 }
 
+#[cfg(test)]
 fn run_agent_chat_with_clients_and_api_keys(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -8818,6 +8844,10 @@ fn run_agent_chat_with_clients_and_api_keys(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This private chat execution seam keeps event-store ownership, credential and cache state, model runtime context, pricing, and independently substitutable file, search, browser, and computer clients explicit across permission dispatch and evidence recording; remove only when a commands.rs-local runtime dependency object preserves identical lock, permission, and test-substitution behavior."
+)]
 fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -8953,17 +8983,15 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
         );
         let memory_candidate_gate = apply_agent_memory_candidate_gate(&store, &mut response)?;
         record_agent_memory_candidates(&store, &response)?;
-        record_agent_context_receipts(
-            &store,
-            &response,
-            &model_route_context,
-            &thinking_level_context,
-            &access_mode_context,
-            runtime_context.soul_profile.as_ref(),
-            &runtime_context.memory_context,
-            &memory_candidate_gate,
-            &telemetry,
-        )?;
+        let receipt_context = AgentContextReceiptContext {
+            model_route: &model_route_context,
+            thinking_level: &thinking_level_context,
+            access_mode: &access_mode_context,
+            soul_profile: runtime_context.soul_profile.as_ref(),
+            memory_context: &runtime_context.memory_context,
+            memory_candidate_gate: &memory_candidate_gate,
+        };
+        record_agent_context_receipts(&store, &response, &receipt_context, &telemetry)?;
         for entry in telemetry {
             store
                 .append_deepseek_chat_telemetry(&entry)
@@ -9104,6 +9132,7 @@ fn record_agent_tool_loop_limit_step(
         .map_err(event_store_error)
 }
 
+#[cfg(test)]
 fn run_next_queued_agent_chat_with_clients_and_api_keys(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -9140,6 +9169,7 @@ fn run_next_queued_agent_chat_with_clients_and_api_keys(
     )
 }
 
+#[cfg(test)]
 fn run_queued_agent_chat_with_clients_and_api_keys(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -9179,6 +9209,10 @@ fn run_queued_agent_chat_with_clients_and_api_keys(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This private durable-worker seam keeps claim identity, execution prompt, model and access settings, runtime context, pricing, and client adapters explicit across lease heartbeat, resume, and failure recording; remove only when a commands.rs-local worker input and dependency object preserves those recovery semantics."
+)]
 fn run_queued_agent_chat_with_clients_and_api_keys_and_computer_use(
     store: &Mutex<EventStore>,
     transport: &impl DeepSeekChatCompletionTransport,
@@ -10006,15 +10040,19 @@ fn build_agent_tool_evidence_followup_prompt(
     ))
 }
 
+struct AgentContextReceiptContext<'a> {
+    model_route: &'a str,
+    thinking_level: &'a str,
+    access_mode: &'a str,
+    soul_profile: Option<&'a AgentSoulProfileContext>,
+    memory_context: &'a AgentMemoryRuntimeContext,
+    memory_candidate_gate: &'a AgentMemoryCandidateGateReceipt,
+}
+
 fn record_agent_context_receipts(
     store: &EventStore,
     response: &AgentChatResponse,
-    model_route: &str,
-    thinking_level: &str,
-    access_mode: &str,
-    soul_profile: Option<&AgentSoulProfileContext>,
-    memory_context: &AgentMemoryRuntimeContext,
-    memory_candidate_gate: &AgentMemoryCandidateGateReceipt,
+    context: &AgentContextReceiptContext<'_>,
     telemetry: &[DeepSeekChatTelemetry],
 ) -> Result<(), String> {
     let token_cache_state = operations_briefing_token_cache_context(telemetry);
@@ -10023,16 +10061,7 @@ fn record_agent_context_receipts(
         .iter()
         .filter(|action| agent_action_needs_context_receipt(action))
     {
-        let receipt = agent_context_receipt_for_action(
-            action,
-            model_route,
-            thinking_level,
-            access_mode,
-            &token_cache_state,
-            soul_profile,
-            memory_context,
-            memory_candidate_gate,
-        );
+        let receipt = agent_context_receipt_for_action(action, context, &token_cache_state);
         store
             .append_agent_context_receipt(&receipt)
             .map_err(event_store_error)?;
@@ -10046,19 +10075,14 @@ fn agent_action_needs_context_receipt(action: &AgentChatActionProposal) -> bool 
 
 fn agent_context_receipt_for_action(
     action: &AgentChatActionProposal,
-    model_route: &str,
-    thinking_level: &str,
-    access_mode: &str,
+    context: &AgentContextReceiptContext<'_>,
     token_cache_state: &str,
-    soul_profile: Option<&AgentSoulProfileContext>,
-    memory_context: &AgentMemoryRuntimeContext,
-    memory_candidate_gate: &AgentMemoryCandidateGateReceipt,
 ) -> AgentContextReceipt {
     let mut receipt = AgentContextReceipt::new(
         action.action_type.clone(),
         action.execution_state.clone(),
-        model_route.to_string(),
-        thinking_level.to_string(),
+        context.model_route.to_string(),
+        context.thinking_level.to_string(),
         token_cache_state.to_string(),
     );
     receipt.capability = action
@@ -10096,26 +10120,28 @@ fn agent_context_receipt_for_action(
         .collect();
     receipt.matched_stop_conditions = agent_context_matched_stop_conditions(action, loop_mode);
     receipt.confirmation_rule = loop_mode_descriptor.confirmation_rule.to_string();
-    receipt.policy_constraints = agent_context_policy_constraints(action, access_mode);
+    receipt.policy_constraints = agent_context_policy_constraints(action, context.access_mode);
     receipt.selected_evidence = agent_context_selected_evidence(action);
-    let mut selected_memories = soul_profile
+    let mut selected_memories = context
+        .soul_profile
         .map(agent_soul_profile_receipt_line)
         .into_iter()
         .collect::<Vec<_>>();
-    if agent_memory_context_has_retrieval_receipt(memory_context) {
-        selected_memories.push(agent_memory_retrieval_receipt_line(memory_context));
+    if agent_memory_context_has_retrieval_receipt(context.memory_context) {
+        selected_memories.push(agent_memory_retrieval_receipt_line(context.memory_context));
     }
     selected_memories.extend(
-        memory_context
+        context
+            .memory_context
             .selected
             .iter()
             .map(agent_selected_memory_receipt_line),
     );
     receipt.selected_memories = selected_memories;
     receipt.memory_candidate_gate =
-        agent_memory_candidate_gate_receipt_lines(memory_candidate_gate);
+        agent_memory_candidate_gate_receipt_lines(context.memory_candidate_gate);
     receipt.validation_results = agent_context_validation_results(action);
-    if memory_candidate_gate.proposed > 0 {
+    if context.memory_candidate_gate.proposed > 0 {
         receipt
             .validation_results
             .push("memory candidate gate reviewed".to_string());
@@ -10138,8 +10164,8 @@ fn agent_context_receipt_for_action(
     ];
     receipt
         .intentional_omissions
-        .extend(memory_context.omissions.iter().cloned());
-    if memory_candidate_gate.proposed > 0 {
+        .extend(context.memory_context.omissions.iter().cloned());
+    if context.memory_candidate_gate.proposed > 0 {
         receipt.intentional_omissions.push(
             "Rejected memory candidate bodies are omitted; only gate counts and safe kept labels are stored."
                 .to_string(),
@@ -10888,6 +10914,7 @@ fn record_agent_memory_candidates(
     Ok(())
 }
 
+#[cfg(test)]
 fn record_agent_action_permission_requests(
     store: &EventStore,
     access_mode: AccessMode,
@@ -11139,6 +11166,7 @@ fn dispatch_agent_skill_uninstall_action_with_store_mutex(
     apply_skill_uninstall_result(action, result);
 }
 
+#[cfg(test)]
 fn dispatch_agent_action_proposals(
     store: &EventStore,
     access_mode: AccessMode,
@@ -11161,6 +11189,10 @@ fn dispatch_agent_action_proposals(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This private direct-store dispatcher keeps access policy, desktop resolution, and independently substitutable file, write, search, and browser clients explicit for permission and path tests; remove only when a commands.rs-local dispatcher context preserves identical policy, path, and substitution behavior."
+)]
 fn dispatch_agent_action_proposals_with_desktop_dir(
     store: &EventStore,
     access_mode: AccessMode,
@@ -11184,6 +11216,10 @@ fn dispatch_agent_action_proposals_with_desktop_dir(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This private direct-store dispatcher keeps computer-use capability separate from file, search, and browser adapters so approval and postcondition behavior remains testable; remove only when a commands.rs-local dispatcher context preserves identical permission, desktop, and computer-use semantics."
+)]
 fn dispatch_agent_action_proposals_with_desktop_dir_and_computer_use(
     store: &EventStore,
     access_mode: AccessMode,
@@ -11821,6 +11857,10 @@ fn dispatch_agent_action_proposals_with_desktop_dir_and_computer_use(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This mutex-backed dispatcher keeps EventStore lock ownership, active-run identity, desktop scope, and blocking client adapters explicit so locks are released around external work and resumes bind the owning run; remove only when a commands.rs-local dispatcher runtime proves identical lock and recovery behavior."
+)]
 fn dispatch_agent_action_proposals_with_store_mutex(
     store_mutex: &Mutex<EventStore>,
     access_mode: AccessMode,
@@ -12317,6 +12357,7 @@ fn dispatch_agent_action_proposals_with_store_mutex(
     Ok(())
 }
 
+#[cfg(test)]
 fn resume_agent_chat_action_with_clients(
     store: &EventStore,
     access_mode: AccessMode,
@@ -12340,6 +12381,10 @@ fn resume_agent_chat_action_with_clients(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This private resume seam keeps the normalized action, access policy, desktop scope, and independently substitutable clients explicit so approved capability invocation identity is re-dispatched unchanged; remove only when a commands.rs-local resume context preserves identical permission, invocation, and computer-use behavior."
+)]
 fn resume_agent_chat_action_with_clients_and_computer_use(
     store: &EventStore,
     access_mode: AccessMode,
@@ -12469,7 +12514,7 @@ fn mark_office_open_actions_waiting_for_pending_create(response: &mut AgentChatR
                 "proposed" | "needs_confirmation" | "waiting_prerequisite" | "blocked" | "failed"
             )
         })
-        .filter_map(|action| normalized_agent_action_target(action))
+        .filter_map(normalized_agent_action_target)
         .collect::<Vec<_>>();
 
     if pending_create_targets.is_empty() {
@@ -12700,6 +12745,7 @@ fn dispatch_agent_operations_briefing_action(
     Ok(())
 }
 
+#[cfg(test)]
 fn dispatch_agent_office_create_action(
     store: &EventStore,
     access_mode: AccessMode,
@@ -13272,6 +13318,7 @@ fn agent_office_open_dispatch_note(
     }
 }
 
+#[cfg(test)]
 fn agent_office_create_dispatch_note(
     invocation: &CapabilityInvocation,
     result: Option<OfficeCreateResult>,
@@ -13300,6 +13347,7 @@ fn agent_office_create_dispatch_note(
     }
 }
 
+#[cfg(test)]
 fn agent_office_create_content_evidence(spec: &OfficeCreateSpec) -> Option<String> {
     let evidence = match spec.app {
         OfficeApp::Word => spec.body.trim().to_string(),
@@ -13336,6 +13384,7 @@ fn agent_office_create_content_evidence(spec: &OfficeCreateSpec) -> Option<Strin
     compact_agent_tool_evidence_text(&evidence, AGENT_OFFICE_CREATE_EVIDENCE_TEXT_LIMIT)
 }
 
+#[cfg(test)]
 fn compact_agent_tool_evidence_text(text: &str, limit: usize) -> Option<String> {
     let compact = text
         .lines()
@@ -13829,7 +13878,7 @@ fn agent_chat_runtime_context(
                 let readiness = local_directory_readiness_from_state(&state);
                 let projection = workspace_readiness_projection_from_state(&state);
                 let authority_material = (projection.code == WorkspaceReadinessCode::Ready)
-                    .then(|| state.settings.as_ref())
+                    .then_some(state.settings.as_ref())
                     .flatten()
                     .map(|settings| {
                         format!("{}\0{}", settings.workspace_dir, settings.workspace_name)
@@ -14194,6 +14243,10 @@ pub fn stage_agent_attachments(
     stage_agent_attachment_paths(paths, existing_count, existing_total_bytes)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These argument names are the registered Tauri run_agent_chat payload plus injected AppHandle and State used by App.tsx; remove only through a versioned cross-language command migration that updates registration, frontend invokes, and compatibility tests."
+)]
 #[tauri::command]
 pub fn run_agent_chat(
     app: AppHandle,
@@ -14258,6 +14311,10 @@ pub fn run_agent_chat(
     result
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These argument names are the registered Tauri queued-worker payload plus injected state and preserve durable run, lease, and recovery identity; remove only through a versioned cross-language command migration that updates registration, frontend invokes, recovery semantics, and compatibility tests."
+)]
 #[tauri::command]
 pub async fn run_next_queued_agent_chat_worker(
     app: AppHandle,
@@ -15666,6 +15723,10 @@ pub fn search_memory_records(
         .map_err(event_store_error)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These argument names are the registered Tauri Memory Studio candidate payload and preserve enum serde names and review-only semantics; remove only through a versioned cross-language command migration that updates registration, frontend invokes, serde compatibility, and review tests."
+)]
 #[tauri::command]
 pub fn propose_memory_candidate(
     title: String,
@@ -15879,6 +15940,10 @@ pub fn link_memory_records(
         .map_err(event_store_error)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These argument names are the registered Tauri memory update payload forwarding identity, metadata, expiration, and audit note; remove only through a versioned cross-language command migration that preserves EventStore recovery, frontend invokes, and compatibility tests."
+)]
 #[tauri::command]
 pub fn update_memory_record(
     memory_id: Uuid,

@@ -4,13 +4,15 @@ use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use uuid::Uuid;
 
-use crate::kernel::capability::{
-    ComputerControlAction, ComputerControlClient, ComputerScreenshotClient,
-};
+#[cfg(test)]
+use crate::kernel::capability::ComputerControlAction;
+use crate::kernel::capability::{ComputerControlClient, ComputerScreenshotClient};
+#[cfg(test)]
+use crate::kernel::computer_use_session::ComputerUseActionBinding;
 use crate::kernel::computer_use_session::{
-    ComputerUseActionBinding, ComputerUseObservation, ComputerUseObservationPhase,
-    ComputerUsePostcondition, ComputerUseSession, ComputerUseStep, ComputerUseStepStatus,
-    ComputerUseUndoCapability, ComputerUseVerificationOutcome, ComputerUseVerificationReceipt,
+    ComputerUseObservation, ComputerUseObservationPhase, ComputerUsePostcondition,
+    ComputerUseSession, ComputerUseStep, ComputerUseStepStatus, ComputerUseUndoCapability,
+    ComputerUseVerificationOutcome, ComputerUseVerificationReceipt,
 };
 use crate::kernel::event_store::EventStore;
 
@@ -83,7 +85,7 @@ impl ComputerUseAccessibilityClient for LocalComputerUseAccessibilityClient {
     fn capture_redacted_state(&self) -> Result<RedactedComputerUseState, String> {
         #[cfg(windows)]
         {
-            return WindowsComputerUseAccessibilityClient.capture_redacted_state();
+            WindowsComputerUseAccessibilityClient.capture_redacted_state()
         }
         #[cfg(not(windows))]
         {
@@ -192,6 +194,7 @@ impl From<&ComputerUseStep> for ComputerUseStepView {
     }
 }
 
+#[cfg(test)]
 pub fn create_observed_computer_use_session(
     store: &EventStore,
     run_id: Option<Uuid>,
@@ -218,6 +221,7 @@ pub fn create_observed_computer_use_session(
     Ok((session, step))
 }
 
+#[cfg(test)]
 pub fn bind_computer_use_action(
     store: &EventStore,
     step_id: Uuid,
@@ -238,6 +242,7 @@ pub fn bind_computer_use_action(
     Ok(step)
 }
 
+#[cfg(test)]
 pub fn approve_computer_use_step(
     store: &EventStore,
     step_id: Uuid,

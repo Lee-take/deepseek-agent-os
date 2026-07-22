@@ -24,25 +24,13 @@ pub enum DeepSeekPricingError {
     InvalidPrice(String),
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeepSeekPricingSettings {
     pub enabled: bool,
     pub flash_prompt_usd_per_million_tokens: String,
     pub flash_completion_usd_per_million_tokens: String,
     pub pro_prompt_usd_per_million_tokens: String,
     pub pro_completion_usd_per_million_tokens: String,
-}
-
-impl Default for DeepSeekPricingSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            flash_prompt_usd_per_million_tokens: String::new(),
-            flash_completion_usd_per_million_tokens: String::new(),
-            pro_prompt_usd_per_million_tokens: String::new(),
-            pro_completion_usd_per_million_tokens: String::new(),
-        }
-    }
 }
 
 impl DeepSeekPricingSettings {
@@ -289,6 +277,34 @@ mod tests {
     use crate::kernel::deepseek::{
         DeepSeekChatCacheStatus, DeepSeekChatTelemetry, DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL,
     };
+
+    #[test]
+    fn deepseek_pricing_default_matches_field_and_json_contract() {
+        let derived = DeepSeekPricingSettings::default();
+        let manual_fixture = DeepSeekPricingSettings {
+            enabled: false,
+            flash_prompt_usd_per_million_tokens: String::new(),
+            flash_completion_usd_per_million_tokens: String::new(),
+            pro_prompt_usd_per_million_tokens: String::new(),
+            pro_completion_usd_per_million_tokens: String::new(),
+        };
+
+        assert_eq!(derived, manual_fixture);
+        let derived_json = serde_json::to_value(&derived).expect("derived default serializes");
+        let manual_json =
+            serde_json::to_value(&manual_fixture).expect("manual default fixture serializes");
+        assert_eq!(derived_json, manual_json);
+        assert_eq!(
+            derived_json,
+            serde_json::json!({
+                "enabled": false,
+                "flash_prompt_usd_per_million_tokens": "",
+                "flash_completion_usd_per_million_tokens": "",
+                "pro_prompt_usd_per_million_tokens": "",
+                "pro_completion_usd_per_million_tokens": "",
+            })
+        );
+    }
 
     #[test]
     fn missing_deepseek_pricing_settings_defaults_to_disabled() {

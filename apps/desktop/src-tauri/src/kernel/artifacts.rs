@@ -1003,7 +1003,7 @@ fn build_text_pdf(title: &str, paragraphs: &[String]) -> Result<Vec<u8>, String>
         stream.push_str(&format!("({line}) Tj "));
     }
     stream.push_str("ET");
-    let objects = vec![
+    let objects = [
         "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_string(),

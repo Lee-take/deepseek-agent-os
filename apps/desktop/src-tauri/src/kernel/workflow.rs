@@ -494,6 +494,7 @@ fn model_operations_briefing_synthesis(
         Err(error) => {
             let repair_excerpt =
                 operations_briefing_repair_manifest_excerpt(manifest_excerpt, &error);
+            let mut last_repair_error = None;
             for _ in 0..OPERATIONS_BRIEFING_REPAIR_RETRY_BUDGET {
                 match synthesizer.synthesize_briefing(&repair_excerpt, evidence_ref) {
                     Ok(mut synthesis) => {
@@ -509,20 +510,7 @@ fn model_operations_briefing_synthesis(
                         );
                     }
                     Err(repair_error) => {
-                        let mut synthesis = deterministic;
-                        synthesis
-                            .warnings
-                            .push(format!("model-backed synthesis failed: {error}"));
-                        synthesis
-                            .warnings
-                            .push(format!("bounded repair loop failed: {repair_error}"));
-                        return (
-                            synthesis,
-                            Some(OperationsBriefingRepairResult {
-                                reason: error,
-                                succeeded: false,
-                            }),
-                        );
+                        last_repair_error = Some(repair_error);
                     }
                 }
             }
@@ -531,6 +519,11 @@ fn model_operations_briefing_synthesis(
             synthesis
                 .warnings
                 .push(format!("model-backed synthesis failed: {error}"));
+            if let Some(repair_error) = last_repair_error {
+                synthesis
+                    .warnings
+                    .push(format!("bounded repair loop failed: {repair_error}"));
+            }
             (
                 synthesis,
                 Some(OperationsBriefingRepairResult {
@@ -1410,6 +1403,7 @@ mod tests {
 
     struct FakeOperationsBriefingSynthesizer {
         failing: bool,
+        calls: Cell<u32>,
     }
 
     struct RepairableOperationsBriefingSynthesizer {
@@ -1465,8 +1459,15 @@ mod tests {
             manifest_excerpt: &str,
             evidence_ref: Option<&str>,
         ) -> Result<OperationsBriefingSynthesis, String> {
+            let next_call = self.calls.get() + 1;
+            self.calls.set(next_call);
             if self.failing {
-                return Err("model synthesis unavailable".to_string());
+                return Err(if next_call == 1 {
+                    "model synthesis unavailable"
+                } else {
+                    "repair synthesis unavailable"
+                }
+                .to_string());
             }
 
             Ok(OperationsBriefingSynthesis {
@@ -1628,7 +1629,10 @@ mod tests {
     #[test]
     fn operations_briefing_uses_model_synthesis_after_evidence_manifest_succeeds() {
         let client = FakeEvidenceFolderClient::new();
-        let synthesizer = FakeOperationsBriefingSynthesizer { failing: false };
+        let synthesizer = FakeOperationsBriefingSynthesizer {
+            failing: false,
+            calls: Cell::new(0),
+        };
         let outcome = run_operations_briefing_with_synthesizer(
             OperationsBriefingRequest {
                 access_mode: AccessMode::AskOnRisk,
@@ -1645,12 +1649,16 @@ mod tests {
         assert_eq!(outcome.run.anomalies[0].area, "Guest experience");
         assert_eq!(outcome.run.action_plan[0].owner, "Rooms");
         assert!(outcome.run.warnings.is_empty());
+        assert_eq!(synthesizer.calls.get(), 1);
     }
 
     #[test]
     fn operations_briefing_keeps_deterministic_draft_when_model_synthesis_fails() {
         let client = FakeEvidenceFolderClient::new();
-        let synthesizer = FakeOperationsBriefingSynthesizer { failing: true };
+        let synthesizer = FakeOperationsBriefingSynthesizer {
+            failing: true,
+            calls: Cell::new(0),
+        };
         let outcome = run_operations_briefing_with_synthesizer(
             OperationsBriefingRequest {
                 access_mode: AccessMode::AskOnRisk,
@@ -1667,11 +1675,14 @@ mod tests {
             .run
             .summary
             .contains("Draft ready from evidence folder manifest"));
-        assert!(outcome
-            .run
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("model synthesis unavailable")));
+        assert_eq!(synthesizer.calls.get(), 2);
+        assert_eq!(
+            outcome.run.warnings,
+            vec![
+                "model-backed synthesis failed: model synthesis unavailable",
+                "bounded repair loop failed: repair synthesis unavailable",
+            ]
+        );
     }
 
     #[test]
@@ -1695,6 +1706,10 @@ mod tests {
         assert_eq!(
             outcome.run.summary,
             "Repaired model summary from compact context."
+        );
+        assert_eq!(
+            outcome.run.anomalies[0].evidence_ref.as_deref(),
+            Some("fixtures/evidence")
         );
         assert!(outcome
             .run

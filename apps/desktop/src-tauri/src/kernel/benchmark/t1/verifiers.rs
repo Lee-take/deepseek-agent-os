@@ -1360,7 +1360,7 @@ impl OpcPackage {
         }
         let mut archive = ZipArchive::new(Cursor::new(bytes))
             .map_err(|_| "T1 OPC package cannot be opened".to_string())?;
-        if archive.len() == 0 || archive.len() > MAX_OPC_PARTS {
+        if archive.is_empty() || archive.len() > MAX_OPC_PARTS {
             return Err("T1 OPC part count is invalid".to_string());
         }
         let mut parts = BTreeMap::new();
@@ -1664,7 +1664,7 @@ fn format_integer_grouped(value: i64) -> String {
     let digits = value.unsigned_abs().to_string();
     let mut grouped = String::new();
     for (index, character) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(character);

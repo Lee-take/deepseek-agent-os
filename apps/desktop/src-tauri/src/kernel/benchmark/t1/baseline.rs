@@ -654,7 +654,7 @@ fn build_render_evidence(
             output_sha256: sha256(&output.bytes),
             renderer_version: ACTUAL_RENDERER_VERSION.to_string(),
             rendered_unit_count: 1,
-            preview_manifest_sha256: preview_manifest_hash(&[png.clone()]),
+            preview_manifest_sha256: preview_manifest_hash(std::slice::from_ref(&png)),
             previews: vec![T1PreviewReceipt {
                 relative_path: path.to_string(),
                 bytes: png.len() as u64,

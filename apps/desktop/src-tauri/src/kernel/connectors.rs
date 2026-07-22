@@ -1391,6 +1391,10 @@ pub trait ConnectorMutationReconciler: ConnectorProvider {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the unboxed receipt is a public provider trait contract used across connector implementations; remove only with a versioned provider API migration and measured allocation and layout evidence"
+)]
 pub enum ConnectorMutationApplyOutcome {
     Applied(ConnectorMutationReceipt),
     ReconciliationRequired,
@@ -1398,6 +1402,10 @@ pub enum ConnectorMutationApplyOutcome {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the unboxed receipt is a public provider trait contract used across connector implementations; remove only with a versioned provider API migration and measured allocation and layout evidence"
+)]
 pub enum ConnectorReconciliationOutcome {
     Applied(ConnectorMutationReceipt),
     KnownNotApplied,

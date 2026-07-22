@@ -6,6 +6,7 @@ pub mod artifact_render;
 pub mod artifacts;
 pub mod attachments;
 pub mod automation;
+#[cfg(test)]
 pub mod benchmark;
 pub mod capability;
 pub mod codex_bridge_contract;

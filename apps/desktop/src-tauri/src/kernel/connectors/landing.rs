@@ -293,12 +293,12 @@ impl StagedConnectorAttachment {
             if committed_identity != self.receipt.storage_identity {
                 return Err("connector attachment file identity changed during commit".to_string());
             }
-            return Ok(LandedConnectorAttachment {
+            Ok(LandedConnectorAttachment {
                 receipt: self.receipt,
                 path,
                 _file: self.file,
                 _landing_root: self.landing_root,
-            });
+            })
         }
         #[cfg(not(windows))]
         {
@@ -381,7 +381,7 @@ pub(crate) fn cleanup_incomplete_connector_attachment(
         if !deleted {
             return Ok(());
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(windows))]
     {
@@ -548,7 +548,7 @@ pub(crate) fn connector_attachment_workspace_binding(
         if !managed.handles_are_live() {
             return Err("connector attachment workspace handles are unavailable".to_string());
         }
-        return Ok((managed.workspace_root().to_path_buf(), managed.binding()));
+        Ok((managed.workspace_root().to_path_buf(), managed.binding()))
     }
     #[cfg(not(windows))]
     {
@@ -853,7 +853,7 @@ fn validate_office_archive(file: &mut fs::File, kind: AttachmentType) -> Result<
         .map_err(|_| "connector attachment archive is invalid".to_string())?;
     let mut archive = zip::ZipArchive::new(cloned)
         .map_err(|_| "connector attachment archive is invalid".to_string())?;
-    if archive.len() == 0 || archive.len() > MAX_ARCHIVE_ENTRIES {
+    if archive.is_empty() || archive.len() > MAX_ARCHIVE_ENTRIES {
         return Err("connector attachment archive budget exceeded".to_string());
     }
     let mut declared_expanded = 0u64;

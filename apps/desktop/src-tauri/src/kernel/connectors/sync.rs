@@ -602,7 +602,7 @@ impl ConnectorSyncState {
             && self
                 .retry_state
                 .as_ref()
-                .map_or(true, |retry| retry.retry_at <= now)
+                .is_none_or(|retry| retry.retry_at <= now)
     }
 
     pub fn stopped(&self) -> bool {

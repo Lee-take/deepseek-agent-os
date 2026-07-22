@@ -306,8 +306,8 @@ impl ManagedLandingRoot {
     }
 
     pub(crate) fn handles_are_live(&self) -> bool {
-        self.workspace_handle.as_raw_handle() != std::ptr::null_mut()
-            && self.landing_handle.as_raw_handle() != std::ptr::null_mut()
+        !self.workspace_handle.as_raw_handle().is_null()
+            && !self.landing_handle.as_raw_handle().is_null()
     }
 }
 

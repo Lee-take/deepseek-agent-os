@@ -501,6 +501,7 @@ impl AgentRunFinish {
         Ok(finish)
     }
 
+    #[cfg(test)]
     pub fn completed(run_id: Uuid, summary: String) -> Result<Self, String> {
         Self::new(run_id, AgentRunStatus::Completed, Some(summary), None)
     }

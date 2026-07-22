@@ -166,6 +166,7 @@ impl<'de> Deserialize<'de> for TaskCapabilityProposal {
 }
 
 impl TaskCapabilityProposal {
+    #[cfg(test)]
     pub fn parse_json(json: &str) -> Result<Self, TaskCapabilityManifestError> {
         if json.len() > MAX_JSON_BYTES {
             return Err(TaskCapabilityManifestError::JsonTooLarge);
@@ -190,6 +191,7 @@ impl TaskCapabilityProposal {
         Ok(proposal)
     }
 
+    #[cfg(test)]
     pub fn to_json(&self) -> Result<String, TaskCapabilityManifestError> {
         self.validate()?;
         serde_json::to_string(self).map_err(|_| TaskCapabilityManifestError::InvalidJson)
@@ -344,6 +346,7 @@ impl<'de> Deserialize<'de> for TaskCapabilityManifestProposal {
 }
 
 impl TaskCapabilityManifestProposal {
+    #[cfg(test)]
     pub fn parse_json(json: &str) -> Result<Self, TaskCapabilityManifestError> {
         if json.len() > MAX_JSON_BYTES {
             return Err(TaskCapabilityManifestError::JsonTooLarge);
@@ -355,6 +358,7 @@ impl TaskCapabilityManifestProposal {
         Ok(proposal)
     }
 
+    #[cfg(test)]
     pub fn parse_value(value: Value) -> Result<Self, TaskCapabilityManifestError> {
         let encoded =
             serde_json::to_vec(&value).map_err(|_| TaskCapabilityManifestError::InvalidJson)?;
@@ -368,6 +372,7 @@ impl TaskCapabilityManifestProposal {
         Ok(proposal)
     }
 
+    #[cfg(test)]
     pub fn to_json(&self) -> Result<String, TaskCapabilityManifestError> {
         self.validate()?;
         serde_json::to_string(self).map_err(|_| TaskCapabilityManifestError::InvalidJson)
@@ -517,6 +522,7 @@ pub struct TaskCapabilityManifest {
 }
 
 impl TaskCapabilityManifest {
+    #[cfg(test)]
     pub fn parse_json(json: &str) -> Result<Self, TaskCapabilityManifestError> {
         if json.len() > MAX_JSON_BYTES {
             return Err(TaskCapabilityManifestError::JsonTooLarge);
@@ -527,6 +533,7 @@ impl TaskCapabilityManifest {
         Ok(manifest)
     }
 
+    #[cfg(test)]
     pub fn canonical_json(&self) -> Result<String, TaskCapabilityManifestError> {
         self.validate_integrity()?;
         serde_json::to_string(self).map_err(|_| TaskCapabilityManifestError::InvalidJson)
@@ -677,6 +684,7 @@ pub struct TaskAuthorizationPreview {
 }
 
 impl TaskAuthorizationPreview {
+    #[cfg(test)]
     pub fn parse_json(json: &str) -> Result<Self, TaskCapabilityManifestError> {
         if json.len() > MAX_JSON_BYTES {
             return Err(TaskCapabilityManifestError::JsonTooLarge);
@@ -687,11 +695,13 @@ impl TaskAuthorizationPreview {
         Ok(preview)
     }
 
+    #[cfg(test)]
     pub fn canonical_json(&self) -> Result<String, TaskCapabilityManifestError> {
         self.validate_integrity()?;
         serde_json::to_string(self).map_err(|_| TaskCapabilityManifestError::InvalidJson)
     }
 
+    #[cfg(test)]
     pub fn validate_integrity(&self) -> Result<(), TaskCapabilityManifestError> {
         if self.version != TASK_AUTHORIZATION_PREVIEW_VERSION
             || self.schema_revision != TASK_AUTHORIZATION_PREVIEW_SCHEMA_REVISION
@@ -1422,6 +1432,7 @@ fn validate_verifier_summaries(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_preview_labels(values: &[TaskPreviewLabel]) -> Result<(), TaskCapabilityManifestError> {
     if values.len() > MAX_ITEMS_PER_FIELD {
         return Err(TaskCapabilityManifestError::CollectionOutOfBounds);

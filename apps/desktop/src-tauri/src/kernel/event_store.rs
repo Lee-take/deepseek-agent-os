@@ -90,8 +90,9 @@ use crate::kernel::models::{
     MemoryCandidateReplacePreview, MemoryCandidateResolution, MemoryCandidateSource,
     MemoryCandidateStatus, MemoryConflictSummary, MemoryMaintenanceActionKind,
     MemoryMaintenanceReviewAction, MemoryRecord, MemoryRecordDeletion, MemoryRecordLink,
-    MemoryRecordLinkSummary, MemoryRecordUpdate, MemoryRelationKind, MemorySearchMatch,
-    MemorySearchMatchSource, MemorySelectedFeedback, MemorySelectedFeedbackKind, TaskRecord,
+    MemoryRecordLinkSummary, MemoryRecordUpdate, MemoryRecordUpdateInput, MemoryRelationKind,
+    MemorySearchMatch, MemorySearchMatchSource, MemorySelectedFeedback, MemorySelectedFeedbackKind,
+    TaskRecord,
 };
 use crate::kernel::policy::{
     capability_risk, request_capability_access, CapabilityAccessRecord, CapabilityAccessRequest,
@@ -657,7 +658,7 @@ fn load_connector_reconciliation_binding(
     if i64::try_from(generation).ok() != Some(projected_generation)
         || invocation.status != ConnectorInvocationStatus::ReconciliationRequired
         || !invocation.capability.external_mutation()
-        || invocation.mutation.as_ref().map_or(true, |mutation| {
+        || invocation.mutation.as_ref().is_none_or(|mutation| {
             mutation.account_generation != Some(generation)
                 || mutation.provider_id != invocation.provider_id
                 || mutation.account_id != invocation.account_id
@@ -3969,7 +3970,7 @@ impl EventStore {
         }
         let event = KernelEvent::new(
             CONNECTOR_RECOVERY_RETRY_QUEUED_EVENT,
-            &serde_json::json!({
+            serde_json::json!({
                 "landing_id": landing_id,
                 "kind": "attachment_cleanup",
                 "changed_at": changed_at,
@@ -4227,7 +4228,7 @@ impl EventStore {
         )?;
         let event = KernelEvent::new(
             "connector.sync_recovery.resumed",
-            &serde_json::json!({
+            serde_json::json!({
                 "recovery_item_id": item_id,
                 "kind": "read_sync",
                 "capability": match capability {
@@ -4861,7 +4862,7 @@ impl EventStore {
         }
         let event = KernelEvent::new(
             "connector.sync_recovery.failed",
-            &serde_json::json!({
+            serde_json::json!({
                 "kind": "read_sync",
                 "capability": match claim.state.capability() {
                     ConnectorCapability::MailSyncInbox => "mail",
@@ -4949,7 +4950,7 @@ impl EventStore {
         }
         let event = KernelEvent::new(
             "connector.reconciliation_inspection.scheduled",
-            &serde_json::json!({
+            serde_json::json!({
                 "recovery_item_id": item_id,
                 "kind": "read_only_verification",
                 "changed_at": changed_at,
@@ -10002,7 +10003,7 @@ impl EventStore {
         };
         let event = KernelEvent::new(
             "connector.sync_page.committed",
-            &serde_json::json!({
+            serde_json::json!({
                 "kind": "read_sync",
                 "capability": match next.capability() {
                     ConnectorCapability::MailSyncInbox => "mail",
@@ -10242,7 +10243,7 @@ impl EventStore {
         };
         let event = KernelEvent::new(
             "connector.sync_state.changed",
-            &serde_json::json!({
+            serde_json::json!({
                 "kind": "read_sync",
                 "capability": match next.capability() {
                     ConnectorCapability::MailSyncInbox => "mail",
@@ -12419,11 +12420,10 @@ impl EventStore {
                 for artifact in &artifacts {
                     updated_at = updated_at.max(artifact.created_at);
                 }
-                let active_claim = if queue_is_latest {
-                    None
-                } else if latest_transition
-                    .as_ref()
-                    .is_some_and(|transition| transition.status == AgentRunStatus::Queued)
+                let active_claim = if queue_is_latest
+                    || latest_transition
+                        .as_ref()
+                        .is_some_and(|transition| transition.status == AgentRunStatus::Queued)
                 {
                     None
                 } else {
@@ -12861,6 +12861,10 @@ impl EventStore {
             .collect()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This positional field set is the stable EventStore memory-update boundary used by Tauri and maintenance callers; remove only when all callers migrate together while preserving event payload, replay projection, validation, expiration, and audit semantics."
+    )]
     pub fn update_memory_record(
         &self,
         memory_id: Uuid,
@@ -12880,7 +12884,7 @@ impl EventStore {
             .ok_or_else(|| {
                 EventStoreError::NotFound(format!("memory record {memory_id} was not found"))
             })?;
-        let update = MemoryRecordUpdate::new(
+        let update = MemoryRecordUpdate::new(MemoryRecordUpdateInput {
             memory_id,
             title,
             body,
@@ -12888,10 +12892,10 @@ impl EventStore {
             scope,
             sensitivity,
             lifecycle,
-            existing.pinned,
+            pinned: existing.pinned,
             expires_at,
             note,
-        )
+        })
         .map_err(EventStoreError::InvalidState)?;
         let event = KernelEvent::new(MEMORY_RECORD_UPDATED_EVENT, &update)?;
         self.append(&event)?;
@@ -14179,7 +14183,7 @@ impl EventStore {
             .into_iter()
             .map(|json| serde_json::from_str::<CapabilityAccessRequest>(&json).map_err(Into::into))
             .collect::<EventStoreResult<Vec<_>>>()?;
-        requests.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        requests.sort_by_key(|right| std::cmp::Reverse(right.created_at));
         Ok(requests)
     }
 
@@ -14203,7 +14207,7 @@ impl EventStore {
             .into_iter()
             .map(|json| serde_json::from_str::<PermissionResolution>(&json).map_err(Into::into))
             .collect::<EventStoreResult<Vec<_>>>()?;
-        resolutions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        resolutions.sort_by_key(|right| std::cmp::Reverse(right.created_at));
         Ok(resolutions)
     }
 

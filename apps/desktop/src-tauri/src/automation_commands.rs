@@ -67,6 +67,10 @@ pub fn create_once_automation(
     Ok(definition)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These argument names are the registered Tauri recurring-automation payload spanning schedule variants; remove only through a versioned frontend/command migration that preserves schedule validation, serde shape, and EventStore persistence."
+)]
 #[tauri::command]
 pub fn create_recurring_automation(
     goal: String,

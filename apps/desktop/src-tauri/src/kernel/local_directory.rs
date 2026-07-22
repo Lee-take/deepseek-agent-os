@@ -76,6 +76,7 @@ impl LocalDirectorySettings {
         Self::from_optional_dirs(workspace_dir, None, Some(evidence_dir), Some(export_dir))
     }
 
+    #[cfg(test)]
     pub fn from_workspace_dir(workspace_dir: String) -> Result<Self, LocalDirectoryError> {
         Self::from_optional_dirs(workspace_dir, None, None, None)
     }
