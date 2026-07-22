@@ -20,6 +20,7 @@ pub mod deepseek_credential;
 pub mod deepseek_pricing;
 pub mod event_store;
 pub mod expert_team;
+pub mod goal_continuation;
 pub mod goal_envelope;
 pub mod goal_lifecycle;
 pub mod local_directory;

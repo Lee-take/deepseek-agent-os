@@ -3,6 +3,7 @@
 mod artifact;
 mod computer_use;
 mod connector_draft;
+mod goal_continuation;
 mod grouped_approval;
 mod read_execution;
 mod revocation;
@@ -1678,6 +1679,7 @@ impl EventStore {
         artifact::migrate(self)?;
         computer_use::migrate(self)?;
         connector_draft::migrate(self)?;
+        goal_continuation::migrate(self)?;
         revocation::migrate(self)?;
         read_execution::migrate(self)?;
         workspace_undo::migrate(self)?;
@@ -10368,6 +10370,12 @@ impl EventStore {
                     .to_string(),
             ));
         }
+        if event.event_type.starts_with("goal_context_checkpoint.") {
+            return Err(EventStoreError::InvalidState(
+                "goal context checkpoint events require the dedicated Kernel state machine"
+                    .to_string(),
+            ));
+        }
         if event.event_type == PERMISSION_RESOLUTION_RECORDED_EVENT {
             let resolution: PermissionResolution = serde_json::from_str(&event.payload_json)?;
             if grouped_approval::is_grouped_request(self, resolution.request_id)? {
@@ -10738,6 +10746,13 @@ impl EventStore {
             return Ok(AgentRunCompletionClassification::GoalLess);
         };
         if lifecycle.frozen().is_none() {
+            if let Some(reason) =
+                goal_continuation::blocker_reason_from_connection(connection, run_id)?
+            {
+                return Ok(AgentRunCompletionClassification::VerificationBlocked(
+                    reason,
+                ));
+            }
             return Ok(AgentRunCompletionClassification::VerificationBlocked(
                 AGENT_RUN_GOAL_COMPLETION_BLOCKED_REASON.to_string(),
             ));
@@ -10745,11 +10760,25 @@ impl EventStore {
         let Some(projection) =
             Self::goal_completion_projection_from_connection(connection, run_id)?
         else {
+            if let Some(reason) =
+                goal_continuation::blocker_reason_from_connection(connection, run_id)?
+            {
+                return Ok(AgentRunCompletionClassification::VerificationBlocked(
+                    reason,
+                ));
+            }
             return Ok(AgentRunCompletionClassification::VerificationBlocked(
                 AGENT_RUN_GOAL_COMPLETION_BLOCKED_REASON.to_string(),
             ));
         };
         if projection.status != GoalCompletionStatus::Complete {
+            if let Some(reason) =
+                goal_continuation::blocker_reason_from_connection(connection, run_id)?
+            {
+                return Ok(AgentRunCompletionClassification::VerificationBlocked(
+                    reason,
+                ));
+            }
             return Ok(AgentRunCompletionClassification::VerificationBlocked(
                 AGENT_RUN_GOAL_COMPLETION_BLOCKED_REASON.to_string(),
             ));

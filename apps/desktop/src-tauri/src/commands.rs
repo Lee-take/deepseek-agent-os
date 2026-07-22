@@ -98,6 +98,10 @@ use crate::kernel::expert_team::{
     ExpertCapability, ExpertEvidenceRef, ExpertExternalEffectState, ExpertMergeReceipt,
     ExpertOutput, ExpertQualityGate, ExpertReviewDecision, ExpertRole, ExpertTeamPlanItem,
 };
+use crate::kernel::goal_continuation::{
+    GoalContinuationBlocker, GoalContinuationObservation, GoalContinuationObservationStage,
+    GoalModelUsage, GoalToolUsage,
+};
 use crate::kernel::goal_envelope::GoalEnvelopeProposal;
 use crate::kernel::goal_lifecycle::{
     GoalEnvelopeUiProjection, GoalEnvelopeUiStatus, GoalLifecycleStatus, GoalTargetBindingKind,
@@ -8579,6 +8583,7 @@ fn agent_chat_with_dispatch_and_tool_followup(
                 pricing_settings,
             )
         },
+        |_, _, _, _| Ok(None),
     )?;
 
     Ok((outcome.response, outcome.telemetry))
@@ -8589,6 +8594,7 @@ struct AgentToolLoopOutcome {
     telemetry: Vec<DeepSeekChatTelemetry>,
     tool_rounds: usize,
     limit_reached: bool,
+    continuation_blocker: Option<GoalContinuationBlocker>,
 }
 
 fn run_bounded_agent_tool_loop(
@@ -8599,11 +8605,33 @@ fn run_bounded_agent_tool_loop(
     mut request_followup: impl FnMut(
         String,
     ) -> Result<(AgentChatResponse, DeepSeekChatTelemetry), String>,
+    mut observe: impl FnMut(
+        GoalContinuationObservationStage,
+        usize,
+        &[DeepSeekChatTelemetry],
+        &AgentChatResponse,
+    ) -> Result<Option<GoalContinuationBlocker>, String>,
 ) -> Result<AgentToolLoopOutcome, String> {
     let mut telemetry = vec![initial_telemetry];
     let mut accumulated_response: Option<AgentChatResponse> = None;
     let mut current_response = initial_response;
     let mut tool_rounds = 0;
+
+    if let Some(blocker) = observe(
+        GoalContinuationObservationStage::InitialModel,
+        tool_rounds,
+        &telemetry,
+        &current_response,
+    )? {
+        block_agent_actions_for_goal_continuation(&mut current_response, &blocker);
+        return Ok(AgentToolLoopOutcome {
+            response: current_response,
+            telemetry,
+            tool_rounds,
+            limit_reached: false,
+            continuation_blocker: Some(blocker),
+        });
+    }
 
     loop {
         if current_response.proposed_actions.is_empty() {
@@ -8618,11 +8646,33 @@ fn run_bounded_agent_tool_loop(
                 telemetry,
                 tool_rounds,
                 limit_reached: false,
+                continuation_blocker: None,
             });
         }
 
         tool_rounds += 1;
         dispatch(&mut current_response)?;
+        if let Some(blocker) = observe(
+            GoalContinuationObservationStage::AfterToolRound,
+            tool_rounds,
+            &telemetry,
+            &current_response,
+        )? {
+            let mut response = accumulated_response
+                .take()
+                .map(|accumulated| {
+                    merge_agent_chat_followup_response(accumulated, current_response.clone())
+                })
+                .unwrap_or(current_response);
+            response.content = blocker.user_message();
+            return Ok(AgentToolLoopOutcome {
+                response,
+                telemetry,
+                tool_rounds,
+                limit_reached: false,
+                continuation_blocker: Some(blocker),
+            });
+        }
         let current_round_has_evidence =
             build_agent_tool_evidence_followup_prompt(original_user_prompt, &current_response)
                 .is_some();
@@ -8640,6 +8690,7 @@ fn run_bounded_agent_tool_loop(
                 telemetry,
                 tool_rounds,
                 limit_reached: false,
+                continuation_blocker: None,
             });
         }
 
@@ -8656,10 +8707,27 @@ fn run_bounded_agent_tool_loop(
                     telemetry,
                     tool_rounds,
                     limit_reached: false,
+                    continuation_blocker: None,
                 });
             }
         };
         telemetry.push(followup_telemetry);
+
+        if let Some(blocker) = observe(
+            GoalContinuationObservationStage::AfterModelFollowup,
+            tool_rounds,
+            &telemetry,
+            &followup_response,
+        )? {
+            block_agent_actions_for_goal_continuation(&mut followup_response, &blocker);
+            return Ok(AgentToolLoopOutcome {
+                response: merge_agent_chat_followup_response(response, followup_response),
+                telemetry,
+                tool_rounds,
+                limit_reached: false,
+                continuation_blocker: Some(blocker),
+            });
+        }
 
         if followup_response.proposed_actions.is_empty() {
             return Ok(AgentToolLoopOutcome {
@@ -8667,6 +8735,7 @@ fn run_bounded_agent_tool_loop(
                 telemetry,
                 tool_rounds,
                 limit_reached: false,
+                continuation_blocker: None,
             });
         }
 
@@ -8677,12 +8746,119 @@ fn run_bounded_agent_tool_loop(
                 telemetry,
                 tool_rounds,
                 limit_reached: true,
+                continuation_blocker: None,
             });
         }
 
         accumulated_response = Some(response);
         current_response = followup_response;
     }
+}
+
+fn block_agent_actions_for_goal_continuation(
+    response: &mut AgentChatResponse,
+    blocker: &GoalContinuationBlocker,
+) {
+    let reason = blocker.stable_reason();
+    for action in &mut response.proposed_actions {
+        if action.execution_state == "succeeded" {
+            continue;
+        }
+        action.execution_state = "blocked".to_string();
+        action.blocked_reason = Some(reason.clone());
+        action.dispatch_note = Some(reason.clone());
+        action.permission_request_id = None;
+        action.capability_invocation_id = None;
+    }
+    response.content = blocker.user_message();
+}
+
+fn agent_prompt_with_kernel_context_checkpoint(
+    store: &Mutex<EventStore>,
+    run_id: Uuid,
+    prompt: String,
+) -> Result<String, String> {
+    let checkpoint_prompt = {
+        let store = store.lock().map_err(|_| lock_error())?;
+        store
+            .record_goal_context_checkpoint(
+                run_id,
+                GoalContinuationObservation {
+                    stage: GoalContinuationObservationStage::Final,
+                    local_tool_round: 0,
+                    model_usage: Vec::new(),
+                    tool_usage: Vec::new(),
+                    observed_at: Utc::now(),
+                },
+            )
+            .map_err(event_store_error)?
+            .map(|checkpoint| checkpoint.advisory_prompt().map_err(event_store_error))
+            .transpose()?
+    };
+    Ok(match checkpoint_prompt {
+        Some(checkpoint_prompt) => {
+            format!("{checkpoint_prompt}\n\nCurrent execution prompt:\n{prompt}")
+        }
+        None => prompt,
+    })
+}
+
+fn record_agent_goal_continuation_observation(
+    store: &Mutex<EventStore>,
+    run_id: Option<Uuid>,
+    stage: GoalContinuationObservationStage,
+    tool_rounds: usize,
+    telemetry: &[DeepSeekChatTelemetry],
+    response: &AgentChatResponse,
+) -> Result<Option<GoalContinuationBlocker>, String> {
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    let current_invocation_ids = response
+        .proposed_actions
+        .iter()
+        .filter_map(|action| action.capability_invocation_id)
+        .collect::<Vec<_>>();
+    let store = store.lock().map_err(|_| lock_error())?;
+    let tool_usage = store
+        .list_tool_invocations()
+        .map_err(event_store_error)?
+        .into_iter()
+        .filter(|invocation| {
+            current_invocation_ids.contains(&invocation.id)
+                && matches!(
+                    invocation.status,
+                    ToolExecutionStatus::Succeeded
+                        | ToolExecutionStatus::Failed
+                        | ToolExecutionStatus::Blocked
+                )
+        })
+        .map(|invocation| GoalToolUsage {
+            invocation_id: invocation.id,
+            elapsed_ms: u64::try_from(invocation.elapsed_ms).unwrap_or(u64::MAX),
+        })
+        .collect();
+    let checkpoint = store
+        .record_goal_context_checkpoint(
+            run_id,
+            GoalContinuationObservation {
+                stage,
+                local_tool_round: u32::try_from(tool_rounds).unwrap_or(u32::MAX),
+                model_usage: telemetry
+                    .iter()
+                    .map(|item| GoalModelUsage {
+                        request_id: item.id,
+                        elapsed_ms: u64::try_from(item.elapsed_ms).unwrap_or(u64::MAX),
+                        total_tokens: item.total_tokens,
+                        estimated_cost_micro_usd: item.estimated_cost_micro_usd,
+                    })
+                    .collect(),
+                tool_usage,
+                observed_at: Utc::now(),
+            },
+        )
+        .map_err(event_store_error)?;
+    Ok(checkpoint.and_then(|checkpoint| checkpoint.blocker))
 }
 
 fn block_agent_actions_at_tool_loop_limit(response: &mut AgentChatResponse) {
@@ -8925,6 +9101,10 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
         )
     };
     request.prompt = agent_prompt_with_run_guidance(request.prompt, &initial_guidance);
+    if let Some(run_id) = runtime_context.active_run_id {
+        request.prompt =
+            agent_prompt_with_kernel_context_checkpoint(store, run_id, request.prompt)?;
+    }
     let original_user_prompt = request.prompt.clone();
     let mut runtime_context = runtime_context;
     runtime_context.memory_context = memory_context;
@@ -8989,7 +9169,11 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
                 let store = store.lock().map_err(|_| lock_error())?;
                 load_agent_run_guidance_batch(&store, runtime_context.active_run_id)?
             };
-            let followup_prompt = agent_prompt_with_run_guidance(followup_prompt, &guidance);
+            let mut followup_prompt = agent_prompt_with_run_guidance(followup_prompt, &guidance);
+            if let Some(run_id) = runtime_context.active_run_id {
+                followup_prompt =
+                    agent_prompt_with_kernel_context_checkpoint(store, run_id, followup_prompt)?;
+            }
             let result = agent_chat_with_transport_and_runtime_context(
                 transport,
                 cache,
@@ -9010,14 +9194,47 @@ fn run_agent_chat_with_clients_and_api_keys_and_computer_use(
             }
             result
         },
+        |stage, tool_rounds, telemetry, response| {
+            record_agent_goal_continuation_observation(
+                store,
+                runtime_context.active_run_id,
+                stage,
+                tool_rounds,
+                telemetry,
+                response,
+            )
+        },
     )?;
-    let mut response = loop_outcome.response;
-    let telemetry = loop_outcome.telemetry;
+    let AgentToolLoopOutcome {
+        mut response,
+        telemetry,
+        tool_rounds,
+        limit_reached,
+        mut continuation_blocker,
+    } = loop_outcome;
     reconcile_agent_goal_projection(store, &mut response, &runtime_context, request.access_mode)?;
 
-    if loop_outcome.limit_reached {
+    if let Some(run_id) = runtime_context.active_run_id {
+        let final_blocker = record_agent_goal_continuation_observation(
+            store,
+            Some(run_id),
+            GoalContinuationObservationStage::Final,
+            tool_rounds,
+            &telemetry,
+            &response,
+        )?;
+        if continuation_blocker.is_none() {
+            continuation_blocker = final_blocker;
+        }
+        if let Some(blocker) = continuation_blocker.as_ref() {
+            block_agent_actions_for_goal_continuation(&mut response, blocker);
+            record_agent_goal_continuation_blocker_step(store, run_id, blocker)?;
+        }
+    }
+
+    if limit_reached {
         if let Some(run_id) = runtime_context.active_run_id {
-            record_agent_tool_loop_limit_step(store, run_id, loop_outcome.tool_rounds)?;
+            record_agent_tool_loop_limit_step(store, run_id, tool_rounds)?;
         }
     }
 
@@ -9176,6 +9393,51 @@ fn record_agent_tool_loop_limit_step(
         format!(
             "Bounded agent loop stopped after {tool_rounds} tool rounds before executing newly proposed actions."
         ),
+    )
+    .map_err(event_store_error)?;
+    store
+        .append_agent_run_step(&step)
+        .map_err(event_store_error)
+}
+
+fn record_agent_goal_continuation_blocker_step(
+    store: &Mutex<EventStore>,
+    run_id: Uuid,
+    blocker: &GoalContinuationBlocker,
+) -> Result<(), String> {
+    let store = store.lock().map_err(|_| lock_error())?;
+    let record = read_agent_run_record(&store, run_id)?;
+    let detail = format!(
+        "Kernel ContextCheckpoint stopped continuation: {}; model_rounds={}; tool_rounds={}; elapsed_ms={}; tokens={}; cost_micro_usd={}; evidence_total={}; gap_fingerprint={}.",
+        blocker.code.as_str(),
+        blocker.model_rounds,
+        blocker.tool_rounds,
+        blocker.elapsed_ms,
+        blocker.tokens,
+        blocker.cost_micro_usd,
+        blocker.evidence_total,
+        blocker.gap_fingerprint,
+    );
+    if record
+        .steps
+        .iter()
+        .any(|step| step.label == "agent.context_checkpoint" && step.detail == detail)
+    {
+        return Ok(());
+    }
+    let sequence = record
+        .steps
+        .iter()
+        .map(|step| step.sequence)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let step = AgentRunStepRecord::new(
+        run_id,
+        sequence,
+        AgentRunStepStatus::Failed,
+        "agent.context_checkpoint".to_string(),
+        detail,
     )
     .map_err(event_store_error)?;
     store
