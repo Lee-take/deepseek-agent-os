@@ -1,7 +1,7 @@
 {
   "name": "deepseek-agent-os",
   "private": true,
-  "version": "1.3.0",
+  "version": "1.4.0",
   "author": "Lee take",
   "license": "Apache-2.0",
   "description": "Local-first DeepSeek AI work platform with background runs, permissioned tools, auditable evidence, and recovery.",

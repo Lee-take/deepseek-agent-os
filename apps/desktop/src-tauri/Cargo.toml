@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-agent-os-desktop"
-version = "1.3.0"
+version = "1.4.0"
 description = "Local-first DeepSeek AI work platform"
 edition = "2021"
 license = "Apache-2.0"

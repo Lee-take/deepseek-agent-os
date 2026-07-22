@@ -17,8 +17,8 @@ pub(crate) const APP_UPDATE_RELEASES_API_URL: &str =
 const APP_UPDATE_RELEASE_DOWNLOAD_PATH_PREFIX: &str = "/Lee-take/dsagent/releases/download/";
 const APP_UPDATE_LEGACY_RELEASE_DOWNLOAD_PATH_PREFIX: &str =
     "/Lee-take/deepseek-agent-os/releases/download/";
-const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/1.3.0";
-const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v1.3.0";
+const APP_UPDATE_USER_AGENT: &str = "DS-Agent-Updater/1.4.0";
+const APP_UPDATE_CURRENT_RELEASE_TAG: &str = "v1.4.0";
 #[cfg(windows)]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -653,7 +653,7 @@ mod tests {
         let status = update_status_from_releases(releases, app_update_current_version());
 
         assert!(!status.update_available);
-        assert_eq!(status.current_version, "v1.3.0");
+        assert_eq!(status.current_version, "v1.4.0");
         assert_eq!(status.latest_version.as_deref(), Some("0.3.0"));
         assert!(status.asset_name.is_none());
     }
