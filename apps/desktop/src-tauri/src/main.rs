@@ -114,6 +114,7 @@ impl WindowsSingleInstanceGuard {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .share_mode(0)
             .open(app_data_dir.join("runtime-instance.lock"))
             .map(Self)
