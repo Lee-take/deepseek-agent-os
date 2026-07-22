@@ -32,6 +32,7 @@ pub mod sandbox;
 pub mod skill;
 pub mod skill_source;
 pub mod soul;
+pub mod t1_powerpoint;
 pub mod t1_reconciliation;
 pub mod task_capability_manifest;
 pub mod task_grouped_approval;

@@ -24,6 +24,7 @@ pub const OFFICE_CREATE_TOOL_ID: &str = "office.create";
 pub const OFFICE_OPEN_TOOL_ID: &str = "office.open";
 pub const OFFICE_UPDATE_TOOL_ID: &str = "office.update";
 pub const OPERATIONS_BRIEFING_TOOL_ID: &str = "operations.briefing";
+pub const T1_POWERPOINT_TOOL_ID: &str = "operations.generate_powerpoint";
 pub const T1_RECONCILIATION_TOOL_ID: &str = "operations.reconcile_excel";
 pub const SKILL_ACTIVATE_TOOL_ID: &str = "skill.activate";
 pub const TERMINAL_READ_TOOL_ID: &str = "terminal.read";
@@ -846,6 +847,112 @@ pub fn builtin_tool_catalog() -> Vec<ToolContract> {
             },
             recovery_hint:
                 "Restore the exact three-source T1 set or choose a new authorized XLSX path, then retry one reconciliation without overwriting an existing artifact."
+                    .to_string(),
+        },
+        ToolContract {
+            id: T1_POWERPOINT_TOOL_ID.to_string(),
+            version: "1.0.0".to_string(),
+            title: "Generate and locally verify the T1 PowerPoint brief".to_string(),
+            description:
+                "Re-read the exact completed T1 reconciliation receipt, create one new workspace-relative PPTX, render it through local Microsoft Office, and permit at most three non-overwriting sibling revisions before Kernel completion."
+                    .to_string(),
+            capability: CapabilityKind::FileWrite,
+            risk_level: RiskLevel::High,
+            executor_id: "kernel.operations.generate_powerpoint.v1".to_string(),
+            input_schema: object_schema(
+                vec![
+                    field(
+                        "source_directory",
+                        ToolValueType::String,
+                        "Workspace-relative directory containing the exact C4A source set.",
+                    ),
+                    field(
+                        "reconciliation",
+                        ToolValueType::Object,
+                        "Complete Kernel-issued C4A reconciliation outcome and evidence receipts.",
+                    ),
+                    field(
+                        "output_relative_path",
+                        ToolValueType::String,
+                        "Workspace-relative new PPTX output path inside an existing authorized directory.",
+                    ),
+                ],
+                &["source_directory", "reconciliation", "output_relative_path"],
+            ),
+            output_schema: object_schema(
+                vec![
+                    field(
+                        "reconciliation_artifact_sha256",
+                        ToolValueType::String,
+                        "Exact reverified C4A reconciliation artifact identity.",
+                    ),
+                    field(
+                        "artifact",
+                        ToolValueType::Object,
+                        "Persisted PPTX artifact identity and delivered revision receipt.",
+                    ),
+                    field(
+                        "render",
+                        ToolValueType::Object,
+                        "Actual local Office render and preview identity receipt.",
+                    ),
+                    field(
+                        "revision",
+                        ToolValueType::Object,
+                        "Bounded sibling-only revision history.",
+                    ),
+                    field(
+                        "key_figures",
+                        ToolValueType::Object,
+                        "Reverified C4A key-number projection used in the slide.",
+                    ),
+                    field(
+                        "anomalies",
+                        ToolValueType::Object,
+                        "Reverified operational anomaly projection used in the slide.",
+                    ),
+                    field(
+                        "completion_evidence",
+                        ToolValueType::Array,
+                        "Kernel-issued evidence created only after persisted PPTX and actual-render verification.",
+                    ),
+                ],
+                &[
+                    "reconciliation_artifact_sha256",
+                    "artifact",
+                    "render",
+                    "revision",
+                    "key_figures",
+                    "anomalies",
+                    "completion_evidence",
+                ],
+            ),
+            constraints: ToolConstraints {
+                allowed_network_hosts: Vec::new(),
+                path_scope: ToolPathScope::Workspace,
+                mutates_machine_state: true,
+                protected_path_policy:
+                    "exact C4A receipt and new workspace-relative PPTX; no overwrite, link traversal, protected path, boundary escape, external relationship, macro, or non-sibling revision"
+                        .to_string(),
+                resource: Some(ToolResourceRequirement {
+                    key: "local_filesystem://mutation".to_string(),
+                    access: ToolResourceAccess::Write,
+                    lease_seconds: 30 * 60,
+                }),
+            },
+            verification: ToolVerificationContract {
+                recipe_id: "operations.generate_powerpoint.t1.v1".to_string(),
+                description:
+                    "Require exact C4A source and XLSX identity, a deterministic one-page PPTX, persisted artifact identity, actual local Office render evidence, and bounded sibling-only revision evidence."
+                        .to_string(),
+                required_evidence_kinds: vec![
+                    "one_page_pptx".to_string(),
+                    "actual_render_receipt".to_string(),
+                    "office_revision_receipt".to_string(),
+                ],
+            },
+            recovery_hint:
+                "Restore the exact C4A sources and XLSX, choose a new authorized PPTX path, or restore local Office rendering, then retry without overwriting any artifact."
                     .to_string(),
         },
         ToolContract {
@@ -1745,6 +1852,35 @@ fn validate_tool_semantics(contract: &ToolContract, input: &Value) -> Result<(),
             );
         }
     }
+    if contract.id == T1_POWERPOINT_TOOL_ID {
+        for field in ["source_directory", "output_relative_path"] {
+            let value = input
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if value.is_empty() {
+                return Err(format!(
+                    "operations.generate_powerpoint input field `{field}` cannot be blank"
+                ));
+            }
+        }
+        if !input.get("reconciliation").is_some_and(Value::is_object) {
+            return Err(
+                "operations.generate_powerpoint reconciliation must be an object".to_string(),
+            );
+        }
+        if !input["output_relative_path"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .ends_with(".pptx")
+        {
+            return Err(
+                "operations.generate_powerpoint output_relative_path must end in .pptx".to_string(),
+            );
+        }
+    }
     if contract.id == FILESYSTEM_MUTATE_TOOL_ID {
         validate_filesystem_mutation_semantics(input)?;
     }
@@ -2101,7 +2237,8 @@ mod tests {
         BROWSER_OPEN_TOOL_ID, CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID, CONNECTOR_MUTATE_TOOL_ID,
         FILESYSTEM_MUTATE_TOOL_ID, FILE_READ_TOOL_ID, FILE_WRITE_TOOL_ID, OFFICE_CREATE_TOOL_ID,
         OFFICE_OPEN_TOOL_ID, OFFICE_UPDATE_TOOL_ID, OPERATIONS_BRIEFING_TOOL_ID,
-        SKILL_ACTIVATE_TOOL_ID, T1_RECONCILIATION_TOOL_ID, TERMINAL_READ_TOOL_ID,
+        SKILL_ACTIVATE_TOOL_ID, T1_POWERPOINT_TOOL_ID, T1_RECONCILIATION_TOOL_ID,
+        TERMINAL_READ_TOOL_ID,
     };
     use crate::kernel::models::AccessMode;
     use crate::kernel::policy::{CapabilityKind, PolicyDecision, RiskLevel};
@@ -2278,6 +2415,42 @@ mod tests {
             input: json!({
                 "source_directory": "inputs",
                 "output_relative_path": "outputs/reconciliation.txt",
+            }),
+            access_mode: AccessMode::FullAccess,
+            run_id: None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn builtin_catalog_declares_t1_powerpoint_as_verified_workspace_write() {
+        let contract = builtin_tool_catalog()
+            .into_iter()
+            .find(|contract| contract.id == T1_POWERPOINT_TOOL_ID)
+            .expect("T1 PowerPoint contract");
+
+        assert_eq!(contract.version, "1.0.0");
+        assert_eq!(contract.capability, CapabilityKind::FileWrite);
+        assert_eq!(contract.risk_level, RiskLevel::High);
+        assert_eq!(contract.constraints.path_scope, ToolPathScope::Workspace);
+        assert!(contract.constraints.mutates_machine_state);
+        let resource = contract.constraints.resource.expect("write resource");
+        assert_eq!(resource.key, "local_filesystem://mutation");
+        assert_eq!(resource.access, ToolResourceAccess::Write);
+        assert_eq!(
+            contract.verification.required_evidence_kinds,
+            [
+                "one_page_pptx",
+                "actual_render_receipt",
+                "office_revision_receipt",
+            ]
+        );
+        assert!(prepare_tool_execution(&ToolExecutionRequest {
+            tool_id: T1_POWERPOINT_TOOL_ID.to_string(),
+            input: json!({
+                "source_directory": "inputs",
+                "reconciliation": {},
+                "output_relative_path": "outputs/brief.txt",
             }),
             access_mode: AccessMode::FullAccess,
             run_id: None,

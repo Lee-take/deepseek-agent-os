@@ -162,6 +162,7 @@ use crate::kernel::skill_source::{
 use crate::kernel::soul::{
     AgentSoulProfileUpdateAudit, AgentSoulProfileUpdateProposal, AgentSoulProfileUpdateReceipt,
 };
+use crate::kernel::t1_powerpoint::{LocalT1PowerPointRenderer, T1PowerPointAgentToolExecutor};
 use crate::kernel::t1_reconciliation::T1ReconciliationAgentToolExecutor;
 use crate::kernel::task_capability_manifest::{
     TaskCapabilityManifestContext, TaskCapabilityProposal,
@@ -178,7 +179,8 @@ use crate::kernel::tool_runtime::{
     COMPUTER_CONTROL_TOOL_ID, COMPUTER_SCREENSHOT_TOOL_ID, CONNECTOR_ATTACHMENT_DOWNLOAD_TOOL_ID,
     FILESYSTEM_MUTATE_TOOL_ID, FILE_READ_TOOL_ID, FILE_WRITE_TOOL_ID, NETWORK_SEARCH_TOOL_ID,
     OFFICE_CREATE_TOOL_ID, OFFICE_OPEN_TOOL_ID, OFFICE_UPDATE_TOOL_ID, OPERATIONS_BRIEFING_TOOL_ID,
-    SKILL_ACTIVATE_TOOL_ID, T1_RECONCILIATION_TOOL_ID, TERMINAL_READ_TOOL_ID,
+    SKILL_ACTIVATE_TOOL_ID, T1_POWERPOINT_TOOL_ID, T1_RECONCILIATION_TOOL_ID,
+    TERMINAL_READ_TOOL_ID,
 };
 use crate::kernel::tool_strategy::{
     model_driven_tool_strategy_for_current_platform, ModelDrivenToolStrategy,
@@ -2670,6 +2672,21 @@ fn validate_agent_tool_local_constraints(plan: &ToolExecutionPlan) -> Result<(),
             })?;
         enforce_workspace_relative_mutation_path(output_relative_path)?;
     }
+    if plan.contract.id == T1_POWERPOINT_TOOL_ID {
+        let source_directory =
+            plan.request.input["source_directory"]
+                .as_str()
+                .ok_or_else(|| {
+                    "operations.generate_powerpoint requires a source_directory string".to_string()
+                })?;
+        enforce_workspace_relative_read_path(source_directory)?;
+        let output_relative_path = plan.request.input["output_relative_path"]
+            .as_str()
+            .ok_or_else(|| {
+                "operations.generate_powerpoint requires an output_relative_path string".to_string()
+            })?;
+        enforce_workspace_relative_mutation_path(output_relative_path)?;
+    }
     if plan.contract.id == COMPUTER_CONTROL_TOOL_ID {
         let action = plan.request.input["action"]
             .as_str()
@@ -4677,22 +4694,20 @@ fn agent_file_write_client(
     })
 }
 
-fn t1_reconciliation_workspace_root(
-    directory_state: &LocalDirectoryState,
-) -> Result<PathBuf, String> {
+fn t1_workspace_root(directory_state: &LocalDirectoryState) -> Result<PathBuf, String> {
     let settings = directory_state.settings.as_ref().ok_or_else(|| {
-        "workspace is not configured; choose a DS Agent work root before reconciling T1 sources"
+        "workspace is not configured; choose a DS Agent work root before running T1 tools"
             .to_string()
     })?;
     if directory_state.needs_setup {
         return Err(
-            "workspace setup is incomplete; choose a DS Agent work root before reconciling T1 sources"
+            "workspace setup is incomplete; choose a DS Agent work root before running T1 tools"
                 .to_string(),
         );
     }
     let workspace_root = PathBuf::from(&settings.workspace_dir);
     if !workspace_root.is_dir() {
-        return Err("configured workspace is unavailable for T1 reconciliation".to_string());
+        return Err("configured workspace is unavailable for T1 tools".to_string());
     }
     Ok(workspace_root)
 }
@@ -14105,11 +14120,14 @@ pub fn execute_agent_tool(
     } else {
         None
     };
-    let t1_workspace_root = if request.tool_id.trim() == T1_RECONCILIATION_TOOL_ID {
+    let t1_workspace_root = if matches!(
+        request.tool_id.trim(),
+        T1_RECONCILIATION_TOOL_ID | T1_POWERPOINT_TOOL_ID
+    ) {
         let app_data_dir = app.resolved_app_data_dir()?;
         let directory_state =
             load_local_directory_state(&app_data_dir).map_err(event_store_error)?;
-        Some(t1_reconciliation_workspace_root(&directory_state)?)
+        Some(t1_workspace_root(&directory_state)?)
     } else {
         None
     };
@@ -14176,6 +14194,15 @@ pub fn execute_agent_tool(
             t1_workspace_root
                 .as_deref()
                 .ok_or_else(|| "operations.reconcile_excel executor is unavailable".to_string())?,
+        );
+        run_authorized_agent_tool_execution(authorized, &executor)
+    } else if authorized.plan.contract.id == T1_POWERPOINT_TOOL_ID {
+        let renderer = LocalT1PowerPointRenderer;
+        let executor = T1PowerPointAgentToolExecutor::new(
+            t1_workspace_root.as_deref().ok_or_else(|| {
+                "operations.generate_powerpoint executor is unavailable".to_string()
+            })?,
+            &renderer,
         );
         run_authorized_agent_tool_execution(authorized, &executor)
     } else if authorized.plan.contract.id == FILESYSTEM_MUTATE_TOOL_ID {

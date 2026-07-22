@@ -235,6 +235,33 @@ pub fn verify_persisted_t1_reconciliation(
     verify_t1_reconciliation_artifact(&source_manifest, &provenance, expected_artifact, &bytes)
 }
 
+pub fn verify_existing_t1_reconciliation(
+    workspace_root: &Path,
+    source_directory: &str,
+    expected: &T1ReconciliationOutcome,
+) -> Result<T1ReconciliationOutcome, String> {
+    let request = T1ReconciliationRequest {
+        source_directory: source_directory.to_string(),
+        output_relative_path: expected.artifact.relative_path.clone(),
+    };
+    let completion_evidence = verify_persisted_t1_reconciliation(
+        workspace_root,
+        &request,
+        &expected.source_manifest,
+        &expected.provenance,
+        &expected.artifact,
+    )?;
+    if completion_evidence != expected.completion_evidence {
+        return Err(
+            "T1 reconciliation completion evidence changed before PPT generation".to_string(),
+        );
+    }
+    if key_figures(&expected.provenance)? != expected.key_figures {
+        return Err("T1 reconciliation key figures changed before PPT generation".to_string());
+    }
+    Ok(expected.clone())
+}
+
 pub fn verify_t1_reconciliation_artifact(
     source_manifest: &T1SourceManifest,
     provenance: &T1ProvenanceManifest,
