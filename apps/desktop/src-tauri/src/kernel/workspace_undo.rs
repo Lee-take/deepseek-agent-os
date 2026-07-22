@@ -189,9 +189,8 @@ pub(crate) fn execute_checkpointed_mutation<T: FileSystemMutationClient + ?Sized
     store
         .insert_workspace_mutation_intent(&intent)
         .map_err(|error| error.to_string())?;
-    let (prepared, preimage) = prepare_checkpoint(intent).map_err(|error| {
+    let (prepared, preimage) = prepare_checkpoint(intent).inspect_err(|_| {
         let _ = store.fail_workspace_mutation_checkpoint(plan.invocation_id, "precheck_failed");
-        error
     })?;
     let prepared = store
         .prepare_workspace_mutation_checkpoint(&prepared, preimage.as_deref())
@@ -211,12 +210,11 @@ pub(crate) fn execute_checkpointed_mutation<T: FileSystemMutationClient + ?Sized
             return Err(error);
         }
     };
-    let completed = complete_checkpoint(started, content).map_err(|error| {
+    let completed = complete_checkpoint(started, content).inspect_err(|_| {
         let _ = store.repair_workspace_mutation_checkpoint_by_invocation(
             plan.invocation_id,
             "postcheck_failed_unknown",
         );
-        error
     })?;
     store
         .finish_workspace_mutation_checkpoint(&completed)

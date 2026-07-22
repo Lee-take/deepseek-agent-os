@@ -12420,11 +12420,10 @@ impl EventStore {
                 for artifact in &artifacts {
                     updated_at = updated_at.max(artifact.created_at);
                 }
-                let active_claim = if queue_is_latest {
-                    None
-                } else if latest_transition
-                    .as_ref()
-                    .is_some_and(|transition| transition.status == AgentRunStatus::Queued)
+                let active_claim = if queue_is_latest
+                    || latest_transition
+                        .as_ref()
+                        .is_some_and(|transition| transition.status == AgentRunStatus::Queued)
                 {
                     None
                 } else {

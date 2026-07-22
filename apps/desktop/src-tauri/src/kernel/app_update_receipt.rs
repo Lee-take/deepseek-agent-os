@@ -568,10 +568,10 @@ pub(crate) fn recover_update_receipts_at(root: &Path) -> Result<(), String> {
                     }
                 }
             }
-            ReceiptStatus::Staged => {
-                if recover_staged_receipt(&directory, &store, &record).is_err() {
-                    store.mark_repair_required(&record)?;
-                }
+            ReceiptStatus::Staged
+                if recover_staged_receipt(&directory, &store, &record).is_err() =>
+            {
+                store.mark_repair_required(&record)?;
             }
             ReceiptStatus::InstallPending => {
                 store.mark_repair_required(&record)?;
