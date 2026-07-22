@@ -1,4 +1,6 @@
 pub mod baseline;
+#[cfg(test)]
+mod c4c;
 pub mod fixtures;
 pub mod verifiers;
 
