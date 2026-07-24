@@ -1053,6 +1053,20 @@ function capabilityFamilyIcon(family: CapabilityFamily) {
   }
 }
 
+function durableComputerUsePostcondition(actionContract: string) {
+  const normalized = actionContract.trim();
+  const separator = normalized.indexOf(":");
+  const verb = separator >= 0 ? normalized.slice(0, separator).trim().toLowerCase() : "";
+  const payload = separator >= 0 ? normalized.slice(separator + 1).trim() : "";
+  if (verb === "set_value" && payload) {
+    return { kind: "semantic_equals_text", expectedText: payload } as const;
+  }
+  if (verb === "select" && payload.toLowerCase() === "focused") {
+    return { kind: "semantic_equals_text", expectedText: "selection:selected" } as const;
+  }
+  return { kind: "semantic_changed" } as const;
+}
+
 export function App() {
   const [state, setState] = useState<FoundationState>(fallbackState);
   const [onboardingReadiness, setOnboardingReadiness] =
@@ -1170,7 +1184,9 @@ export function App() {
   const [computerControlTarget, setComputerControlTarget] = useState("");
   const [computerControlAction, setComputerControlAction] = useState("");
   const [computerControlUnlockToken, setComputerControlUnlockToken] = useState("");
-  const [computerUseActionDraft, setComputerUseActionDraft] = useState("type:DS Agent verified");
+  const [computerUseActionDraft, setComputerUseActionDraft] = useState(
+    "set_value:DS Agent verified",
+  );
   const [lastComputerScreenshotInvocationId, setLastComputerScreenshotInvocationId] =
     useState<string | null>(null);
   const [setupWorkspaceName, setSetupWorkspaceName] = useState("");
@@ -3827,8 +3843,8 @@ export function App() {
           runId: null,
           safeGoalSummary:
             language === "zh"
-              ? "在隔离的记事本类应用中执行一个可验证动作。"
-              : "Execute one verifiable action in an isolated Notepad-like app.",
+              ? "在隔离的 Windows 前台目标中执行一个可验证动作。"
+              : "Execute one verifiable action on an isolated foreground Windows target.",
           undoCapability: "none",
         },
       );
@@ -3856,9 +3872,9 @@ export function App() {
         actionContract: computerUseActionDraft.trim(),
         safeSummary:
           language === "zh"
-            ? "在隔离的前台编辑器中执行这一项已显示的结构化动作。"
-            : "Execute this displayed structured action in the isolated foreground editor.",
-        postcondition: { kind: "semantic_changed" },
+            ? "在隔离的前台可访问性目标中执行这一项已显示的结构化动作。"
+            : "Execute this displayed structured action on the isolated foreground accessibility target.",
+        postcondition: durableComputerUsePostcondition(computerUseActionDraft),
       });
       await refreshDurableComputerUseState();
       setComputerUseStepNotice(step.status_reason ?? computerUseStepCopy.awaiting_approval);

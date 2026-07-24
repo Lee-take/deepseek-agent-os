@@ -367,6 +367,10 @@ pub enum ComputerControlAction {
     TypeText {
         text: String,
     },
+    SetAccessibilityValue {
+        value: String,
+    },
+    SelectAccessibilityTarget,
     PressKey {
         key: String,
     },
@@ -388,6 +392,15 @@ impl ComputerControlAction {
             ComputerControlAction::Move { x, y } => format!("move pointer to ({x}, {y})"),
             ComputerControlAction::TypeText { text } => {
                 format!("type text ({} chars)", text.chars().count())
+            }
+            ComputerControlAction::SetAccessibilityValue { value } => {
+                format!(
+                    "set focused accessibility value ({} chars)",
+                    value.chars().count()
+                )
+            }
+            ComputerControlAction::SelectAccessibilityTarget => {
+                "select focused accessibility target".to_string()
             }
             ComputerControlAction::PressKey { key } => format!("press key {key}"),
             ComputerControlAction::Hotkey { keys } => format!("press hotkey {}", keys.join("+")),
@@ -417,6 +430,10 @@ pub trait LocalComputerControlInputBackend {
     fn click_mouse(&mut self, button: ComputerControlMouseButton) -> Result<(), String>;
 
     fn type_text(&mut self, text: &str) -> Result<(), String>;
+
+    fn set_accessibility_value(&mut self, value: &str) -> Result<(), String>;
+
+    fn select_accessibility_target(&mut self) -> Result<(), String>;
 
     fn key_down(&mut self, key: &str) -> Result<(), String>;
 
@@ -1032,6 +1049,341 @@ impl ComputerScreenshotClient for LocalComputerScreenshotClient {
     }
 }
 
+#[cfg(windows)]
+#[allow(dead_code)]
+pub struct WindowsBoundComputerScreenshotClient {
+    local: LocalComputerScreenshotClient,
+    window_handle: isize,
+    process_id: u32,
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+impl WindowsBoundComputerScreenshotClient {
+    pub fn new(
+        evidence_base_dir: PathBuf,
+        window_handle: isize,
+        process_id: u32,
+    ) -> Result<Self, String> {
+        if window_handle == 0 || process_id == 0 {
+            return Err("bound Windows screenshot requires an exact HWND and process".to_string());
+        }
+        Ok(Self {
+            local: LocalComputerScreenshotClient::new(evidence_base_dir),
+            window_handle,
+            process_id,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl ComputerScreenshotClient for WindowsBoundComputerScreenshotClient {
+    fn capture_screenshot(&self) -> Result<ComputerScreenshot, String> {
+        self.local
+            .capture_with_backend(&WindowsBoundScreenshotCaptureBackend {
+                window_handle: self.window_handle,
+                process_id: self.process_id,
+            })
+    }
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+struct WindowsBoundScreenshotCaptureBackend {
+    window_handle: isize,
+    process_id: u32,
+}
+
+#[cfg(windows)]
+impl LocalScreenshotCaptureBackend for WindowsBoundScreenshotCaptureBackend {
+    fn capture_primary_display(&self) -> Result<CapturedScreenshotImage, String> {
+        capture_bound_windows_window_image(self.window_handle, self.process_id)
+    }
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn require_bound_windows_process_identity(
+    actual_process_id: u32,
+    expected_process_id: u32,
+) -> Result<(), String> {
+    if actual_process_id == 0 {
+        return Err("bound Windows screenshot HWND has no live process identity".to_string());
+    }
+    if actual_process_id != expected_process_id {
+        return Err(
+            "bound Windows screenshot HWND no longer belongs to the expected process".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments, dead_code)]
+fn require_bound_excel_editor_identity(
+    main_window_handle: isize,
+    expected_process_id: u32,
+    expected_thread_id: u32,
+    editor_window_handle: isize,
+    editor_process_id: u32,
+    editor_thread_id: u32,
+    editor_is_exact_or_child: bool,
+    editor_window_class: &str,
+) -> Result<(), String> {
+    if main_window_handle == 0
+        || expected_process_id == 0
+        || expected_thread_id == 0
+        || editor_window_handle == 0
+    {
+        return Err("bound Excel editor identity is incomplete".to_string());
+    }
+    if editor_process_id != expected_process_id || editor_thread_id != expected_thread_id {
+        return Err(
+            "bound Excel editor no longer belongs to the exact process and window thread"
+                .to_string(),
+        );
+    }
+    if !editor_is_exact_or_child {
+        return Err("bound Excel editor is outside the exact Excel HWND".to_string());
+    }
+    if !editor_window_class.eq_ignore_ascii_case("EXCEL6") {
+        return Err("bound Excel editor has the wrong native window class".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments, dead_code)]
+fn require_bound_excel_grid_identity(
+    main_window_handle: isize,
+    expected_process_id: u32,
+    expected_thread_id: u32,
+    grid_window_handle: isize,
+    grid_process_id: u32,
+    grid_thread_id: u32,
+    grid_is_exact_or_child: bool,
+    grid_window_class: &str,
+) -> Result<(), String> {
+    if main_window_handle == 0
+        || expected_process_id == 0
+        || expected_thread_id == 0
+        || grid_window_handle == 0
+    {
+        return Err("bound Excel grid identity is incomplete".to_string());
+    }
+    if grid_process_id != expected_process_id || grid_thread_id != expected_thread_id {
+        return Err(
+            "bound Excel grid no longer belongs to the exact process and window thread".to_string(),
+        );
+    }
+    if !grid_is_exact_or_child {
+        return Err("bound Excel grid is outside the exact Excel HWND".to_string());
+    }
+    if !grid_window_class.eq_ignore_ascii_case("EXCEL7") {
+        return Err("bound Excel grid has the wrong native window class".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn excel_grid_automation_id(row: i32, column: i32) -> Result<String, String> {
+    if row <= 0 || column <= 0 {
+        return Err("bound Excel grid identity requires one-based row and column".to_string());
+    }
+    let mut remaining =
+        u32::try_from(column).map_err(|_| "bound Excel grid column is invalid".to_string())?;
+    let mut letters = Vec::new();
+    while remaining > 0 {
+        remaining -= 1;
+        letters.push(
+            char::from_u32(u32::from(b'A') + (remaining % 26))
+                .ok_or_else(|| "bound Excel grid column is invalid".to_string())?,
+        );
+        remaining /= 26;
+    }
+    letters.reverse();
+    Ok(format!("{}{row}", letters.into_iter().collect::<String>()))
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn revalidate_bound_windows_screenshot_identity(
+    window_handle: isize,
+    expected_process_id: u32,
+) -> Result<windows::Win32::Foundation::HWND, String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    let hwnd = HWND(window_handle as _);
+    let mut actual_process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut actual_process_id)) };
+    if thread_id == 0 {
+        return Err("bound Windows screenshot HWND is no longer available".to_string());
+    }
+    require_bound_windows_process_identity(actual_process_id, expected_process_id)?;
+    Ok(hwnd)
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn capture_bound_windows_window_image(
+    window_handle: isize,
+    expected_process_id: u32,
+) -> Result<CapturedScreenshotImage, String> {
+    use std::ffi::c_void;
+    use std::mem;
+
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetWindowDC,
+        ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn PrintWindow(window: isize, target_dc: isize, flags: u32) -> i32;
+    }
+
+    let hwnd = revalidate_bound_windows_screenshot_identity(window_handle, expected_process_id)?;
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }.map_err(|error| {
+        format!("bound Windows screenshot could not read the window bounds: {error}")
+    })?;
+    let width_i32 = rect.right.saturating_sub(rect.left);
+    let height_i32 = rect.bottom.saturating_sub(rect.top);
+    if width_i32 <= 0 || height_i32 <= 0 {
+        return Err(format!(
+            "bound Windows screenshot returned invalid dimensions: {width_i32}x{height_i32}"
+        ));
+    }
+    let width = u32::try_from(width_i32)
+        .map_err(|_| "bound Windows screenshot width exceeds PNG limits".to_string())?;
+    let height = u32::try_from(height_i32)
+        .map_err(|_| "bound Windows screenshot height exceeds PNG limits".to_string())?;
+    let buffer_len = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "bound Windows screenshot pixel buffer size overflowed".to_string())?;
+    let buffer_len_u32 = u32::try_from(buffer_len)
+        .map_err(|_| "bound Windows screenshot pixel buffer exceeds GDI limits".to_string())?;
+
+    let pixels = unsafe {
+        let window_dc = GetWindowDC(Some(hwnd));
+        if window_dc.is_invalid() {
+            return Err(
+                "bound Windows screenshot GetWindowDC returned an invalid device context"
+                    .to_string(),
+            );
+        }
+        let memory_dc = CreateCompatibleDC(Some(window_dc));
+        if memory_dc.is_invalid() {
+            ReleaseDC(Some(hwnd), window_dc);
+            return Err(
+                "bound Windows screenshot CreateCompatibleDC returned an invalid device context"
+                    .to_string(),
+            );
+        }
+        let bitmap = CreateCompatibleBitmap(window_dc, width_i32, height_i32);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(memory_dc);
+            ReleaseDC(Some(hwnd), window_dc);
+            return Err(
+                "bound Windows screenshot CreateCompatibleBitmap returned an invalid bitmap"
+                    .to_string(),
+            );
+        }
+        let previous_object = SelectObject(memory_dc, bitmap.into());
+        if previous_object.is_invalid() {
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(memory_dc);
+            ReleaseDC(Some(hwnd), window_dc);
+            return Err(
+                "bound Windows screenshot SelectObject could not bind the capture bitmap"
+                    .to_string(),
+            );
+        }
+
+        let print_result = if PrintWindow(hwnd.0 as isize, memory_dc.0 as isize, 2) == 0 {
+            Err(format!(
+                "bound Windows screenshot PrintWindow failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(())
+        };
+        SelectObject(memory_dc, previous_object);
+        let result = print_result.and_then(|()| {
+            let mut bitmap_info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width_i32,
+                    biHeight: -height_i32,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0,
+                    biSizeImage: buffer_len_u32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixels = vec![0_u8; buffer_len];
+            let copied_lines = GetDIBits(
+                memory_dc,
+                bitmap,
+                0,
+                height,
+                Some(pixels.as_mut_ptr().cast::<c_void>()),
+                &mut bitmap_info,
+                DIB_RGB_COLORS,
+            );
+            if copied_lines != height_i32 {
+                return Err(format!(
+                    "bound Windows screenshot GetDIBits copied {copied_lines} of {height_i32} window lines"
+                ));
+            }
+            Ok(pixels)
+        });
+
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(memory_dc);
+        ReleaseDC(Some(hwnd), window_dc);
+        result?
+    };
+    revalidate_bound_windows_screenshot_identity(window_handle, expected_process_id)?;
+
+    let mut pixels = pixels;
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        pixel[3] = 255;
+    }
+    if pixels
+        .chunks_exact(4)
+        .all(|pixel| pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
+    {
+        return Err("bound Windows screenshot PrintWindow returned only black pixels".to_string());
+    }
+    let image = xcap::image::RgbaImage::from_raw(width, height, pixels).ok_or_else(|| {
+        "bound Windows screenshot pixels did not match window dimensions".to_string()
+    })?;
+    let mut buffer = Cursor::new(Vec::new());
+    xcap::image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut buffer, xcap::image::ImageFormat::Png)
+        .map_err(|error| format!("bound Windows screenshot PNG encoding failed: {error}"))?;
+
+    Ok(CapturedScreenshotImage {
+        display_label: "Exact bound Windows window".to_string(),
+        width,
+        height,
+        png_bytes: buffer.into_inner(),
+    })
+}
+
 struct XcapLocalScreenshotCaptureBackend;
 
 impl LocalScreenshotCaptureBackend for XcapLocalScreenshotCaptureBackend {
@@ -1445,6 +1797,12 @@ impl LocalComputerControlClient {
             ComputerControlAction::TypeText { text } => {
                 backend.type_text(text)?;
             }
+            ComputerControlAction::SetAccessibilityValue { value } => {
+                backend.set_accessibility_value(value)?;
+            }
+            ComputerControlAction::SelectAccessibilityTarget => {
+                backend.select_accessibility_target()?;
+            }
             ComputerControlAction::PressKey { key } => {
                 backend.key_click(key)?;
             }
@@ -1482,6 +1840,149 @@ impl ComputerControlClient for LocalComputerControlClient {
     ) -> Result<ComputerControlExecution, String> {
         let mut backend = EnigoLocalComputerControlInputBackend::new()?;
         self.execute_with_backend(action, &mut backend)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct WindowsBoundComputerControlClient {
+    window_handle: isize,
+    process_id: u32,
+    target: WindowsBoundComputerControlTarget,
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+const BOUND_WINDOWS_ACCESSIBILITY_ACTION_TIMEOUT: Duration = Duration::from_secs(6);
+
+// Bound-13 reached fresh post-commit B3 observation at 5.381 seconds. Nine seconds
+// dominates the two-second semantic-convergence ceiling plus exact B4-to-B3
+// restoration, while still bounding any non-returning Excel provider call.
+#[cfg(windows)]
+#[allow(dead_code)]
+const BOUND_EXCEL_ACCESSIBILITY_ACTION_TIMEOUT: Duration = Duration::from_secs(9);
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn bound_windows_accessibility_action_timeout(
+    target: &WindowsBoundComputerControlTarget,
+) -> Duration {
+    if matches!(target, WindowsBoundComputerControlTarget::Excel { .. }) {
+        BOUND_EXCEL_ACCESSIBILITY_ACTION_TIMEOUT
+    } else {
+        BOUND_WINDOWS_ACCESSIBILITY_ACTION_TIMEOUT
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum WindowsBoundComputerControlTarget {
+    Any,
+    FileExplorer {
+        target_name: String,
+    },
+    Excel {
+        worksheet_automation_id: String,
+        cell_automation_id: String,
+        row: i32,
+        column: i32,
+    },
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+impl WindowsBoundComputerControlClient {
+    pub fn new(window_handle: isize, process_id: u32) -> Result<Self, String> {
+        if window_handle == 0 || process_id == 0 {
+            return Err(
+                "bound Windows computer control requires an exact HWND and process".to_string(),
+            );
+        }
+        Ok(Self {
+            window_handle,
+            process_id,
+            target: WindowsBoundComputerControlTarget::Any,
+        })
+    }
+
+    pub fn new_file_explorer(
+        window_handle: isize,
+        process_id: u32,
+        target_name: String,
+    ) -> Result<Self, String> {
+        let mut client = Self::new(window_handle, process_id)?;
+        if target_name.trim().is_empty() {
+            return Err("bound File Explorer control requires an exact target name".to_string());
+        }
+        client.target = WindowsBoundComputerControlTarget::FileExplorer { target_name };
+        Ok(client)
+    }
+
+    pub fn new_excel(
+        window_handle: isize,
+        process_id: u32,
+        worksheet_automation_id: String,
+        cell_automation_id: String,
+        row: i32,
+        column: i32,
+    ) -> Result<Self, String> {
+        let mut client = Self::new(window_handle, process_id)?;
+        if worksheet_automation_id.trim().is_empty()
+            || cell_automation_id.trim().is_empty()
+            || row < 0
+            || column < 0
+        {
+            return Err(
+                "bound Excel control requires an exact worksheet, cell, row, and column"
+                    .to_string(),
+            );
+        }
+        client.target = WindowsBoundComputerControlTarget::Excel {
+            worksheet_automation_id,
+            cell_automation_id,
+            row,
+            column,
+        };
+        Ok(client)
+    }
+}
+
+#[cfg(windows)]
+impl ComputerControlClient for WindowsBoundComputerControlClient {
+    fn execute_control(
+        &self,
+        _target: &str,
+        action: &ComputerControlAction,
+    ) -> Result<ComputerControlExecution, String> {
+        use std::sync::mpsc;
+
+        let action = action.clone();
+        let summary = action.audit_summary();
+        let window_handle = self.window_handle;
+        let process_id = self.process_id;
+        let target = self.target.clone();
+        let action_timeout = bound_windows_accessibility_action_timeout(&target);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = execute_bound_windows_accessibility_action(
+                window_handle,
+                process_id,
+                &target,
+                &action,
+            );
+            let _ = sender.send(result);
+        });
+        receiver
+            .recv_timeout(action_timeout)
+            .map_err(|error| {
+                format!(
+                    "bound Windows accessibility action timed out after {} seconds; the effect is unknown and automatic replay is forbidden: {error}",
+                    action_timeout.as_secs(),
+                )
+            })??;
+        Ok(ComputerControlExecution { summary })
     }
 }
 
@@ -1574,6 +2075,14 @@ impl LocalComputerControlInputBackend for EnigoLocalComputerControlInputBackend 
             .map_err(|error| format!("computer control text input failed: {error}"))
     }
 
+    fn set_accessibility_value(&mut self, value: &str) -> Result<(), String> {
+        execute_local_accessibility_set_value(value)
+    }
+
+    fn select_accessibility_target(&mut self) -> Result<(), String> {
+        execute_local_accessibility_select()
+    }
+
     fn key_down(&mut self, key: &str) -> Result<(), String> {
         let key = enigo_key(key)?;
         enigo::Keyboard::key(&mut self.enigo, key, enigo::Direction::Press)
@@ -1595,6 +2104,1057 @@ impl LocalComputerControlInputBackend for EnigoLocalComputerControlInputBackend 
     fn scroll(&mut self, delta: i32, axis: ComputerControlScrollAxis) -> Result<(), String> {
         enigo::Mouse::scroll(&mut self.enigo, delta, enigo_axis(axis))
             .map_err(|error| format!("computer control scroll failed: {error}"))
+    }
+}
+
+fn execute_local_accessibility_set_value(value: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let value = value.to_string();
+        std::thread::spawn(move || set_windows_focused_accessibility_value(&value))
+            .join()
+            .map_err(|_| "Windows accessibility value action thread failed".to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = value;
+        Err("focused accessibility value actions are Windows-first in Step 5".to_string())
+    }
+}
+
+fn execute_local_accessibility_select() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        std::thread::spawn(select_windows_focused_accessibility_target)
+            .join()
+            .map_err(|_| "Windows accessibility selection action thread failed".to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        Err("focused accessibility selection actions are Windows-first in Step 5".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn set_windows_focused_accessibility_value(value: &str) -> Result<(), String> {
+    use windows::core::BSTR;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationLegacyIAccessiblePattern,
+        IUIAutomationValuePattern, UIA_LegacyIAccessiblePatternId, UIA_ValuePatternId,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    struct ComGuard;
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .map_err(|error| format!("Windows accessibility COM initialization failed: {error}"))?;
+    let _guard = ComGuard;
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return Err("Windows accessibility found no foreground window".to_string());
+    }
+    let mut foreground_process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut foreground_process_id)) };
+    if thread_id == 0 || foreground_process_id == 0 {
+        return Err("Windows accessibility could not identify the foreground process".to_string());
+    }
+    let automation: IUIAutomation = unsafe {
+        CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+            .map_err(|error| format!("Windows UI Automation client creation failed: {error}"))?
+    };
+    let focused = unsafe {
+        automation
+            .GetFocusedElement()
+            .map_err(|error| format!("Windows UI Automation found no focused target: {error}"))?
+    };
+    let target_process_id = unsafe { focused.CurrentProcessId() }
+        .map_err(|error| format!("Windows UI Automation target process is unavailable: {error}"))?;
+    if target_process_id <= 0 || target_process_id as u32 != foreground_process_id {
+        return Err(
+            "Windows UI Automation focus does not belong to the foreground window".to_string(),
+        );
+    }
+    let value = BSTR::from(value);
+    if let Ok(pattern) =
+        unsafe { focused.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+    {
+        return unsafe { pattern.SetValue(&value) }
+            .map_err(|error| format!("Windows accessibility value action failed: {error}"));
+    }
+    if let Ok(pattern) = unsafe {
+        focused.GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+            UIA_LegacyIAccessiblePatternId,
+        )
+    } {
+        return unsafe { pattern.SetValue(&value) }
+            .map_err(|error| format!("Windows legacy accessibility value action failed: {error}"));
+    }
+    Err("focused Windows accessibility target does not support an exact value action".to_string())
+}
+
+#[cfg(windows)]
+fn select_windows_focused_accessibility_target() -> Result<(), String> {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationSelectionItemPattern,
+        IUIAutomationTreeWalker, UIA_SelectionItemPatternId,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    struct ComGuard;
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .map_err(|error| format!("Windows accessibility COM initialization failed: {error}"))?;
+    let _guard = ComGuard;
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return Err("Windows accessibility found no foreground window".to_string());
+    }
+    let mut foreground_process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut foreground_process_id)) };
+    if thread_id == 0 || foreground_process_id == 0 {
+        return Err("Windows accessibility could not identify the foreground process".to_string());
+    }
+    let automation: IUIAutomation = unsafe {
+        CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+            .map_err(|error| format!("Windows UI Automation client creation failed: {error}"))?
+    };
+    let focused = unsafe {
+        automation
+            .GetFocusedElement()
+            .map_err(|error| format!("Windows UI Automation found no focused target: {error}"))?
+    };
+    let focused_process_id = unsafe { focused.CurrentProcessId() }
+        .map_err(|error| format!("Windows UI Automation target process is unavailable: {error}"))?;
+    if focused_process_id <= 0 || focused_process_id as u32 != foreground_process_id {
+        return Err(
+            "Windows UI Automation focus does not belong to the foreground window".to_string(),
+        );
+    }
+    let mut class_buffer = [0u16; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class_buffer) }.max(0) as usize;
+    let window_class = String::from_utf16_lossy(&class_buffer[..class_len]);
+    let target = if window_class.eq_ignore_ascii_case("CabinetWClass")
+        || window_class.eq_ignore_ascii_case("ExploreWClass")
+    {
+        let root = unsafe {
+            automation.ElementFromHandle(hwnd).map_err(|error| {
+                format!("Windows UI Automation could not inspect File Explorer: {error}")
+            })?
+        };
+        let walker = unsafe {
+            automation.ControlViewWalker().map_err(|error| {
+                format!("Windows UI Automation control walker is unavailable: {error}")
+            })?
+        };
+        let find_selected = |root: &IUIAutomationElement,
+                             walker: &IUIAutomationTreeWalker|
+         -> Option<IUIAutomationElement> {
+            let mut pending = Vec::new();
+            if let Ok(child) = unsafe { walker.GetFirstChildElement(root) } {
+                pending.push(child);
+            }
+            let mut visited = 0usize;
+            while let Some(element) = pending.pop() {
+                visited += 1;
+                if visited > 4_096 {
+                    return None;
+                }
+                let process_matches = unsafe { element.CurrentProcessId() }
+                    .map(|process_id| process_id == focused_process_id)
+                    .unwrap_or(false);
+                if process_matches {
+                    let is_selected = unsafe {
+                        element
+                            .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                                UIA_SelectionItemPatternId,
+                            )
+                            .ok()
+                            .and_then(|pattern| pattern.CurrentIsSelected().ok())
+                            .map(|selected| selected.as_bool())
+                            .unwrap_or(false)
+                    };
+                    if is_selected {
+                        return Some(element);
+                    }
+                    if let Ok(child) = unsafe { walker.GetFirstChildElement(&element) } {
+                        pending.push(child);
+                    }
+                }
+                if let Ok(sibling) = unsafe { walker.GetNextSiblingElement(&element) } {
+                    pending.push(sibling);
+                }
+            }
+            None
+        };
+        find_selected(&root, &walker).ok_or_else(|| {
+            "Windows UI Automation found no selected File Explorer target".to_string()
+        })?
+    } else {
+        focused
+    };
+    let target_process_id = unsafe { target.CurrentProcessId() }
+        .map_err(|error| format!("Windows UI Automation target process is unavailable: {error}"))?;
+    if target_process_id <= 0 || target_process_id as u32 != foreground_process_id {
+        return Err(
+            "Windows UI Automation target does not belong to the foreground window".to_string(),
+        );
+    }
+    let pattern = unsafe {
+        target
+            .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+            .map_err(|error| {
+                format!(
+                    "focused Windows accessibility target does not support exact selection: {error}"
+                )
+            })?
+    };
+    unsafe { pattern.Select() }
+        .map_err(|error| format!("Windows accessibility selection action failed: {error}"))
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum WindowsBoundAccessibilityProfile {
+    FileExplorer,
+    Excel,
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn execute_bound_windows_accessibility_action(
+    window_handle: isize,
+    expected_process_id: u32,
+    expected_target: &WindowsBoundComputerControlTarget,
+    action: &ComputerControlAction,
+) -> Result<(), String> {
+    use windows::core::BSTR;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationGridItemPattern,
+        IUIAutomationInvokePattern, IUIAutomationLegacyIAccessiblePattern,
+        IUIAutomationSelectionItemPattern, IUIAutomationTextPattern, IUIAutomationTreeWalker,
+        IUIAutomationValuePattern, UIA_DataItemControlTypeId, UIA_EditControlTypeId,
+        UIA_GridItemPatternId, UIA_InvokePatternId, UIA_LegacyIAccessiblePatternId,
+        UIA_ListItemControlTypeId, UIA_SelectionItemPatternId, UIA_TextPatternId,
+        UIA_ValuePatternId,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetGUIThreadInfo, GetWindowThreadProcessId, IsChild, PostMessageW,
+        GUITHREADINFO, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
+    };
+
+    struct ComGuard;
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    struct ExcelEditCancelGuard {
+        editor_window: HWND,
+        active: bool,
+    }
+    impl Drop for ExcelEditCancelGuard {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let key_down = LPARAM((1u32 | (0x01u32 << 16)) as isize);
+            let key_up = LPARAM((1u32 | (0x01u32 << 16) | (1u32 << 30) | (1u32 << 31)) as isize);
+            let _ = unsafe {
+                PostMessageW(Some(self.editor_window), WM_KEYDOWN, WPARAM(0x1b), key_down)
+            };
+            let _ =
+                unsafe { PostMessageW(Some(self.editor_window), WM_KEYUP, WPARAM(0x1b), key_up) };
+        }
+    }
+
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .map_err(|error| format!("Windows accessibility COM initialization failed: {error}"))?;
+    let _guard = ComGuard;
+    let hwnd = HWND(window_handle as _);
+    let mut actual_process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut actual_process_id)) };
+    if thread_id == 0 || actual_process_id == 0 {
+        return Err("bound Windows accessibility HWND is no longer available".to_string());
+    }
+    if actual_process_id != expected_process_id {
+        return Err(
+            "bound Windows accessibility HWND no longer belongs to the expected process"
+                .to_string(),
+        );
+    }
+    let mut class_buffer = [0u16; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class_buffer) }.max(0) as usize;
+    let window_class = String::from_utf16_lossy(&class_buffer[..class_len]);
+    let profile = match action {
+        ComputerControlAction::SelectAccessibilityTarget
+            if window_class.eq_ignore_ascii_case("CabinetWClass")
+                || window_class.eq_ignore_ascii_case("ExploreWClass") =>
+        {
+            WindowsBoundAccessibilityProfile::FileExplorer
+        }
+        ComputerControlAction::SetAccessibilityValue { .. }
+            if window_class.eq_ignore_ascii_case("XLMAIN") =>
+        {
+            WindowsBoundAccessibilityProfile::Excel
+        }
+        ComputerControlAction::SelectAccessibilityTarget => {
+            return Err(
+                "bound accessibility selection requires the exact File Explorer HWND".to_string(),
+            );
+        }
+        ComputerControlAction::SetAccessibilityValue { .. } => {
+            return Err(
+                "bound accessibility value action requires the exact Excel HWND".to_string(),
+            );
+        }
+        _ => {
+            return Err(
+                "bound Windows computer control accepts only semantic File Explorer or Excel actions"
+                    .to_string(),
+            );
+        }
+    };
+
+    let automation: IUIAutomation = unsafe {
+        CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+            .map_err(|error| format!("Windows UI Automation client creation failed: {error}"))?
+    };
+    let root = unsafe {
+        automation.ElementFromHandle(hwnd).map_err(|error| {
+            format!("Windows UI Automation could not inspect the exact bound window: {error}")
+        })?
+    };
+    let walker = unsafe {
+        automation
+            .ControlViewWalker()
+            .map_err(|error| format!("Windows UI Automation control walker failed: {error}"))?
+    };
+    let find_target = |root: &IUIAutomationElement,
+                       walker: &IUIAutomationTreeWalker,
+                       require_selected: bool|
+     -> Option<IUIAutomationElement> {
+        let mut pending = Vec::new();
+        if let Ok(child) = unsafe { walker.GetFirstChildElement(root) } {
+            pending.push(child);
+        }
+        let mut visited = 0usize;
+        while let Some(element) = pending.pop() {
+            visited += 1;
+            let max_visited = if matches!(expected_target, WindowsBoundComputerControlTarget::Any) {
+                4_096
+            } else {
+                1_024
+            };
+            if visited > max_visited {
+                return None;
+            }
+            let process_matches = unsafe { element.CurrentProcessId() }
+                .map(|process_id| process_id == expected_process_id as i32)
+                .unwrap_or(false);
+            if process_matches {
+                let is_selected = unsafe {
+                    element
+                        .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                            UIA_SelectionItemPatternId,
+                        )
+                        .ok()
+                        .and_then(|pattern| pattern.CurrentIsSelected().ok())
+                        .map(|selected| selected.as_bool())
+                        .unwrap_or(false)
+                };
+                let exact_target_kind = match profile {
+                    WindowsBoundAccessibilityProfile::FileExplorer => unsafe {
+                        element
+                            .CurrentControlType()
+                            .map(|control_type| control_type == UIA_ListItemControlTypeId)
+                            .unwrap_or(false)
+                            && match expected_target {
+                                WindowsBoundComputerControlTarget::FileExplorer { target_name } => {
+                                    element
+                                        .CurrentName()
+                                        .map(|name| name == target_name.as_str())
+                                        .unwrap_or(false)
+                                }
+                                WindowsBoundComputerControlTarget::Any => true,
+                                WindowsBoundComputerControlTarget::Excel { .. } => false,
+                            }
+                    },
+                    WindowsBoundAccessibilityProfile::Excel => unsafe {
+                        let is_data_item = element
+                            .CurrentControlType()
+                            .map(|control_type| control_type == UIA_DataItemControlTypeId)
+                            .unwrap_or(false);
+                        let supports_value = element
+                            .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                            .is_ok()
+                            || element
+                                .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+                                    UIA_LegacyIAccessiblePatternId,
+                                )
+                                .is_ok();
+                        let exact_excel_target = match expected_target {
+                            WindowsBoundComputerControlTarget::Excel {
+                                worksheet_automation_id,
+                                cell_automation_id,
+                                row,
+                                column,
+                            } => {
+                                let address_matches = element
+                                    .CurrentAutomationId()
+                                    .map(|value| value == cell_automation_id.as_str())
+                                    .unwrap_or(false);
+                                let grid_matches = element
+                                    .GetCurrentPatternAs::<IUIAutomationGridItemPattern>(
+                                        UIA_GridItemPatternId,
+                                    )
+                                    .ok()
+                                    .is_some_and(|grid| {
+                                        grid.CurrentRow().ok() == Some(*row)
+                                            && grid.CurrentColumn().ok() == Some(*column)
+                                    });
+                                let worksheet_matches = element
+                                    .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                                        UIA_SelectionItemPatternId,
+                                    )
+                                    .ok()
+                                    .and_then(|selection| {
+                                        selection.CurrentSelectionContainer().ok()
+                                    })
+                                    .and_then(|container| container.CurrentAutomationId().ok())
+                                    .map(|value| value == worksheet_automation_id.as_str())
+                                    .unwrap_or(false);
+                                address_matches && grid_matches && worksheet_matches
+                            }
+                            WindowsBoundComputerControlTarget::Any => true,
+                            WindowsBoundComputerControlTarget::FileExplorer { .. } => false,
+                        };
+                        is_data_item && supports_value && exact_excel_target
+                    },
+                };
+                if (!require_selected || is_selected) && exact_target_kind {
+                    return Some(element);
+                }
+                if let Ok(child) = unsafe { walker.GetFirstChildElement(&element) } {
+                    pending.push(child);
+                }
+            }
+            if let Ok(sibling) = unsafe { walker.GetNextSiblingElement(&element) } {
+                pending.push(sibling);
+            }
+        }
+        None
+    };
+    let target = find_target(&root, &walker, true).ok_or_else(|| {
+        "Windows UI Automation found no selected target in the exact bound window".to_string()
+    })?;
+    let target_process_id = unsafe { target.CurrentProcessId() }
+        .map_err(|error| format!("Windows UI Automation target process is unavailable: {error}"))?;
+    if target_process_id <= 0 || target_process_id as u32 != expected_process_id {
+        return Err(
+            "Windows UI Automation target does not belong to the exact bound process".to_string(),
+        );
+    }
+
+    match action {
+        ComputerControlAction::SelectAccessibilityTarget => {
+            let pattern = unsafe {
+                target
+                    .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                        UIA_SelectionItemPatternId,
+                    )
+                    .map_err(|error| {
+                        format!("bound File Explorer target does not support selection: {error}")
+                    })?
+            };
+            unsafe { pattern.Select() }
+                .map_err(|error| format!("bound File Explorer selection failed: {error}"))
+        }
+        ComputerControlAction::SetAccessibilityValue { value } => {
+            if profile == WindowsBoundAccessibilityProfile::Excel {
+                let excel_action_started = std::time::Instant::now();
+                let excel_phase = |phase: &str, attempt: Option<usize>| {
+                    eprintln!(
+                        "C5B bound Excel action phase={phase} attempt={} elapsed_ms={}",
+                        attempt
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        excel_action_started.elapsed().as_millis(),
+                    );
+                };
+                excel_phase("validate-exact-target", None);
+                let (
+                    expected_worksheet_automation_id,
+                    expected_cell_automation_id,
+                    expected_row,
+                    expected_column,
+                ) =
+                    match expected_target {
+                        WindowsBoundComputerControlTarget::Excel {
+                            worksheet_automation_id,
+                            cell_automation_id,
+                            row,
+                            column,
+                        } => (worksheet_automation_id, cell_automation_id, *row, *column),
+                        _ => return Err(
+                            "bound Excel value action requires an exact worksheet and cell target"
+                                .to_string(),
+                        ),
+                    };
+                if excel_grid_automation_id(expected_row, expected_column)?
+                    != *expected_cell_automation_id
+                {
+                    return Err(
+                        "bound Excel cell automation id disagrees with its exact grid identity"
+                            .to_string(),
+                    );
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(
+                        "bound Excel exact cell value contains unsupported control characters"
+                            .to_string(),
+                    );
+                }
+
+                excel_phase("set-target-focus-start", None);
+                unsafe { target.SetFocus() }
+                    .map_err(|error| format!("bound Excel target focus failed: {error}"))?;
+                excel_phase("set-target-focus-complete", None);
+                let invoke = unsafe {
+                    target
+                        .GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
+                        .map_err(|error| {
+                            format!("bound Excel target does not support semantic editing: {error}")
+                        })?
+                };
+                excel_phase("invoke-cell-edit-start", None);
+                unsafe { invoke.Invoke() }
+                    .map_err(|error| format!("bound Excel semantic edit failed: {error}"))?;
+                excel_phase("invoke-cell-edit-complete", None);
+                std::thread::sleep(Duration::from_millis(350));
+
+                excel_phase("discover-cell-edit-start", None);
+                let mut editor = None;
+                let mut pending = Vec::new();
+                if let Ok(child) = unsafe { walker.GetFirstChildElement(&root) } {
+                    pending.push(child);
+                }
+                let mut visited = 0usize;
+                while let Some(element) = pending.pop() {
+                    visited += 1;
+                    if visited > 1_024 {
+                        break;
+                    }
+                    let exact_editor = unsafe {
+                        element
+                            .CurrentProcessId()
+                            .map(|process_id| process_id == expected_process_id as i32)
+                            .unwrap_or(false)
+                            && element
+                                .CurrentControlType()
+                                .map(|control_type| control_type == UIA_EditControlTypeId)
+                                .unwrap_or(false)
+                            && element
+                                .CurrentAutomationId()
+                                .map(|automation_id| automation_id == "CellEdit")
+                                .unwrap_or(false)
+                            && element
+                                .CurrentHasKeyboardFocus()
+                                .map(|focused| focused.as_bool())
+                                .unwrap_or(false)
+                            && element
+                                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                                .is_ok()
+                    };
+                    if exact_editor {
+                        if editor.is_some() {
+                            return Err("bound Excel exposed multiple focused exact cell editors"
+                                .to_string());
+                        }
+                        editor = Some(element.clone());
+                    }
+                    if let Ok(child) = unsafe { walker.GetFirstChildElement(&element) } {
+                        pending.push(child);
+                    }
+                    if let Ok(sibling) = unsafe { walker.GetNextSiblingElement(&element) } {
+                        pending.push(sibling);
+                    }
+                }
+                let editor = editor.ok_or_else(|| {
+                    "bound Excel did not expose one focused exact CellEdit through UI Automation"
+                        .to_string()
+                })?;
+                excel_phase("discover-cell-edit-complete", None);
+                excel_phase("get-editor-text-pattern-start", None);
+                let editor_text = unsafe {
+                    editor
+                        .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                        .map_err(|error| {
+                            format!("bound Excel exact CellEdit lost TextPattern: {error}")
+                        })?
+                };
+                excel_phase("get-editor-text-pattern-complete", None);
+                excel_phase("get-editor-document-range-start", None);
+                let editor_range = unsafe { editor_text.DocumentRange() }.map_err(|error| {
+                    format!("bound Excel exact CellEdit document range failed: {error}")
+                })?;
+                excel_phase("get-editor-document-range-complete", None);
+                excel_phase("select-editor-document-range-start", None);
+                unsafe { editor_range.Select() }.map_err(|error| {
+                    format!("bound Excel exact CellEdit selection failed: {error}")
+                })?;
+                excel_phase("select-editor-document-range-complete", None);
+
+                excel_phase("validate-native-editor-start", None);
+                let mut gui = GUITHREADINFO {
+                    cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                    ..Default::default()
+                };
+                unsafe { GetGUIThreadInfo(thread_id, &mut gui) }.map_err(|error| {
+                    format!("bound Excel editor thread identity is unavailable: {error}")
+                })?;
+                let editor_window = gui.hwndFocus;
+                let mut editor_process_id = 0u32;
+                let editor_thread_id = unsafe {
+                    GetWindowThreadProcessId(editor_window, Some(&mut editor_process_id))
+                };
+                let editor_is_exact_or_child =
+                    editor_window == hwnd || unsafe { IsChild(hwnd, editor_window).as_bool() };
+                let mut editor_class_buffer = [0u16; 64];
+                let editor_class_len =
+                    unsafe { GetClassNameW(editor_window, &mut editor_class_buffer) }.max(0)
+                        as usize;
+                let editor_window_class =
+                    String::from_utf16_lossy(&editor_class_buffer[..editor_class_len]);
+                require_bound_excel_editor_identity(
+                    window_handle,
+                    expected_process_id,
+                    thread_id,
+                    editor_window.0 as isize,
+                    editor_process_id,
+                    editor_thread_id,
+                    editor_is_exact_or_child,
+                    &editor_window_class,
+                )?;
+                excel_phase("validate-native-editor-complete", None);
+                let mut cancel_guard = ExcelEditCancelGuard {
+                    editor_window,
+                    active: true,
+                };
+
+                excel_phase("post-cell-characters-start", None);
+                for unit in value.encode_utf16() {
+                    unsafe {
+                        PostMessageW(
+                            Some(editor_window),
+                            WM_CHAR,
+                            WPARAM(unit as usize),
+                            LPARAM(1),
+                        )
+                    }
+                    .map_err(|error| {
+                        format!("bound Excel exact CellEdit character input failed: {error}")
+                    })?;
+                }
+                excel_phase("post-cell-characters-complete", None);
+                let mut semantic_converged = false;
+                let mut last_observed_chars = None;
+                let mut last_read_error = None;
+                for attempt in 1..=20 {
+                    excel_phase("semantic-convergence-sleep", Some(attempt));
+                    std::thread::sleep(Duration::from_millis(100));
+
+                    excel_phase("semantic-convergence-main-identity-start", Some(attempt));
+                    let mut current_process_id = 0u32;
+                    let current_thread_id =
+                        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut current_process_id)) };
+                    if current_thread_id != thread_id || current_process_id != expected_process_id {
+                        return Err(
+                            "bound Excel HWND identity changed during exact CellEdit semantic convergence"
+                                .to_string(),
+                        );
+                    }
+                    excel_phase("semantic-convergence-main-identity-complete", Some(attempt));
+                    excel_phase("semantic-convergence-editor-identity-start", Some(attempt));
+                    let mut current_editor_process_id = 0u32;
+                    let current_editor_thread_id = unsafe {
+                        GetWindowThreadProcessId(
+                            editor_window,
+                            Some(&mut current_editor_process_id),
+                        )
+                    };
+                    if current_editor_thread_id != thread_id
+                        || current_editor_process_id != expected_process_id
+                    {
+                        return Err(
+                            "bound Excel editor identity changed during semantic convergence"
+                                .to_string(),
+                        );
+                    }
+                    excel_phase(
+                        "semantic-convergence-editor-identity-complete",
+                        Some(attempt),
+                    );
+                    excel_phase("semantic-convergence-native-focus-start", Some(attempt));
+                    let mut current_gui = GUITHREADINFO {
+                        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                        ..Default::default()
+                    };
+                    unsafe { GetGUIThreadInfo(thread_id, &mut current_gui) }.map_err(|error| {
+                        format!(
+                            "bound Excel editor focus is unavailable during semantic convergence: {error}"
+                        )
+                    })?;
+                    if current_gui.hwndFocus != editor_window {
+                        return Err(
+                            "bound Excel editor focus changed before semantic convergence"
+                                .to_string(),
+                        );
+                    }
+                    excel_phase("semantic-convergence-native-focus-complete", Some(attempt));
+                    excel_phase("semantic-convergence-uia-focus-start", Some(attempt));
+                    let editor_has_focus = unsafe { editor.CurrentHasKeyboardFocus() }
+                        .map(|focused| focused.as_bool())
+                        .unwrap_or(false);
+                    excel_phase("semantic-convergence-uia-focus-complete", Some(attempt));
+                    if !editor_has_focus {
+                        return Err(
+                            "bound Excel exact CellEdit lost UI Automation focus before semantic convergence"
+                                .to_string(),
+                        );
+                    }
+
+                    excel_phase("semantic-convergence-document-range-start", Some(attempt));
+                    let current_range = unsafe { editor_text.DocumentRange() };
+                    excel_phase(
+                        "semantic-convergence-document-range-complete",
+                        Some(attempt),
+                    );
+                    let observed_text = match current_range {
+                        Ok(range) => {
+                            excel_phase("semantic-convergence-get-text-start", Some(attempt));
+                            let result = unsafe { range.GetText(-1) };
+                            excel_phase("semantic-convergence-get-text-complete", Some(attempt));
+                            result
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match observed_text {
+                        Ok(observed) => {
+                            let observed = observed.to_string();
+                            last_observed_chars = Some(observed.chars().count());
+                            last_read_error = None;
+                            if observed == *value {
+                                semantic_converged = true;
+                                excel_phase("semantic-convergence-exact", Some(attempt));
+                                break;
+                            }
+                            excel_phase("semantic-convergence-mismatch", Some(attempt));
+                        }
+                        Err(error) => {
+                            last_read_error = Some(error.to_string());
+                            excel_phase("semantic-convergence-read-error", Some(attempt));
+                        }
+                    }
+                }
+                if !semantic_converged {
+                    return Err(format!(
+                        "bound Excel exact CellEdit semantic readback did not converge within 2 seconds (expected_chars={}, observed_chars={}, read_error={})",
+                        value.chars().count(),
+                        last_observed_chars
+                            .map(|count| count.to_string())
+                            .unwrap_or_else(|| "unavailable".to_string()),
+                        last_read_error.as_deref().unwrap_or("none"),
+                    ));
+                }
+
+                excel_phase("commit-cell-edit-start", None);
+                let enter_down = LPARAM((1u32 | (0x1cu32 << 16)) as isize);
+                let enter_up =
+                    LPARAM((1u32 | (0x1cu32 << 16) | (1u32 << 30) | (1u32 << 31)) as isize);
+                unsafe { PostMessageW(Some(editor_window), WM_KEYDOWN, WPARAM(0x0d), enter_down) }
+                    .map_err(|error| {
+                        format!("bound Excel exact CellEdit commit keydown failed: {error}")
+                    })?;
+                unsafe { PostMessageW(Some(editor_window), WM_KEYUP, WPARAM(0x0d), enter_up) }
+                    .map_err(|error| {
+                        format!("bound Excel exact CellEdit commit keyup failed: {error}")
+                    })?;
+                cancel_guard.active = false;
+                excel_phase("commit-cell-edit-complete", None);
+                std::thread::sleep(Duration::from_millis(350));
+
+                excel_phase("revalidate-post-commit-hwnd-start", None);
+                let mut post_process_id = 0u32;
+                let post_thread_id =
+                    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut post_process_id)) };
+                if post_thread_id != thread_id || post_process_id != expected_process_id {
+                    return Err(
+                        "bound Excel HWND identity changed after the exact cell commit".to_string(),
+                    );
+                }
+                excel_phase("revalidate-post-commit-hwnd-complete", None);
+                excel_phase("reobserve-post-commit-cell-start", None);
+                let post_root = unsafe {
+                    automation.ElementFromHandle(hwnd).map_err(|error| {
+                        format!(
+                            "Windows UI Automation could not re-observe the exact Excel window after commit: {error}"
+                        )
+                    })?
+                };
+                let _post_target = find_target(&post_root, &walker, false).ok_or_else(|| {
+                    "bound Excel could not re-observe the exact worksheet and cell after commit"
+                        .to_string()
+                })?;
+                excel_phase("reobserve-post-commit-cell-complete", None);
+
+                excel_phase("observe-post-commit-selection-start", None);
+                let mut selected_cell = None;
+                let mut pending = Vec::new();
+                if let Ok(child) = unsafe { walker.GetFirstChildElement(&post_root) } {
+                    pending.push(child);
+                }
+                let mut visited = 0usize;
+                while let Some(element) = pending.pop() {
+                    visited += 1;
+                    if visited > 1_024 {
+                        return Err(
+                            "bound Excel post-commit selection traversal exceeded its exact bound"
+                                .to_string(),
+                        );
+                    }
+                    let process_matches = unsafe { element.CurrentProcessId() }
+                        .map(|process_id| process_id == expected_process_id as i32)
+                        .unwrap_or(false);
+                    let is_data_item = unsafe { element.CurrentControlType() }
+                        .map(|control_type| control_type == UIA_DataItemControlTypeId)
+                        .unwrap_or(false);
+                    if process_matches && is_data_item {
+                        if let Ok(selection) = unsafe {
+                            element.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                                UIA_SelectionItemPatternId,
+                            )
+                        } {
+                            let is_selected = unsafe { selection.CurrentIsSelected() }
+                                .map(|selected| selected.as_bool())
+                                .unwrap_or(false);
+                            if is_selected {
+                                let grid = unsafe {
+                                    element
+                                        .GetCurrentPatternAs::<IUIAutomationGridItemPattern>(
+                                            UIA_GridItemPatternId,
+                                        )
+                                        .map_err(|error| {
+                                            format!(
+                                                "bound Excel selected post-commit cell lost its grid identity: {error}"
+                                            )
+                                        })?
+                                };
+                                let worksheet_automation_id = unsafe {
+                                    selection
+                                        .CurrentSelectionContainer()
+                                        .and_then(|container| container.CurrentAutomationId())
+                                        .map_err(|error| {
+                                            format!(
+                                                "bound Excel selected post-commit cell lost its worksheet identity: {error}"
+                                            )
+                                        })?
+                                        .to_string()
+                                };
+                                let automation_id = unsafe { element.CurrentAutomationId() }
+                                    .map_err(|error| {
+                                        format!(
+                                            "bound Excel selected post-commit cell lost its address: {error}"
+                                        )
+                                    })?
+                                    .to_string();
+                                let row = unsafe { grid.CurrentRow() }.map_err(|error| {
+                                    format!(
+                                        "bound Excel selected post-commit cell lost its row: {error}"
+                                    )
+                                })?;
+                                let column =
+                                    unsafe { grid.CurrentColumn() }.map_err(|error| {
+                                        format!(
+                                            "bound Excel selected post-commit cell lost its column: {error}"
+                                        )
+                                    })?;
+                                if selected_cell.is_some() {
+                                    return Err(
+                                        "bound Excel exposed multiple selected post-commit cells"
+                                            .to_string(),
+                                    );
+                                }
+                                selected_cell =
+                                    Some((automation_id, worksheet_automation_id, row, column));
+                            }
+                        }
+                    }
+                    if process_matches {
+                        if let Ok(child) = unsafe { walker.GetFirstChildElement(&element) } {
+                            pending.push(child);
+                        }
+                    }
+                    if let Ok(sibling) = unsafe { walker.GetNextSiblingElement(&element) } {
+                        pending.push(sibling);
+                    }
+                }
+                let (
+                    selected_automation_id,
+                    selected_worksheet_automation_id,
+                    selected_row,
+                    selected_column,
+                ) = selected_cell.ok_or_else(|| {
+                    "bound Excel exposed no selected post-commit cell".to_string()
+                })?;
+                excel_phase("observe-post-commit-selection-complete", None);
+
+                let target_is_selected = selected_automation_id == *expected_cell_automation_id
+                    && selected_worksheet_automation_id == *expected_worksheet_automation_id
+                    && selected_row == expected_row
+                    && selected_column == expected_column;
+                if !target_is_selected {
+                    let next_row = expected_row.checked_add(1).ok_or_else(|| {
+                        "bound Excel post-commit row identity overflowed".to_string()
+                    })?;
+                    let expected_next_automation_id =
+                        excel_grid_automation_id(next_row, expected_column)?;
+                    if selected_automation_id != expected_next_automation_id
+                        || selected_worksheet_automation_id != *expected_worksheet_automation_id
+                        || selected_row != next_row
+                        || selected_column != expected_column
+                    {
+                        return Err(
+                            "bound Excel post-commit selection changed to an unexpected workbook cell"
+                                .to_string(),
+                        );
+                    }
+
+                    excel_phase("validate-post-commit-grid-start", None);
+                    let mut grid_gui = GUITHREADINFO {
+                        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                        ..Default::default()
+                    };
+                    unsafe { GetGUIThreadInfo(thread_id, &mut grid_gui) }.map_err(|error| {
+                        format!("bound Excel post-commit grid focus is unavailable: {error}")
+                    })?;
+                    let grid_window = grid_gui.hwndFocus;
+                    let mut grid_process_id = 0u32;
+                    let grid_thread_id = unsafe {
+                        GetWindowThreadProcessId(grid_window, Some(&mut grid_process_id))
+                    };
+                    let grid_is_exact_or_child =
+                        grid_window == hwnd || unsafe { IsChild(hwnd, grid_window).as_bool() };
+                    let mut grid_class_buffer = [0u16; 64];
+                    let grid_class_len =
+                        unsafe { GetClassNameW(grid_window, &mut grid_class_buffer) }.max(0)
+                            as usize;
+                    let grid_window_class =
+                        String::from_utf16_lossy(&grid_class_buffer[..grid_class_len]);
+                    require_bound_excel_grid_identity(
+                        window_handle,
+                        expected_process_id,
+                        thread_id,
+                        grid_window.0 as isize,
+                        grid_process_id,
+                        grid_thread_id,
+                        grid_is_exact_or_child,
+                        &grid_window_class,
+                    )?;
+                    excel_phase("validate-post-commit-grid-complete", None);
+
+                    excel_phase("restore-target-selection-start", None);
+                    let up_down = LPARAM((1u32 | (0x48u32 << 16)) as isize);
+                    let up_up =
+                        LPARAM((1u32 | (0x48u32 << 16) | (1u32 << 30) | (1u32 << 31)) as isize);
+                    unsafe { PostMessageW(Some(grid_window), WM_KEYDOWN, WPARAM(0x26), up_down) }
+                        .map_err(|error| {
+                        format!("bound Excel exact grid Up keydown failed: {error}")
+                    })?;
+                    unsafe { PostMessageW(Some(grid_window), WM_KEYUP, WPARAM(0x26), up_up) }
+                        .map_err(|error| {
+                            format!("bound Excel exact grid Up keyup failed: {error}")
+                        })?;
+                    excel_phase("restore-target-selection-complete", None);
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+
+                excel_phase("verify-post-commit-target-selection-start", None);
+                let final_root = unsafe {
+                    automation.ElementFromHandle(hwnd).map_err(|error| {
+                        format!(
+                            "Windows UI Automation could not verify the exact Excel target selection after commit: {error}"
+                        )
+                    })?
+                };
+                find_target(&final_root, &walker, true).ok_or_else(|| {
+                    "bound Excel could not verify the exact worksheet and cell selection after commit"
+                        .to_string()
+                })?;
+                excel_phase("verify-post-commit-target-selection-complete", None);
+
+                excel_phase("final-hwnd-identity-start", None);
+                let mut final_process_id = 0u32;
+                let final_thread_id =
+                    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut final_process_id)) };
+                if final_thread_id != thread_id || final_process_id != expected_process_id {
+                    return Err(
+                        "bound Excel HWND identity changed after exact target selection restoration"
+                            .to_string(),
+                    );
+                }
+                excel_phase("final-hwnd-identity-complete", None);
+                return Ok(());
+            }
+            let value = BSTR::from(value.as_str());
+            if let Ok(pattern) = unsafe {
+                target.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+            } {
+                return unsafe { pattern.SetValue(&value) }
+                    .map_err(|error| format!("bound Excel value action failed: {error}"));
+            }
+            let pattern = unsafe {
+                target
+                    .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+                        UIA_LegacyIAccessiblePatternId,
+                    )
+                    .map_err(|error| {
+                        format!("bound Excel target does not support an exact value: {error}")
+                    })?
+            };
+            unsafe { pattern.SetValue(&value) }
+                .map_err(|error| format!("bound Excel legacy value action failed: {error}"))
+        }
+        _ => Err("bound Windows semantic action changed unexpectedly".to_string()),
     }
 }
 
@@ -3288,7 +4848,7 @@ pub fn parse_computer_control_action(value: &str) -> Result<ComputerControlActio
     let trimmed = value.trim();
     let Some((verb, payload)) = trimmed.split_once(':') else {
         return Err(
-            "structured computer control action is required: use click:x,y[,button], move:x,y, type:text, press:key, hotkey:key+key, or scroll:delta[,axis]"
+            "structured computer control action is required: use click:x,y[,button], move:x,y, type:text, set_value:text, select:focused, press:key, hotkey:key+key, or scroll:delta[,axis]"
                 .to_string(),
         );
     };
@@ -3335,6 +4895,21 @@ pub fn parse_computer_control_action(value: &str) -> Result<ComputerControlActio
                 text: payload.to_string(),
             })
         }
+        "set_value" => {
+            if payload.contains('\0') {
+                return Err("accessibility value action cannot contain null bytes".to_string());
+            }
+            if payload.chars().count() > 2_000 {
+                return Err("accessibility value action exceeds 2000 characters".to_string());
+            }
+            Ok(ComputerControlAction::SetAccessibilityValue {
+                value: payload.to_string(),
+            })
+        }
+        "select" if payload.eq_ignore_ascii_case("focused") => {
+            Ok(ComputerControlAction::SelectAccessibilityTarget)
+        }
+        "select" => Err("select action must be select:focused".to_string()),
         "press" => Ok(ComputerControlAction::PressKey {
             key: normalize_control_key(payload)?,
         }),
@@ -3369,7 +4944,7 @@ pub fn parse_computer_control_action(value: &str) -> Result<ComputerControlActio
             })
         }
         _ => Err(format!(
-            "unsupported computer control action '{verb}': use click, move, type, press, hotkey, or scroll"
+            "unsupported computer control action '{verb}': use click, move, type, set_value, select, press, hotkey, or scroll"
         )),
     }
 }
@@ -3381,6 +4956,8 @@ pub fn computer_control_action_contract_string(action: &ComputerControlAction) -
         }
         ComputerControlAction::Move { x, y } => format!("move:{x},{y}"),
         ComputerControlAction::TypeText { text } => format!("type:{text}"),
+        ComputerControlAction::SetAccessibilityValue { value } => format!("set_value:{value}"),
+        ComputerControlAction::SelectAccessibilityTarget => "select:focused".to_string(),
         ComputerControlAction::PressKey { key } => format!("press:{key}"),
         ComputerControlAction::Hotkey { keys } => format!("hotkey:{}", keys.join("+")),
         ComputerControlAction::Scroll { delta, axis } => {
@@ -4253,24 +5830,32 @@ mod tests {
     use base64::{engine::general_purpose, Engine as _};
     use chrono::{TimeZone, Utc};
 
+    #[cfg(windows)]
     use crate::kernel::capability::{
-        parse_computer_control_action, run_browser_browse, run_browser_submit_boundary,
-        run_computer_control_boundary, run_computer_screenshot, run_drive_read_boundary,
-        run_drive_write_boundary, run_email_draft_boundary, run_email_read_boundary,
-        run_email_send_boundary, run_evidence_folder_ingest, run_file_read,
-        run_file_write_boundary, run_filesystem_mutation_boundary, run_network_search_boundary,
-        run_terminal_read, run_terminal_write_boundary, BrowserBrowseRequest, BrowserPage,
-        BrowserPageClient, BrowserSubmitRequest, CapabilityInvocation, CapabilityInvocationStatus,
-        CapturedScreenshotImage, CodexBridgeComputerControlClient,
-        CodexBridgeComputerScreenshotClient, CodexBridgeNetworkSearchClient, ComputerControlAction,
-        ComputerControlClient, ComputerControlExecution, ComputerControlMouseButton,
-        ComputerControlRequest, ComputerScreenshot, ComputerScreenshotClient,
-        ComputerScreenshotRequest, DriveFolderEntry, DriveReadRequest, DriveWriteExportFile,
-        DriveWriteRequest, EmailDraftRequest, EmailReadRequest, EmailSendRequest,
-        EvidenceFolderClient, EvidenceFolderFile, EvidenceFolderRequest, FileContent,
-        FileContentClient, FileReadRequest, FileSystemMutationClient, FileSystemMutationOperation,
-        FileSystemMutationRequest, FileSystemMutationResult, FileWriteRequest, FileWriteResult,
-        HttpBrowserPageClient, LocalComputerControlClient, LocalComputerControlInputBackend,
+        bound_windows_accessibility_action_timeout, excel_grid_automation_id,
+        require_bound_excel_editor_identity, require_bound_excel_grid_identity,
+        require_bound_windows_process_identity, WindowsBoundComputerControlTarget,
+        WindowsBoundComputerScreenshotClient,
+    };
+    use crate::kernel::capability::{
+        computer_control_action_contract_string, parse_computer_control_action, run_browser_browse,
+        run_browser_submit_boundary, run_computer_control_boundary, run_computer_screenshot,
+        run_drive_read_boundary, run_drive_write_boundary, run_email_draft_boundary,
+        run_email_read_boundary, run_email_send_boundary, run_evidence_folder_ingest,
+        run_file_read, run_file_write_boundary, run_filesystem_mutation_boundary,
+        run_network_search_boundary, run_terminal_read, run_terminal_write_boundary,
+        BrowserBrowseRequest, BrowserPage, BrowserPageClient, BrowserSubmitRequest,
+        CapabilityInvocation, CapabilityInvocationStatus, CapturedScreenshotImage,
+        CodexBridgeComputerControlClient, CodexBridgeComputerScreenshotClient,
+        CodexBridgeNetworkSearchClient, ComputerControlAction, ComputerControlClient,
+        ComputerControlExecution, ComputerControlMouseButton, ComputerControlRequest,
+        ComputerScreenshot, ComputerScreenshotClient, ComputerScreenshotRequest, DriveFolderEntry,
+        DriveReadRequest, DriveWriteExportFile, DriveWriteRequest, EmailDraftRequest,
+        EmailReadRequest, EmailSendRequest, EvidenceFolderClient, EvidenceFolderFile,
+        EvidenceFolderRequest, FileContent, FileContentClient, FileReadRequest,
+        FileSystemMutationClient, FileSystemMutationOperation, FileSystemMutationRequest,
+        FileSystemMutationResult, FileWriteRequest, FileWriteResult, HttpBrowserPageClient,
+        LocalComputerControlClient, LocalComputerControlInputBackend,
         LocalComputerScreenshotClient, LocalDriveFolderClient, LocalFileSystemMutationClient,
         LocalScreenshotCaptureBackend, LocalWorkspaceFileWriteClient, NetworkSearchClient,
         NetworkSearchRequest, NetworkSearchResult, NetworkSearchResultItem, TerminalCommandOutput,
@@ -4699,6 +6284,17 @@ mod tests {
 
         fn type_text(&mut self, text: &str) -> Result<(), String> {
             self.operations.push(format!("type:{text}"));
+            Ok(())
+        }
+
+        fn set_accessibility_value(&mut self, value: &str) -> Result<(), String> {
+            self.operations
+                .push(format!("set_value:{} chars", value.chars().count()));
+            Ok(())
+        }
+
+        fn select_accessibility_target(&mut self) -> Result<(), String> {
+            self.operations.push("select:focused".to_string());
             Ok(())
         }
 
@@ -5517,6 +7113,65 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn bound_windows_screenshot_rejects_invalid_hwnd_and_process_identity() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        assert!(
+            WindowsBoundComputerScreenshotClient::new(temp_dir.path().to_path_buf(), 0, 1,)
+                .is_err()
+        );
+        assert!(
+            WindowsBoundComputerScreenshotClient::new(temp_dir.path().to_path_buf(), 1, 0,)
+                .is_err()
+        );
+        assert!(require_bound_windows_process_identity(41, 42).is_err());
+
+        let client = WindowsBoundComputerScreenshotClient::new(temp_dir.path().to_path_buf(), 1, 1)
+            .expect("nonzero identity binds provisionally");
+        assert!(client.capture_screenshot().is_err());
+        assert!(!temp_dir.path().join("computer-screenshots").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bound_excel_editor_identity_rejects_wrong_handle_process_thread_and_class() {
+        assert!(
+            require_bound_excel_editor_identity(100, 41, 7, 200, 41, 7, true, "EXCEL6").is_ok()
+        );
+        assert!(require_bound_excel_editor_identity(0, 41, 7, 200, 41, 7, true, "EXCEL6").is_err());
+        assert!(require_bound_excel_editor_identity(100, 41, 7, 0, 41, 7, true, "EXCEL6").is_err());
+        assert!(
+            require_bound_excel_editor_identity(100, 41, 7, 200, 42, 7, true, "EXCEL6").is_err()
+        );
+        assert!(
+            require_bound_excel_editor_identity(100, 41, 7, 200, 41, 8, true, "EXCEL6").is_err()
+        );
+        assert!(
+            require_bound_excel_editor_identity(100, 41, 7, 200, 41, 7, false, "EXCEL6").is_err()
+        );
+        assert!(
+            require_bound_excel_editor_identity(100, 41, 7, 200, 41, 7, true, "EXCEL7").is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bound_excel_grid_identity_and_one_based_address_fail_closed() {
+        assert_eq!(excel_grid_automation_id(3, 2).unwrap(), "B3");
+        assert_eq!(excel_grid_automation_id(10, 27).unwrap(), "AA10");
+        assert!(excel_grid_automation_id(0, 2).is_err());
+        assert!(excel_grid_automation_id(3, 0).is_err());
+
+        assert!(require_bound_excel_grid_identity(100, 41, 7, 200, 41, 7, true, "EXCEL7").is_ok());
+        assert!(require_bound_excel_grid_identity(100, 41, 7, 200, 42, 7, true, "EXCEL7").is_err());
+        assert!(require_bound_excel_grid_identity(100, 41, 7, 200, 41, 8, true, "EXCEL7").is_err());
+        assert!(
+            require_bound_excel_grid_identity(100, 41, 7, 200, 41, 7, false, "EXCEL7").is_err()
+        );
+        assert!(require_bound_excel_grid_identity(100, 41, 7, 200, 41, 7, true, "EXCEL6").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
     #[ignore = "requires a visible interactive Windows desktop"]
     fn windows_primary_display_capture_smoke_writes_real_png_evidence() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -5555,6 +7210,32 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn bound_excel_deadline_dominates_measured_path_without_widening_other_actions() {
+        assert_eq!(
+            bound_windows_accessibility_action_timeout(&WindowsBoundComputerControlTarget::Excel {
+                worksheet_automation_id: "C5B_Target".to_string(),
+                cell_automation_id: "B3".to_string(),
+                row: 3,
+                column: 2,
+            }),
+            Duration::from_secs(9),
+        );
+        assert_eq!(
+            bound_windows_accessibility_action_timeout(
+                &WindowsBoundComputerControlTarget::FileExplorer {
+                    target_name: "c5b-target.txt".to_string(),
+                }
+            ),
+            Duration::from_secs(6),
+        );
+        assert_eq!(
+            bound_windows_accessibility_action_timeout(&WindowsBoundComputerControlTarget::Any),
+            Duration::from_secs(6),
+        );
+    }
+
     #[test]
     fn computer_control_action_parser_accepts_click_and_hotkey_actions() {
         assert_eq!(
@@ -5571,6 +7252,37 @@ mod tests {
                 keys: vec!["ctrl".to_string(), "shift".to_string(), "p".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn computer_control_action_parser_accepts_bounded_accessibility_actions() {
+        assert_eq!(
+            parse_computer_control_action("set_value:DS Agent C5B")
+                .expect("accessibility value action parses"),
+            ComputerControlAction::SetAccessibilityValue {
+                value: "DS Agent C5B".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_computer_control_action("select:focused")
+                .expect("accessibility selection action parses"),
+            ComputerControlAction::SelectAccessibilityTarget
+        );
+        assert_eq!(
+            computer_control_action_contract_string(
+                &ComputerControlAction::SetAccessibilityValue {
+                    value: "DS Agent C5B".to_string(),
+                },
+            ),
+            "set_value:DS Agent C5B"
+        );
+        assert_eq!(
+            computer_control_action_contract_string(
+                &ComputerControlAction::SelectAccessibilityTarget,
+            ),
+            "select:focused"
+        );
+        assert!(parse_computer_control_action("select:other").is_err());
     }
 
     #[test]
@@ -5781,6 +7493,34 @@ mod tests {
                 "up:ctrl"
             ]
         );
+    }
+
+    #[test]
+    fn local_computer_control_client_routes_semantic_accessibility_actions_once() {
+        let client = LocalComputerControlClient::new();
+        let mut backend = FakeLocalControlInputBackend::default();
+
+        let value_execution = client
+            .execute_with_backend(
+                &ComputerControlAction::SetAccessibilityValue {
+                    value: "verified".to_string(),
+                },
+                &mut backend,
+            )
+            .expect("accessibility value action translates");
+        let select_execution = client
+            .execute_with_backend(
+                &ComputerControlAction::SelectAccessibilityTarget,
+                &mut backend,
+            )
+            .expect("accessibility selection action translates");
+
+        assert_eq!(
+            backend.operations,
+            vec!["set_value:8 chars", "select:focused"]
+        );
+        assert!(value_execution.summary.contains("8 chars"));
+        assert!(select_execution.summary.contains("select focused"));
     }
 
     #[test]

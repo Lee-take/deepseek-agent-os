@@ -16,6 +16,16 @@ assert.match(app, /"bind_durable_computer_use_action"/);
 assert.match(app, /"run_durable_computer_use_step"/);
 assert.match(app, /"take_over_durable_computer_use_step"/);
 assert.match(app, /"reobserve_durable_computer_use_session"/);
+assert.match(app, /function durableComputerUsePostcondition/);
+assert.match(app, /"set_value:DS Agent verified"/);
+assert.match(app, /expectedText: "selection:selected"/);
+assert.match(app, /postcondition: durableComputerUsePostcondition\(computerUseActionDraft\)/);
+assert.match(app, /isolated foreground Windows target/);
+assert.doesNotMatch(
+  app,
+  /Execute one verifiable action in an isolated Notepad-like app/,
+  "the reachable C5B surface must not remain falsely limited to Notepad",
+);
 assert.match(app, /computerUseStepPending \|\| !computerControlUnlockStatus\.unlocked/);
 assert.match(
   app,
