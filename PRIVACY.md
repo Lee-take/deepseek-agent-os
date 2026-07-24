@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Last updated: 2026-07-23
+Last updated: 2026-07-25
 
 This policy describes the current published DS Agent desktop application and
 public project. DS Agent is local-first and does not operate a project cloud
@@ -14,7 +14,7 @@ User-selected workspaces hold approved evidence, exports, reports, work
 packages, screenshots, and other artifacts. This information is not silently
 synced to a DS Agent-operated server.
 
-The current stable `v1.4.0` accepts one user-supplied DeepSeek API key through
+The current stable `v1.5.0` accepts one user-supplied DeepSeek API key through
 the onboarding screen and stores it in a dedicated Windows DPAPI-protected
 local vault. A process-environment key remains an explicit compatibility
 fallback and is never silently copied into that vault. The project does not
@@ -31,12 +31,19 @@ coverage counts plus a redacted authorization intent; it does not receive the
 private capability proposal, a preparation/compiler command, or a local
 completion writer.
 
-The v1.4.0 T1 Office verification engine keeps source identities, bounded fact
+The v1.5.0 package preserves the T1 Office verification engine, which keeps source identities, bounded fact
 provenance, artifact hashes, render receipts, revision receipts, and
 continuation checkpoints locally in the selected workspace or application data.
 Ordinary chat does not yet automatically select or sequence the two T1 tools;
 their presence does not cause workspace files to be scanned or uploaded merely
 because the application is open.
+
+The v1.5.0 durable Computer Use lifecycle stores bounded application, process,
+window, frame, target, action, approval, screenshot-evidence, and semantic
+receipt identities locally. Its installed reliability tests use generated
+files, workbooks, data, fresh Edge profiles, an ephemeral loopback portal, and
+isolated Event Stores. Those tests do not read stored browser logins, production
+accounts, or the user's normal DS Agent AppData.
 
 Uninstalling the application may not delete a user-selected workspace or every
 application-data file. Review and remove those local locations separately when
@@ -74,7 +81,7 @@ the user or person operating the application:
 The optional local desktop bridge accepts only loopback addresses and is
 started and controlled by the user. DS Agent does not install or supervise that
 service. Production Microsoft and Google account registration and live
-mail/calendar writes are disabled in `v1.4.0`; offline connector contracts do
+mail/calendar writes are disabled in `v1.5.0`; offline connector contracts do
 not authorize a production account or external write.
 
 ## What can be included in a model request

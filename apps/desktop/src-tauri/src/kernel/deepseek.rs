@@ -265,7 +265,7 @@ impl<T: DeepSeekChatCompletionTransport> Drop for DeepSeekOperationsBriefingSynt
 impl HttpDeepSeekChatCompletionTransport {
     pub fn new() -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
-            .user_agent("DS-Agent/1.4.0 deepseek-v4")
+            .user_agent("DS-Agent/1.5.0 deepseek-v4")
             .timeout(std::time::Duration::from_secs(
                 DEEPSEEK_CHAT_HTTP_TIMEOUT_SECS,
             ))
@@ -982,7 +982,7 @@ mod tests {
 
         assert_eq!(response.first_text(), Some("ok"));
         assert!(recorded.raw.starts_with("POST / HTTP/1.1"));
-        assert!(normalized_headers.contains("user-agent: ds-agent/1.4.0 deepseek-v4"));
+        assert!(normalized_headers.contains("user-agent: ds-agent/1.5.0 deepseek-v4"));
     }
 
     #[test]

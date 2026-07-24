@@ -11,15 +11,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Lee-take/dsagent/releases/tag/v1.4.0">v1.4.0 stable</a> ·
-  <a href="https://github.com/Lee-take/dsagent/releases/download/v1.4.0/DS.Agent_1.4.0_x64-setup.exe">Download for Windows</a> ·
+  <a href="https://github.com/Lee-take/dsagent/releases/tag/v1.5.0">v1.5.0 stable</a> ·
+  <a href="https://github.com/Lee-take/dsagent/releases/download/v1.5.0/DS.Agent_1.5.0_x64-setup.exe">Download for Windows</a> ·
   <a href="LICENSE">Apache-2.0</a>
 </p>
 
 <p align="center">Created and maintained by <strong>Lee take</strong>.</p>
 
-DS Agent is a DeepSeek-first local Windows agent for everyday work. Describe the
-result you need in chat: it can organize office material, research with sources,
+DS Agent is a DeepSeek-first local Windows agent for everyday work. Describe the result you need in chat: it can organize office material, research with sources,
 work with local files, run durable automations, and control desktop apps when you
 approve—while keeping steps, evidence, permissions, verification, and recovery
 visible.
@@ -28,9 +27,7 @@ Under the hood, DS Agent is a local Agent Harness optimized for DeepSeek. The
 Harness gives model-backed work a durable, permissioned, and verifiable
 execution boundary on the local machine.
 
-DS Agent began from a practical need: more colleagues were using DeepSeek in
-daily work, yet it was difficult to find an Agent specifically optimized for
-DeepSeek with strong local automation and a trustworthy execution boundary.
+DS Agent began from a practical need: more colleagues were using DeepSeek in daily work, yet it was difficult to find an Agent optimized for DeepSeek with a trustworthy local execution boundary.
 
 <p align="center">
   <img src="docs/assets/ds-agent-office-workflow.png" alt="A real DS Agent v1.0.0 run turning meeting notes into a team execution checklist, with six completed verification steps" />
@@ -132,7 +129,7 @@ does not claim completion from model confidence alone. Local files, browser
 actions, Office artifacts, and Computer Use are complete only when observable
 evidence satisfies the task's completion criteria.
 
-In v1.4.0, DeepSeek may propose a bounded `GoalEnvelope`, but only the local
+In v1.5.0, DeepSeek may propose a bounded `GoalEnvelope`, but only the local
 Kernel can validate and freeze it. For the same queued task, the Kernel alone
 derives the capability manifest, risk, and preview shown in one exact-task
 authorization card. Approval creates only exact authority; it does not execute
@@ -140,8 +137,9 @@ a Tool, resume the task, or mark the Goal complete. Completion remains blocked
 until locally authoritative verifier evidence covers every frozen `done_when`
 condition and required artifact identity.
 
-The v1.4.0 binary adds Kernel-authorized T1 Excel reconciliation, PowerPoint/render verification, and persisted goal-continuation checkpoints. These are production execution and verification primitives, but ordinary chat does not yet automatically select or sequence the two T1 tools. This release therefore
-does not claim that a user can already run the complete one-sentence T1 Office workflow from the React chat UI.
+The v1.5.0 binary preserves the T1 Excel/PowerPoint verification engine and adds a production-reachable durable Computer Use session/step UI and Kernel loop.
+Exact installed evidence is limited to generated File Explorer and Excel targets plus installed Edge with a fresh profile and an ephemeral loopback test portal; it does not claim general browser automation, stored-login reuse, or production-site completion.
+The release remains honest: ordinary chat does not yet automatically select or sequence the two T1 tools or the complete T1 Office workflow.
 
 ## DeepSeek and DS Agent boundary
 
@@ -166,7 +164,7 @@ high-risk action. See the full [model boundary](docs/AGENT_MODEL_BOUNDARY.md).
   reconciliation contracts validated with offline adversarial fake providers.
 
 Production Microsoft/Google account registration and live external-write
-authority remain disabled in v1.4.0. The release does not sign in to real
+authority remain disabled in v1.5.0. The release does not sign in to real
 accounts, send real email, or create, change, or cancel real calendar events.
 
 ## Why Rust
@@ -179,7 +177,7 @@ remain thin; the Kernel and persistent projections own business state.
 
 ## Quick start
 
-1. Download the [Windows x64 installer](https://github.com/Lee-take/dsagent/releases/download/v1.4.0/DS.Agent_1.4.0_x64-setup.exe).
+1. Download the [Windows x64 installer](https://github.com/Lee-take/dsagent/releases/download/v1.5.0/DS.Agent_1.5.0_x64-setup.exe).
 2. Enter your own valid DeepSeek API key in onboarding and run the explicit
    balance/model verification. The key is stored locally with Windows DPAPI.
 3. Choose one local workspace and let the readiness doctor verify its managed
@@ -191,7 +189,7 @@ A user-supplied DeepSeek API key is a required prerequisite. DS Agent does not
 bundle a shared key or bypass DeepSeek access requirements; use remains subject
 to DeepSeek's terms and account policies.
 
-The v1.4.0 application executable and installer are Authenticode `NotSigned`.
+The v1.5.0 application executable and installer are Authenticode `NotSigned`.
 Windows may display `Unknown publisher` or a Microsoft Defender SmartScreen
 warning. Download only over HTTPS from this repository, verify the SHA-256 in
 the GitHub Release, and read the [installation guide](docs/INSTALLATION.md)
@@ -199,10 +197,10 @@ before running the installer.
 
 ## Code signing policy
 
-DS Agent `v1.4.0` is intentionally unsigned. The SignPath Foundation application
+DS Agent `v1.5.0` is intentionally unsigned. The SignPath Foundation application
 is submitted and approval is pending; no release is represented as signed.
 If the project is accepted, signing starts with a later new version and does not
-replace the immutable v1.1.0, v1.2.0, v1.3.0, or v1.4.0 tag or asset. For releases accepted into the program:
+replace the immutable v1.1.0, v1.2.0, v1.3.0, v1.4.0, or v1.5.0 tag or asset. For releases accepted into the program:
 **Free code signing provided by SignPath.io, certificate by SignPath
 Foundation.** See the full [code signing policy](CODE_SIGNING_POLICY.md) and
 [privacy policy](PRIVACY.md).
@@ -220,8 +218,8 @@ example `D:\build-target\ds-agent-v1-release`.
 
 ## Stable release
 
-- Release: [DS Agent v1.4.0](https://github.com/Lee-take/dsagent/releases/tag/v1.4.0)
-- Installer: `DS.Agent_1.4.0_x64-setup.exe`
+- Release: [DS Agent v1.5.0](https://github.com/Lee-take/dsagent/releases/tag/v1.5.0)
+- Installer: `DS.Agent_1.5.0_x64-setup.exe`
 - Integrity: verify the final byte size and SHA-256 published in the GitHub
   Release before running the installer.
 - Onboarding: one user-supplied Key, Windows DPAPI storage, explicit DeepSeek
@@ -235,6 +233,7 @@ example `D:\build-target\ds-agent-v1-release`.
 - Task authorization: one Kernel-derived exact-task card with manifest/risk/
   preview binding, one user decision, per-capability audit, and exact revocation;
   approval does not execute or resume the task.
+- Computer Use: production-reachable durable lifecycle and fail-closed execution; exact installed proof is limited to generated Explorer/Excel targets and an isolated Edge/loopback test portal, not general browsing.
 - T1 verification engine: exact source identities and provenance, non-overwriting XLSX/PPTX artifacts, actual local render evidence, bounded revisions, and persisted continuation checkpoints; ordinary chat does not yet automatically select or sequence this complete T1 path.
 
 ## Documentation
@@ -242,6 +241,7 @@ example `D:\build-target\ds-agent-v1-release`.
 - [Installation](docs/INSTALLATION.md)
 - [DS Agent and DeepSeek boundary](docs/AGENT_MODEL_BOUNDARY.md)
 - [v1 architecture](docs/architecture/DS_AGENT_V1_ARCHITECTURE_PLAN.md)
+- [v1.5.0 release notes](docs/RELEASE_NOTES_v1.5.0.md)
 - [v1.4.0 release notes](docs/RELEASE_NOTES_v1.4.0.md)
 - [v1.3.0 release notes](docs/RELEASE_NOTES_v1.3.0.md)
 - [v1.2.0 release notes](docs/RELEASE_NOTES_v1.2.0.md)

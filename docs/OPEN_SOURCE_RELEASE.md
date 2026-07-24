@@ -69,7 +69,7 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
   fresh, distinct `CARGO_TARGET_DIR` builds with identical application and
   installer byte sizes and SHA-256 values.
 - The immutable `v1.0.2` installer remains unsigned. `v1.1.0`, `v1.2.0`,
-  `v1.3.0`, and `v1.4.0` are explicitly disclosed unsigned exceptions: both the application executable and
+  `v1.3.0`, `v1.4.0`, and `v1.5.0` are explicitly disclosed unsigned exceptions: both the application executable and
   NSIS installer must read back as `NotSigned`, and each Release must warn about
   `Unknown publisher` and Microsoft Defender SmartScreen while binding the
   HTTPS asset to its exact source, version, byte size, and SHA-256. A later
@@ -119,7 +119,8 @@ Ship a buildable local-first desktop Agent OS preview that demonstrates:
   exports or packaged assets do not enter generated source archives.
 - `.env.example` documents local DeepSeek and optional local bridge environment
   variables without storing secret values.
-- `docs/RELEASE_NOTES_v1.4.0.md` is the current stable release note.
+- `docs/RELEASE_NOTES_v1.5.0.md` is the current stable release note.
+  `docs/RELEASE_NOTES_v1.4.0.md` preserves the immutable Step 4 release evidence.
   `docs/RELEASE_NOTES_v1.3.0.md` preserves the immutable Step 3 release evidence.
   `docs/RELEASE_NOTES_v1.2.0.md` preserves the immutable Step 2 release evidence.
   `docs/RELEASE_NOTES_v1.1.0.md`, `docs/RELEASE_NOTES_v1.0.2.md`, `docs/RELEASE_NOTES_v1.0.1.md`,
@@ -166,6 +167,10 @@ testing, signing, and user support.
   approval and audit records only.
 - Do not claim the T1 Office engine as an ordinary-chat one-sentence workflow
   until the product UI can actually select, sequence, and complete it.
+- Describe the v1.5.0 production-reachable durable Computer Use lifecycle
+  separately from its exact installed-test evidence. File Explorer, Excel, and
+  Edge/ephemeral-loopback cases do not prove general browser or production-site
+  automation.
 - Do not hide high-risk Computer Use limitations.
 - Do not add broad feature work outside the existing DeepSeek-first workflows,
   permissions, memory, Windows setup behavior, and Operations Briefing scope.
