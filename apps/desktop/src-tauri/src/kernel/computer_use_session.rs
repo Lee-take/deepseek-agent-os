@@ -1,11 +1,12 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kernel::capability::ComputerControlAction;
 
-pub const COMPUTER_USE_STEP_CONTRACT_VERSION: &str = "computer-use-step/v1";
+pub const COMPUTER_USE_STEP_CONTRACT_VERSION: &str = "computer-use-step/v2";
+pub const COMPUTER_USE_OBSERVATION_FRESHNESS_SECS: i64 = 120;
 const MAX_SAFE_SUMMARY_CHARS: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,6 +54,15 @@ pub enum ComputerUseVerificationOutcome {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerUseApprovalActor {
+    User,
+    KernelLifecycle,
+    DeepSeekModel,
+    FrontendPayload,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ComputerUseRecoverySweep {
     pub needs_replan: usize,
@@ -78,13 +88,17 @@ pub struct ComputerUseObservation {
     pub id: Uuid,
     pub phase: ComputerUseObservationPhase,
     pub fingerprint: String,
+    pub application_fingerprint: String,
+    pub process_fingerprint: String,
     pub window_fingerprint: String,
     pub window_title_fingerprint: String,
+    pub frame_fingerprint: String,
     pub target_fingerprint: Option<String>,
     pub semantic_fingerprint: Option<String>,
     pub screenshot_evidence_ref: String,
     pub safe_summary: String,
     pub captured_at: DateTime<Utc>,
+    pub valid_until: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -92,8 +106,11 @@ pub struct ComputerUseActionBinding {
     pub action: ComputerControlAction,
     pub safe_summary: String,
     pub pre_observation_fingerprint: String,
+    pub application_fingerprint: String,
+    pub process_fingerprint: String,
     pub window_fingerprint: String,
     pub pre_window_title_fingerprint: String,
+    pub frame_fingerprint: String,
     pub target_fingerprint: String,
     pub pre_semantic_fingerprint: Option<String>,
     pub postcondition: ComputerUsePostcondition,
@@ -129,6 +146,7 @@ pub struct ComputerUseStep {
     pub pre_observation: ComputerUseObservation,
     pub action: Option<ComputerUseActionBinding>,
     pub approval_request_id: Option<Uuid>,
+    pub approval_actor: Option<ComputerUseApprovalActor>,
     pub action_started_at: Option<DateTime<Utc>>,
     pub action_start_count: u32,
     pub post_observation: Option<ComputerUseObservation>,
@@ -186,16 +204,22 @@ impl ComputerUseObservation {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         phase: ComputerUseObservationPhase,
+        application_fingerprint: String,
+        process_fingerprint: String,
         window_fingerprint: String,
         window_title_fingerprint: String,
+        frame_fingerprint: String,
         target_fingerprint: Option<String>,
         semantic_fingerprint: Option<String>,
         screenshot_evidence_ref: String,
         safe_summary: String,
         captured_at: DateTime<Utc>,
     ) -> Result<Self, String> {
+        require_fingerprint(&application_fingerprint, "application fingerprint")?;
+        require_fingerprint(&process_fingerprint, "process fingerprint")?;
         require_fingerprint(&window_fingerprint, "window fingerprint")?;
         require_fingerprint(&window_title_fingerprint, "window title fingerprint")?;
+        require_fingerprint(&frame_fingerprint, "frame fingerprint")?;
         if let Some(value) = target_fingerprint.as_deref() {
             require_fingerprint(value, "target fingerprint")?;
         }
@@ -204,27 +228,57 @@ impl ComputerUseObservation {
         }
         let screenshot_evidence_ref = safe_evidence_ref(screenshot_evidence_ref)?;
         let safe_summary = safe_text(safe_summary, "observation summary")?;
+        let id = Uuid::new_v4();
+        let valid_until = captured_at
+            .checked_add_signed(Duration::seconds(COMPUTER_USE_OBSERVATION_FRESHNESS_SECS))
+            .ok_or_else(|| "computer use observation freshness window overflowed".to_string())?;
+        let id_text = id.to_string();
+        let captured_at_text = timestamp_text(captured_at);
+        let valid_until_text = timestamp_text(valid_until);
         let fingerprint = hash_parts(&[
             COMPUTER_USE_STEP_CONTRACT_VERSION,
+            &id_text,
             observation_phase_name(phase),
+            &application_fingerprint,
+            &process_fingerprint,
             &window_fingerprint,
             &window_title_fingerprint,
+            &frame_fingerprint,
             target_fingerprint.as_deref().unwrap_or("none"),
             semantic_fingerprint.as_deref().unwrap_or("none"),
             &screenshot_evidence_ref,
+            &captured_at_text,
+            &valid_until_text,
         ]);
         Ok(Self {
-            id: Uuid::new_v4(),
+            id,
             phase,
             fingerprint,
+            application_fingerprint,
+            process_fingerprint,
             window_fingerprint,
             window_title_fingerprint,
+            frame_fingerprint,
             target_fingerprint,
             semantic_fingerprint,
             screenshot_evidence_ref,
             safe_summary,
             captured_at,
+            valid_until,
         })
+    }
+
+    pub fn require_fresh_at(&self, now: DateTime<Utc>) -> Result<(), String> {
+        if now < self.captured_at {
+            return Err("computer use observation timestamp is in the future".to_string());
+        }
+        if now > self.valid_until {
+            return Err(
+                "computer use observation is stale; re-observation and a new approval are required"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -251,8 +305,11 @@ impl ComputerUseActionBinding {
         let action_fingerprint = hash_parts(&[
             COMPUTER_USE_STEP_CONTRACT_VERSION,
             &pre_observation.fingerprint,
+            &pre_observation.application_fingerprint,
+            &pre_observation.process_fingerprint,
             &pre_observation.window_fingerprint,
             &pre_observation.window_title_fingerprint,
+            &pre_observation.frame_fingerprint,
             &target_fingerprint,
             &action_json,
             &postcondition_json,
@@ -261,8 +318,11 @@ impl ComputerUseActionBinding {
             action,
             safe_summary,
             pre_observation_fingerprint: pre_observation.fingerprint.clone(),
+            application_fingerprint: pre_observation.application_fingerprint.clone(),
+            process_fingerprint: pre_observation.process_fingerprint.clone(),
             window_fingerprint: pre_observation.window_fingerprint.clone(),
             pre_window_title_fingerprint: pre_observation.window_title_fingerprint.clone(),
+            frame_fingerprint: pre_observation.frame_fingerprint.clone(),
             target_fingerprint,
             pre_semantic_fingerprint: pre_observation.semantic_fingerprint.clone(),
             postcondition,
@@ -295,6 +355,7 @@ impl ComputerUseStep {
             pre_observation,
             action: None,
             approval_request_id: None,
+            approval_actor: None,
             action_started_at: None,
             action_start_count: 0,
             post_observation: None,
@@ -317,9 +378,13 @@ impl ComputerUseStep {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         self.require_status(ComputerUseStepStatus::Observed, "bind an action")?;
+        self.pre_observation.require_fresh_at(now)?;
         if action.pre_observation_fingerprint != self.pre_observation.fingerprint
+            || action.application_fingerprint != self.pre_observation.application_fingerprint
+            || action.process_fingerprint != self.pre_observation.process_fingerprint
             || action.window_fingerprint != self.pre_observation.window_fingerprint
             || action.pre_window_title_fingerprint != self.pre_observation.window_title_fingerprint
+            || action.frame_fingerprint != self.pre_observation.frame_fingerprint
             || self.pre_observation.target_fingerprint.as_deref()
                 != Some(action.target_fingerprint.as_str())
             || action.pre_semantic_fingerprint != self.pre_observation.semantic_fingerprint
@@ -353,9 +418,17 @@ impl ComputerUseStep {
         &mut self,
         approval_request_id: Uuid,
         approved_action_fingerprint: &str,
+        actor: ComputerUseApprovalActor,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         self.require_status(ComputerUseStepStatus::AwaitingApproval, "bind an approval")?;
+        if actor != ComputerUseApprovalActor::User {
+            return Err(
+                "computer use approval authority can only come from a local user decision"
+                    .to_string(),
+            );
+        }
+        self.pre_observation.require_fresh_at(now)?;
         if approval_request_id.is_nil() {
             return Err("computer use approval request id is invalid".to_string());
         }
@@ -370,6 +443,7 @@ impl ComputerUseStep {
             return Err("computer use approval is stale or bound to another action".to_string());
         }
         self.approval_request_id = Some(approval_request_id);
+        self.approval_actor = Some(actor);
         self.transition(
             ComputerUseStepStatus::Ready,
             "Exact desktop action is approved and ready for revalidation.".to_string(),
@@ -378,11 +452,15 @@ impl ComputerUseStep {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn mark_action_started(
         &mut self,
         approval_request_id: Uuid,
+        current_application_fingerprint: &str,
+        current_process_fingerprint: &str,
         current_window_fingerprint: &str,
         current_window_title_fingerprint: &str,
+        current_frame_fingerprint: &str,
         current_target_fingerprint: &str,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
@@ -398,16 +476,36 @@ impl ComputerUseStep {
         if self.approval_request_id != Some(approval_request_id) {
             return Err("computer use approval does not match the ready step".to_string());
         }
+        if self.approval_actor != Some(ComputerUseApprovalActor::User) {
+            return Err("computer use step lacks local-user approval authority".to_string());
+        }
+        require_fingerprint(
+            current_application_fingerprint,
+            "current application fingerprint",
+        )?;
+        require_fingerprint(current_process_fingerprint, "current process fingerprint")?;
         require_fingerprint(current_window_fingerprint, "current window fingerprint")?;
         require_fingerprint(
             current_window_title_fingerprint,
             "current window title fingerprint",
         )?;
+        require_fingerprint(current_frame_fingerprint, "current frame fingerprint")?;
         require_fingerprint(current_target_fingerprint, "current target fingerprint")?;
         let action = self
             .action
             .as_ref()
             .ok_or_else(|| "computer use step has no exact action".to_string())?;
+        if action.application_fingerprint != current_application_fingerprint {
+            return Err(
+                "foreground application changed after approval; re-observation is required"
+                    .to_string(),
+            );
+        }
+        if action.process_fingerprint != current_process_fingerprint {
+            return Err(
+                "foreground process changed after approval; re-observation is required".to_string(),
+            );
+        }
         if action.window_fingerprint != current_window_fingerprint {
             return Err(
                 "foreground window changed after approval; re-observation is required".to_string(),
@@ -417,6 +515,11 @@ impl ComputerUseStep {
             return Err(
                 "foreground window title changed after approval; re-observation is required"
                     .to_string(),
+            );
+        }
+        if action.frame_fingerprint != current_frame_fingerprint {
+            return Err(
+                "foreground frame changed after approval; re-observation is required".to_string(),
             );
         }
         if action.target_fingerprint != current_target_fingerprint {
@@ -452,9 +555,14 @@ impl ComputerUseStep {
             .action
             .as_ref()
             .ok_or_else(|| "computer use step has no exact action".to_string())?;
-        if observation.window_fingerprint != action.window_fingerprint {
+        if observation.application_fingerprint != action.application_fingerprint
+            || observation.process_fingerprint != action.process_fingerprint
+            || observation.window_fingerprint != action.window_fingerprint
+            || observation.frame_fingerprint != action.frame_fingerprint
+        {
             return Err(
-                "post-action observation is bound to a different foreground window".to_string(),
+                "post-action observation is bound to a different application, process, window, or frame"
+                    .to_string(),
             );
         }
         if observation.target_fingerprint.as_deref() != Some(action.target_fingerprint.as_str()) {
@@ -574,6 +682,7 @@ impl ComputerUseStep {
             ));
         }
         self.approval_request_id = None;
+        self.approval_actor = None;
         self.transition(
             ComputerUseStepStatus::NeedsReplan,
             safe_text(reason, "replan reason")?,
@@ -606,6 +715,7 @@ impl ComputerUseStep {
             | ComputerUseStepStatus::AwaitingApproval
             | ComputerUseStepStatus::Ready => {
                 self.approval_request_id = None;
+                self.approval_actor = None;
                 self.transition(
                     ComputerUseStepStatus::NeedsReplan,
                     "Desktop state may have changed after restart; re-observation is required."
@@ -679,9 +789,13 @@ impl ComputerUseStep {
             Some(action) => {
                 action.validate()?;
                 if action.pre_observation_fingerprint != self.pre_observation.fingerprint
+                    || action.application_fingerprint
+                        != self.pre_observation.application_fingerprint
+                    || action.process_fingerprint != self.pre_observation.process_fingerprint
                     || action.window_fingerprint != self.pre_observation.window_fingerprint
                     || action.pre_window_title_fingerprint
                         != self.pre_observation.window_title_fingerprint
+                    || action.frame_fingerprint != self.pre_observation.frame_fingerprint
                     || self.pre_observation.target_fingerprint.as_deref()
                         != Some(action.target_fingerprint.as_str())
                     || action.pre_semantic_fingerprint != self.pre_observation.semantic_fingerprint
@@ -704,13 +818,15 @@ impl ComputerUseStep {
             let action = self.action.as_ref().ok_or_else(|| {
                 "computer use post-observation has no exact action binding".to_string()
             })?;
-            if observation.window_fingerprint != action.window_fingerprint
+            if observation.application_fingerprint != action.application_fingerprint
+                || observation.process_fingerprint != action.process_fingerprint
+                || observation.window_fingerprint != action.window_fingerprint
+                || observation.frame_fingerprint != action.frame_fingerprint
                 || observation.target_fingerprint.as_deref()
                     != Some(action.target_fingerprint.as_str())
             {
                 return Err(
-                    "computer use post-observation is bound to another window or target"
-                        .to_string(),
+                    "computer use post-observation is bound to another application, process, window, frame, or target".to_string(),
                 );
             }
             if self
@@ -802,8 +918,28 @@ impl ComputerUseStep {
                 | ComputerUseStepStatus::EffectUnknown
                 | ComputerUseStepStatus::VerificationFailed
         );
-        if approval_required && self.approval_request_id.is_none() {
-            return Err("computer use step status requires exact approval".to_string());
+        if self.approval_request_id.is_some() != self.approval_actor.is_some() {
+            return Err("computer use approval identity and actor are inconsistent".to_string());
+        }
+        if self
+            .approval_request_id
+            .is_some_and(|approval_request_id| approval_request_id.is_nil())
+        {
+            return Err("computer use approval request id is invalid".to_string());
+        }
+        if self
+            .approval_actor
+            .is_some_and(|actor| actor != ComputerUseApprovalActor::User)
+        {
+            return Err(
+                "computer use approval evidence can only name a local user actor".to_string(),
+            );
+        }
+        if approval_required
+            && (self.approval_request_id.is_none()
+                || self.approval_actor != Some(ComputerUseApprovalActor::User))
+        {
+            return Err("computer use step status requires exact local-user approval".to_string());
         }
         let started_required = matches!(
             self.status,
@@ -864,8 +1000,11 @@ impl ComputerUseObservation {
             return Err("computer use observation identity is invalid".to_string());
         }
         require_fingerprint(&self.fingerprint, "observation fingerprint")?;
+        require_fingerprint(&self.application_fingerprint, "application fingerprint")?;
+        require_fingerprint(&self.process_fingerprint, "process fingerprint")?;
         require_fingerprint(&self.window_fingerprint, "window fingerprint")?;
         require_fingerprint(&self.window_title_fingerprint, "window title fingerprint")?;
+        require_fingerprint(&self.frame_fingerprint, "frame fingerprint")?;
         if let Some(value) = self.target_fingerprint.as_deref() {
             require_fingerprint(value, "target fingerprint")?;
         }
@@ -874,14 +1013,30 @@ impl ComputerUseObservation {
         }
         safe_evidence_ref(self.screenshot_evidence_ref.clone())?;
         safe_text(self.safe_summary.clone(), "observation summary")?;
+        let expected_valid_until = self
+            .captured_at
+            .checked_add_signed(Duration::seconds(COMPUTER_USE_OBSERVATION_FRESHNESS_SECS))
+            .ok_or_else(|| "computer use observation freshness window overflowed".to_string())?;
+        if self.valid_until != expected_valid_until {
+            return Err("computer use observation freshness window is inconsistent".to_string());
+        }
+        let id_text = self.id.to_string();
+        let captured_at_text = timestamp_text(self.captured_at);
+        let valid_until_text = timestamp_text(self.valid_until);
         let expected = hash_parts(&[
             COMPUTER_USE_STEP_CONTRACT_VERSION,
+            &id_text,
             observation_phase_name(self.phase),
+            &self.application_fingerprint,
+            &self.process_fingerprint,
             &self.window_fingerprint,
             &self.window_title_fingerprint,
+            &self.frame_fingerprint,
             self.target_fingerprint.as_deref().unwrap_or("none"),
             self.semantic_fingerprint.as_deref().unwrap_or("none"),
             &self.screenshot_evidence_ref,
+            &captured_at_text,
+            &valid_until_text,
         ]);
         if expected != self.fingerprint {
             return Err("computer use observation fingerprint is inconsistent".to_string());
@@ -896,11 +1051,14 @@ impl ComputerUseActionBinding {
             &self.pre_observation_fingerprint,
             "pre-observation fingerprint",
         )?;
+        require_fingerprint(&self.application_fingerprint, "application fingerprint")?;
+        require_fingerprint(&self.process_fingerprint, "process fingerprint")?;
         require_fingerprint(&self.window_fingerprint, "window fingerprint")?;
         require_fingerprint(
             &self.pre_window_title_fingerprint,
             "pre-action window title fingerprint",
         )?;
+        require_fingerprint(&self.frame_fingerprint, "frame fingerprint")?;
         require_fingerprint(&self.target_fingerprint, "target fingerprint")?;
         if let Some(value) = self.pre_semantic_fingerprint.as_deref() {
             require_fingerprint(value, "pre-action semantic fingerprint")?;
@@ -916,8 +1074,11 @@ impl ComputerUseActionBinding {
         let expected = hash_parts(&[
             COMPUTER_USE_STEP_CONTRACT_VERSION,
             &self.pre_observation_fingerprint,
+            &self.application_fingerprint,
+            &self.process_fingerprint,
             &self.window_fingerprint,
             &self.pre_window_title_fingerprint,
+            &self.frame_fingerprint,
             &self.target_fingerprint,
             &action_json,
             &postcondition_json,
@@ -980,6 +1141,10 @@ fn hash_parts(parts: &[&str]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn timestamp_text(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
 fn observation_phase_name(phase: ComputerUseObservationPhase) -> &'static str {
     match phase {
         ComputerUseObservationPhase::PreAction => "pre_action",
@@ -1003,8 +1168,11 @@ mod tests {
     ) -> ComputerUseObservation {
         ComputerUseObservation::new(
             phase,
+            fingerprint("notepad-application"),
+            fingerprint("notepad-process"),
             fingerprint("notepad-window"),
             fingerprint("notepad-title"),
+            fingerprint("notepad-frame"),
             Some(fingerprint("notepad-editor")),
             semantic.map(fingerprint),
             format!(
@@ -1034,6 +1202,43 @@ mod tests {
         .expect("action is valid")
     }
 
+    fn approve_as_user(
+        step: &mut ComputerUseStep,
+        approval_id: Uuid,
+        action_fingerprint: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        step.approve(
+            approval_id,
+            action_fingerprint,
+            ComputerUseApprovalActor::User,
+            now,
+        )
+    }
+
+    fn mark_started(
+        step: &mut ComputerUseStep,
+        approval_id: Uuid,
+        window: &str,
+        window_title: &str,
+        target: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let application = step.pre_observation.application_fingerprint.clone();
+        let process = step.pre_observation.process_fingerprint.clone();
+        let frame = step.pre_observation.frame_fingerprint.clone();
+        step.mark_action_started(
+            approval_id,
+            &application,
+            &process,
+            window,
+            window_title,
+            &frame,
+            target,
+            now,
+        )
+    }
+
     #[test]
     fn verified_step_binds_observation_action_approval_and_postcondition() {
         let now = Utc::now();
@@ -1048,8 +1253,7 @@ mod tests {
                 .expect("step is valid");
 
         step.bind_action(binding, now).expect("action binds");
-        step.approve(approval_id, &action_fingerprint, now)
-            .expect("approval binds");
+        approve_as_user(&mut step, approval_id, &action_fingerprint, now).expect("approval binds");
         let window = step.pre_observation.window_fingerprint.clone();
         let window_title = step.pre_observation.window_title_fingerprint.clone();
         let target = step
@@ -1057,7 +1261,7 @@ mod tests {
             .target_fingerprint
             .clone()
             .expect("target exists");
-        step.mark_action_started(approval_id, &window, &window_title, &target, now)
+        mark_started(&mut step, approval_id, &window, &window_title, &target, now)
             .expect("action starts once");
         let post = observation(
             ComputerUseObservationPhase::PostAction,
@@ -1097,8 +1301,11 @@ mod tests {
         let mut false_verified = step.clone();
         let altered_post = ComputerUseObservation::new(
             ComputerUseObservationPhase::PostAction,
+            fingerprint("notepad-application"),
+            fingerprint("notepad-process"),
             fingerprint("notepad-window"),
             fingerprint("notepad-title"),
+            fingerprint("notepad-frame"),
             Some(fingerprint("notepad-editor")),
             Some(fingerprint("wrong-result")),
             "computer-screenshots/altered-notepad.png".to_string(),
@@ -1131,38 +1338,102 @@ mod tests {
         )
         .expect("step is valid");
         step.bind_action(binding, now).expect("action binds");
-        assert!(step
-            .approve(Uuid::new_v4(), &fingerprint("stale-action"), now)
-            .is_err());
-        step.approve(approval_id, &action_fingerprint, now)
+        assert!(
+            approve_as_user(&mut step, Uuid::new_v4(), &fingerprint("stale-action"), now,).is_err()
+        );
+        approve_as_user(&mut step, approval_id, &action_fingerprint, now)
             .expect("exact approval binds");
         let window = step.pre_observation.window_fingerprint.clone();
         let window_title = step.pre_observation.window_title_fingerprint.clone();
         let target = step.pre_observation.target_fingerprint.clone().unwrap();
-        assert!(step
-            .mark_action_started(
-                approval_id,
-                &window,
-                &window_title,
-                &fingerprint("changed-target"),
-                now,
-            )
-            .is_err());
-        assert!(step
-            .mark_action_started(
-                approval_id,
-                &window,
-                &fingerprint("changed-title"),
-                &target,
-                now,
-            )
-            .is_err());
-        step.mark_action_started(approval_id, &window, &window_title, &target, now)
+        assert!(mark_started(
+            &mut step,
+            approval_id,
+            &window,
+            &window_title,
+            &fingerprint("changed-target"),
+            now,
+        )
+        .is_err());
+        assert!(mark_started(
+            &mut step,
+            approval_id,
+            &window,
+            &fingerprint("changed-title"),
+            &target,
+            now,
+        )
+        .is_err());
+        mark_started(&mut step, approval_id, &window, &window_title, &target, now)
             .expect("exact action starts");
-        assert!(step
-            .mark_action_started(approval_id, &window, &window_title, &target, now)
-            .is_err());
+        assert!(
+            mark_started(&mut step, approval_id, &window, &window_title, &target, now,).is_err()
+        );
         assert_eq!(step.action_start_count, 1);
+    }
+
+    #[test]
+    fn stale_observation_and_non_user_approval_fail_closed() {
+        let now = Utc::now();
+        let stale_captured_at =
+            now - Duration::seconds(COMPUTER_USE_OBSERVATION_FRESHNESS_SECS + 1);
+        let stale_pre = observation(
+            ComputerUseObservationPhase::PreAction,
+            Some("empty"),
+            stale_captured_at,
+        );
+        let stale_binding = action(&stale_pre, "verified text");
+        let mut stale_step = ComputerUseStep::new_observed(
+            Uuid::new_v4(),
+            1,
+            stale_pre,
+            ComputerUseUndoCapability::None,
+            stale_captured_at,
+        )
+        .unwrap();
+        assert!(stale_step.bind_action(stale_binding, now).is_err());
+        assert_eq!(stale_step.status, ComputerUseStepStatus::Observed);
+
+        let pre = observation(ComputerUseObservationPhase::PreAction, Some("empty"), now);
+        let binding = action(&pre, "verified text");
+        let action_fingerprint = binding.action_fingerprint.clone();
+        let mut step = ComputerUseStep::new_observed(
+            Uuid::new_v4(),
+            1,
+            pre,
+            ComputerUseUndoCapability::None,
+            now,
+        )
+        .unwrap();
+        step.bind_action(binding, now).unwrap();
+        for actor in [
+            ComputerUseApprovalActor::DeepSeekModel,
+            ComputerUseApprovalActor::FrontendPayload,
+            ComputerUseApprovalActor::KernelLifecycle,
+        ] {
+            assert!(step
+                .approve(Uuid::new_v4(), &action_fingerprint, actor, now)
+                .is_err());
+            assert_eq!(step.status, ComputerUseStepStatus::AwaitingApproval);
+            assert!(step.approval_request_id.is_none());
+            assert!(step.approval_actor.is_none());
+        }
+        let mut forged = step.clone();
+        forged.approval_request_id = Some(Uuid::new_v4());
+        forged.approval_actor = Some(ComputerUseApprovalActor::DeepSeekModel);
+        assert!(forged.validate().is_err());
+        let stale_approval_time = step.pre_observation.valid_until + Duration::milliseconds(1);
+        assert!(step
+            .approve(
+                Uuid::new_v4(),
+                &action_fingerprint,
+                ComputerUseApprovalActor::User,
+                stale_approval_time,
+            )
+            .is_err());
+        assert_eq!(step.status, ComputerUseStepStatus::AwaitingApproval);
+        assert!(step.approval_request_id.is_none());
+        assert!(step.approval_actor.is_none());
     }
 
     #[test]
@@ -1182,9 +1453,7 @@ mod tests {
         )
         .unwrap();
         stale.bind_action(binding.clone(), now).unwrap();
-        stale
-            .approve(approval_id, &action_fingerprint, now)
-            .unwrap();
+        approve_as_user(&mut stale, approval_id, &action_fingerprint, now).unwrap();
         stale
             .require_replan(
                 "Foreground target changed; a new observation is required.".to_string(),
@@ -1203,9 +1472,7 @@ mod tests {
         )
         .unwrap();
         uncertain.bind_action(binding, now).unwrap();
-        uncertain
-            .approve(approval_id, &action_fingerprint, now)
-            .unwrap();
+        approve_as_user(&mut uncertain, approval_id, &action_fingerprint, now).unwrap();
         let window = uncertain.pre_observation.window_fingerprint.clone();
         let window_title = uncertain.pre_observation.window_title_fingerprint.clone();
         let target = uncertain
@@ -1213,9 +1480,15 @@ mod tests {
             .target_fingerprint
             .clone()
             .unwrap();
-        uncertain
-            .mark_action_started(approval_id, &window, &window_title, &target, now)
-            .unwrap();
+        mark_started(
+            &mut uncertain,
+            approval_id,
+            &window,
+            &window_title,
+            &target,
+            now,
+        )
+        .unwrap();
         assert!(uncertain
             .cancel("Do not hide a possible external effect.".to_string(), now)
             .is_err());
@@ -1245,22 +1518,20 @@ mod tests {
         )
         .unwrap();
         ready.bind_action(binding.clone(), now).unwrap();
-        ready
-            .approve(approval_id, &action_fingerprint, now)
-            .unwrap();
+        approve_as_user(&mut ready, approval_id, &action_fingerprint, now).unwrap();
         ready
             .take_over("User moved the mouse.".to_string(), now)
             .expect("takeover records");
         assert_eq!(ready.status, ComputerUseStepStatus::UserTakenOver);
-        assert!(ready
-            .mark_action_started(
-                approval_id,
-                &pre.window_fingerprint,
-                &pre.window_title_fingerprint,
-                pre.target_fingerprint.as_deref().unwrap(),
-                now,
-            )
-            .is_err());
+        assert!(mark_started(
+            &mut ready,
+            approval_id,
+            &pre.window_fingerprint,
+            &pre.window_title_fingerprint,
+            pre.target_fingerprint.as_deref().unwrap(),
+            now,
+        )
+        .is_err());
 
         let mut started = ComputerUseStep::new_observed(
             Uuid::new_v4(),
@@ -1271,21 +1542,31 @@ mod tests {
         )
         .unwrap();
         started.bind_action(binding, now).unwrap();
-        started
-            .approve(approval_id, &action_fingerprint, now)
-            .unwrap();
+        approve_as_user(&mut started, approval_id, &action_fingerprint, now).unwrap();
         let window = started.pre_observation.window_fingerprint.clone();
         let window_title = started.pre_observation.window_title_fingerprint.clone();
         let target = started.pre_observation.target_fingerprint.clone().unwrap();
-        started
-            .mark_action_started(approval_id, &window, &window_title, &target, now)
-            .unwrap();
+        mark_started(
+            &mut started,
+            approval_id,
+            &window,
+            &window_title,
+            &target,
+            now,
+        )
+        .unwrap();
         started.recover_after_restart(now).unwrap();
         assert_eq!(started.status, ComputerUseStepStatus::EffectUnknown);
         assert_eq!(started.action_start_count, 1);
-        assert!(started
-            .mark_action_started(approval_id, &window, &window_title, &target, now)
-            .is_err());
+        assert!(mark_started(
+            &mut started,
+            approval_id,
+            &window,
+            &window_title,
+            &target,
+            now,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1304,12 +1585,11 @@ mod tests {
         )
         .unwrap();
         step.bind_action(binding, now).unwrap();
-        step.approve(approval_id, &action_fingerprint, now).unwrap();
+        approve_as_user(&mut step, approval_id, &action_fingerprint, now).unwrap();
         let window = step.pre_observation.window_fingerprint.clone();
         let window_title = step.pre_observation.window_title_fingerprint.clone();
         let target = step.pre_observation.target_fingerprint.clone().unwrap();
-        step.mark_action_started(approval_id, &window, &window_title, &target, now)
-            .unwrap();
+        mark_started(&mut step, approval_id, &window, &window_title, &target, now).unwrap();
         let post = observation(ComputerUseObservationPhase::PostAction, None, now);
         let post_fingerprint = post.fingerprint.clone();
         step.record_post_observation(post, now).unwrap();

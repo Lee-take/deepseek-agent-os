@@ -4,25 +4,28 @@ use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use uuid::Uuid;
 
-#[cfg(test)]
-use crate::kernel::capability::ComputerControlAction;
-use crate::kernel::capability::{ComputerControlClient, ComputerScreenshotClient};
-#[cfg(test)]
-use crate::kernel::computer_use_session::ComputerUseActionBinding;
+use crate::kernel::capability::{
+    ComputerControlAction, ComputerControlClient, ComputerScreenshotClient,
+};
 use crate::kernel::computer_use_session::{
-    ComputerUseObservation, ComputerUseObservationPhase, ComputerUsePostcondition,
-    ComputerUseSession, ComputerUseStep, ComputerUseStepStatus, ComputerUseUndoCapability,
-    ComputerUseVerificationOutcome, ComputerUseVerificationReceipt,
+    ComputerUseActionBinding, ComputerUseApprovalActor, ComputerUseObservation,
+    ComputerUseObservationPhase, ComputerUsePostcondition, ComputerUseSession, ComputerUseStep,
+    ComputerUseStepStatus, ComputerUseUndoCapability, ComputerUseVerificationOutcome,
+    ComputerUseVerificationReceipt,
 };
 use crate::kernel::event_store::EventStore;
 
 const MAX_REDACTED_SUMMARY_CHARS: usize = 1_000;
 const MAX_SEMANTIC_VALUE_CHARS: usize = 32_768;
+pub const COMPUTER_USE_OBSERVATION_MAX_ATTEMPTS: usize = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RedactedComputerUseState {
+    pub application_fingerprint: String,
+    pub process_fingerprint: String,
     pub window_fingerprint: String,
     pub window_title_fingerprint: String,
+    pub frame_fingerprint: String,
     pub target_fingerprint: String,
     pub semantic_fingerprint: Option<String>,
     pub safe_summary: String,
@@ -30,8 +33,11 @@ pub struct RedactedComputerUseState {
 
 impl RedactedComputerUseState {
     pub fn validate(&self) -> Result<(), String> {
+        require_fingerprint(&self.application_fingerprint, "application fingerprint")?;
+        require_fingerprint(&self.process_fingerprint, "process fingerprint")?;
         require_fingerprint(&self.window_fingerprint, "window fingerprint")?;
         require_fingerprint(&self.window_title_fingerprint, "window title fingerprint")?;
+        require_fingerprint(&self.frame_fingerprint, "frame fingerprint")?;
         require_fingerprint(&self.target_fingerprint, "target fingerprint")?;
         if let Some(value) = self.semantic_fingerprint.as_deref() {
             require_fingerprint(value, "semantic fingerprint")?;
@@ -126,7 +132,10 @@ pub struct ComputerUseStepView {
     pub status: ComputerUseStepStatus,
     pub revision: u64,
     pub pre_observation_fingerprint: String,
+    pub application_fingerprint: String,
+    pub process_fingerprint: String,
     pub window_fingerprint: String,
+    pub frame_fingerprint: String,
     pub target_fingerprint: Option<String>,
     pub pre_semantic_fingerprint: Option<String>,
     pub pre_screenshot_evidence_ref: String,
@@ -135,6 +144,8 @@ pub struct ComputerUseStepView {
     pub action_safe_summary: Option<String>,
     pub action_fingerprint: Option<String>,
     pub approval_request_id: Option<Uuid>,
+    pub approval_actor: Option<ComputerUseApprovalActor>,
+    pub observation_valid_until: DateTime<Utc>,
     pub post_observation_fingerprint: Option<String>,
     pub post_semantic_fingerprint: Option<String>,
     pub post_screenshot_evidence_ref: Option<String>,
@@ -172,7 +183,10 @@ impl From<&ComputerUseStep> for ComputerUseStepView {
             status: step.status,
             revision: step.revision,
             pre_observation_fingerprint: step.pre_observation.fingerprint.clone(),
+            application_fingerprint: step.pre_observation.application_fingerprint.clone(),
+            process_fingerprint: step.pre_observation.process_fingerprint.clone(),
             window_fingerprint: step.pre_observation.window_fingerprint.clone(),
+            frame_fingerprint: step.pre_observation.frame_fingerprint.clone(),
             target_fingerprint: step.pre_observation.target_fingerprint.clone(),
             pre_semantic_fingerprint: step.pre_observation.semantic_fingerprint.clone(),
             pre_screenshot_evidence_ref: step.pre_observation.screenshot_evidence_ref.clone(),
@@ -181,6 +195,8 @@ impl From<&ComputerUseStep> for ComputerUseStepView {
             action_safe_summary: action.map(|value| value.safe_summary.clone()),
             action_fingerprint: action.map(|value| value.action_fingerprint.clone()),
             approval_request_id: step.approval_request_id,
+            approval_actor: step.approval_actor,
+            observation_valid_until: step.pre_observation.valid_until,
             post_observation_fingerprint: post.map(|value| value.fingerprint.clone()),
             post_semantic_fingerprint: post.and_then(|value| value.semantic_fingerprint.clone()),
             post_screenshot_evidence_ref: post.map(|value| value.screenshot_evidence_ref.clone()),
@@ -194,20 +210,18 @@ impl From<&ComputerUseStep> for ComputerUseStepView {
     }
 }
 
-#[cfg(test)]
-pub fn create_observed_computer_use_session(
+pub fn persist_observed_computer_use_session(
     store: &EventStore,
     run_id: Option<Uuid>,
     safe_goal_summary: String,
     undo_capability: ComputerUseUndoCapability,
-    screenshot_client: &impl ComputerScreenshotClient,
-    accessibility_client: &impl ComputerUseAccessibilityClient,
+    observation: ComputerUseObservation,
 ) -> Result<(ComputerUseSession, ComputerUseStep), String> {
-    let observation = capture_computer_use_observation(
-        ComputerUseObservationPhase::PreAction,
-        screenshot_client,
-        accessibility_client,
-    )?;
+    observation.validate()?;
+    observation.require_fresh_at(Utc::now())?;
+    if observation.phase != ComputerUseObservationPhase::PreAction {
+        return Err("computer use session requires a pre-action observation".to_string());
+    }
     let now = observation.captured_at;
     let mut session = ComputerUseSession::new(run_id, safe_goal_summary, now)?;
     let step = ComputerUseStep::new_observed(session.id, 1, observation, undo_capability, now)?;
@@ -221,7 +235,6 @@ pub fn create_observed_computer_use_session(
     Ok((session, step))
 }
 
-#[cfg(test)]
 pub fn bind_computer_use_action(
     store: &EventStore,
     step_id: Uuid,
@@ -242,18 +255,33 @@ pub fn bind_computer_use_action(
     Ok(step)
 }
 
-#[cfg(test)]
 pub fn approve_computer_use_step(
     store: &EventStore,
     step_id: Uuid,
     approval_request_id: Uuid,
     approved_action_fingerprint: &str,
+    actor: ComputerUseApprovalActor,
 ) -> Result<ComputerUseStep, String> {
     let mut step = store
         .get_computer_use_step(step_id)
         .map_err(|error| error.to_string())?;
     let expected_revision = step.revision;
-    step.approve(approval_request_id, approved_action_fingerprint, Utc::now())?;
+    let now = Utc::now();
+    if step.pre_observation.require_fresh_at(now).is_err() {
+        step.require_replan(
+            "The approved observation expired before authority could be bound; re-observation and a new local-user approval are required."
+                .to_string(),
+            now,
+        )?;
+        store
+            .update_computer_use_step(&step, expected_revision)
+            .map_err(|error| error.to_string())?;
+        return Err(
+            "computer use observation expired before approval; the step now requires re-observation"
+                .to_string(),
+        );
+    }
+    step.approve(approval_request_id, approved_action_fingerprint, actor, now)?;
     store
         .update_computer_use_step(&step, expected_revision)
         .map_err(|error| error.to_string())?;
@@ -284,6 +312,26 @@ pub fn execute_ready_computer_use_step(
     accessibility_client: &impl ComputerUseAccessibilityClient,
     control_client: &impl ComputerControlClient,
 ) -> Result<ComputerUseExecutionResult, String> {
+    execute_ready_computer_use_step_at(
+        store,
+        step_id,
+        permit,
+        screenshot_client,
+        accessibility_client,
+        control_client,
+        Utc::now(),
+    )
+}
+
+fn execute_ready_computer_use_step_at(
+    store: &impl ComputerUseStepPersistence,
+    step_id: Uuid,
+    permit: ComputerUseExecutionPermit,
+    screenshot_client: &impl ComputerScreenshotClient,
+    accessibility_client: &impl ComputerUseAccessibilityClient,
+    control_client: &impl ComputerControlClient,
+    now: DateTime<Utc>,
+) -> Result<ComputerUseExecutionResult, String> {
     if !permit.local_unlock_confirmed {
         return Err("computer use execution requires an active local unlock".to_string());
     }
@@ -292,11 +340,29 @@ pub fn execute_ready_computer_use_step(
     }
 
     let mut step = store.load_step(step_id)?;
+    step.validate()?;
     if step.status != ComputerUseStepStatus::Ready {
         return Err(format!(
             "computer use step in {:?} is not ready for execution",
             step.status
         ));
+    }
+    if step.pre_observation.require_fresh_at(now).is_err() {
+        let expected_revision = step.revision;
+        step.require_replan(
+            "The approved desktop observation expired before execution; re-observation and a new local-user approval are required."
+                .to_string(),
+            now,
+        )?;
+        store.persist_step(&step, expected_revision)?;
+        return Ok(ComputerUseExecutionResult {
+            step,
+            execution_summary: None,
+            safe_error: Some(
+                "Desktop observation expired before execution; no input action was sent."
+                    .to_string(),
+            ),
+        });
     }
     let action = step
         .action
@@ -304,8 +370,11 @@ pub fn execute_ready_computer_use_step(
         .ok_or_else(|| "computer use ready step has no exact action".to_string())?;
     let current = accessibility_client.capture_redacted_state()?;
     current.validate()?;
-    if current.window_fingerprint != action.window_fingerprint
+    if current.application_fingerprint != action.application_fingerprint
+        || current.process_fingerprint != action.process_fingerprint
+        || current.window_fingerprint != action.window_fingerprint
         || current.window_title_fingerprint != action.pre_window_title_fingerprint
+        || current.frame_fingerprint != action.frame_fingerprint
         || current.target_fingerprint != action.target_fingerprint
         || current.semantic_fingerprint != step.pre_observation.semantic_fingerprint
     {
@@ -328,10 +397,13 @@ pub fn execute_ready_computer_use_step(
     let expected_revision = step.revision;
     step.mark_action_started(
         permit.approval_request_id,
+        &current.application_fingerprint,
+        &current.process_fingerprint,
         &current.window_fingerprint,
         &current.window_title_fingerprint,
+        &current.frame_fingerprint,
         &current.target_fingerprint,
-        Utc::now(),
+        now,
     )?;
     store.persist_step(&step, expected_revision)?;
 
@@ -429,13 +501,35 @@ pub fn capture_computer_use_observation(
     screenshot_client: &impl ComputerScreenshotClient,
     accessibility_client: &impl ComputerUseAccessibilityClient,
 ) -> Result<ComputerUseObservation, String> {
+    let mut last_error = None;
+    for _ in 0..COMPUTER_USE_OBSERVATION_MAX_ATTEMPTS {
+        match capture_computer_use_observation_once(phase, screenshot_client, accessibility_client)
+        {
+            Ok(observation) => return Ok(observation),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "computer use observation failed after {COMPUTER_USE_OBSERVATION_MAX_ATTEMPTS} bounded attempts: {}",
+        last_error.unwrap_or_else(|| "no observation receipt was returned".to_string())
+    ))
+}
+
+fn capture_computer_use_observation_once(
+    phase: ComputerUseObservationPhase,
+    screenshot_client: &impl ComputerScreenshotClient,
+    accessibility_client: &impl ComputerUseAccessibilityClient,
+) -> Result<ComputerUseObservation, String> {
     let screenshot = screenshot_client.capture_screenshot()?;
     let state = accessibility_client.capture_redacted_state()?;
     state.validate()?;
     ComputerUseObservation::new(
         phase,
+        state.application_fingerprint,
+        state.process_fingerprint,
         state.window_fingerprint,
         state.window_title_fingerprint,
+        state.frame_fingerprint,
         Some(state.target_fingerprint),
         state.semantic_fingerprint,
         screenshot.evidence_ref,
@@ -635,6 +729,7 @@ fn capture_windows_redacted_state() -> Result<RedactedComputerUseState, String> 
     let handle_identity = format!("{:p}", hwnd.0);
     let process_text = process_id.to_string();
     let thread_text = thread_id.to_string();
+    let process_fingerprint = fingerprint_parts(&["windows-process/v1", process_text.as_str()]);
     let window_fingerprint = fingerprint_parts(&[
         "windows-foreground-window/v1",
         &handle_identity,
@@ -699,6 +794,19 @@ fn capture_windows_redacted_state() -> Result<RedactedComputerUseState, String> 
             "not_keyboard_focusable"
         },
     ]);
+    let application_fingerprint = fingerprint_parts(&[
+        "windows-application/v1",
+        &fingerprint_parts(&[&window_class]),
+        &fingerprint_parts(&[&target_class]),
+    ]);
+    let frame_fingerprint = fingerprint_parts(&[
+        "windows-accessibility-frame/v1",
+        &process_fingerprint,
+        &window_fingerprint,
+        &control_type_text,
+        &fingerprint_parts(&[&automation_id]),
+        &fingerprint_parts(&[&target_class]),
+    ]);
 
     let semantic_fingerprint = if is_password {
         None
@@ -739,8 +847,11 @@ fn capture_windows_redacted_state() -> Result<RedactedComputerUseState, String> 
         "semantic state unavailable"
     };
     Ok(RedactedComputerUseState {
+        application_fingerprint,
+        process_fingerprint,
         window_fingerprint,
         window_title_fingerprint,
+        frame_fingerprint,
         target_fingerprint,
         semantic_fingerprint,
         safe_summary: format!(
@@ -777,6 +888,12 @@ mod tests {
         fn new(states: Vec<RedactedComputerUseState>) -> Self {
             Self {
                 states: Mutex::new(states.into_iter().map(Ok).collect()),
+            }
+        }
+
+        fn with_results(states: Vec<Result<RedactedComputerUseState, String>>) -> Self {
+            Self {
+                states: Mutex::new(states.into()),
             }
         }
     }
@@ -829,6 +946,41 @@ mod tests {
         fail: bool,
     }
 
+    struct InMemoryStepPersistence {
+        step: Mutex<ComputerUseStep>,
+    }
+
+    impl InMemoryStepPersistence {
+        fn new(step: ComputerUseStep) -> Self {
+            Self {
+                step: Mutex::new(step),
+            }
+        }
+    }
+
+    impl ComputerUseStepPersistence for InMemoryStepPersistence {
+        fn load_step(&self, step_id: Uuid) -> Result<ComputerUseStep, String> {
+            let step = self.step.lock().unwrap().clone();
+            if step.id != step_id {
+                return Err("in-memory computer use step does not exist".to_string());
+            }
+            Ok(step)
+        }
+
+        fn persist_step(
+            &self,
+            step: &ComputerUseStep,
+            expected_revision: u64,
+        ) -> Result<(), String> {
+            let mut current = self.step.lock().unwrap();
+            if current.id != step.id || current.revision != expected_revision {
+                return Err("in-memory computer use step changed concurrently".to_string());
+            }
+            *current = step.clone();
+            Ok(())
+        }
+    }
+
     impl FakeControlClient {
         fn succeeding() -> Self {
             Self {
@@ -876,9 +1028,33 @@ mod tests {
         target: &str,
         semantic: Option<&str>,
     ) -> RedactedComputerUseState {
+        redacted_state_with_identity(
+            "application",
+            "process",
+            window,
+            title,
+            "frame",
+            target,
+            semantic,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn redacted_state_with_identity(
+        application: &str,
+        process: &str,
+        window: &str,
+        title: &str,
+        frame: &str,
+        target: &str,
+        semantic: Option<&str>,
+    ) -> RedactedComputerUseState {
         RedactedComputerUseState {
+            application_fingerprint: fingerprint_parts(&[application]),
+            process_fingerprint: fingerprint_parts(&[process]),
             window_fingerprint: fingerprint_parts(&[window]),
             window_title_fingerprint: fingerprint_parts(&[title]),
+            frame_fingerprint: fingerprint_parts(&[frame]),
             target_fingerprint: fingerprint_parts(&[target]),
             semantic_fingerprint: semantic.map(|value| fingerprint_parts(&[value])),
             safe_summary: "Isolated Notepad-like editor is foreground and focused.".to_string(),
@@ -891,13 +1067,18 @@ mod tests {
         accessibility: &FakeAccessibilityClient,
         expected_semantic: &str,
     ) -> (ComputerUseStep, Uuid) {
-        let (_, observed) = create_observed_computer_use_session(
+        let observation = capture_computer_use_observation(
+            ComputerUseObservationPhase::PreAction,
+            screenshots,
+            accessibility,
+        )
+        .unwrap();
+        let (_, observed) = persist_observed_computer_use_session(
             store,
             None,
             "Update an isolated Notepad-like editor.".to_string(),
             ComputerUseUndoCapability::None,
-            screenshots,
-            accessibility,
+            observation,
         )
         .unwrap();
         let bound = bind_computer_use_action(
@@ -918,9 +1099,197 @@ mod tests {
             bound.id,
             approval_id,
             &bound.action.as_ref().unwrap().action_fingerprint,
+            ComputerUseApprovalActor::User,
         )
         .unwrap();
         (ready, approval_id)
+    }
+
+    #[test]
+    fn observation_retry_is_bounded_and_never_retries_an_action() {
+        let screenshots = FakeScreenshotClient::new(COMPUTER_USE_OBSERVATION_MAX_ATTEMPTS);
+        let accessibility = FakeAccessibilityClient::with_results(vec![
+            Err("transient accessibility failure".to_string()),
+            Ok(redacted_state("window", "target", Some("before"))),
+        ]);
+        let observation = capture_computer_use_observation(
+            ComputerUseObservationPhase::PreAction,
+            &screenshots,
+            &accessibility,
+        )
+        .expect("the second observation attempt succeeds");
+        assert_eq!(
+            observation.screenshot_evidence_ref,
+            "computer-screenshots/fake-2.png"
+        );
+
+        let screenshots = FakeScreenshotClient::new(COMPUTER_USE_OBSERVATION_MAX_ATTEMPTS);
+        let accessibility = FakeAccessibilityClient::with_results(vec![
+            Err("first failure".to_string()),
+            Err("second failure".to_string()),
+        ]);
+        let error = capture_computer_use_observation(
+            ComputerUseObservationPhase::PreAction,
+            &screenshots,
+            &accessibility,
+        )
+        .expect_err("observation stops at the fixed retry bound");
+        assert!(error.contains("failed after 2 bounded attempts"));
+    }
+
+    #[test]
+    fn wrong_application_process_window_or_frame_stops_before_input() {
+        let cases = [
+            (
+                "application",
+                redacted_state_with_identity(
+                    "changed-application",
+                    "process",
+                    "window",
+                    "stable-title",
+                    "frame",
+                    "target",
+                    Some("before"),
+                ),
+            ),
+            (
+                "process",
+                redacted_state_with_identity(
+                    "application",
+                    "changed-process",
+                    "window",
+                    "stable-title",
+                    "frame",
+                    "target",
+                    Some("before"),
+                ),
+            ),
+            (
+                "window",
+                redacted_state_with_identity(
+                    "application",
+                    "process",
+                    "changed-window",
+                    "stable-title",
+                    "frame",
+                    "target",
+                    Some("before"),
+                ),
+            ),
+            (
+                "frame",
+                redacted_state_with_identity(
+                    "application",
+                    "process",
+                    "window",
+                    "stable-title",
+                    "changed-frame",
+                    "target",
+                    Some("before"),
+                ),
+            ),
+        ];
+
+        for (label, drifted) in cases {
+            let store = EventStore::open_memory().unwrap();
+            let screenshots = FakeScreenshotClient::new(1);
+            let accessibility = FakeAccessibilityClient::new(vec![
+                redacted_state("window", "target", Some("before")),
+                drifted,
+            ]);
+            let control = FakeControlClient::succeeding();
+            let (ready, approval_id) =
+                setup_ready_step(&store, &screenshots, &accessibility, "after");
+
+            let result = execute_ready_computer_use_step(
+                &store,
+                ready.id,
+                ComputerUseExecutionPermit {
+                    approval_request_id: approval_id,
+                    local_unlock_confirmed: true,
+                },
+                &screenshots,
+                &accessibility,
+                &control,
+            )
+            .unwrap();
+
+            assert_eq!(
+                result.step.status,
+                ComputerUseStepStatus::NeedsReplan,
+                "{label} drift must require replanning"
+            );
+            assert!(result.step.approval_request_id.is_none());
+            assert!(result.step.approval_actor.is_none());
+            assert_eq!(
+                control.calls.load(Ordering::SeqCst),
+                0,
+                "{label} drift must stop before input"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_approved_observation_requires_replan_before_revalidation() {
+        let store = EventStore::open_memory().unwrap();
+        let screenshots = FakeScreenshotClient::new(1);
+        let accessibility =
+            FakeAccessibilityClient::new(vec![redacted_state("window", "target", Some("before"))]);
+        let control = FakeControlClient::succeeding();
+        let (ready, approval_id) = setup_ready_step(&store, &screenshots, &accessibility, "after");
+        let expired_at = ready.pre_observation.valid_until + chrono::Duration::milliseconds(1);
+
+        let result = execute_ready_computer_use_step_at(
+            &store,
+            ready.id,
+            ComputerUseExecutionPermit {
+                approval_request_id: approval_id,
+                local_unlock_confirmed: true,
+            },
+            &screenshots,
+            &accessibility,
+            &control,
+            expired_at,
+        )
+        .unwrap();
+
+        assert_eq!(result.step.status, ComputerUseStepStatus::NeedsReplan);
+        assert!(result.step.approval_request_id.is_none());
+        assert!(result.step.approval_actor.is_none());
+        assert_eq!(control.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn action_mutation_after_approval_is_rejected_before_input() {
+        let store = EventStore::open_memory().unwrap();
+        let screenshots = FakeScreenshotClient::new(1);
+        let accessibility =
+            FakeAccessibilityClient::new(vec![redacted_state("window", "target", Some("before"))]);
+        let (mut ready, approval_id) =
+            setup_ready_step(&store, &screenshots, &accessibility, "after");
+        ready.action.as_mut().unwrap().action = ComputerControlAction::PressKey {
+            key: "ENTER".to_string(),
+        };
+        let persistence = InMemoryStepPersistence::new(ready.clone());
+        let no_observation = FakeAccessibilityClient::new(Vec::new());
+        let no_screenshot = FakeScreenshotClient::new(0);
+        let control = FakeControlClient::succeeding();
+
+        let error = execute_ready_computer_use_step(
+            &persistence,
+            ready.id,
+            ComputerUseExecutionPermit {
+                approval_request_id: approval_id,
+                local_unlock_confirmed: true,
+            },
+            &no_screenshot,
+            &no_observation,
+            &control,
+        )
+        .expect_err("mutated approved action must fail domain validation");
+
+        assert!(error.contains("action fingerprint is inconsistent"));
+        assert_eq!(control.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1369,13 +1738,17 @@ $form.Add_Shown({ [void]$editor.Focus() })
             let store = EventStore::open(directory.path().join("notepad-like-smoke.db"))
                 .map_err(|error| error.to_string())?;
             let screenshot = LocalComputerScreenshotClient::new(directory.path().to_path_buf());
-            let (_, observed) = create_observed_computer_use_session(
+            let observation = capture_computer_use_observation(
+                ComputerUseObservationPhase::PreAction,
+                &screenshot,
+                &accessibility,
+            )?;
+            let (_, observed) = persist_observed_computer_use_session(
                 &store,
                 None,
                 "Verify one isolated Notepad-like editor action.".to_string(),
                 ComputerUseUndoCapability::None,
-                &screenshot,
-                &accessibility,
+                observation,
             )?;
             if observed.pre_observation.semantic_fingerprint.is_none() {
                 return Err(
@@ -1401,6 +1774,7 @@ $form.Add_Shown({ [void]$editor.Focus() })
                     .as_ref()
                     .ok_or_else(|| "smoke action is missing".to_string())?
                     .action_fingerprint,
+                ComputerUseApprovalActor::User,
             )?;
             let control = LocalComputerControlClient::new();
             let result = execute_ready_computer_use_step(

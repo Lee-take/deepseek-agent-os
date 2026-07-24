@@ -58,15 +58,15 @@ use crate::kernel::computer_use::{
     computer_use_backend_status_for_strategy, ComputerUseBackendStatus,
 };
 use crate::kernel::computer_use_runtime::{
-    accessibility_value_semantic_fingerprint, execute_ready_computer_use_step,
+    accessibility_value_semantic_fingerprint, approve_computer_use_step, bind_computer_use_action,
+    execute_ready_computer_use_step, persist_observed_computer_use_session,
     take_over_computer_use_step, ComputerUseAccessibilityClient, ComputerUseExecutionPermit,
     ComputerUseSessionView, ComputerUseStepView, LocalComputerUseAccessibilityClient,
     RedactedComputerUseState,
 };
 use crate::kernel::computer_use_session::{
-    ComputerUseActionBinding, ComputerUseObservation, ComputerUseObservationPhase,
-    ComputerUsePostcondition, ComputerUseSession, ComputerUseStep, ComputerUseStepStatus,
-    ComputerUseUndoCapability,
+    ComputerUseApprovalActor, ComputerUseObservation, ComputerUseObservationPhase,
+    ComputerUsePostcondition, ComputerUseStep, ComputerUseStepStatus, ComputerUseUndoCapability,
 };
 use crate::kernel::connectors::reconciliation::ConnectorReconcilerRegistry;
 use crate::kernel::connectors::runtime_registry::{
@@ -15020,8 +15020,11 @@ fn computer_use_observation_from_redacted_state(
     state.validate()?;
     ComputerUseObservation::new(
         phase,
+        state.application_fingerprint,
+        state.process_fingerprint,
         state.window_fingerprint,
         state.window_title_fingerprint,
+        state.frame_fingerprint,
         Some(state.target_fingerprint),
         state.semantic_fingerprint,
         screenshot_evidence_ref,
@@ -15096,19 +15099,16 @@ pub fn start_durable_computer_use_session(
         evidence_ref,
         screenshot_captured_at,
     )?;
-    let now = observation.captured_at;
-    let mut session = ComputerUseSession::new(run_id, safe_goal_summary, now)?;
-    let step = ComputerUseStep::new_observed(session.id, 1, observation, undo_capability, now)?;
-    {
+    let (session, step) = {
         let store = state.event_store.lock().map_err(|_| lock_error())?;
-        store
-            .insert_computer_use_session(&session)
-            .map_err(event_store_error)?;
-        store
-            .insert_computer_use_step(&step)
-            .map_err(event_store_error)?;
-    }
-    session.activate_step(step.id, now)?;
+        persist_observed_computer_use_session(
+            &store,
+            run_id,
+            safe_goal_summary,
+            undo_capability,
+            observation,
+        )?
+    };
     Ok(ComputerUseSessionStartResult {
         session: ComputerUseSessionView::from(&session),
         step: ComputerUseStepView::from(&step),
@@ -15170,16 +15170,7 @@ pub fn bind_durable_computer_use_action(
     let action = parse_computer_control_action(&action_contract)?;
     let postcondition = computer_use_postcondition_from_request(postcondition)?;
     let store = state.event_store.lock().map_err(|_| lock_error())?;
-    let mut step = store
-        .get_computer_use_step(step_id)
-        .map_err(event_store_error)?;
-    let expected_revision = step.revision;
-    let binding =
-        ComputerUseActionBinding::new(&step.pre_observation, action, safe_summary, postcondition)?;
-    step.bind_action(binding, Utc::now())?;
-    store
-        .update_computer_use_step(&step, expected_revision)
-        .map_err(event_store_error)?;
+    let step = bind_computer_use_action(&store, step_id, action, safe_summary, postcondition)?;
     Ok(ComputerUseStepView::from(&step))
 }
 
@@ -15231,18 +15222,13 @@ pub fn run_durable_computer_use_step(
         .ok_or_else(|| "computer use step has no exact action".to_string())?;
     {
         let store = state.event_store.lock().map_err(|_| lock_error())?;
-        let mut current = store
-            .get_computer_use_step(step_id)
-            .map_err(event_store_error)?;
-        let expected_revision = current.revision;
-        current.approve(
+        approve_computer_use_step(
+            &store,
+            step_id,
             approval_request_id,
             &approved_action_fingerprint,
-            Utc::now(),
+            ComputerUseApprovalActor::User,
         )?;
-        store
-            .update_computer_use_step(&current, expected_revision)
-            .map_err(event_store_error)?;
     }
 
     let app_data_dir = app.resolved_app_data_dir()?;
@@ -20334,8 +20320,11 @@ mod tests {
         let now = Utc::now();
         let pre = ComputerUseObservation::new(
             ComputerUseObservationPhase::PreAction,
+            "f".repeat(64),
+            "d".repeat(64),
             "a".repeat(64),
             "e".repeat(64),
+            "9".repeat(64),
             Some("b".repeat(64)),
             Some("c".repeat(64)),
             "computer-screenshots/pre.png".to_string(),

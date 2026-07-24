@@ -459,8 +459,8 @@ mod tests {
     use super::*;
     use crate::kernel::capability::ComputerControlAction;
     use crate::kernel::computer_use_session::{
-        ComputerUseActionBinding, ComputerUseObservation, ComputerUseObservationPhase,
-        ComputerUsePostcondition, ComputerUseUndoCapability,
+        ComputerUseActionBinding, ComputerUseApprovalActor, ComputerUseObservation,
+        ComputerUseObservationPhase, ComputerUsePostcondition, ComputerUseUndoCapability,
     };
     use sha2::{Digest, Sha256};
 
@@ -480,8 +480,11 @@ mod tests {
                 .unwrap();
         let observation = ComputerUseObservation::new(
             ComputerUseObservationPhase::PreAction,
+            fingerprint("application"),
+            fingerprint("process"),
             fingerprint("window"),
             fingerprint("window-title"),
+            fingerprint("frame"),
             Some(fingerprint("target")),
             Some(fingerprint("before")),
             "computer-screenshots/before-notepad.png".to_string(),
@@ -527,14 +530,32 @@ mod tests {
             step.bind_action(action, now).unwrap();
             store.update_computer_use_step(&step, expected).unwrap();
             let expected = step.revision;
-            step.approve(approval_id, &action_fingerprint, now).unwrap();
+            step.approve(
+                approval_id,
+                &action_fingerprint,
+                ComputerUseApprovalActor::User,
+                now,
+            )
+            .unwrap();
             store.update_computer_use_step(&step, expected).unwrap();
             let expected = step.revision;
+            let application = step.pre_observation.application_fingerprint.clone();
+            let process = step.pre_observation.process_fingerprint.clone();
             let window = step.pre_observation.window_fingerprint.clone();
             let window_title = step.pre_observation.window_title_fingerprint.clone();
+            let frame = step.pre_observation.frame_fingerprint.clone();
             let target = step.pre_observation.target_fingerprint.clone().unwrap();
-            step.mark_action_started(approval_id, &window, &window_title, &target, now)
-                .unwrap();
+            step.mark_action_started(
+                approval_id,
+                &application,
+                &process,
+                &window,
+                &window_title,
+                &frame,
+                &target,
+                now,
+            )
+            .unwrap();
             store.update_computer_use_step(&step, expected).unwrap();
         }
 
@@ -564,8 +585,13 @@ mod tests {
         step.bind_action(action, now).unwrap();
         store.update_computer_use_step(&step, expected).unwrap();
         let expected = step.revision;
-        step.approve(Uuid::new_v4(), &action_fingerprint, now)
-            .unwrap();
+        step.approve(
+            Uuid::new_v4(),
+            &action_fingerprint,
+            ComputerUseApprovalActor::User,
+            now,
+        )
+        .unwrap();
         store.update_computer_use_step(&step, expected).unwrap();
 
         let sweep = store.recover_computer_use_steps_after_restart(now).unwrap();
@@ -597,6 +623,46 @@ mod tests {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM computer_use_steps WHERE quarantine_code='invalid_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1);
+    }
+
+    #[test]
+    fn obsolete_contract_version_is_quarantined_without_starving_healthy_recovery() {
+        let store = EventStore::open_memory().unwrap();
+        let now = Utc::now();
+        let (session, step, _) = observed_records(now);
+        store.insert_computer_use_session(&session).unwrap();
+        store.insert_computer_use_step(&step).unwrap();
+
+        let mut obsolete = step.clone();
+        obsolete.id = Uuid::new_v4();
+        obsolete.sequence = 99;
+        obsolete.contract_version = "computer-use-step/v1".to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO computer_use_steps (id, session_id, sequence, step_json, status, row_revision, updated_at) VALUES (?1, ?2, ?3, ?4, 'observed', 0, ?5)",
+                params![
+                    obsolete.id.to_string(),
+                    session.id.to_string(),
+                    i64::from(obsolete.sequence),
+                    serde_json::to_string(&obsolete).unwrap(),
+                    timestamp(now)
+                ],
+            )
+            .unwrap();
+
+        let sweep = store.recover_computer_use_steps_after_restart(now).unwrap();
+        assert_eq!(sweep.quarantined, 1);
+        assert_eq!(sweep.needs_replan, 1);
+        let quarantined: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM computer_use_steps WHERE quarantine_code='invalid_record'",
                 [],
                 |row| row.get(0),
             )
