@@ -1863,6 +1863,623 @@ const BOUND_WINDOWS_ACCESSIBILITY_ACTION_TIMEOUT: Duration = Duration::from_secs
 #[allow(dead_code)]
 const BOUND_EXCEL_ACCESSIBILITY_ACTION_TIMEOUT: Duration = Duration::from_secs(9);
 
+#[cfg(all(windows, test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsEdgePortalDomQuery {
+    pub devtools_port: u16,
+    pub url: String,
+    pub document_title: String,
+    pub document_token: String,
+    pub target_element_id: String,
+    pub target_name: String,
+    pub decoy_element_id: String,
+    pub decoy_name: String,
+    pub receipt_element_id: String,
+    pub receipt_prefix: String,
+}
+
+#[cfg(all(windows, test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsEdgePortalDomSnapshot {
+    pub target_id: String,
+    pub frame_id: String,
+    pub browser_window_id: i64,
+    pub url: String,
+    pub origin: String,
+    pub document_title: String,
+    pub document_token: String,
+    pub target_name: String,
+    pub target_value: String,
+    pub semantic_receipt: String,
+    pub decoy_value: String,
+}
+
+#[cfg(all(windows, test))]
+struct EdgeDevToolsSocket {
+    stream: std::net::TcpStream,
+    next_command_id: u64,
+}
+
+#[cfg(all(windows, test))]
+impl EdgeDevToolsSocket {
+    fn connect(websocket_url: &str, expected_port: u16) -> Result<Self, String> {
+        use base64::Engine;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let parsed = reqwest::Url::parse(websocket_url)
+            .map_err(|error| format!("Edge DevTools WebSocket URL is invalid: {error}"))?;
+        if parsed.scheme() != "ws"
+            || !parsed
+                .host_str()
+                .is_some_and(|host| host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
+            || parsed.port() != Some(expected_port)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(
+                "Edge DevTools WebSocket must remain on the exact loopback port".to_string(),
+            );
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "Edge DevTools WebSocket host is missing".to_string())?;
+        let mut path = parsed.path().to_string();
+        if let Some(query) = parsed.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        let mut stream = std::net::TcpStream::connect((host, expected_port))
+            .map_err(|error| format!("Edge DevTools WebSocket connection failed: {error}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(|error| format!("Edge DevTools read timeout setup failed: {error}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .map_err(|error| format!("Edge DevTools write timeout setup failed: {error}"))?;
+
+        let key = base64::engine::general_purpose::STANDARD.encode(Uuid::new_v4().as_bytes());
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{expected_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|error| format!("Edge DevTools handshake write failed: {error}"))?;
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            if response.len() >= 16_384 {
+                return Err("Edge DevTools handshake headers exceeded their bound".to_string());
+            }
+            stream
+                .read_exact(&mut byte)
+                .map_err(|error| format!("Edge DevTools handshake read failed: {error}"))?;
+            response.push(byte[0]);
+        }
+        let response = String::from_utf8(response)
+            .map_err(|_| "Edge DevTools handshake was not valid HTTP".to_string())?;
+        let mut lines = response.split("\r\n");
+        let status = lines.next().unwrap_or_default();
+        if !status.starts_with("HTTP/1.1 101 ") {
+            return Err(format!(
+                "Edge DevTools WebSocket upgrade was refused: {status}"
+            ));
+        }
+        let mut upgrade = false;
+        let mut connection = false;
+        let mut accept = None;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket") {
+                upgrade = true;
+            } else if name.eq_ignore_ascii_case("connection")
+                && value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+            {
+                connection = true;
+            } else if name.eq_ignore_ascii_case("sec-websocket-accept") {
+                accept = Some(value.to_string());
+            }
+        }
+        let expected_accept = base64::engine::general_purpose::STANDARD.encode(edge_sha1(
+            format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
+        ));
+        if !upgrade || !connection || accept.as_deref() != Some(expected_accept.as_str()) {
+            return Err("Edge DevTools WebSocket handshake identity did not verify".to_string());
+        }
+        Ok(Self {
+            stream,
+            next_command_id: 1,
+        })
+    }
+
+    fn command(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let command_id = self.next_command_id;
+        self.next_command_id = self.next_command_id.saturating_add(1);
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "id": command_id,
+            "method": method,
+            "params": params,
+        }))
+        .map_err(|error| format!("Edge DevTools command serialization failed: {error}"))?;
+        self.write_frame(0x1, &payload)?;
+        loop {
+            let message = self.read_text_message()?;
+            let message: serde_json::Value = serde_json::from_slice(&message)
+                .map_err(|error| format!("Edge DevTools response was invalid JSON: {error}"))?;
+            if message.get("id").and_then(serde_json::Value::as_u64) != Some(command_id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(format!(
+                    "Edge DevTools command {method} failed: {}",
+                    edge_safe_json_summary(error)
+                ));
+            }
+            return message
+                .get("result")
+                .cloned()
+                .ok_or_else(|| format!("Edge DevTools command {method} returned no result"));
+        }
+    }
+
+    fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+
+        if payload.len() > 1_048_576 {
+            return Err("Edge DevTools outbound frame exceeded its bound".to_string());
+        }
+        let mut frame = Vec::with_capacity(payload.len().saturating_add(14));
+        frame.push(0x80 | (opcode & 0x0f));
+        if payload.len() < 126 {
+            frame.push(0x80 | payload.len() as u8);
+        } else if payload.len() <= u16::MAX as usize {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        let mask_seed = Uuid::new_v4();
+        let mask = &mask_seed.as_bytes()[..4];
+        frame.extend_from_slice(mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(*byte ^ mask[index % mask.len()]);
+        }
+        self.stream
+            .write_all(&frame)
+            .map_err(|error| format!("Edge DevTools frame write failed: {error}"))
+    }
+
+    fn read_text_message(&mut self) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+
+        let mut message = Vec::new();
+        let mut started = false;
+        loop {
+            let mut header = [0u8; 2];
+            self.stream
+                .read_exact(&mut header)
+                .map_err(|error| format!("Edge DevTools frame header read failed: {error}"))?;
+            let finished = header[0] & 0x80 != 0;
+            let opcode = header[0] & 0x0f;
+            if header[1] & 0x80 != 0 {
+                return Err("Edge DevTools server unexpectedly masked a frame".to_string());
+            }
+            let mut length = u64::from(header[1] & 0x7f);
+            if length == 126 {
+                let mut bytes = [0u8; 2];
+                self.stream
+                    .read_exact(&mut bytes)
+                    .map_err(|error| format!("Edge DevTools frame length read failed: {error}"))?;
+                length = u64::from(u16::from_be_bytes(bytes));
+            } else if length == 127 {
+                let mut bytes = [0u8; 8];
+                self.stream
+                    .read_exact(&mut bytes)
+                    .map_err(|error| format!("Edge DevTools frame length read failed: {error}"))?;
+                length = u64::from_be_bytes(bytes);
+            }
+            if length > 1_048_576 || message.len().saturating_add(length as usize) > 1_048_576 {
+                return Err("Edge DevTools inbound message exceeded its bound".to_string());
+            }
+            let mut payload = vec![0u8; length as usize];
+            self.stream
+                .read_exact(&mut payload)
+                .map_err(|error| format!("Edge DevTools frame payload read failed: {error}"))?;
+            match opcode {
+                0x0 if started => message.extend_from_slice(&payload),
+                0x1 if !started => {
+                    started = true;
+                    message.extend_from_slice(&payload);
+                }
+                0x8 => return Err("Edge DevTools WebSocket closed unexpectedly".to_string()),
+                0x9 => {
+                    self.write_frame(0xA, &payload)?;
+                    continue;
+                }
+                0xA => continue,
+                _ => {
+                    return Err(format!(
+                        "Edge DevTools returned an unexpected WebSocket opcode: {opcode}"
+                    ))
+                }
+            }
+            if finished {
+                return Ok(message);
+            }
+        }
+    }
+}
+
+#[cfg(all(windows, test))]
+fn edge_sha1(input: &[u8]) -> [u8; 20] {
+    let bit_length = (input.len() as u64).wrapping_mul(8);
+    let mut message = input.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_length.to_be_bytes());
+    let mut state = [
+        0x6745_2301u32,
+        0xefcd_ab89u32,
+        0x98ba_dcfeu32,
+        0x1032_5476u32,
+        0xc3d2_e1f0u32,
+    ];
+    for block in message.chunks_exact(64) {
+        let mut words = [0u32; 80];
+        for (index, word) in words.iter_mut().take(16).enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                block[offset],
+                block[offset + 1],
+                block[offset + 2],
+                block[offset + 3],
+            ]);
+        }
+        for index in 16..80 {
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = state;
+        for (index, word) in words.iter().enumerate() {
+            let (function, constant) = match index {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+                _ => (b ^ c ^ d, 0xca62_c1d6),
+            };
+            let next = a
+                .rotate_left(5)
+                .wrapping_add(function)
+                .wrapping_add(e)
+                .wrapping_add(constant)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = next;
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+    }
+    let mut digest = [0u8; 20];
+    for (index, word) in state.iter().enumerate() {
+        digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+#[cfg(all(windows, test))]
+fn edge_safe_json_summary(value: &serde_json::Value) -> String {
+    value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("bounded DevTools error")
+        .chars()
+        .take(256)
+        .collect()
+}
+
+#[cfg(all(windows, test))]
+fn edge_devtools_target(query: &WindowsEdgePortalDomQuery) -> Result<(String, String), String> {
+    let endpoint = format!("http://127.0.0.1:{}/json/list", query.devtools_port);
+    let targets: Vec<serde_json::Value> = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|error| format!("Edge DevTools client setup failed: {error}"))?
+        .get(endpoint)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| format!("Edge DevTools target discovery failed: {error}"))?
+        .json()
+        .map_err(|error| format!("Edge DevTools target list was invalid: {error}"))?;
+    if targets.len() > 64 {
+        return Err("Edge DevTools target list exceeded its bound".to_string());
+    }
+    let matches = targets
+        .into_iter()
+        .filter(|target| {
+            target.get("type").and_then(serde_json::Value::as_str) == Some("page")
+                && target.get("url").and_then(serde_json::Value::as_str) == Some(query.url.as_str())
+                && target.get("title").and_then(serde_json::Value::as_str)
+                    == Some(query.document_title.as_str())
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "Edge DevTools requires exactly one exact page target; found {}",
+            matches.len()
+        ));
+    }
+    let target = &matches[0];
+    let target_id = target
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Edge DevTools exact page target ID is missing".to_string())?
+        .to_string();
+    let websocket_url = target
+        .get("webSocketDebuggerUrl")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Edge DevTools exact page WebSocket is missing".to_string())?
+        .to_string();
+    Ok((target_id, websocket_url))
+}
+
+#[cfg(all(windows, test))]
+fn edge_portal_capture_expression(query: &WindowsEdgePortalDomQuery) -> String {
+    let title = serde_json::to_string(&query.document_title).unwrap_or_default();
+    let url = serde_json::to_string(&query.url).unwrap_or_default();
+    let token = serde_json::to_string(&query.document_token).unwrap_or_default();
+    let target_id = serde_json::to_string(&query.target_element_id).unwrap_or_default();
+    let target_name = serde_json::to_string(&query.target_name).unwrap_or_default();
+    let decoy_id = serde_json::to_string(&query.decoy_element_id).unwrap_or_default();
+    let decoy_name = serde_json::to_string(&query.decoy_name).unwrap_or_default();
+    let receipt_id = serde_json::to_string(&query.receipt_element_id).unwrap_or_default();
+    format!(
+        r#"(() => {{
+const exact = (id) => {{
+  const matches = document.querySelectorAll(`[id="${{CSS.escape(id)}}"]`);
+  return matches.length === 1 ? matches[0] : null;
+}};
+const target = exact({target_id});
+const decoy = exact({decoy_id});
+const receipt = exact({receipt_id});
+const ok = document.title === {title}
+  && location.href === {url}
+  && document.documentElement.dataset.c5cDocument === {token}
+  && target instanceof HTMLInputElement
+  && target.getAttribute("aria-label") === {target_name}
+  && !target.disabled
+  && !target.readOnly
+  && decoy instanceof HTMLInputElement
+  && decoy.getAttribute("aria-label") === {decoy_name}
+  && receipt instanceof HTMLElement;
+return {{
+  ok,
+  url: location.href,
+  origin: location.origin,
+  documentTitle: document.title,
+  documentToken: document.documentElement.dataset.c5cDocument || "",
+  targetName: target?.getAttribute("aria-label") || "",
+  targetValue: target?.value || "",
+  semanticReceipt: receipt?.textContent || "",
+  decoyValue: decoy?.value || ""
+}};
+}})()"#
+    )
+}
+
+#[cfg(all(windows, test))]
+fn edge_portal_mutation_expression(
+    query: &WindowsEdgePortalDomQuery,
+    expected_before: &str,
+    expected_decoy: &str,
+    value: &str,
+) -> String {
+    let title = serde_json::to_string(&query.document_title).unwrap_or_default();
+    let url = serde_json::to_string(&query.url).unwrap_or_default();
+    let token = serde_json::to_string(&query.document_token).unwrap_or_default();
+    let target_id = serde_json::to_string(&query.target_element_id).unwrap_or_default();
+    let target_name = serde_json::to_string(&query.target_name).unwrap_or_default();
+    let decoy_id = serde_json::to_string(&query.decoy_element_id).unwrap_or_default();
+    let decoy_name = serde_json::to_string(&query.decoy_name).unwrap_or_default();
+    let receipt_id = serde_json::to_string(&query.receipt_element_id).unwrap_or_default();
+    let expected_before = serde_json::to_string(expected_before).unwrap_or_default();
+    let expected_decoy = serde_json::to_string(expected_decoy).unwrap_or_default();
+    let value = serde_json::to_string(value).unwrap_or_default();
+    format!(
+        r#"(() => {{
+const exact = (id) => {{
+  const matches = document.querySelectorAll(`[id="${{CSS.escape(id)}}"]`);
+  return matches.length === 1 ? matches[0] : null;
+}};
+const target = exact({target_id});
+const decoy = exact({decoy_id});
+const receipt = exact({receipt_id});
+const ready = document.title === {title}
+  && location.href === {url}
+  && document.documentElement.dataset.c5cDocument === {token}
+  && target instanceof HTMLInputElement
+  && target.getAttribute("aria-label") === {target_name}
+  && !target.disabled
+  && !target.readOnly
+  && target.value === {expected_before}
+  && decoy instanceof HTMLInputElement
+  && decoy.getAttribute("aria-label") === {decoy_name}
+  && decoy.value === {expected_decoy}
+  && receipt instanceof HTMLElement;
+if (!ready) return {{ ok: false }};
+target.value = {value};
+target.dispatchEvent(new Event("input", {{ bubbles: true }}));
+target.dispatchEvent(new Event("change", {{ bubbles: true }}));
+return {{
+  ok: true,
+  url: location.href,
+  origin: location.origin,
+  documentTitle: document.title,
+  documentToken: document.documentElement.dataset.c5cDocument || "",
+  targetName: target.getAttribute("aria-label") || "",
+  targetValue: target.value,
+  semanticReceipt: receipt.textContent || "",
+  decoyValue: decoy.value
+}};
+}})()"#
+    )
+}
+
+#[cfg(all(windows, test))]
+fn edge_runtime_value(
+    socket: &mut EdgeDevToolsSocket,
+    expression: String,
+) -> Result<serde_json::Value, String> {
+    let result = socket.command(
+        "Runtime.evaluate",
+        serde_json::json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": false,
+        }),
+    )?;
+    if result.get("exceptionDetails").is_some() {
+        return Err("Edge portal DOM evaluation returned an exception".to_string());
+    }
+    result
+        .pointer("/result/value")
+        .cloned()
+        .ok_or_else(|| "Edge portal DOM evaluation returned no bounded value".to_string())
+}
+
+#[cfg(all(windows, test))]
+fn edge_portal_dom_session(
+    query: &WindowsEdgePortalDomQuery,
+    expression: String,
+) -> Result<WindowsEdgePortalDomSnapshot, String> {
+    let parsed = reqwest::Url::parse(&query.url)
+        .map_err(|error| format!("Edge portal URL is invalid: {error}"))?;
+    if parsed.scheme() != "http"
+        || !parsed
+            .host_str()
+            .is_some_and(|host| host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("Edge portal DOM query requires an exact loopback HTTP URL".to_string());
+    }
+    let (target_id, websocket_url) = edge_devtools_target(query)?;
+    let mut socket = EdgeDevToolsSocket::connect(&websocket_url, query.devtools_port)?;
+    let frame_tree = socket.command("Page.getFrameTree", serde_json::json!({}))?;
+    let frame_id = frame_tree
+        .pointer("/frameTree/frame/id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Edge DevTools exact main frame ID is missing".to_string())?
+        .to_string();
+    if frame_tree
+        .pointer("/frameTree/frame/url")
+        .and_then(serde_json::Value::as_str)
+        != Some(query.url.as_str())
+    {
+        return Err("Edge DevTools main frame URL changed".to_string());
+    }
+    let window = socket.command(
+        "Browser.getWindowForTarget",
+        serde_json::json!({ "targetId": target_id }),
+    )?;
+    let browser_window_id = window
+        .get("windowId")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "Edge DevTools exact browser window ID is missing".to_string())?;
+    let value = edge_runtime_value(&mut socket, expression)?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("Edge portal DOM identity failed exact revalidation".to_string());
+    }
+    let string = |name: &str| -> Result<String, String> {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("Edge portal DOM field {name} is missing"))
+    };
+    let snapshot = WindowsEdgePortalDomSnapshot {
+        target_id,
+        frame_id,
+        browser_window_id,
+        url: string("url")?,
+        origin: string("origin")?,
+        document_title: string("documentTitle")?,
+        document_token: string("documentToken")?,
+        target_name: string("targetName")?,
+        target_value: string("targetValue")?,
+        semantic_receipt: string("semanticReceipt")?,
+        decoy_value: string("decoyValue")?,
+    };
+    if snapshot.url != query.url
+        || snapshot.origin != parsed.origin().ascii_serialization()
+        || snapshot.document_title != query.document_title
+        || snapshot.document_token != query.document_token
+        || snapshot.target_name != query.target_name
+        || !snapshot.semantic_receipt.starts_with(&query.receipt_prefix)
+    {
+        return Err("Edge portal DOM snapshot changed its exact identity".to_string());
+    }
+    Ok(snapshot)
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn capture_windows_edge_portal_dom(
+    query: &WindowsEdgePortalDomQuery,
+) -> Result<WindowsEdgePortalDomSnapshot, String> {
+    edge_portal_dom_session(query, edge_portal_capture_expression(query))
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn mutate_windows_edge_portal_dom(
+    query: &WindowsEdgePortalDomQuery,
+    expected_target_id: &str,
+    expected_frame_id: &str,
+    expected_browser_window_id: i64,
+    expected_before: &str,
+    expected_decoy: &str,
+    value: &str,
+) -> Result<WindowsEdgePortalDomSnapshot, String> {
+    let snapshot = edge_portal_dom_session(
+        query,
+        edge_portal_mutation_expression(query, expected_before, expected_decoy, value),
+    )?;
+    if snapshot.target_id != expected_target_id
+        || snapshot.frame_id != expected_frame_id
+        || snapshot.browser_window_id != expected_browser_window_id
+        || snapshot.target_value != value
+        || snapshot.semantic_receipt != format!("{}{}", query.receipt_prefix, value)
+        || snapshot.decoy_value != expected_decoy
+    {
+        return Err(
+            "Edge portal mutation did not return the exact semantic receipt and frozen identity"
+                .to_string(),
+        );
+    }
+    Ok(snapshot)
+}
+
 #[cfg(windows)]
 #[allow(dead_code)]
 fn bound_windows_accessibility_action_timeout(
@@ -5832,10 +6449,11 @@ mod tests {
 
     #[cfg(windows)]
     use crate::kernel::capability::{
-        bound_windows_accessibility_action_timeout, excel_grid_automation_id,
-        require_bound_excel_editor_identity, require_bound_excel_grid_identity,
-        require_bound_windows_process_identity, WindowsBoundComputerControlTarget,
-        WindowsBoundComputerScreenshotClient,
+        bound_windows_accessibility_action_timeout, capture_windows_edge_portal_dom, edge_sha1,
+        excel_grid_automation_id, require_bound_excel_editor_identity,
+        require_bound_excel_grid_identity, require_bound_windows_process_identity,
+        WindowsBoundComputerControlTarget, WindowsBoundComputerScreenshotClient,
+        WindowsEdgePortalDomQuery,
     };
     use crate::kernel::capability::{
         computer_control_action_contract_string, parse_computer_control_action, run_browser_browse,
@@ -7234,6 +7852,37 @@ mod tests {
             bound_windows_accessibility_action_timeout(&WindowsBoundComputerControlTarget::Any),
             Duration::from_secs(6),
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_devtools_websocket_accept_hash_matches_rfc6455() {
+        use base64::Engine;
+
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(edge_sha1(
+                b"dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            )),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_portal_dom_rejects_non_loopback_url_before_target_discovery() {
+        let query = WindowsEdgePortalDomQuery {
+            devtools_port: 9,
+            url: "https://example.com/production".to_string(),
+            document_title: "forbidden production portal".to_string(),
+            document_token: "forbidden".to_string(),
+            target_element_id: "target".to_string(),
+            target_name: "Target".to_string(),
+            decoy_element_id: "decoy".to_string(),
+            decoy_name: "Decoy".to_string(),
+            receipt_element_id: "receipt".to_string(),
+            receipt_prefix: "receipt:".to_string(),
+        };
+        assert!(capture_windows_edge_portal_dom(&query).is_err());
     }
 
     #[test]

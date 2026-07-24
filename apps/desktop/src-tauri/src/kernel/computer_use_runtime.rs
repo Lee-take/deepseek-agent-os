@@ -653,6 +653,7 @@ pub fn accessibility_value_semantic_fingerprint(value: &str) -> Result<String, S
 enum WindowsComputerUseTargetProfile {
     FileExplorer,
     Excel,
+    Edge,
     Generic,
 }
 
@@ -665,6 +666,8 @@ impl WindowsComputerUseTargetProfile {
             Self::FileExplorer
         } else if window_class.eq_ignore_ascii_case("XLMAIN") {
             Self::Excel
+        } else if window_class.eq_ignore_ascii_case("Chrome_WidgetWin_1") {
+            Self::Edge
         } else {
             Self::Generic
         }
@@ -674,6 +677,7 @@ impl WindowsComputerUseTargetProfile {
         match self {
             Self::FileExplorer => "file-explorer",
             Self::Excel => "excel",
+            Self::Edge => "edge",
             Self::Generic => "generic",
         }
     }
@@ -682,6 +686,7 @@ impl WindowsComputerUseTargetProfile {
         match self {
             Self::FileExplorer => "File Explorer",
             Self::Excel => "Excel",
+            Self::Edge => "Edge",
             Self::Generic => "Windows",
         }
     }
@@ -737,9 +742,9 @@ fn current_windows_bounded_semantic_value(
     };
     match profile {
         WindowsComputerUseTargetProfile::FileExplorer => selection().or_else(value),
-        WindowsComputerUseTargetProfile::Excel | WindowsComputerUseTargetProfile::Generic => {
-            value().or_else(selection)
-        }
+        WindowsComputerUseTargetProfile::Excel
+        | WindowsComputerUseTargetProfile::Edge
+        | WindowsComputerUseTargetProfile::Generic => value().or_else(selection),
     }
 }
 
@@ -819,8 +824,8 @@ fn current_windows_selected_accessibility_descendant(
     use windows::Win32::UI::Accessibility::{
         IUIAutomationGridItemPattern, IUIAutomationLegacyIAccessiblePattern,
         IUIAutomationSelectionItemPattern, IUIAutomationValuePattern, UIA_DataItemControlTypeId,
-        UIA_GridItemPatternId, UIA_LegacyIAccessiblePatternId, UIA_ListItemControlTypeId,
-        UIA_SelectionItemPatternId, UIA_ValuePatternId,
+        UIA_EditControlTypeId, UIA_GridItemPatternId, UIA_LegacyIAccessiblePatternId,
+        UIA_ListItemControlTypeId, UIA_SelectionItemPatternId, UIA_ValuePatternId,
     };
 
     let mut pending = Vec::new();
@@ -918,9 +923,25 @@ fn current_windows_selected_accessibility_descendant(
                     };
                     is_data_item && supports_value && exact_excel_target
                 },
+                WindowsComputerUseTargetProfile::Edge => unsafe {
+                    let is_edit = element
+                        .CurrentControlType()
+                        .map(|control_type| control_type == UIA_EditControlTypeId)
+                        .unwrap_or(false);
+                    let supports_value = element
+                        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                        .is_ok();
+                    let accepts_browser_chrome = matches!(
+                        expected_target,
+                        None | Some(WindowsBoundAccessibilityTarget::Any)
+                    );
+                    is_edit && supports_value && accepts_browser_chrome
+                },
                 WindowsComputerUseTargetProfile::Generic => false,
             };
-            if is_selected && exact_target_kind {
+            if (is_selected || profile == WindowsComputerUseTargetProfile::Edge)
+                && exact_target_kind
+            {
                 return Some(element);
             }
             if let Ok(child) = unsafe { walker.GetFirstChildElement(&element) } {
@@ -1190,9 +1211,10 @@ fn capture_windows_redacted_state(
                 target_profile,
                 WindowsComputerUseTargetProfile::FileExplorer
                     | WindowsComputerUseTargetProfile::Excel
+                    | WindowsComputerUseTargetProfile::Edge
             ) {
                 return Err(
-                    "bound Windows accessibility observation supports only File Explorer or Excel"
+                    "bound Windows accessibility observation supports only File Explorer, Excel, or Edge"
                         .to_string(),
                 );
             }
@@ -1442,8 +1464,8 @@ fn capture_windows_redacted_state(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
     use tempfile::tempdir;
@@ -2631,6 +2653,1255 @@ mod tests {
         std::fs::create_dir_all(&directory)
             .map_err(|error| format!("C5B smoke directory creation failed: {error}"))?;
         Ok(directory)
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct EdgePortalLiveIdentity {
+        application_fingerprint: String,
+        window_handle: isize,
+        browser_process_id: u32,
+        devtools_port: u16,
+        target_id: String,
+        frame_id: String,
+        browser_window_id: i64,
+        profile_fingerprint: String,
+        tab_fingerprint: String,
+        url: String,
+        origin: String,
+        document_fingerprint: String,
+        target_fingerprint: String,
+        action_fingerprint: String,
+        target_value: String,
+        semantic_receipt: String,
+        decoy_value: String,
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct EdgePortalContract {
+        application_fingerprint: String,
+        window_handle: isize,
+        browser_process_id: u32,
+        devtools_port: u16,
+        target_id: String,
+        frame_id: String,
+        browser_window_id: i64,
+        profile_fingerprint: String,
+        tab_fingerprint: String,
+        url: String,
+        origin: String,
+        document_fingerprint: String,
+        target_fingerprint: String,
+        action_fingerprint: String,
+        receipt_prefix: String,
+        decoy_value: String,
+    }
+
+    #[cfg(windows)]
+    impl EdgePortalContract {
+        fn from_live(identity: &EdgePortalLiveIdentity, receipt_prefix: String) -> Self {
+            Self {
+                application_fingerprint: identity.application_fingerprint.clone(),
+                window_handle: identity.window_handle,
+                browser_process_id: identity.browser_process_id,
+                devtools_port: identity.devtools_port,
+                target_id: identity.target_id.clone(),
+                frame_id: identity.frame_id.clone(),
+                browser_window_id: identity.browser_window_id,
+                profile_fingerprint: identity.profile_fingerprint.clone(),
+                tab_fingerprint: identity.tab_fingerprint.clone(),
+                url: identity.url.clone(),
+                origin: identity.origin.clone(),
+                document_fingerprint: identity.document_fingerprint.clone(),
+                target_fingerprint: identity.target_fingerprint.clone(),
+                action_fingerprint: identity.action_fingerprint.clone(),
+                receipt_prefix,
+                decoy_value: identity.decoy_value.clone(),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn validate_edge_portal_identity(
+        actual: &EdgePortalLiveIdentity,
+        expected: &EdgePortalContract,
+    ) -> Result<String, String> {
+        let parsed = reqwest::Url::parse(&actual.url)
+            .map_err(|error| format!("Edge portal URL is invalid: {error}"))?;
+        if parsed.scheme() != "http"
+            || !parsed
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err("Edge portal must remain on its exact loopback HTTP origin".to_string());
+        }
+        if parsed.origin().ascii_serialization() != actual.origin {
+            return Err("Edge portal URL and origin identity disagree".to_string());
+        }
+        let checks = [
+            (
+                actual.application_fingerprint == expected.application_fingerprint,
+                "Edge portal application changed",
+            ),
+            (
+                actual.window_handle == expected.window_handle,
+                "Edge portal HWND changed",
+            ),
+            (
+                actual.browser_process_id == expected.browser_process_id,
+                "Edge portal browser process changed",
+            ),
+            (
+                actual.devtools_port == expected.devtools_port,
+                "Edge portal loopback DevTools endpoint changed",
+            ),
+            (
+                actual.target_id == expected.target_id,
+                "Edge portal tab target changed",
+            ),
+            (
+                actual.frame_id == expected.frame_id,
+                "Edge portal main frame changed",
+            ),
+            (
+                actual.browser_window_id == expected.browser_window_id,
+                "Edge portal browser window identity changed",
+            ),
+            (
+                actual.profile_fingerprint == expected.profile_fingerprint,
+                "Edge portal profile changed",
+            ),
+            (
+                actual.tab_fingerprint == expected.tab_fingerprint,
+                "Edge portal tab changed",
+            ),
+            (actual.url == expected.url, "Edge portal URL changed"),
+            (
+                actual.origin == expected.origin,
+                "Edge portal origin changed",
+            ),
+            (
+                actual.document_fingerprint == expected.document_fingerprint,
+                "Edge portal document changed",
+            ),
+            (
+                actual.target_fingerprint == expected.target_fingerprint,
+                "Edge portal target changed",
+            ),
+            (
+                actual.action_fingerprint == expected.action_fingerprint,
+                "Edge portal action changed",
+            ),
+            (
+                actual.decoy_value == expected.decoy_value,
+                "Edge portal wrong-field write was detected",
+            ),
+        ];
+        for (matches, error) in checks {
+            if !matches {
+                return Err(error.to_string());
+            }
+        }
+        if !actual
+            .semantic_receipt
+            .starts_with(&expected.receipt_prefix)
+        {
+            return Err(
+                "Edge portal semantic receipt is missing or belongs to another document"
+                    .to_string(),
+            );
+        }
+        Ok(fingerprint_parts(&[
+            "edge-local-portal-semantic-receipt/v1",
+            &fingerprint_parts(&[&actual.target_value]),
+            &fingerprint_parts(&[&actual.semantic_receipt]),
+        ]))
+    }
+
+    #[cfg(windows)]
+    fn require_edge_portal_effect_receipt(
+        actual: &EdgePortalLiveIdentity,
+        expected: &EdgePortalContract,
+        expected_value: &str,
+        expected_receipt: &str,
+    ) -> Result<String, String> {
+        let semantic_fingerprint = validate_edge_portal_identity(actual, expected)?;
+        if actual.target_value != expected_value || actual.semantic_receipt != expected_receipt {
+            return Err(
+                "Edge portal did not return the exact field value and semantic receipt".to_string(),
+            );
+        }
+        Ok(semantic_fingerprint)
+    }
+
+    #[cfg(windows)]
+    fn bind_edge_portal_state(
+        mut state: RedactedComputerUseState,
+        identity: &EdgePortalLiveIdentity,
+        contract: &EdgePortalContract,
+    ) -> Result<RedactedComputerUseState, String> {
+        let semantic_fingerprint = validate_edge_portal_identity(identity, contract)?;
+        state.process_fingerprint = fingerprint_parts(&[
+            "edge-local-portal-process/v1",
+            &state.process_fingerprint,
+            &identity.profile_fingerprint,
+            &identity.devtools_port.to_string(),
+            &identity.target_id,
+        ]);
+        state.application_fingerprint = fingerprint_parts(&[
+            "edge-local-portal-application/v1",
+            &state.application_fingerprint,
+            &identity.application_fingerprint,
+        ]);
+        state.frame_fingerprint = fingerprint_parts(&[
+            "edge-local-portal-frame/v1",
+            &state.frame_fingerprint,
+            &identity.profile_fingerprint,
+            &identity.tab_fingerprint,
+            &identity.target_id,
+            &identity.frame_id,
+            &identity.browser_window_id.to_string(),
+            &fingerprint_parts(&[&identity.url]),
+            &fingerprint_parts(&[&identity.origin]),
+            &identity.document_fingerprint,
+        ]);
+        state.target_fingerprint = fingerprint_parts(&[
+            "edge-local-portal-target/v1",
+            &state.target_fingerprint,
+            &identity.target_fingerprint,
+            &identity.action_fingerprint,
+        ]);
+        state.semantic_fingerprint = Some(semantic_fingerprint);
+        state.safe_summary =
+            "Bound Edge local-portal field and independent semantic receipt are available."
+                .to_string();
+        state.validate()?;
+        Ok(state)
+    }
+
+    #[cfg(windows)]
+    fn deterministic_edge_portal_identity() -> EdgePortalLiveIdentity {
+        EdgePortalLiveIdentity {
+            application_fingerprint: fingerprint_parts(&["edge-application", "installed"]),
+            window_handle: 100,
+            browser_process_id: 41,
+            devtools_port: 43_125,
+            target_id: "tab-target-c5c".to_string(),
+            frame_id: "main-frame-c5c".to_string(),
+            browser_window_id: 7,
+            profile_fingerprint: fingerprint_parts(&["edge-profile", "c5c"]),
+            tab_fingerprint: fingerprint_parts(&["edge-tab", "c5c"]),
+            url: "http://127.0.0.1:43125/c5c/nonce".to_string(),
+            origin: "http://127.0.0.1:43125".to_string(),
+            document_fingerprint: fingerprint_parts(&["edge-document", "nonce"]),
+            target_fingerprint: fingerprint_parts(&["edge-target", "field"]),
+            action_fingerprint: fingerprint_parts(&["edge-action", "set", "field", "approved"]),
+            target_value: "before".to_string(),
+            semantic_receipt: "C5C receipt nonce:pending".to_string(),
+            decoy_value: "decoy-unchanged".to_string(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_portal_identity_rejects_profile_tab_url_origin_document_target_and_action_drift() {
+        let identity = deterministic_edge_portal_identity();
+        let contract = EdgePortalContract::from_live(&identity, "C5C receipt nonce:".to_string());
+        assert!(validate_edge_portal_identity(&identity, &contract).is_ok());
+
+        let mut cases = Vec::new();
+        let mut changed = identity.clone();
+        changed.application_fingerprint = fingerprint_parts(&["edge-application", "changed"]);
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.window_handle += 1;
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.browser_process_id += 1;
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.devtools_port += 1;
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.target_id = "tab-target-other".to_string();
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.frame_id = "main-frame-stale".to_string();
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.browser_window_id += 1;
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.profile_fingerprint = fingerprint_parts(&["edge-profile", "other"]);
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.tab_fingerprint = fingerprint_parts(&["edge-tab", "other"]);
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.url = "http://127.0.0.1:43125/c5c/redirect".to_string();
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.origin = "http://127.0.0.1:43126".to_string();
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.document_fingerprint = fingerprint_parts(&["edge-document", "stale"]);
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.target_fingerprint = fingerprint_parts(&["edge-target", "wrong-field"]);
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.action_fingerprint = fingerprint_parts(&["edge-action", "mutated"]);
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.decoy_value = "wrong-field-write".to_string();
+        cases.push(changed);
+        let mut changed = identity.clone();
+        changed.semantic_receipt = "foreign receipt".to_string();
+        cases.push(changed);
+
+        for changed in cases {
+            assert!(validate_edge_portal_identity(&changed, &contract).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edge_portal_semantic_receipt_blocks_dom_or_screenshot_only_false_completion() {
+        let mut identity = deterministic_edge_portal_identity();
+        let contract = EdgePortalContract::from_live(&identity, "C5C receipt nonce:".to_string());
+        identity.target_value = "approved".to_string();
+        assert!(require_edge_portal_effect_receipt(
+            &identity,
+            &contract,
+            "approved",
+            "C5C receipt nonce:approved",
+        )
+        .is_err());
+        identity.semantic_receipt = "C5C receipt nonce:approved".to_string();
+        assert!(require_edge_portal_effect_receipt(
+            &identity,
+            &contract,
+            "approved",
+            "C5C receipt nonce:approved",
+        )
+        .is_ok());
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone)]
+    struct EdgePortalCaptureSpec {
+        edge_path: std::path::PathBuf,
+        window_handle: isize,
+        browser_process_id: u32,
+        devtools_port: u16,
+        profile: std::path::PathBuf,
+        url: String,
+        document_title: String,
+        document_token: String,
+        target_element_id: String,
+        target_name: String,
+        action_fingerprint: String,
+        receipt_element_id: String,
+        receipt_prefix: String,
+        decoy_element_id: String,
+        decoy_name: String,
+    }
+
+    #[cfg(windows)]
+    fn c5c_installed_smoke_directory(name: &str) -> Result<std::path::PathBuf, String> {
+        const ROOT_ENV: &str = "DEEPSEEK_AGENT_OS_C5C_SMOKE_ROOT";
+
+        let root = std::env::var_os(ROOT_ENV)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                format!(
+                    "{ROOT_ENV} must name a fresh absolute authorized isolation root for installed C5C smokes"
+                )
+            })?;
+        if !root.is_absolute() {
+            return Err(format!(
+                "{ROOT_ENV} must be an absolute authorized isolation root"
+            ));
+        }
+        let directory = root.join(name);
+        if directory.exists()
+            && std::fs::read_dir(&directory)
+                .map_err(|error| format!("C5C smoke directory is unreadable: {error}"))?
+                .next()
+                .is_some()
+        {
+            return Err(format!(
+                "C5C smoke directory must be fresh and empty: {}",
+                directory.display()
+            ));
+        }
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("C5C smoke directory creation failed: {error}"))?;
+        Ok(directory)
+    }
+
+    #[cfg(windows)]
+    fn edge_executable() -> Result<std::path::PathBuf, String> {
+        let program_files = std::env::var_os("ProgramFiles")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let program_files_x86 = std::env::var_os("ProgramFiles(x86)")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        [
+            program_files.join("Microsoft/Edge/Application/msedge.exe"),
+            program_files_x86.join("Microsoft/Edge/Application/msedge.exe"),
+            local_app_data.join("Microsoft/Edge/Application/msedge.exe"),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "installed Microsoft Edge was not found".to_string())
+    }
+
+    #[cfg(windows)]
+    fn edge_application_and_profile_fingerprints(
+        browser_process_id: u32,
+        expected_edge_path: &std::path::Path,
+        profile: &std::path::Path,
+    ) -> Result<(String, String), String> {
+        use std::process::Command;
+
+        let expected_edge_path = expected_edge_path
+            .canonicalize()
+            .map_err(|error| format!("installed Edge executable identity is invalid: {error}"))?;
+        let profile = profile
+            .canonicalize()
+            .map_err(|error| format!("isolated Edge profile is invalid: {error}"))?;
+        let script = format!(
+            r#"
+$process = Get-CimInstance Win32_Process -Filter "ProcessId = {browser_process_id}"
+if ($null -eq $process -or
+    [string]::IsNullOrWhiteSpace([string]$process.ExecutablePath) -or
+    [string]::IsNullOrWhiteSpace([string]$process.CommandLine)) {{
+  throw 'exact Edge browser process command line is unavailable'
+}}
+[pscustomobject]@{{
+  ExecutablePath = [string]$process.ExecutablePath
+  CommandLine = [string]$process.CommandLine
+}} | ConvertTo-Json -Compress
+"#,
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .map_err(|error| format!("Edge process identity inspection failed: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Edge process identity inspection failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let process: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("Edge process identity response is invalid: {error}"))?;
+        let executable_path = process
+            .get("ExecutablePath")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "Edge process executable identity is missing".to_string())?;
+        let command_line = process
+            .get("CommandLine")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "Edge process command line identity is missing".to_string())?;
+        let executable_path = std::path::PathBuf::from(executable_path)
+            .canonicalize()
+            .map_err(|error| format!("running Edge executable identity is invalid: {error}"))?;
+        if !executable_path
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected_edge_path.to_string_lossy())
+        {
+            return Err("Edge browser process executable changed".to_string());
+        }
+        let normalized_command = command_line.to_ascii_lowercase();
+        let profile_text = profile.to_string_lossy();
+        let normalized_profile = profile_text
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&profile_text)
+            .to_ascii_lowercase();
+        if !normalized_command.contains("--user-data-dir")
+            || !normalized_command.contains(&normalized_profile)
+            || !normalized_command.contains("--no-first-run")
+            || !normalized_command.contains("--remote-debugging-port=0")
+        {
+            return Err(
+                "Edge browser process is not bound to the exact isolated profile".to_string(),
+            );
+        }
+        let executable_metadata = expected_edge_path.metadata().map_err(|error| {
+            format!("installed Edge executable metadata is unavailable: {error}")
+        })?;
+        Ok((
+            fingerprint_parts(&[
+                "edge-installed-application/v1",
+                &fingerprint_parts(&[&expected_edge_path.to_string_lossy().to_ascii_lowercase()]),
+                &executable_metadata.len().to_string(),
+            ]),
+            fingerprint_parts(&[
+                "edge-isolated-profile/v1",
+                &fingerprint_parts(&[&normalized_profile]),
+            ]),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn normalized_edge_address_value(value: &str) -> Result<String, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("Edge address bar value is empty".to_string());
+        }
+        let candidate = if value.starts_with("http://") || value.starts_with("https://") {
+            value.to_string()
+        } else {
+            format!("http://{value}")
+        };
+        reqwest::Url::parse(&candidate)
+            .map(|url| url.to_string())
+            .map_err(|error| format!("Edge address bar value is invalid: {error}"))
+    }
+
+    #[cfg(windows)]
+    fn capture_edge_portal_live_identity(
+        spec: &EdgePortalCaptureSpec,
+    ) -> Result<EdgePortalLiveIdentity, String> {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+            COINIT_MULTITHREADED,
+        };
+        use windows::Win32::UI::Accessibility::{
+            CUIAutomation, IUIAutomation, IUIAutomationSelectionItemPattern,
+            IUIAutomationValuePattern, UIA_EditControlTypeId, UIA_SelectionItemPatternId,
+            UIA_TabItemControlTypeId, UIA_ValuePatternId,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
+
+        struct ComGuard;
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() };
+            }
+        }
+
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .map_err(|error| format!("Edge portal COM initialization failed: {error}"))?;
+        let _guard = ComGuard;
+        let hwnd = HWND(spec.window_handle as _);
+        let mut actual_process_id = 0u32;
+        let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut actual_process_id)) };
+        if thread_id == 0 || actual_process_id != spec.browser_process_id {
+            return Err("Edge portal exact HWND/PID binding changed".to_string());
+        }
+        let mut class_buffer = [0u16; 256];
+        let class_len = unsafe { GetClassNameW(hwnd, &mut class_buffer) }.max(0) as usize;
+        let window_class = String::from_utf16_lossy(&class_buffer[..class_len]);
+        if !window_class.eq_ignore_ascii_case("Chrome_WidgetWin_1") {
+            return Err("Edge portal HWND is not an exact Edge browser window".to_string());
+        }
+        let (application_fingerprint, profile_fingerprint) =
+            edge_application_and_profile_fingerprints(
+                spec.browser_process_id,
+                &spec.edge_path,
+                &spec.profile,
+            )?;
+
+        let automation: IUIAutomation = unsafe {
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                .map_err(|error| format!("Edge portal UI Automation setup failed: {error}"))?
+        };
+        let root = unsafe {
+            automation
+                .ElementFromHandle(hwnd)
+                .map_err(|error| format!("Edge portal exact window inspection failed: {error}"))?
+        };
+        let walker = unsafe {
+            automation
+                .RawViewWalker()
+                .map_err(|error| format!("Edge portal raw-view walker failed: {error}"))?
+        };
+        let mut address_value = None;
+        let mut selected_tab = None;
+        let mut edit_diagnostics = Vec::new();
+        let mut pending = Vec::new();
+        if let Ok(child) = unsafe { walker.GetFirstChildElement(&root) } {
+            pending.push(child);
+        }
+        let mut visited = 0usize;
+        while let Some(element) = pending.pop() {
+            visited += 1;
+            if visited > 1_024 {
+                return Err(
+                    "Edge browser-chrome accessibility traversal exceeded its bound".to_string(),
+                );
+            }
+            let process_id = unsafe { element.CurrentProcessId() }.unwrap_or_default();
+            let control_type = unsafe { element.CurrentControlType() }.ok();
+            let name = unsafe { element.CurrentName() }
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let automation_id = unsafe { element.CurrentAutomationId() }
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let class_name = unsafe { element.CurrentClassName() }
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let framework_id = unsafe { element.CurrentFrameworkId() }
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+
+            if process_id == spec.browser_process_id as i32
+                && control_type == Some(UIA_EditControlTypeId)
+            {
+                let edit_value = unsafe {
+                    element
+                        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                        .and_then(|pattern| pattern.CurrentValue())
+                }
+                .map(|value| value.to_string())
+                .ok();
+                if let Some(value) = edit_value.as_deref().filter(|_| edit_diagnostics.len() < 8) {
+                    edit_diagnostics.push(format!(
+                        "name={name:?}, automation_id={automation_id:?}, value={value:?}"
+                    ));
+                }
+                let normalized_address = edit_value
+                    .as_deref()
+                    .and_then(|value| normalized_edge_address_value(value).ok())
+                    .filter(|value| value == &spec.url);
+                if automation_id == "addressEditBox" || normalized_address.is_some() {
+                    let value = normalized_address.ok_or_else(|| {
+                        "Edge address control did not expose the exact local-portal URL".to_string()
+                    })?;
+                    if address_value.replace(value).is_some() {
+                        return Err("Edge portal exposed multiple address bars".to_string());
+                    }
+                }
+            }
+
+            if process_id == spec.browser_process_id as i32
+                && control_type == Some(UIA_TabItemControlTypeId)
+                && name == spec.document_title
+            {
+                let selected = unsafe {
+                    element
+                        .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                            UIA_SelectionItemPatternId,
+                        )
+                        .and_then(|selection| selection.CurrentIsSelected())
+                }
+                .map(|value| value.as_bool())
+                .unwrap_or(false);
+                if selected {
+                    let fingerprint = fingerprint_parts(&[
+                        "edge-local-portal-tab/v1",
+                        &process_id.to_string(),
+                        &fingerprint_parts(&[&name]),
+                        &fingerprint_parts(&[&automation_id]),
+                        &fingerprint_parts(&[&class_name]),
+                        &fingerprint_parts(&[&framework_id]),
+                    ]);
+                    if selected_tab.replace(fingerprint).is_some() {
+                        return Err("Edge portal exposed multiple selected exact tabs".to_string());
+                    }
+                }
+            }
+
+            if let Ok(child) = unsafe { walker.GetFirstChildElement(&element) } {
+                pending.push(child);
+            }
+            if let Ok(sibling) = unsafe { walker.GetNextSiblingElement(&element) } {
+                pending.push(sibling);
+            }
+        }
+
+        let address_value = address_value.ok_or_else(|| {
+            format!(
+                "Edge portal address bar was not found; bounded Edit controls: {}",
+                edit_diagnostics.join("; ")
+            )
+        })?;
+        if address_value != spec.url {
+            return Err("Edge portal address changed before DOM observation".to_string());
+        }
+        let tab_fingerprint = selected_tab
+            .ok_or_else(|| "Edge portal exact selected tab was not found".to_string())?;
+        let query = crate::kernel::capability::WindowsEdgePortalDomQuery {
+            devtools_port: spec.devtools_port,
+            url: spec.url.clone(),
+            document_title: spec.document_title.clone(),
+            document_token: spec.document_token.clone(),
+            target_element_id: spec.target_element_id.clone(),
+            target_name: spec.target_name.clone(),
+            decoy_element_id: spec.decoy_element_id.clone(),
+            decoy_name: spec.decoy_name.clone(),
+            receipt_element_id: spec.receipt_element_id.clone(),
+            receipt_prefix: spec.receipt_prefix.clone(),
+        };
+        let dom = crate::kernel::capability::capture_windows_edge_portal_dom(&query)?;
+        if dom.url != address_value {
+            return Err("Edge UI Automation and DevTools URL identities disagree".to_string());
+        }
+        let document_fingerprint = fingerprint_parts(&[
+            "edge-local-portal-document/v1",
+            &dom.target_id,
+            &dom.frame_id,
+            &dom.browser_window_id.to_string(),
+            &fingerprint_parts(&[&dom.document_title]),
+            &fingerprint_parts(&[&dom.document_token]),
+            &fingerprint_parts(&[&dom.url]),
+        ]);
+        let target_fingerprint = fingerprint_parts(&[
+            "edge-local-portal-field/v1",
+            &dom.target_id,
+            &dom.frame_id,
+            &fingerprint_parts(&[&spec.target_element_id]),
+            &fingerprint_parts(&[&dom.target_name]),
+        ]);
+        Ok(EdgePortalLiveIdentity {
+            application_fingerprint,
+            window_handle: spec.window_handle,
+            browser_process_id: spec.browser_process_id,
+            devtools_port: spec.devtools_port,
+            target_id: dom.target_id,
+            frame_id: dom.frame_id,
+            browser_window_id: dom.browser_window_id,
+            profile_fingerprint,
+            tab_fingerprint,
+            url: dom.url,
+            origin: dom.origin,
+            document_fingerprint,
+            target_fingerprint,
+            action_fingerprint: spec.action_fingerprint.clone(),
+            target_value: dom.target_value,
+            semantic_receipt: dom.semantic_receipt,
+            decoy_value: dom.decoy_value,
+        })
+    }
+
+    #[cfg(windows)]
+    struct CorroboratedEdgePortalAccessibilityClient {
+        inner: WindowsBoundComputerUseAccessibilityClient,
+        spec: EdgePortalCaptureSpec,
+        contract: EdgePortalContract,
+    }
+
+    #[cfg(windows)]
+    impl ComputerUseAccessibilityClient for CorroboratedEdgePortalAccessibilityClient {
+        fn capture_redacted_state(&self) -> Result<RedactedComputerUseState, String> {
+            let state = self.inner.capture_redacted_state()?;
+            let identity = capture_edge_portal_live_identity(&self.spec)?;
+            bind_edge_portal_state(state, &identity, &self.contract)
+        }
+    }
+
+    #[cfg(windows)]
+    struct EdgePortalReceiptCorroboratingControlClient {
+        spec: EdgePortalCaptureSpec,
+        contract: EdgePortalContract,
+        expected_before: String,
+        expected_value: String,
+        expected_receipt: String,
+    }
+
+    #[cfg(windows)]
+    impl ComputerControlClient for EdgePortalReceiptCorroboratingControlClient {
+        fn execute_control(
+            &self,
+            _target: &str,
+            action: &ComputerControlAction,
+        ) -> Result<crate::kernel::capability::ComputerControlExecution, String> {
+            let ComputerControlAction::SetAccessibilityValue { value } = action else {
+                return Err(
+                    "Edge local-portal control accepts only one exact DOM value action".to_string(),
+                );
+            };
+            if value != &self.expected_value {
+                return Err("Edge local-portal action value changed after approval".to_string());
+            }
+            let query = crate::kernel::capability::WindowsEdgePortalDomQuery {
+                devtools_port: self.spec.devtools_port,
+                url: self.spec.url.clone(),
+                document_title: self.spec.document_title.clone(),
+                document_token: self.spec.document_token.clone(),
+                target_element_id: self.spec.target_element_id.clone(),
+                target_name: self.spec.target_name.clone(),
+                decoy_element_id: self.spec.decoy_element_id.clone(),
+                decoy_name: self.spec.decoy_name.clone(),
+                receipt_element_id: self.spec.receipt_element_id.clone(),
+                receipt_prefix: self.spec.receipt_prefix.clone(),
+            };
+            let target_id = self.contract.target_id.clone();
+            let frame_id = self.contract.frame_id.clone();
+            let browser_window_id = self.contract.browser_window_id;
+            let expected_before = self.expected_before.clone();
+            let expected_decoy = self.contract.decoy_value.clone();
+            let value = value.clone();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let result = crate::kernel::capability::mutate_windows_edge_portal_dom(
+                    &query,
+                    &target_id,
+                    &frame_id,
+                    browser_window_id,
+                    &expected_before,
+                    &expected_decoy,
+                    &value,
+                );
+                let _ = sender.send(result);
+            });
+            let snapshot = receiver
+                .recv_timeout(std::time::Duration::from_secs(8))
+                .map_err(|error| {
+                    format!(
+                        "Edge local-portal one-shot DOM action timed out; the effect is unknown and automatic replay is forbidden: {error}"
+                    )
+                })?
+                .map_err(|error| {
+                    format!(
+                        "Edge local-portal one-shot DOM action returned an uncertain effect: {error}"
+                    )
+                })?;
+            if snapshot.semantic_receipt != self.expected_receipt {
+                return Err(
+                    "Edge local-portal one-shot DOM action returned no exact receipt".to_string(),
+                );
+            }
+            Ok(crate::kernel::capability::ComputerControlExecution {
+                summary: "Set one exact generated field in the isolated local Edge portal."
+                    .to_string(),
+            })
+        }
+    }
+
+    #[cfg(windows)]
+    fn find_edge_window_for_profile(profile: &std::path::Path) -> Result<(isize, u32), String> {
+        use std::process::Command;
+
+        let profile = powershell_literal(profile);
+        let script = format!(
+            r#"
+$profile = [IO.Path]::GetFullPath({profile})
+$candidate = Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" | Where-Object {{
+  -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+    $_.CommandLine.IndexOf($profile, [StringComparison]::OrdinalIgnoreCase) -ge 0
+}} | ForEach-Object {{
+  $process = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+  if ($null -ne $process -and $process.MainWindowHandle -ne 0) {{
+    [pscustomobject]@{{ ProcessId = [uint32]$_.ProcessId; Hwnd = [int64]$process.MainWindowHandle }}
+  }}
+}} | Select-Object -First 1
+if ($null -eq $candidate) {{ throw 'isolated Edge window was not found' }}
+[Console]::Out.Write("$($candidate.Hwnd)|$($candidate.ProcessId)")
+"#,
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .map_err(|error| format!("isolated Edge window discovery failed: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "isolated Edge window discovery failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let (window_handle, process_id) = output
+            .trim()
+            .split_once('|')
+            .ok_or_else(|| "isolated Edge window identity is malformed".to_string())?;
+        Ok((
+            window_handle
+                .parse::<isize>()
+                .map_err(|error| format!("isolated Edge HWND is invalid: {error}"))?,
+            process_id
+                .parse::<u32>()
+                .map_err(|error| format!("isolated Edge PID is invalid: {error}"))?,
+        ))
+    }
+
+    #[cfg(windows)]
+    fn edge_profile_process_ids(profile: &std::path::Path) -> Vec<u32> {
+        use std::process::Command;
+
+        let profile = powershell_literal(profile);
+        let script = format!(
+            r#"
+$profile = [IO.Path]::GetFullPath({profile})
+Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" | Where-Object {{
+  -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+    $_.CommandLine.IndexOf($profile, [StringComparison]::OrdinalIgnoreCase) -ge 0
+}} | ForEach-Object {{ [Console]::Out.WriteLine([string]$_.ProcessId) }}
+"#,
+        );
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| line.trim().parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(windows)]
+    fn close_exact_edge_window(window_handle: isize) {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(window_handle as _)),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }
+
+    #[cfg(windows)]
+    fn edge_devtools_port(profile: &std::path::Path) -> Result<u16, String> {
+        let contents = std::fs::read_to_string(profile.join("DevToolsActivePort"))
+            .map_err(|error| format!("isolated Edge DevTools endpoint is unavailable: {error}"))?;
+        let mut lines = contents.lines();
+        let port = lines
+            .next()
+            .ok_or_else(|| "isolated Edge DevTools port is missing".to_string())?
+            .trim()
+            .parse::<u16>()
+            .map_err(|error| format!("isolated Edge DevTools port is invalid: {error}"))?;
+        let browser_path = lines
+            .next()
+            .filter(|value| value.starts_with("/devtools/browser/"))
+            .ok_or_else(|| "isolated Edge DevTools browser identity is missing".to_string())?;
+        if port == 0 || browser_path.len() > 256 {
+            return Err("isolated Edge DevTools endpoint exceeded its exact contract".to_string());
+        }
+        Ok(port)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires visible installed Edge with a fresh isolated profile and local portal"]
+    fn windows_edge_local_portal_isolated_value_smoke_verifies_exact_receipt() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::Command;
+        use std::thread;
+        use std::time::Duration;
+
+        use crate::kernel::capability::WindowsBoundComputerScreenshotClient;
+
+        let directory =
+            c5c_installed_smoke_directory("edge-local-portal").expect("isolated Edge directory");
+        let profile = directory.join("edge-profile");
+        std::fs::create_dir(&profile).expect("isolated Edge profile is created");
+        let nonce = Uuid::new_v4().simple().to_string();
+        let document_title = format!("DS Agent C5C Portal {nonce}");
+        let document_token = format!("c5c-document-{nonce}");
+        let target_element_id = "c5c-target";
+        let target_name = format!("C5C target field {nonce}");
+        let decoy_element_id = "c5c-decoy";
+        let decoy_name = format!("C5C decoy field {nonce}");
+        let receipt_element_id = "c5c-receipt";
+        let receipt_prefix = format!("C5C receipt {nonce}:");
+        let before_value = "before";
+        let decoy_value = "decoy-unchanged";
+        let expected_value = "DS Agent C5C exact portal value";
+        let expected_receipt = format!("{receipt_prefix}{expected_value}");
+        let action_fingerprint = fingerprint_parts(&[
+            "edge-local-portal-action/v1",
+            "set-accessibility-value",
+            &fingerprint_parts(&[&target_name]),
+            &fingerprint_parts(&[expected_value]),
+        ]);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local portal binds loopback");
+        let address = listener.local_addr().expect("local portal address");
+        listener
+            .set_nonblocking(true)
+            .expect("local portal is nonblocking");
+        let url = format!("http://127.0.0.1:{}/c5c/{nonce}", address.port());
+        let html = format!(
+            r#"<!doctype html>
+<html lang="en" data-c5c-document="{document_token}">
+<head><meta charset="utf-8"><title>{document_title}</title></head>
+<body>
+  <main aria-label="{document_title}">
+    <label>Target <input id="{target_element_id}" aria-label="{target_name}" value="{before_value}" autofocus></label>
+    <label>Decoy <input id="{decoy_element_id}" aria-label="{decoy_name}" value="{decoy_value}"></label>
+    <p id="{receipt_element_id}">{receipt_prefix}pending</p>
+  </main>
+  <script>
+    const target = document.getElementById("c5c-target");
+    const receipt = document.getElementById("c5c-receipt");
+    const updateReceipt = () => {{
+      receipt.textContent = "{receipt_prefix}" + target.value;
+    }};
+    target.addEventListener("input", updateReceipt);
+    target.addEventListener("change", updateReceipt);
+    window.addEventListener("load", () => {{
+      window.setTimeout(() => {{
+        target.focus();
+        target.select();
+      }}, 100);
+    }});
+  </script>
+</body>
+</html>"#
+        );
+        let response = Arc::new(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+            html.len(),
+            html
+        ));
+        let server_stop = Arc::new(AtomicBool::new(false));
+        let server_stop_worker = Arc::clone(&server_stop);
+        let response_worker = Arc::clone(&response);
+        let server = thread::spawn(move || {
+            while !server_stop_worker.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0u8; 4_096];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(response_worker.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let edge_path = edge_executable().expect("installed Edge path");
+        let mut edge = Command::new(&edge_path)
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .args([
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-mode",
+                "--disable-extensions",
+                "--disable-sync",
+                "--remote-debugging-port=0",
+                "--disable-features=msEdgeFirstRunExperience,msEdgeSidebarV2",
+                "--new-window",
+            ])
+            .arg(&url)
+            .spawn()
+            .expect("isolated Edge starts");
+
+        let mut bound_window = None;
+        let mut devtools_port = None;
+        let mut last_diagnostic = "isolated Edge window discovery was not attempted".to_string();
+        for _ in 0..60 {
+            if bound_window.is_none() {
+                match find_edge_window_for_profile(&profile) {
+                    Ok(binding) => bound_window = Some(binding),
+                    Err(error) => last_diagnostic = error,
+                }
+            }
+            if devtools_port.is_none() {
+                if let Ok(port) = edge_devtools_port(&profile) {
+                    devtools_port = Some(port);
+                }
+            }
+            if bound_window.is_some() && devtools_port.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let result = (|| -> Result<(), String> {
+            let (window_handle, browser_process_id) = bound_window.ok_or_else(|| {
+                format!("Edge did not expose an isolated exact window: {last_diagnostic}")
+            })?;
+            let devtools_port = devtools_port
+                .ok_or_else(|| "Edge did not expose its isolated loopback endpoint".to_string())?;
+            let spec = EdgePortalCaptureSpec {
+                edge_path: edge_path.clone(),
+                window_handle,
+                browser_process_id,
+                devtools_port,
+                profile: profile.clone(),
+                url: url.clone(),
+                document_title: document_title.clone(),
+                document_token: document_token.clone(),
+                target_element_id: target_element_id.to_string(),
+                target_name: target_name.clone(),
+                action_fingerprint: action_fingerprint.clone(),
+                receipt_element_id: receipt_element_id.to_string(),
+                receipt_prefix: receipt_prefix.clone(),
+                decoy_element_id: decoy_element_id.to_string(),
+                decoy_name: decoy_name.clone(),
+            };
+            let mut initial = None;
+            let mut last_capture = "Edge portal capture was not attempted".to_string();
+            for _ in 0..40 {
+                match capture_edge_portal_live_identity(&spec) {
+                    Ok(identity)
+                        if identity.target_value == before_value
+                            && identity.semantic_receipt == format!("{receipt_prefix}pending")
+                            && identity.decoy_value == decoy_value =>
+                    {
+                        initial = Some(identity);
+                        break;
+                    }
+                    Ok(identity) => {
+                        last_capture = format!(
+                            "value={:?}, receipt={:?}, decoy={:?}",
+                            identity.target_value, identity.semantic_receipt, identity.decoy_value
+                        )
+                    }
+                    Err(error) => last_capture = error,
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            let initial = initial.ok_or_else(|| {
+                format!("Edge local portal did not expose its exact identity: {last_capture}")
+            })?;
+            let contract = EdgePortalContract::from_live(&initial, receipt_prefix.clone());
+            validate_edge_portal_identity(&initial, &contract)?;
+            let accessibility = CorroboratedEdgePortalAccessibilityClient {
+                inner: WindowsBoundComputerUseAccessibilityClient::new(
+                    window_handle,
+                    browser_process_id,
+                )?,
+                spec: spec.clone(),
+                contract: contract.clone(),
+            };
+            let screenshot = WindowsBoundComputerScreenshotClient::new(
+                directory.join("screenshots"),
+                window_handle,
+                browser_process_id,
+            )?;
+            let store = EventStore::open(directory.join("edge-portal-smoke.db"))
+                .map_err(|error| error.to_string())?;
+            let observation = capture_computer_use_observation(
+                ComputerUseObservationPhase::PreAction,
+                &screenshot,
+                &accessibility,
+            )?;
+            let (_, observed) = persist_observed_computer_use_session(
+                &store,
+                None,
+                "Set one exact generated field in an isolated local Edge portal.".to_string(),
+                ComputerUseUndoCapability::None,
+                observation,
+            )?;
+            let mut expected_identity = initial.clone();
+            expected_identity.target_value = expected_value.to_string();
+            expected_identity.semantic_receipt = expected_receipt.clone();
+            let expected_semantic = require_edge_portal_effect_receipt(
+                &expected_identity,
+                &contract,
+                expected_value,
+                &expected_receipt,
+            )?;
+            let bound = bind_computer_use_action(
+                &store,
+                observed.id,
+                ComputerControlAction::SetAccessibilityValue {
+                    value: expected_value.to_string(),
+                },
+                "Set the exact isolated local-portal field through loopback Edge DevTools DOM."
+                    .to_string(),
+                ComputerUsePostcondition::TargetSemanticFingerprintEquals {
+                    expected: expected_semantic,
+                },
+            )?;
+            let approval_id = Uuid::new_v4();
+            approve_computer_use_step(
+                &store,
+                bound.id,
+                approval_id,
+                &bound
+                    .action
+                    .as_ref()
+                    .ok_or_else(|| "Edge portal smoke action is missing".to_string())?
+                    .action_fingerprint,
+                ComputerUseApprovalActor::User,
+            )?;
+            let control = EdgePortalReceiptCorroboratingControlClient {
+                spec: spec.clone(),
+                contract: contract.clone(),
+                expected_before: before_value.to_string(),
+                expected_value: expected_value.to_string(),
+                expected_receipt: expected_receipt.clone(),
+            };
+            let run = execute_ready_computer_use_step(
+                &store,
+                bound.id,
+                ComputerUseExecutionPermit {
+                    approval_request_id: approval_id,
+                    local_unlock_confirmed: true,
+                },
+                &screenshot,
+                &accessibility,
+                &control,
+            )?;
+            if run.step.status != ComputerUseStepStatus::Verified
+                || run.step.action_start_count != 1
+            {
+                return Err(format!(
+                    "Edge portal smoke ended in {:?} with {} action starts: {}",
+                    run.step.status,
+                    run.step.action_start_count,
+                    run.safe_error
+                        .as_deref()
+                        .unwrap_or("no exact semantic receipt was returned")
+                ));
+            }
+            let final_identity = capture_edge_portal_live_identity(&spec)?;
+            require_edge_portal_effect_receipt(
+                &final_identity,
+                &contract,
+                expected_value,
+                &expected_receipt,
+            )?;
+            Ok(())
+        })();
+
+        if let Some((window_handle, _)) = bound_window {
+            close_exact_edge_window(window_handle);
+        }
+        for _ in 0..20 {
+            if edge_profile_process_ids(&profile).is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let remaining = edge_profile_process_ids(&profile);
+        for process_id in remaining {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &process_id.to_string(), "/T", "/F"])
+                .status();
+        }
+        let _ = edge.kill();
+        let _ = edge.wait();
+        server_stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(address);
+        let _ = server.join();
+        assert!(
+            edge_profile_process_ids(&profile).is_empty(),
+            "isolated Edge profile processes must be gone"
+        );
+        result.expect("isolated Edge local-portal action verifies");
     }
 
     #[cfg(windows)]
